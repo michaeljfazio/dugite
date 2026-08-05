@@ -394,10 +394,8 @@ impl TxValidator for LedgerTxValidator {
             for err in &errors {
                 self.metrics.record_validation_error(&format!("{:?}", err));
             }
-            let mut mapped: Vec<TxValidationError> = errors
-                .into_iter()
-                .map(|e| convert_validation_error_at_pv(e, pv_major))
-                .collect();
+            let mut mapped: Vec<TxValidationError> =
+                enrich_validation_errors(errors, &tx, &utxo_view, pv_major);
             if mapped.len() == 1 {
                 mapped.pop().expect("vec has exactly one element")
             } else {
@@ -460,6 +458,257 @@ fn redeemer_tag_to_wire(tag: &str) -> Option<u8> {
         "propose" | "proposing" => Some(5),
         _ => None,
     }
+}
+
+/// #1025: build the full `Vec<TxValidationError>` for a rejected tx,
+/// COMBINING same-kind `ValidationError` occurrences into a single
+/// byte-correct typed wire arm where the real Haskell predicate failure
+/// needs a whole set/collection that dugite raises one entry at a time —
+/// and, for two kinds whose payload needs data the raw `ValidationError`
+/// never carries, re-deriving that data fresh from the already-decoded
+/// `tx` (and, for collateral, the same UTxO view Phase-1 validation used).
+///
+/// This exists in `dugite-node` specifically because `dugite-ledger`'s
+/// validation code (owned by a concurrent session this session) is off
+/// limits: none of `ValidationError`'s payloads were widened to make this
+/// possible. Everything below is a PURE re-derivation of data the
+/// validator already established — it makes no new accept/reject decision,
+/// only reshapes already-validated facts into the wire shape Haskell uses.
+/// Where that reshape needs data genuinely absent here too (a `ScriptHash`
+/// for `MissingRedeemer`, the whole `GovAction` for `MalformedProposal`),
+/// the corresponding error is left generic by the per-error fallback below
+/// — see the #1025 PR description for the full per-variant table.
+fn enrich_validation_errors(
+    errors: Vec<dugite_ledger::validation::ValidationError>,
+    tx: &dugite_primitives::transaction::Transaction,
+    utxo_view: &impl dugite_ledger::utxo::UtxoLookup,
+    pv_major: u64,
+) -> Vec<TxValidationError> {
+    use dugite_ledger::validation::ValidationError as VE;
+    use dugite_primitives::transaction::GovAction;
+
+    let mut consumed = vec![false; errors.len()];
+    let mut mapped: Vec<TxValidationError> = Vec::new();
+
+    // ── MissingRequiredDatumsUTXOW (UTXOW tag 11) ──
+    //
+    // Haskell's second field is `Map.keysSet (tx witness datums)` — every
+    // datum hash the tx's OWN witness set supplies, a pure witness-set
+    // derivation independent of which hashes are missing. If it can't be
+    // derived faithfully (no preserved raw spans — see the datum-hash
+    // re-encoding trap documented on `supplied_datum_hashes`), these
+    // occurrences are left generic rather than shipped with a wrong set.
+    let missing_idx: Vec<usize> = errors
+        .iter()
+        .enumerate()
+        .filter_map(|(i, e)| matches!(e, VE::MissingDatumWitness(_)).then_some(i))
+        .collect();
+    if !missing_idx.is_empty() {
+        if let Some(provided) = supplied_datum_hashes(tx) {
+            let missing = missing_idx
+                .iter()
+                .map(|&i| match &errors[i] {
+                    VE::MissingDatumWitness(h) => h.clone(),
+                    _ => unreachable!("filtered above"),
+                })
+                .collect();
+            mapped.push(TxValidationError::MissingRequiredDatumsUTXOW { missing, provided });
+            for &i in &missing_idx {
+                consumed[i] = true;
+            }
+        }
+    }
+
+    // ── NotAllowedSupplementalDatumsUTXOW (UTXOW tag 12) ──
+    //
+    // Haskell's second field is `getSupplementalDataHashes` — every datum
+    // hash referenced by the tx's OWN outputs. Unlike the missing-datum
+    // case this needs no raw-span reconstruction: `OutputDatum::DatumHash`
+    // already carries the hash directly, so this is always derivable.
+    let extra_idx: Vec<usize> = errors
+        .iter()
+        .enumerate()
+        .filter_map(|(i, e)| matches!(e, VE::ExtraDatumWitness(_)).then_some(i))
+        .collect();
+    if !extra_idx.is_empty() {
+        let allowed = allowed_output_datum_hashes(tx);
+        let extra = extra_idx
+            .iter()
+            .map(|&i| match &errors[i] {
+                VE::ExtraDatumWitness(h) => h.clone(),
+                _ => unreachable!("filtered above"),
+            })
+            .collect();
+        mapped.push(TxValidationError::NotAllowedSupplementalDatumsUTXOW { extra, allowed });
+        for &i in &extra_idx {
+            consumed[i] = true;
+        }
+    }
+
+    // ── OutputBootAddrAttrsTooBigUTXO (UTXO tag 10) ──
+    //
+    // `oversized_outputs` already carries the exact tx-body output indices
+    // (outputs are an ORDERED sequence, not a set, so this is a direct
+    // positional lookup — no UTxO join needed).
+    for (i, e) in errors.iter().enumerate() {
+        if let VE::OutputBootAddrAttrsTooBig { oversized_outputs } = e {
+            let outs: Option<Vec<String>> = oversized_outputs
+                .iter()
+                .map(|&idx| tx.body.outputs.get(idx).map(raw_output_hex))
+                .collect();
+            if let Some(outputs_raw_cbor) = outs {
+                mapped.push(TxValidationError::OutputBootAddrAttrsTooBigUTXO { outputs_raw_cbor });
+                consumed[i] = true;
+            }
+        }
+    }
+
+    // ── ScriptsNotPaidUTxOUTXO (UTXO tag 13) ──
+    //
+    // `ScriptLockedCollateral`'s `inputs` are TxIn refs only; the matching
+    // `TxOut` is looked up against the SAME `utxo_view` Phase-1 validation
+    // already used (no new trust decision — the input was already resolved
+    // once during validation).
+    for (i, e) in errors.iter().enumerate() {
+        if let VE::ScriptLockedCollateral { inputs } = e {
+            let resolved: Option<Vec<(String, String)>> = inputs
+                .iter()
+                .map(|s| {
+                    let txin = parse_tx_input_ref(s)?;
+                    let out = utxo_view.lookup(&txin)?;
+                    Some((s.clone(), raw_output_hex(&out)))
+                })
+                .collect();
+            if let Some(inputs_outputs) = resolved {
+                mapped.push(TxValidationError::ScriptsNotPaidUTxOUTXO { inputs_outputs });
+                consumed[i] = true;
+            }
+        }
+    }
+
+    // ── ZeroTreasuryWithdrawalsGOV (GOV tag 15) ──
+    //
+    // Haskell raises ONE `ZeroTreasuryWithdrawals (GovAction era)` PER
+    // offending proposal — dugite's `offending_proposals` aggregates into a
+    // single marker with no correlation back to a specific proposal, so
+    // this re-derives the zero-sum condition directly from
+    // `tx.body.proposal_procedures` (mirroring
+    // `is_treasury_withdrawals_zero_sum`'s PV==9 bootstrap skip) rather
+    // than trying to match strings back to proposals.
+    if errors
+        .iter()
+        .any(|e| matches!(e, VE::ZeroTreasuryWithdrawals { .. }))
+    {
+        let mut any_built = false;
+        for p in &tx.body.proposal_procedures {
+            if let GovAction::TreasuryWithdrawals {
+                withdrawals,
+                policy_hash,
+            } = &p.gov_action
+            {
+                let sum: u128 = withdrawals.values().map(|c| c.0 as u128).sum();
+                if sum == 0 && pv_major != 9 {
+                    mapped.push(TxValidationError::ZeroTreasuryWithdrawalsGOV {
+                        withdrawals: withdrawals
+                            .iter()
+                            .map(|(a, c)| (hex::encode(a), c.0))
+                            .collect(),
+                        policy_hash: policy_hash.as_ref().map(|h| hex::encode(h.as_ref())),
+                    });
+                    any_built = true;
+                }
+            }
+        }
+        if any_built {
+            for (i, e) in errors.iter().enumerate() {
+                if matches!(e, VE::ZeroTreasuryWithdrawals { .. }) {
+                    consumed[i] = true;
+                }
+            }
+        }
+    }
+
+    // Everything not combined above goes through the existing per-error
+    // mapping (typed where #979/#1025 already cover it, generic otherwise).
+    for (i, e) in errors.into_iter().enumerate() {
+        if !consumed[i] {
+            mapped.push(convert_validation_error_at_pv(e, pv_major));
+        }
+    }
+    mapped
+}
+
+/// Every datum hash the tx's OWN witness set supplies — `Map.keysSet`
+/// applied to Haskell's `TxDats`, needed by `MissingRequiredDatumsUTXOW`'s
+/// second field.
+///
+/// Prefers the raw per-element CBOR spans (`plutus_data_element_spans`) the
+/// SAME way `dugite-ledger`'s own datum validation does: on-chain datums
+/// are frequently non-canonically encoded, and Haskell memoises + hashes
+/// the ORIGINAL bytes, never a re-encoding (see the crate-wide
+/// `crypto-output-cbor-reencode` lesson). Returns `None` — rather than a
+/// hash set built from a lossy re-encode — when those spans aren't
+/// available, so the caller can fall back to leaving the occurrence
+/// generic instead of shipping a wrong set.
+fn supplied_datum_hashes(tx: &dugite_primitives::transaction::Transaction) -> Option<Vec<String>> {
+    let spans = tx
+        .witness_set
+        .raw_plutus_data_cbor
+        .as_deref()
+        .and_then(dugite_serialization::plutus_data_element_spans)?;
+    if spans.len() != tx.witness_set.plutus_data.len() {
+        return None;
+    }
+    Some(
+        spans
+            .iter()
+            .map(|raw| dugite_primitives::hash::blake2b_256(raw).to_hex())
+            .collect(),
+    )
+}
+
+/// Every datum hash referenced by the tx's OWN outputs —
+/// `getSupplementalDataHashes`, needed by
+/// `NotAllowedSupplementalDatumsUTXOW`'s second field. Unlike
+/// [`supplied_datum_hashes`] this never needs re-hashing: an output's
+/// `OutputDatum::DatumHash` already carries the hash verbatim.
+fn allowed_output_datum_hashes(tx: &dugite_primitives::transaction::Transaction) -> Vec<String> {
+    use dugite_primitives::transaction::OutputDatum;
+    tx.body
+        .outputs
+        .iter()
+        .filter_map(|o| match &o.datum {
+            OutputDatum::DatumHash(h) => Some(h.to_hex()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Hex-encoded raw CBOR of a `TransactionOutput`, preferring the ORIGINAL
+/// wire bytes (`raw_cbor`, populated by every era's decoder) over a fresh
+/// re-encode — the same "never re-encode when the original bytes survived"
+/// rule the datum-hash path above follows, and for the same reason: a
+/// legacy-vs-post-Alonzo or indefinite-length-datum mismatch in a re-encode
+/// has bitten this codebase before (`crypto-output-cbor-reencode`).
+fn raw_output_hex(output: &dugite_primitives::transaction::TransactionOutput) -> String {
+    match &output.raw_cbor {
+        Some(raw) => hex::encode(raw),
+        None => hex::encode(dugite_serialization::encode::encode_transaction_output(
+            output,
+        )),
+    }
+}
+
+/// Parse dugite's `"<txhash>#<index>"` `TransactionInput::Display` format
+/// back into a real `TransactionInput` for a UTxO lookup.
+fn parse_tx_input_ref(s: &str) -> Option<dugite_primitives::transaction::TransactionInput> {
+    let (hash_hex, idx_str) = s.rsplit_once('#')?;
+    let transaction_id = dugite_primitives::hash::Hash32::from_hex(hash_hex).ok()?;
+    let index: u32 = idx_str.parse().ok()?;
+    Some(dugite_primitives::transaction::TransactionInput {
+        transaction_id,
+        index,
+    })
 }
 
 /// Convert a ledger `ValidationError` into the network-facing
@@ -1466,6 +1715,25 @@ mod tests {
     ///   CBOR encoder arm itself hasn't been written. Newly-added predicates
     ///   (found by this Conway-Phase-1 validation audit) land here until a
     ///   follow-up wires the encoder — tracked alongside #979.
+    ///
+    ///   `#1025` enriched five MORE of these — `MissingDatumWitness`,
+    ///   `ExtraDatumWitness`, `OutputBootAddrAttrsTooBig`,
+    ///   `ScriptLockedCollateral`, `ZeroTreasuryWithdrawals` — but WITHOUT
+    ///   touching `dugite-ledger` (a concurrent session owns it): the
+    ///   missing data is re-derived one layer up, in
+    ///   `enrich_validation_errors`, from the already-decoded `tx` (and,
+    ///   for collateral, the UTxO view Phase-1 validation already used).
+    ///   Those five variants STILL appear in the list below, mapping to
+    ///   `ScriptFailed`, exactly as before — `enrich_validation_errors`
+    ///   intercepts them before they would ever reach
+    ///   `convert_validation_error`, so their entries here are now the
+    ///   FALLBACK for the rare case the enrichment itself can't build a
+    ///   faithful payload (see each one's updated reason below), not the
+    ///   normal path. This test only scans `convert_validation_error`'s own
+    ///   source and cannot see that upstream interception — a live
+    ///   round-trip is the only way to observe it, which is why #1025's
+    ///   verification is a wire-byte assertion test on
+    ///   `enrich_validation_errors` directly, not just this guard.
     #[test]
     fn remaining_generic_failures_are_a_closed_justified_set() {
         // (variant, why it is still generic)
@@ -1515,25 +1783,54 @@ mod tests {
             // ── Payload insufficient: counterpart exists, data does not ──
             (
                 "MalformedProposal",
-                "GOV 1 needs the whole GovAction; dugite carries a reason string",
+                "GOV 1 needs the whole GovAction; dugite carries a reason string only \
+                 (no proposal index/id to correlate back to `tx.body.proposal_procedures` \
+                 in a multi-proposal tx, and re-deriving `ppuWellFormed` independently \
+                 here would duplicate a ~30-field structural check — #1025)",
             ),
             (
                 "ZeroTreasuryWithdrawals",
-                "GOV 15 needs the whole GovAction",
+                "GOV 15's real shape is FIXED by `enrich_validation_errors` (#1025), which \
+                 re-derives the zero-sum condition directly from \
+                 `tx.body.proposal_procedures` and emits one `ZeroTreasuryWithdrawalsGOV` \
+                 per offending proposal. This arm in `convert_validation_error` itself is \
+                 unreachable in practice (the enrichment always finds at least one match \
+                 whenever this `ValidationError` fires) but stays generic as the \
+                 structural fallback.",
             ),
-            ("MissingDatumWitness", "UTXOW 11 needs BOTH datum-hash sets"),
-            ("ExtraDatumWitness", "UTXOW 12 needs BOTH datum-hash sets"),
+            (
+                "MissingDatumWitness",
+                "UTXOW 11 FIXED by `enrich_validation_errors` (#1025): aggregates every \
+                 per-hash occurrence plus a fresh witness-set derivation into one \
+                 `MissingRequiredDatumsUTXOW`. This arm is the fallback for the rare case \
+                 the raw per-element CBOR spans aren't preserved (see \
+                 `supplied_datum_hashes`).",
+            ),
+            (
+                "ExtraDatumWitness",
+                "UTXOW 12 FIXED by `enrich_validation_errors` (#1025), same shape as \
+                 MissingDatumWitness above but always derivable (no raw-span dependency) \
+                 — this arm should be effectively unreachable, kept as the structural \
+                 fallback.",
+            ),
             (
                 "MissingRedeemer",
-                "UTXOW 10 needs the ScriptHash beside the purpose",
+                "UTXOW 10 needs the ScriptHash beside the purpose (Haskell uses \
+                 `AsItem`, not `AsIx` — the item itself, not an index) — genuinely \
+                 unavailable without a `dugite-ledger` raise-site change (#1025)",
             ),
             (
                 "OutputBootAddrAttrsTooBig",
-                "UTXO 10 needs the TxOuts; dugite carries indices",
+                "UTXO 10 FIXED by `enrich_validation_errors` (#1025): tx-body outputs are \
+                 an ordered sequence, so the indices dugite already carries are a direct \
+                 positional lookup into `tx.body.outputs`. This arm is the fallback for \
+                 an out-of-range index.",
             ),
             (
                 "ScriptLockedCollateral",
-                "UTXO 13 needs a UTxO map; dugite carries input refs",
+                "UTXO 13 FIXED by `enrich_validation_errors` (#1025): each offending TxIn \
+                 is resolved to its TxOut via the SAME UTxO view Phase-1 validation \
+                 already used. This arm is the fallback for an unresolvable input.",
             ),
             (
                 "Phase2CollectError",
@@ -1609,6 +1906,288 @@ mod tests {
             "these are listed as deliberately generic but are no longer generic: {stale:?}\n\
              Remove them from JUSTIFIED — a stale entry hides the next regression."
         );
+    }
+
+    // ══ #1025: `enrich_validation_errors` ══════════════════════════════
+
+    fn minimal_tx(body: dugite_primitives::transaction::TransactionBody) -> Transaction {
+        Transaction {
+            hash: Hash32::from_bytes([0u8; 32]),
+            era: dugite_primitives::era::Era::Conway,
+            body,
+            witness_set: dugite_primitives::transaction::TransactionWitnessSet::default(),
+            is_valid: true,
+            auxiliary_data: None,
+            raw_cbor: None,
+            raw_body_cbor: None,
+            raw_witness_cbor: None,
+        }
+    }
+
+    struct EmptyUtxo;
+    impl dugite_ledger::utxo::UtxoLookup for EmptyUtxo {
+        fn lookup(
+            &self,
+            _input: &dugite_primitives::transaction::TransactionInput,
+        ) -> Option<dugite_primitives::transaction::TransactionOutput> {
+            None
+        }
+    }
+
+    use dugite_ledger::validation::ValidationError as VE;
+    use dugite_primitives::transaction::Transaction;
+
+    /// `ZeroTreasuryWithdrawalsGOV` must be re-derived from
+    /// `tx.body.proposal_procedures` (Haskell needs the whole `GovAction`,
+    /// which dugite's `ValidationError` never carries — #1025).
+    #[test]
+    fn enrich_zero_treasury_withdrawals_rederives_from_tx_body() {
+        let mut withdrawals = std::collections::BTreeMap::new();
+        withdrawals.insert(vec![0x55u8; 29], Lovelace(0));
+        let mut body = dugite_primitives::transaction::TransactionBody::default();
+        body.proposal_procedures.push(ProposalProcedure {
+            deposit: Lovelace(100_000_000_000),
+            return_addr: vec![0xAAu8; 29],
+            gov_action: GovAction::TreasuryWithdrawals {
+                withdrawals,
+                policy_hash: None,
+            },
+            anchor: Anchor {
+                url: String::new(),
+                data_hash: Hash32::from_bytes([0u8; 32]),
+            },
+        });
+        let tx = minimal_tx(body);
+
+        let errors = vec![VE::ZeroTreasuryWithdrawals {
+            offending_proposals: vec!["placeholder".to_string()],
+        }];
+        let mapped = enrich_validation_errors(errors, &tx, &EmptyUtxo, 10);
+        assert_eq!(mapped.len(), 1);
+        assert!(
+            matches!(
+                &mapped[0],
+                TxValidationError::ZeroTreasuryWithdrawalsGOV { withdrawals, policy_hash }
+                    if withdrawals.len() == 1 && withdrawals[0].1 == 0 && policy_hash.is_none()
+            ),
+            "expected a real ZeroTreasuryWithdrawalsGOV rebuilt from tx.body, got {:?}",
+            mapped[0]
+        );
+    }
+
+    /// The PV==9 bootstrap skip (`hardforkConwayBootstrapPhase`) must carry
+    /// over into the re-derivation, or a bootstrap-phase tx would get a
+    /// typed rejection Haskell would never produce.
+    #[test]
+    fn enrich_zero_treasury_withdrawals_respects_pv9_bootstrap_skip() {
+        let mut withdrawals = std::collections::BTreeMap::new();
+        withdrawals.insert(vec![0x55u8; 29], Lovelace(0));
+        let mut body = dugite_primitives::transaction::TransactionBody::default();
+        body.proposal_procedures.push(ProposalProcedure {
+            deposit: Lovelace(100_000_000_000),
+            return_addr: vec![0xAAu8; 29],
+            gov_action: GovAction::TreasuryWithdrawals {
+                withdrawals,
+                policy_hash: None,
+            },
+            anchor: Anchor {
+                url: String::new(),
+                data_hash: Hash32::from_bytes([0u8; 32]),
+            },
+        });
+        let tx = minimal_tx(body);
+
+        let errors = vec![VE::ZeroTreasuryWithdrawals {
+            offending_proposals: vec!["placeholder".to_string()],
+        }];
+        let mapped = enrich_validation_errors(errors, &tx, &EmptyUtxo, 9);
+        assert_eq!(mapped.len(), 1);
+        assert!(
+            matches!(&mapped[0], TxValidationError::ScriptFailed { .. }),
+            "PV==9 bootstrap must fall through to the generic arm (no offender found \
+             at PV 9, matching `is_treasury_withdrawals_zero_sum`'s bootstrap skip), \
+             got {:?}",
+            mapped[0]
+        );
+    }
+
+    /// `OutputBootAddrAttrsTooBigUTXO` must be built from a direct
+    /// positional lookup into `tx.body.outputs` — no UTxO join needed since
+    /// outputs are the tx's own ordered sequence.
+    #[test]
+    fn enrich_output_boot_addr_attrs_too_big_indexes_tx_body_outputs() {
+        use dugite_primitives::address::{Address, EnterpriseAddress};
+        use dugite_primitives::credentials::Credential;
+        use dugite_primitives::hash::Hash28;
+        use dugite_primitives::network::NetworkId;
+        use dugite_primitives::transaction::{OutputDatum, TransactionOutput};
+        use dugite_primitives::value::Value;
+
+        let output = TransactionOutput {
+            address: Address::Enterprise(EnterpriseAddress {
+                network: NetworkId::Mainnet,
+                payment: Credential::VerificationKey(Hash28::from_bytes([0x11; 28])),
+            }),
+            value: Value {
+                coin: Lovelace(1_000_000),
+                multi_asset: Default::default(),
+            },
+            datum: OutputDatum::None,
+            script_ref: None,
+            is_legacy: false,
+            raw_cbor: Some(vec![0x82, 0x01, 0x02]),
+        };
+        let mut body = dugite_primitives::transaction::TransactionBody::default();
+        body.outputs.push(output);
+        let tx = minimal_tx(body);
+
+        let errors = vec![VE::OutputBootAddrAttrsTooBig {
+            oversized_outputs: vec![0],
+        }];
+        let mapped = enrich_validation_errors(errors, &tx, &EmptyUtxo, 10);
+        assert_eq!(mapped.len(), 1);
+        match &mapped[0] {
+            TxValidationError::OutputBootAddrAttrsTooBigUTXO { outputs_raw_cbor } => {
+                assert_eq!(outputs_raw_cbor, &vec![hex::encode([0x82, 0x01, 0x02])]);
+            }
+            other => panic!("expected OutputBootAddrAttrsTooBigUTXO, got {other:?}"),
+        }
+    }
+
+    /// An out-of-range index must NOT panic or silently drop the failure —
+    /// it falls through to the generic arm rather than shipping a
+    /// truncated `outputs_raw_cbor` list.
+    #[test]
+    fn enrich_output_boot_addr_attrs_too_big_falls_back_on_bad_index() {
+        let tx = minimal_tx(dugite_primitives::transaction::TransactionBody::default());
+        let errors = vec![VE::OutputBootAddrAttrsTooBig {
+            oversized_outputs: vec![0], // tx has ZERO outputs
+        }];
+        let mapped = enrich_validation_errors(errors, &tx, &EmptyUtxo, 10);
+        assert_eq!(mapped.len(), 1);
+        assert!(matches!(&mapped[0], TxValidationError::ScriptFailed { .. }));
+    }
+
+    /// `MissingRequiredDatumsUTXOW`'s "provided" set needs the preserved raw
+    /// CBOR spans; without them (`raw_plutus_data_cbor: None`, e.g. from a
+    /// re-serialized tx), enrichment must decline rather than guess, and the
+    /// occurrence falls through to the generic arm.
+    #[test]
+    fn enrich_missing_datum_witness_falls_back_without_raw_spans() {
+        let tx = minimal_tx(dugite_primitives::transaction::TransactionBody::default());
+        let errors = vec![VE::MissingDatumWitness("11".repeat(32))];
+        let mapped = enrich_validation_errors(errors, &tx, &EmptyUtxo, 10);
+        assert_eq!(mapped.len(), 1);
+        assert!(matches!(&mapped[0], TxValidationError::ScriptFailed { .. }));
+    }
+
+    /// `NotAllowedSupplementalDatumsUTXOW`'s second field never needs a raw
+    /// span — `OutputDatum::DatumHash` already carries the hash directly —
+    /// so this must ALWAYS build the typed arm when the error fires.
+    #[test]
+    fn enrich_extra_datum_witness_derives_allowed_set_from_output_datums() {
+        use dugite_primitives::address::{Address, EnterpriseAddress};
+        use dugite_primitives::credentials::Credential;
+        use dugite_primitives::hash::DatumHash;
+        use dugite_primitives::hash::Hash28;
+        use dugite_primitives::transaction::{OutputDatum, TransactionOutput};
+        use dugite_primitives::value::Value;
+
+        let dh = DatumHash::from_bytes([0x77u8; 32]);
+        let output = TransactionOutput {
+            address: Address::Enterprise(EnterpriseAddress {
+                network: dugite_primitives::network::NetworkId::Mainnet,
+                payment: Credential::VerificationKey(Hash28::from_bytes([0x11; 28])),
+            }),
+            value: Value {
+                coin: Lovelace(1_000_000),
+                multi_asset: Default::default(),
+            },
+            datum: OutputDatum::DatumHash(dh),
+            script_ref: None,
+            is_legacy: false,
+            raw_cbor: Some(vec![0x82, 0x01, 0x02]),
+        };
+        let mut body = dugite_primitives::transaction::TransactionBody::default();
+        body.outputs.push(output);
+        let tx = minimal_tx(body);
+
+        let errors = vec![VE::ExtraDatumWitness(dh.to_hex())];
+        let mapped = enrich_validation_errors(errors, &tx, &EmptyUtxo, 10);
+        assert_eq!(mapped.len(), 1);
+        match &mapped[0] {
+            TxValidationError::NotAllowedSupplementalDatumsUTXOW { extra, allowed } => {
+                assert_eq!(extra, &vec![dh.to_hex()]);
+                assert_eq!(allowed, &vec![dh.to_hex()]);
+            }
+            other => panic!("expected NotAllowedSupplementalDatumsUTXOW, got {other:?}"),
+        }
+    }
+
+    /// `ScriptsNotPaidUTxOUTXO` must resolve each offending TxIn against
+    /// the SAME UTxO view Phase-1 validation already used, and decline
+    /// (fall through to generic) when the input can't be resolved rather
+    /// than shipping a partial map.
+    #[test]
+    fn enrich_script_locked_collateral_resolves_against_utxo_view() {
+        struct OneUtxo;
+        impl dugite_ledger::utxo::UtxoLookup for OneUtxo {
+            fn lookup(
+                &self,
+                input: &dugite_primitives::transaction::TransactionInput,
+            ) -> Option<dugite_primitives::transaction::TransactionOutput> {
+                use dugite_primitives::address::{Address, EnterpriseAddress};
+                use dugite_primitives::credentials::Credential;
+                use dugite_primitives::hash::Hash28;
+                use dugite_primitives::transaction::{OutputDatum, TransactionOutput};
+                use dugite_primitives::value::Value;
+                if input.index == 0 {
+                    Some(TransactionOutput {
+                        address: Address::Enterprise(EnterpriseAddress {
+                            network: dugite_primitives::network::NetworkId::Mainnet,
+                            payment: Credential::Script(Hash28::from_bytes([0x22; 28])),
+                        }),
+                        value: Value {
+                            coin: Lovelace(5_000_000),
+                            multi_asset: Default::default(),
+                        },
+                        datum: OutputDatum::None,
+                        script_ref: None,
+                        is_legacy: false,
+                        raw_cbor: Some(vec![0x82, 0x03, 0x04]),
+                    })
+                } else {
+                    None
+                }
+            }
+        }
+
+        let tx = minimal_tx(dugite_primitives::transaction::TransactionBody::default());
+        let resolvable_input = format!("{}#0", hex::encode([0x99u8; 32]));
+        let unresolvable_input = format!("{}#1", hex::encode([0x99u8; 32]));
+
+        // Resolvable case.
+        let errors = vec![VE::ScriptLockedCollateral {
+            inputs: vec![resolvable_input.clone()],
+        }];
+        let mapped = enrich_validation_errors(errors, &tx, &OneUtxo, 10);
+        assert_eq!(mapped.len(), 1);
+        match &mapped[0] {
+            TxValidationError::ScriptsNotPaidUTxOUTXO { inputs_outputs } => {
+                assert_eq!(inputs_outputs.len(), 1);
+                assert_eq!(inputs_outputs[0].0, resolvable_input);
+                assert_eq!(inputs_outputs[0].1, hex::encode([0x82, 0x03, 0x04]));
+            }
+            other => panic!("expected ScriptsNotPaidUTxOUTXO, got {other:?}"),
+        }
+
+        // Unresolvable case — must decline, not emit a partial map.
+        let errors = vec![VE::ScriptLockedCollateral {
+            inputs: vec![unresolvable_input],
+        }];
+        let mapped = enrich_validation_errors(errors, &tx, &OneUtxo, 10);
+        assert_eq!(mapped.len(), 1);
+        assert!(matches!(&mapped[0], TxValidationError::ScriptFailed { .. }));
     }
 
     /// #979 acceptance criterion 4 — the PV inversion.
