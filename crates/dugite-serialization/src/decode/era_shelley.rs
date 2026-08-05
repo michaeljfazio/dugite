@@ -1114,11 +1114,18 @@ fn decode_shelley_witness_set(
     let mut native_scripts = Vec::new();
     let mut bootstrap_witnesses = Vec::new();
 
-    let map_len = r.read_map_header()?;
-    let n_entries = map_len.unwrap_or(0) as usize;
-
-    for _ in 0..n_entries {
-        let key = r.read_uint()?;
+    // `for_each_field_entry` handles BOTH definite- and indefinite-length CBOR
+    // maps (issue #1012) and hard-rejects a duplicate field key, matching
+    // Haskell's `decodeSparseKeyed`/`applyField` (the same helper already used
+    // for Conway's witness set at `decode_conway_witness_set`, map-form TxOut,
+    // and the aux-data tag-259 inner map). The previous
+    // `read_map_header()?.unwrap_or(0)` silently decoded an indefinite-length
+    // map as ZERO entries and desynced the reader for everything after it —
+    // fewer honest encoders reach >23 witness-set keys than the 30+-key PPU
+    // sibling (#1012's `read_protocol_param_update`), but dugite is
+    // adversarial-deployment software and a hostile peer chooses its own
+    // encoding.
+    r.for_each_field_entry(|r, key| {
         match key {
             0 => {
                 // vkey_witnesses: [* [vkey, signature]]
@@ -1170,7 +1177,8 @@ fn decode_shelley_witness_set(
                 )));
             }
         }
-    }
+        Ok(())
+    })?;
 
     Ok(TransactionWitnessSet {
         vkey_witnesses,
@@ -1483,34 +1491,26 @@ pub(crate) fn read_pre_conway_protocol_param_update(
     r: &mut Reader<'_>,
 ) -> Result<ProtocolParamUpdate, SerializationError> {
     let mut ppu = ProtocolParamUpdate::default();
-    // Indefinite-map-aware, matching `decode_shelley_tx_body`'s own key-loop
-    // a few hundred lines above (and unlike the previous
-    // `read_map_header()?.unwrap_or(0)` here, which silently decoded an
-    // indefinite-length map — `encode_map_open`'s >23-entry form, #932/#938
-    // — as zero entries and desynced the reader for everything after; the
-    // same bug shape as `read_withdrawals`/`read_multiasset_map_u64`/
-    // `decode_aux_data_map` above). A pre-Conway PPU has ~30 possible keys,
-    // so a proposal setting more than 23 of them at once is exactly the
-    // case this was blind to.
-    let map_len = r.read_map_header()?;
-    let n_entries = match map_len {
-        Some(n) => n as i64,
-        None => -1, // indefinite map
-    };
-    let mut i = 0i64;
-    loop {
-        if n_entries >= 0 && i >= n_entries {
-            break;
-        }
-        if n_entries < 0 {
-            let ty = r.peek_major()?;
-            if ty == Type::Break {
-                r.skip()?;
-                break;
-            }
-        }
-        i += 1;
-
+    // `for_each_map_entry` handles BOTH definite- and indefinite-length CBOR
+    // maps (last-wins on a repeated key, matching Haskell's `PParamsUpdate`
+    // decode — see #1012's oracle finding on `read_protocol_param_update`
+    // just below in `era_conway.rs`, which shares this exact shape). The
+    // original fix here (faaaed42d8) hand-rolled the same definite/indefinite
+    // sentinel loop that `for_each_map_entry` already implements and that
+    // `decode_alonzo_aux_data_map` already uses for an identical purpose;
+    // routing through the shared helper removes that second copy rather than
+    // leaving it to drift — #1012 swept for exactly this pattern. Behavior is
+    // unchanged: this refactor is covered by the same four tests
+    // faaaed42d8 added, including the two indefinite-length-map regressions.
+    //
+    // Previously (pre-faaaed42d8): `read_map_header()?.unwrap_or(0)` silently
+    // decoded an indefinite-length map — `encode_map_open`'s >23-entry form,
+    // #932/#938 — as zero entries and desynced the reader for everything
+    // after; the same bug shape as `read_withdrawals`/`read_multiasset_map_u64`/
+    // `decode_aux_data_map` above. A pre-Conway PPU has ~30 possible keys, so
+    // a proposal setting more than 23 of them at once is exactly the case
+    // this was blind to.
+    r.for_each_map_entry(|r| {
         let key = r.read_uint()?;
         match key {
             0 => ppu.min_fee_a = Some(r.read_uint()?),
@@ -1606,7 +1606,8 @@ pub(crate) fn read_pre_conway_protocol_param_update(
                 r.skip()?;
             }
         }
-    }
+        Ok(())
+    })?;
     Ok(ppu)
 }
 
@@ -2759,6 +2760,106 @@ mod tests {
         ws.extend(cbor_uint(99));
         ws.extend(cbor_uint(0));
         assert!(decode_shelley_block(&shelley_block_with_witness_set(&ws)).is_err());
+    }
+
+    // ── #1012: decode_shelley_witness_set must accept indefinite-length maps ──
+    //
+    // The previous `read_map_header()?.unwrap_or(0)` silently decoded an
+    // indefinite-length witness-set map as ZERO entries and desynced the
+    // reader for everything after it — the same bug shape as the
+    // `read_protocol_param_update` fix in `era_conway.rs` (#1012). Now routed
+    // through `for_each_field_entry`, the same strict (definite- and
+    // indefinite-aware, duplicate-key-rejecting) helper Conway's witness set
+    // already used (`decode_conway_witness_set`).
+
+    #[test]
+    fn shelley_witness_set_accepts_indefinite_length_map() {
+        // Same logical content as `shelley_witness_set_vkey_decoded` +
+        // `shelley_witness_set_bootstrap_decoded`, combined into one map and
+        // encoded BOTH ways: {0: [[vkey,sig]], 2: [[vkey,sig,cc,attrs]]}.
+        let vkey_entry = {
+            let mut v = vec![0x81]; // array(1)
+            v.push(0x82); // [vkey, sig]
+            v.extend(cbor_bytes(&[0x77; 32]));
+            v.extend(cbor_bytes(&[0x88; 64]));
+            v
+        };
+        let bootstrap_entry = {
+            let mut v = vec![0x81]; // array(1)
+            v.push(0x84); // [vkey, sig, chain_code, attrs]
+            v.extend(cbor_bytes(&[0x01; 32]));
+            v.extend(cbor_bytes(&[0x02; 64]));
+            v.extend(cbor_bytes(&[0x03; 32]));
+            v.extend(cbor_bytes(&[]));
+            v
+        };
+
+        let mut ws_definite = vec![0xa2]; // map(2)
+        ws_definite.extend(cbor_uint(0));
+        ws_definite.extend(&vkey_entry);
+        ws_definite.extend(cbor_uint(2));
+        ws_definite.extend(&bootstrap_entry);
+
+        let mut ws_indefinite = vec![0xbf]; // indefinite map open
+        ws_indefinite.extend(cbor_uint(0));
+        ws_indefinite.extend(&vkey_entry);
+        ws_indefinite.extend(cbor_uint(2));
+        ws_indefinite.extend(&bootstrap_entry);
+        ws_indefinite.push(0xff); // break
+
+        let definite_block = decode_shelley_block(&shelley_block_with_witness_set(&ws_definite))
+            .expect("definite-form witness set must decode");
+        let indefinite_block =
+            decode_shelley_block(&shelley_block_with_witness_set(&ws_indefinite))
+                .expect("indefinite-form witness set must decode");
+
+        let definite_ws = &definite_block.transactions[0].witness_set;
+        let indefinite_ws = &indefinite_block.transactions[0].witness_set;
+
+        assert_eq!(
+            indefinite_ws.vkey_witnesses, definite_ws.vkey_witnesses,
+            "PRE-FIX the indefinite form decoded as 0 witnesses"
+        );
+        assert_eq!(
+            indefinite_ws.bootstrap_witnesses,
+            definite_ws.bootstrap_witnesses
+        );
+        assert_eq!(definite_ws.vkey_witnesses.len(), 1);
+        assert_eq!(definite_ws.bootstrap_witnesses.len(), 1);
+    }
+
+    #[test]
+    fn shelley_witness_set_indefinite_unknown_key_rejected() {
+        // Indefinite-map counterpart of `shelley_witness_set_unknown_key_rejected`:
+        // the strictness must survive on the indefinite path too, now that both
+        // go through the same `for_each_field_entry` helper.
+        let mut ws = vec![0xbf]; // indefinite map open
+        ws.extend(cbor_uint(99));
+        ws.extend(cbor_uint(0));
+        ws.push(0xff); // break
+        let result = decode_shelley_block(&shelley_block_with_witness_set(&ws));
+        assert!(
+            result.is_err(),
+            "unknown witness-set key must be rejected on the indefinite path too, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn shelley_witness_set_indefinite_duplicate_key_rejected() {
+        // {0: [], 0: []} as an indefinite map: `for_each_field_entry` rejects a
+        // repeated field key (Haskell `decodeSparseKeyed`/`applyField`), so this
+        // must fail rather than silently keep the last value.
+        let mut ws = vec![0xbf]; // indefinite map open
+        ws.extend(cbor_uint(0));
+        ws.push(0x80); // empty array of vkey witnesses
+        ws.extend(cbor_uint(0));
+        ws.push(0x80);
+        ws.push(0xff); // break
+        let result = decode_shelley_block(&shelley_block_with_witness_set(&ws));
+        assert!(
+            result.is_err(),
+            "duplicate witness-set key must be rejected, got {result:?}"
+        );
     }
 
     // ── Outputs with datum hash + multi-asset ──────────────────────────────
