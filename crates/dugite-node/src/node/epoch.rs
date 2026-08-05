@@ -104,7 +104,6 @@ pub fn era_transitions_for_magic(network_magic: u64) -> Vec<(dugite_primitives::
 /// Two modes:
 /// - **Normal operation:** snapshot every `k * 2` seconds (~72 minutes for k=2160)
 /// - **Bulk sync (replay):** snapshot every `bulk_min_blocks` blocks AND `bulk_min_interval` elapsed
-#[allow(dead_code)] // normal_interval used by should_snapshot_normal (networking rewrite)
 pub struct SnapshotPolicy {
     /// Time between snapshots during normal operation (k * 2 seconds)
     pub normal_interval: std::time::Duration,
@@ -157,7 +156,6 @@ impl SnapshotPolicy {
     }
 
     /// Check if a snapshot should be taken during normal (at-tip) operation.
-    #[allow(dead_code)] // used by networking rewrite (and tests)
     pub fn should_snapshot_normal(&self) -> bool {
         self.last_snapshot_time.elapsed() >= self.normal_interval
     }
@@ -580,7 +578,6 @@ impl Node {
     /// skipped with a warning so they cannot be used as rollback base states.
     /// When `None` (e.g. ChainDB not yet initialised), the canonicality check
     /// is skipped and any snapshot at or before the rollback slot is accepted.
-    #[allow(dead_code)] // used by networking rewrite (handle_rollback)
     pub fn find_best_snapshot_for_rollback(
         &self,
         rollback_slot: u64,
