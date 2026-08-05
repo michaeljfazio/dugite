@@ -972,7 +972,17 @@ pub enum ValidationError {
     /// and `Mint` buckets that corresponds to a Plutus script must have an
     /// explicit redeemer at the correct sorted position.
     #[error("Missing {tag} redeemer at index {index}")]
-    MissingRedeemer { tag: String, index: u32 },
+    /// `script_hash` is the 28-byte Plutus script hash (hex) the missing
+    /// redeemer would have been executed for. Haskell's payload is
+    /// `NonEmpty (PlutusPurpose AsItem era, ScriptHash)` — it pairs the purpose
+    /// with the hash — so without this the wire frame could not be built and
+    /// the failure degraded to a generic `ScriptFailed` (#1025). Every raise
+    /// site already has the hash in hand; it was simply not carried.
+    MissingRedeemer {
+        tag: String,
+        index: u32,
+        script_hash: String,
+    },
     #[error("Redeemer index out of range: tag={tag}, index={index}, max={max}")]
     RedeemerIndexOutOfRange { tag: String, index: u32, max: usize },
     #[error("Missing VKey witness for input credential: {0}")]
@@ -1071,8 +1081,22 @@ pub enum ValidationError {
     ///
     /// Reference: Haskell `MalformedProposal` in
     /// `cardano-ledger-conway:Cardano.Ledger.Conway.Rules.Gov`.
-    #[error("Governance proposal rejected: malformed PParamsUpdate ({reason})")]
-    MalformedProposal { reason: String },
+    ///
+    /// `proposal_index` is the position of the offending procedure in
+    /// `tx.body.proposal_procedures`. Haskell's payload is the whole
+    /// `GovAction`, and without an index there is no way to say WHICH proposal
+    /// of a multi-proposal tx failed — which is why this degraded to a generic
+    /// `ScriptFailed` on the wire (#1025). The index is free here (the check
+    /// already walks the procedures in order) and lets `dugite-node` look the
+    /// action back up rather than re-deriving a ~30-field structural check.
+    #[error(
+        "Governance proposal rejected: malformed PParamsUpdate at proposal \
+         {proposal_index} ({reason})"
+    )]
+    MalformedProposal {
+        reason: String,
+        proposal_index: usize,
+    },
     /// Conway GOV rule: a voter is not authorised to vote on this governance
     /// action type.
     ///

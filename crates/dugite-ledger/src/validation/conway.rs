@@ -191,7 +191,7 @@ pub(super) fn check_pparam_update_well_formed(
     if params.protocol_version_major < 9 {
         return;
     }
-    for proposal in &body.proposal_procedures {
+    for (proposal_index, proposal) in body.proposal_procedures.iter().enumerate() {
         if let GovAction::ParameterChange {
             protocol_param_update,
             ..
@@ -337,6 +337,7 @@ pub(super) fn check_pparam_update_well_formed(
             if !reasons.is_empty() {
                 errors.push(ValidationError::MalformedProposal {
                     reason: reasons.join(", "),
+                    proposal_index,
                 });
             }
         }
@@ -1508,7 +1509,7 @@ mod tests {
         check_pparam_update_well_formed(&params, &body, &mut errors);
         assert_eq!(errors.len(), 1);
         assert!(
-            matches!(&errors[0], ValidationError::MalformedProposal { reason } if reason.contains("maxTxSize=0")),
+            matches!(&errors[0], ValidationError::MalformedProposal { reason, .. } if reason.contains("maxTxSize=0")),
             "Expected MalformedProposal with maxTxSize=0, got: {:?}",
             errors
         );
@@ -1588,7 +1589,7 @@ mod tests {
         check_pparam_update_well_formed(&params, &body, &mut errors);
         assert_eq!(errors.len(), 1);
         assert!(
-            matches!(&errors[0], ValidationError::MalformedProposal { reason } if reason.contains("empty")),
+            matches!(&errors[0], ValidationError::MalformedProposal { reason, .. } if reason.contains("empty")),
             "Expected MalformedProposal with 'empty', got: {:?}",
             errors
         );
@@ -1696,7 +1697,7 @@ mod tests {
         check_pparam_update_well_formed(&params, &body, &mut errors);
         assert_eq!(errors.len(), 1);
         assert!(
-            matches!(&errors[0], ValidationError::MalformedProposal { reason }
+            matches!(&errors[0], ValidationError::MalformedProposal { reason, .. }
                 if reason.contains("cost_models[PlutusV1] too short")),
             "PV11 must reject short V1 vector, got: {errors:?}",
         );
@@ -1717,7 +1718,7 @@ mod tests {
         check_pparam_update_well_formed(&params, &body, &mut errors);
         assert_eq!(errors.len(), 1);
         assert!(
-            matches!(&errors[0], ValidationError::MalformedProposal { reason }
+            matches!(&errors[0], ValidationError::MalformedProposal { reason, .. }
                 if reason.contains("cost_models[PlutusV2] too short")),
             "PV11 must reject short V2 vector, got: {errors:?}",
         );
@@ -1738,7 +1739,7 @@ mod tests {
         check_pparam_update_well_formed(&params, &body, &mut errors);
         assert_eq!(errors.len(), 1);
         assert!(
-            matches!(&errors[0], ValidationError::MalformedProposal { reason }
+            matches!(&errors[0], ValidationError::MalformedProposal { reason, .. }
                 if reason.contains("cost_models[PlutusV3] too short")),
             "PV11 must reject short V3 vector, got: {errors:?}",
         );
