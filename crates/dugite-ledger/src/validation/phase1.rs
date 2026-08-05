@@ -1370,6 +1370,33 @@ pub(super) fn run_phase1_rules(
         }
     }
 
+    // Haskell's `validateOutputTooSmallUTxO` (Babbage/Rules/Utxo.hs) folds
+    // over `allSizedOutputsTxBodyF` — the regular outputs PLUS the
+    // collateral-return output — so `collateral_return` is subject to the
+    // SAME per-era minimum and feeds the same `BabbageOutputTooSmallUTxO`
+    // wire failure (tx-zoo 18d pins this on the wire; before this check
+    // dugite accepted a below-minimum return output Haskell rejects).
+    // Collateral return only exists at Babbage+ (PV >= 7), where the
+    // serialized-size formula applies unconditionally.
+    if params.protocol_version_major >= 7 {
+        if let Some(col_ret) = &body.collateral_return {
+            let has_datum_hash = matches!(col_ret.datum, OutputDatum::DatumHash(_));
+            let output_size_bytes = match &col_ret.raw_cbor {
+                Some(cbor) => cbor.len() as u64,
+                None => dugite_serialization::encode_transaction_output(col_ret).len() as u64,
+            };
+            let min_utxo =
+                params.min_coin_for_output(&col_ret.value, has_datum_hash, output_size_bytes);
+            if col_ret.value.coin.0 < min_utxo.0 {
+                errors.push(ValidationError::OutputTooSmall {
+                    minimum: min_utxo.0,
+                    actual: col_ret.value.coin.0,
+                    output_index: super::COLLATERAL_RETURN_OUTPUT_INDEX,
+                });
+            }
+        }
+    }
+
     // ------------------------------------------------------------------
     // Rule 5a: Output value CBOR size <= max_val_size
     // ------------------------------------------------------------------
@@ -4464,6 +4491,54 @@ mod tests {
                 .any(|e| matches!(e, ValidationError::OutputTooSmall { .. })),
             "output below min UTxO must produce OutputTooSmall, got {errors:?}"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Test 52b — Rule 5: collateral_return below min UTxO rejected (18d)
+    //
+    // Haskell's `validateOutputTooSmallUTxO` folds over
+    // `allSizedOutputsTxBodyF` = outputs + collateral return; before this
+    // check dugite validated only `body.outputs` and ACCEPTED a dust return
+    // output Haskell rejects. The sentinel index distinguishes it so the
+    // wire layer can re-encode the right output.
+    // -----------------------------------------------------------------------
+    #[test]
+    fn test_collateral_return_below_min_utxo_rejected() {
+        let (utxo_set, mut tx, _) = make_valid_tx();
+        let params = ProtocolParameters::mainnet_defaults();
+        let mut col_ret = tx.body.outputs[0].clone();
+        col_ret.value = Value::lovelace(1);
+        col_ret.raw_cbor = None;
+        tx.body.collateral_return = Some(col_ret);
+        let errors = validate_transaction(&tx, &utxo_set, &params, 100, 300, None).unwrap_err();
+        assert!(
+            errors.iter().any(|e| matches!(
+                e,
+                ValidationError::OutputTooSmall {
+                    output_index: crate::validation::COLLATERAL_RETURN_OUTPUT_INDEX,
+                    ..
+                }
+            )),
+            "dust collateral_return must produce OutputTooSmall with the sentinel index, got {errors:?}"
+        );
+        // RED half: a comfortable return output must NOT trip the check.
+        let mut ok_ret = tx.body.outputs[0].clone();
+        ok_ret.value = Value::lovelace(5_000_000);
+        ok_ret.raw_cbor = None;
+        tx.body.collateral_return = Some(ok_ret);
+        let result = validate_transaction(&tx, &utxo_set, &params, 100, 300, None);
+        if let Err(errors) = result {
+            assert!(
+                !errors.iter().any(|e| matches!(
+                    e,
+                    ValidationError::OutputTooSmall {
+                        output_index: crate::validation::COLLATERAL_RETURN_OUTPUT_INDEX,
+                        ..
+                    }
+                )),
+                "well-funded collateral_return must not be flagged, got {errors:?}"
+            );
+        }
     }
 
     // -----------------------------------------------------------------------

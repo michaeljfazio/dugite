@@ -809,6 +809,16 @@ impl ValidationContext {
 // Public error type
 // ---------------------------------------------------------------------------
 
+/// Sentinel `output_index` for [`ValidationError::OutputTooSmall`] meaning the
+/// offending output is `body.collateral_return`, not an entry of
+/// `body.outputs`. Haskell's `validateOutputTooSmallUTxO` folds over
+/// `allSizedOutputsTxBodyF` — the regular outputs PLUS the collateral-return
+/// output — so both feed the same `BabbageOutputTooSmallUTxO` failure; a real
+/// tx can never have `usize::MAX` outputs, and a resolver that forgets this
+/// sentinel fails closed (lookup misses, error degrades to the generic arm)
+/// rather than naming the wrong output.
+pub const COLLATERAL_RETURN_OUTPUT_INDEX: usize = usize::MAX;
+
 #[derive(Debug, thiserror::Error)]
 pub enum ValidationError {
     #[error("No inputs in transaction")]
@@ -833,7 +843,8 @@ pub enum ValidationError {
         minimum: u64,
         /// The coin actually present in the output.
         actual: u64,
-        /// Zero-based index of the offending output in `tx.body.outputs`.
+        /// Zero-based index of the offending output in `tx.body.outputs`, or
+        /// [`COLLATERAL_RETURN_OUTPUT_INDEX`] for `body.collateral_return`.
         output_index: usize,
     },
     #[error("Transaction too large: maximum={maximum}, actual={actual}")]
