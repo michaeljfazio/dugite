@@ -62,7 +62,7 @@ after `v1alpha` was frozen. The spec is pinned in-tree at
 | `SubmitService` | `WaitForTx` (stream) | ✅ implemented |
 | `SubmitService` | `WatchMempool` (stream) | ✅ implemented (full `TxPredicate` filtering, same matcher as `WatchTx`) |
 | `SubmitService` | `EvalTx` | ✅ implemented (per-redeemer `ex_units` + Plutus traces) |
-| `WatchService` | `WatchTx` (stream) | ✅ implemented (full `TxPredicate` filtering: address / asset / mint / `not` / `all_of` / `any_of`) — mempool-sourced, see [Limitations](#limitations) |
+| `WatchService` | `WatchTx` (stream) | ✅ implemented (full `TxPredicate` filtering: address / asset / mint / `not` / `all_of` / `any_of`; chain-sourced with `apply` / `undo` / `idle`) — see [Limitations](#limitations) |
 
 Every method above honours a request's `google.protobuf.FieldMask` (issue
 #1004): unselected fields are pruned from the response, recursively,
@@ -231,21 +231,23 @@ updated, or vice versa) are caught by code review against the diff.
 * `WatchTx` / `WatchMempool` filter on tx output fields (`produces` /
   `has_address` / `moves_asset`) and minting (`mints_asset`). Two
   `TxPattern` leaves are not implemented: `consumes` (needs resolved-input
-  UTxO data unavailable on the mempool-only watch path) and
-  `has_certificate` (needs a certificate-type matcher not yet built). A
-  request naming either — anywhere, including nested under `not` /
-  `all_of` / `any_of` — is **rejected** with `UNIMPLEMENTED` before it
-  ever subscribes, rather than silently accepted and under-filtered.
-* `WatchTx` is **mempool-sourced**, not chain-sourced: it streams
-  `MempoolEvent::Added` (pre-confirmation), matching
-  `SubmitService.WatchMempool`'s semantics rather than the proto's own
-  "stream transactions from the chain" comment. Two consequences:
-  `AnyChainTx.block` is always unset (a mempool tx has no confirming
-  block yet), and the `undo` / `idle` `WatchTxResponse` variants are
-  never emitted (both are block-scoped concepts). Tracked as
-  [#1007](https://github.com/michaeljfazio/dugite/issues/1007) — the
-  fix needs `TipRollback` to carry the rolled-back block's transactions,
-  which today it does not.
+  UTxO data the watch paths don't have) and `has_certificate` (needs a
+  certificate-type matcher not yet built). A request naming either —
+  anywhere, including nested under `not` / `all_of` / `any_of` — is
+  **rejected** with `UNIMPLEMENTED` before it ever subscribes, rather than
+  silently accepted and under-filtered.
+* `WatchTx` is **chain-sourced**, matching the proto's own "stream
+  transactions from the chain" comment (`SubmitService.WatchMempool` is
+  the pre-confirmation counterpart). It subscribes to the same
+  `TipFeed`/`TipRollback` broadcast `FollowTip` uses: each applied block
+  yields one `apply` `WatchTxResponse` per matching tx (with
+  `AnyChainTx.block` populated) or a single `idle` if the block matched
+  nothing, and a rolled-back block replays its cached matches as `undo`,
+  most-recent-first. The replay data comes from a per-subscriber bounded
+  history (`HISTORY_CAP` = 4,320 blocks, above mainnet `k` = 2,160) built
+  from the subscriber's own apply-time observations — `TipRollback` does
+  not need to carry the rolled-back block's contents. Was
+  [#1007](https://github.com/michaeljfazio/dugite/issues/1007).
 * `FollowTip` apply events carry `AnyChainBlock.native_bytes` (the
   raw block CBOR); clients that only need tip metadata can ignore
   the payload.
