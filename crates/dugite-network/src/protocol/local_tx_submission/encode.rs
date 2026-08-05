@@ -846,6 +846,101 @@ fn encode_conway_ledger_pred_failure(enc: &mut Encoder<&mut Vec<u8>>, err: &TxVa
             encode_script_hash_set_utxow(enc, err, 17, script_hashes);
         }
 
+        // ══ #1025: further typed UTXOW/UTXO failures ═══════════════════
+        TxValidationError::MissingRequiredDatumsUTXOW { missing, provided } => {
+            let missing_parsed: Vec<[u8; 32]> =
+                missing.iter().filter_map(|h| parse_hex_32(h)).collect();
+            let provided_parsed: Vec<[u8; 32]> =
+                provided.iter().filter_map(|h| parse_hex_32(h)).collect();
+            if missing_parsed.len() != missing.len()
+                || provided_parsed.len() != provided.len()
+                || missing_parsed.is_empty()
+            {
+                partial_fallback(enc, err);
+            } else {
+                encode_utxow_failure(enc, 11, |e| {
+                    set_open(e, missing_parsed.len());
+                    for h in &missing_parsed {
+                        e.bytes(h).expect("infallible");
+                    }
+                    set_close(e, missing_parsed.len());
+                    set_open(e, provided_parsed.len());
+                    for h in &provided_parsed {
+                        e.bytes(h).expect("infallible");
+                    }
+                    set_close(e, provided_parsed.len());
+                });
+            }
+        }
+        TxValidationError::NotAllowedSupplementalDatumsUTXOW { extra, allowed } => {
+            let extra_parsed: Vec<[u8; 32]> =
+                extra.iter().filter_map(|h| parse_hex_32(h)).collect();
+            let allowed_parsed: Vec<[u8; 32]> =
+                allowed.iter().filter_map(|h| parse_hex_32(h)).collect();
+            if extra_parsed.len() != extra.len()
+                || allowed_parsed.len() != allowed.len()
+                || extra_parsed.is_empty()
+            {
+                partial_fallback(enc, err);
+            } else {
+                encode_utxow_failure(enc, 12, |e| {
+                    set_open(e, extra_parsed.len());
+                    for h in &extra_parsed {
+                        e.bytes(h).expect("infallible");
+                    }
+                    set_close(e, extra_parsed.len());
+                    set_open(e, allowed_parsed.len());
+                    for h in &allowed_parsed {
+                        e.bytes(h).expect("infallible");
+                    }
+                    set_close(e, allowed_parsed.len());
+                });
+            }
+        }
+        TxValidationError::OutputBootAddrAttrsTooBigUTXO { outputs_raw_cbor } => {
+            let parsed: Vec<Vec<u8>> = outputs_raw_cbor
+                .iter()
+                .filter_map(|h| hex::decode(h).ok())
+                .collect();
+            if parsed.len() != outputs_raw_cbor.len() || parsed.is_empty() {
+                partial_fallback(enc, err);
+            } else {
+                // `NonEmpty (TxOut era)` — a plain LIST, not a set.
+                encode_utxo_failure(enc, 10, |e| {
+                    list_open(e, parsed.len());
+                    for raw in &parsed {
+                        e.writer_mut().extend_from_slice(raw);
+                    }
+                    list_close(e, parsed.len());
+                });
+            }
+        }
+        TxValidationError::ScriptsNotPaidUTxOUTXO { inputs_outputs } => {
+            let parsed: Vec<([u8; 32], u32, Vec<u8>)> = inputs_outputs
+                .iter()
+                .filter_map(|(input, out_hex)| {
+                    let (hash, ix) = parse_tx_input(input)?;
+                    let out = hex::decode(out_hex).ok()?;
+                    Some((hash, ix, out))
+                })
+                .collect();
+            if parsed.len() != inputs_outputs.len() || parsed.is_empty() {
+                partial_fallback(enc, err);
+            } else {
+                // `NonEmptyMap TxIn (TxOut era)` — a MAP, not array pairs.
+                encode_utxo_failure(enc, 13, |e| {
+                    map_open(e, parsed.len());
+                    for (hash, ix, out) in &parsed {
+                        e.array(2).expect("infallible");
+                        e.bytes(hash).expect("infallible");
+                        e.u32(*ix).expect("infallible");
+                        e.writer_mut().extend_from_slice(out);
+                    }
+                    map_close(e, parsed.len());
+                });
+            }
+        }
+
         // ══ #979: further typed GOV failures ════════════════════════════
         TxValidationError::ProposalProcedureNetworkIdMismatch { account, network } => {
             match hex::decode(account) {
@@ -974,6 +1069,39 @@ fn encode_conway_ledger_pred_failure(enc: &mut Encoder<&mut Vec<u8>>, err: &TxVa
                             None => {
                                 e.array(0).expect("infallible");
                             }
+                        }
+                    }
+                });
+            }
+        }
+        TxValidationError::ZeroTreasuryWithdrawalsGOV {
+            withdrawals,
+            policy_hash,
+        } => {
+            let parsed: Vec<(Vec<u8>, u64)> = withdrawals
+                .iter()
+                .filter_map(|(a, c)| hex::decode(a).ok().map(|b| (b, *c)))
+                .collect();
+            let policy = policy_hash.as_ref().map(|h| parse_hex_28(h));
+            if parsed.len() != withdrawals.len() || matches!(policy, Some(None)) {
+                partial_fallback(enc, err);
+            } else {
+                // GovAction::TreasuryWithdrawals = array(3)[2, {account: coin}, opt_policy_hash]
+                encode_gov_failure(enc, 15, |e| {
+                    e.array(3).expect("infallible");
+                    e.u32(2).expect("infallible");
+                    map_open(e, parsed.len());
+                    for (account, coin) in &parsed {
+                        e.bytes(account).expect("infallible");
+                        e.u64(*coin).expect("infallible");
+                    }
+                    map_close(e, parsed.len());
+                    match policy.flatten() {
+                        Some(h) => {
+                            e.bytes(&h).expect("infallible");
+                        }
+                        None => {
+                            e.null().expect("infallible");
                         }
                     }
                 });
@@ -1482,6 +1610,18 @@ fn parse_hex_28(s: &str) -> Option<[u8; 28]> {
     Some(arr)
 }
 
+/// Parse a hex string into exactly 32 raw bytes (datum hashes, #1025).
+/// Returns `None` if the string does not decode to exactly 32 bytes.
+fn parse_hex_32(s: &str) -> Option<[u8; 32]> {
+    let bytes = parse_hex_bytes(s)?;
+    if bytes.len() != 32 {
+        return None;
+    }
+    let mut arr = [0u8; 32];
+    arr.copy_from_slice(&bytes);
+    Some(arr)
+}
+
 /// Count the number of top-level CBOR data items in a byte buffer.
 /// Used to determine array lengths for the `Sum` encoding pattern.
 fn count_cbor_items(buf: &[u8]) -> usize {
@@ -1853,6 +1993,163 @@ mod tests {
             want.extend_from_slice(&[0x66; 28]);
             assert_ledger_bytes(&err, &want, what);
         }
+    }
+
+    // ══ #1025 golden vectors ════════════════════════════════════════════
+    //
+    // Tags oracle-verified against cardano-ledger
+    // `a88b60bdcf3248dfe5a2f9372c188c399233f479` (pinned in
+    // `tests/conformance/upstream/sources.toml`): `ConwayUtxowPredFailure`
+    // tags 11/12 (`Conway/Rules/Utxow.hs:84`, wraps Alonzo's tags 2/3
+    // unmodified), `ConwayUtxoPredFailure` tags 10/13
+    // (`Conway/Rules/Utxo.hs`), `ConwayGovPredFailure` tag 15
+    // (`Conway/Rules/Gov.hs:179`).
+
+    /// `MissingRequiredDatums (NonEmptySet DataHash) (Set DataHash)` —
+    /// UTXOW tag 11. Neither set is sorted (matching every other Set arm in
+    /// this file — see `golden_script_hash_set_utxow_arms` above: none of
+    /// them sort either. This is a one-off reject-reason payload, not a
+    /// canonical/hashed wire form, so element order is not load-bearing).
+    #[test]
+    fn golden_missing_required_datums_utxow() {
+        let missing = hex::encode([0x11u8; 32]);
+        let provided = vec![hex::encode([0x11u8; 32]), hex::encode([0x22u8; 32])];
+        let mut want = vec![0x82, 0x01, 0x83, 0x0B];
+        // missing: tag(258) array(1)[bstr32]
+        want.extend_from_slice(&[0xD9, 0x01, 0x02, 0x81, 0x58, 0x20]);
+        want.extend_from_slice(&[0x11; 32]);
+        // provided: tag(258) array(2)[bstr32, bstr32]
+        want.extend_from_slice(&[0xD9, 0x01, 0x02, 0x82, 0x58, 0x20]);
+        want.extend_from_slice(&[0x11; 32]);
+        want.extend_from_slice(&[0x58, 0x20]);
+        want.extend_from_slice(&[0x22; 32]);
+        assert_ledger_bytes(
+            &TxValidationError::MissingRequiredDatumsUTXOW {
+                missing: vec![missing],
+                provided,
+            },
+            &want,
+            "MissingRequiredDatumsUTXOW",
+        );
+    }
+
+    /// `NotAllowedSupplementalDatums (NonEmptySet DataHash) (Set DataHash)`
+    /// — UTXOW tag 12.
+    #[test]
+    fn golden_not_allowed_supplemental_datums_utxow() {
+        let hash = hex::encode([0x33u8; 32]);
+        let mut want = vec![0x82, 0x01, 0x83, 0x0C];
+        want.extend_from_slice(&[0xD9, 0x01, 0x02, 0x81, 0x58, 0x20]);
+        want.extend_from_slice(&[0x33; 32]);
+        want.extend_from_slice(&[0xD9, 0x01, 0x02, 0x81, 0x58, 0x20]);
+        want.extend_from_slice(&[0x33; 32]);
+        assert_ledger_bytes(
+            &TxValidationError::NotAllowedSupplementalDatumsUTXOW {
+                extra: vec![hash.clone()],
+                allowed: vec![hash],
+            },
+            &want,
+            "NotAllowedSupplementalDatumsUTXOW",
+        );
+    }
+
+    /// `OutputBootAddrAttrsTooBig (NonEmpty (TxOut era))` — UTXO tag 10. A
+    /// plain LIST (no set tag), full three-level `[1,[0,[10, list]]]`
+    /// nesting since it's a `ConwayUtxoPredFailure`, not a
+    /// `ConwayUtxowPredFailure`. The raw bytes stand in for "some encoded
+    /// TxOut" — this test only pins the WRAPPER shape, not a real output's
+    /// contents.
+    #[test]
+    fn golden_output_boot_addr_attrs_too_big_utxo() {
+        let raw = vec![0x82u8, 0x01, 0x02];
+        let want = vec![
+            0x82, 0x01, // Ledger: [1, ...]
+            0x82, 0x00, // Utxow: [0, ...]
+            0x82, 0x0A, // Utxo: [10, list]
+            0x81, // list(1)
+            0x82, 0x01, 0x02, // the raw "TxOut" bytes, embedded verbatim
+        ];
+        assert_ledger_bytes(
+            &TxValidationError::OutputBootAddrAttrsTooBigUTXO {
+                outputs_raw_cbor: vec![hex::encode(&raw)],
+            },
+            &want,
+            "OutputBootAddrAttrsTooBigUTXO",
+        );
+    }
+
+    /// `ScriptsNotPaidUTxO (NonEmptyMap TxIn (TxOut era))` — UTXO tag 13. A
+    /// MAP (`TxIn -> TxOut`), not array pairs.
+    #[test]
+    fn golden_scripts_not_paid_utxo() {
+        let raw = vec![0x82u8, 0x01, 0x02];
+        let mut want = vec![
+            0x82, 0x01, // Ledger: [1, ...]
+            0x82, 0x00, // Utxow: [0, ...]
+            0x82, 0x0D, // Utxo: [13, map]
+            0xA1, // map(1)
+        ];
+        // key: TxIn = array(2)[bstr32, u32]
+        want.extend_from_slice(&[0x82, 0x58, 0x20]);
+        want.extend_from_slice(&[0x44; 32]);
+        want.push(0x00);
+        // value: raw TxOut bytes, embedded verbatim
+        want.extend_from_slice(&raw);
+        assert_ledger_bytes(
+            &TxValidationError::ScriptsNotPaidUTxOUTXO {
+                inputs_outputs: vec![(
+                    format!("{}#0", hex::encode([0x44u8; 32])),
+                    hex::encode(&raw),
+                )],
+            },
+            &want,
+            "ScriptsNotPaidUTxOUTXO",
+        );
+    }
+
+    /// `ZeroTreasuryWithdrawals (GovAction era)` — GOV tag 15. The field is
+    /// the WHOLE `GovAction`, which for `TreasuryWithdrawals` is itself
+    /// `array(3)[2, {account: coin}, opt_policy_hash]` — this is a `GovAction`
+    /// nested one level inside the `ConwayGovPredFailure` payload, not a
+    /// bespoke shape.
+    #[test]
+    fn golden_zero_treasury_withdrawals_gov() {
+        let account = hex::encode([0x55u8; 29]);
+        let want = vec![
+            0x82, 0x03, // Ledger: [3, ...] (ConwayGovFailure)
+            0x82, 0x0F, // GovPredFailure: [15, GovAction]
+            0x83, 0x02, // GovAction: [2, ...] (TreasuryWithdrawals)
+            0xA1, // withdrawals map(1)
+            0x58, 0x1D, // bstr(29)
+            0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55,
+            0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55,
+            0x55, // 29 bytes
+            0x1A, 0x00, 0x0F, 0x42, 0x40, // 1_000_000 as u32-width uint
+            0xF6, // policy_hash = null (SNothing)
+        ];
+        assert_ledger_bytes(
+            &TxValidationError::ZeroTreasuryWithdrawalsGOV {
+                withdrawals: vec![(account, 1_000_000)],
+                policy_hash: None,
+            },
+            &want,
+            "ZeroTreasuryWithdrawalsGOV",
+        );
+    }
+
+    /// A malformed payload (odd-length hex) must fall back to the generic
+    /// mempool failure rather than emit a wrong-shaped typed frame — same
+    /// safety net every other arm in this file relies on
+    /// (`partial_fallback`).
+    #[test]
+    fn golden_missing_required_datums_utxow_falls_back_on_malformed_hex() {
+        let got = ledger_failure_bytes(&TxValidationError::MissingRequiredDatumsUTXOW {
+            missing: vec!["not-hex".to_string()],
+            provided: vec![],
+        });
+        // ConwayMempoolFailure: [7, text]
+        assert_eq!(got[0], 0x82);
+        assert_eq!(got[1], 0x07);
     }
 
     /// `encodeSet` uses `variableListLenEncoding`: definite up to 23 elements,
