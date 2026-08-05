@@ -1,7 +1,27 @@
 ---
 name: epoch-nonce-tickn-deep-dive
-description: Complete authoritative analysis of TICKN/UPDN epoch nonce update — formula, freeze window per era, Byron→Shelley seeding, prevHashNonce semantics, and dugite divergence verdict
+description: Complete authoritative analysis of TICKN/UPDN epoch nonce update — formula, freeze window per era, Byron→Shelley seeding, prevHashNonce semantics, and dugite divergence verdict. CORRECTED 2026-08-05 — see section 0, Praos's epoch-boundary combine is 2-term (no extraEntropy), NOT the 3-term TPraos formula.
 type: reference
+---
+
+## 0. CORRECTION (2026-08-05) — Praos's epoch-boundary nonce combine has NO extraEntropy term
+
+Section 1 below documents the **TPraos** (Shelley..Alonzo) TICKN formula only.
+**Babbage, Conway, and Dijkstra do NOT use TICKN at all** — they use `Praos`
+(not `TPraos`) as their `ConsensusProtocol`, whose epoch-boundary combine is a
+structurally different, hand-written 2-term formula with no extraEntropy.
+Section 3's `reupdateChainDepState` snippet below is the PER-BLOCK candidate/
+evolving-nonce bookkeeping only — it does NOT show the epoch-boundary combine.
+The actual combine lives in a DIFFERENT function, `tickChainDepState`, which
+this file never quoted. That gap is what caused a real ambiguity in a
+downstream consumer's docs. Full verbatim source, pinned SHA, and verdict:
+see the sibling memory [[praos-epoch-boundary-nonce-no-extraentropy]].
+
+**One-line verdict**: Babbage's real epoch-boundary formula is **2-term**
+(`candidateNonce ⭒ lastEpochBlockNonce`), not 3-term. Any Rust code that
+reuses the Shelley/TPraos 3-term TICKN formula for Babbage is latently wrong,
+independent of whatever Conway does.
+
 ---
 
 ## Source locations (verified against main/master branches)

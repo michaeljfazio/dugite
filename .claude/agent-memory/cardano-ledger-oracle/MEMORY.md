@@ -20,6 +20,7 @@
 
 ## Reward Calculation (Byte-Exact)
 - [Reward formula 3-stage floor chain + sigma vs sigmaA](reward-calc-floor-chain-and-sigma-vs-sigmaA.md) — 3 independent `rationalToCoinViaFloor` stages; sigma vs sigmaA distinct; PParams from prior epoch; pledge-gate `<=` on go-snapshot (live-verified 2026-07-07)
+- [mkPoolRewardInfo zero-block-pool gate](mkpoolrewardinfo-zero-block-pool-gate.md) — gate lives INSIDE mkPoolRewardInfo (`Map.lookup` into BlocksMade), not in startStep's iteration; mkApparentPerformance's `d>=0.8=>1` branch is unreachable for a zero-block pool; zero-block pool gets NO reward at all, leader or member (live-verified 2026-08-05 @ 4849c13d)
 
 ## CBOR Structure Reference
 - [NewEpochState/EpochState/LedgerState/UTxOState encoding](newepochstate-complete-encoding.md) — field order, array sizes
@@ -47,6 +48,7 @@
 - [Certifying/Rewarding/Voting/Proposing witness matrix + scriptsNeeded indexing](conway-plutus-purpose-witness-and-indexing.md) — per-TxCert witness table; guardrails hash is STRICT EQUALITY; hidden CertificateNotSupported restricts V1/V2 to plain certs only (live-verified 2026-08-02)
 
 ## Governance / Epoch Boundary Corrections
+- [Obligations type + totalObligation composition](obligations-type-and-totalobligation-composition.md) — verbatim 4-field record (oblStake/oblPool/oblDRep/oblProposal), Shelley-vs-Conway obligationCertState/obligationGovState split, no committee-deposit field exists. Dugite audited clean (live-verified 2026-08-05 @ 4849c13d).
 - [Conway proposal deposit epoch boundary](feedback_proposal_deposit_epoch_boundary.md) — returnProposalDeposits scope, expiry off-by-one, no silent drops
 - [DRep expiry and vsNumDormantEpochs mechanics](drep-expiry-numDormantEpochs.md) — computeDRepExpiry formula, cumulative counter, delta-only correction
 - [Conway RATIFY/GOV precision facts](conway-ratify-precision-facts.md) — pvCanFollow modulus (point 2 SUPERSEDED below), reorderActions stability, committee zero-threshold gate (live-verified 2026-07-04)
@@ -60,10 +62,10 @@
 - [Conway FuturePParams lifecycle + JSON shape](conway-futurepparams-lifecycle-and-json.md) — 3 ctors, EPOCH always resets to Nothing; solidifies at point-of-no-return = firstSlotNextEpoch-2*stabilityWindow (live-verified 2026-08-02)
 
 ## Shelley/Byron/Alonzo Deep-Dive Facts
-- **Some 2026-07-04 entries had missing files** — re-derive live before citing. Restored: byron-duplicate-inputs, shelley-ppup (Governance section), MIR-witness half of BBODY entry. Still missing: POOLREAP future-pool-params half, BBODY ExUnits-scope half.
+- **Some 2026-07-04 entries had missing files** — re-derive live before citing. Restored: byron-duplicate-inputs, shelley-ppup (Governance section), MIR-witness half of BBODY entry, POOLREAP (see below, superseded 2026-08-05). Still missing: BBODY ExUnits-scope half.
 - [BBODY total-ExUnits scope + MIR/GenesisDeleg witness rules](alonzo-bbody-exunits-and-cert-witnesses.md) — MISSING FILE: maxBlockExUnits sums ALL txs incl IsValid=False
 - [GenesisDelegCert maturation + MIR quorum-witness](shelley-genesisdeleg-and-mir-witness-quorum.md) — maturation delay = stabilityWindow ONCE (not 2x); MIR witness intersects genDelegs VALUES; absent in Conway (live-verified 2026-07-06). See [[project_dugite_genesisdeleg_mir_gaps_2026_07_06]]
-- [POOLREAP future-pool-params adoption](shelley-ppup-votedvalue-and-poolparams-adoption.md) — MISSING FILE: psFutureStakePoolParams Map.merge drops future-only keys
+- [Conway POOLREAP full verbatim mechanics](conway-poolreap-verbatim-mechanics.md) — SUPERSEDES the old missing `shelley-ppup-votedvalue-and-poolparams-adoption.md` pointer. SNAP runs BEFORE POOLREAP in EPOCH; Conway reuses Shelley's POOLREAP unmodified; unregistered-account refunds → treasury; delegations to a retiring pool ARE actively purged via `removeStakePoolDelegations`/`spsDelegators` (refutes a prior "dangling delegation" belief — none exists in current source); futurePoolParams merge runs BEFORE same-boundary retirement snapshot (can redirect refund to a re-registered reward account); refund = deposit at ORIGINAL registration, immutable, never the live `poolDeposit` param (live-verified 2026-08-05 @ 4849c13d).
 - [Byron duplicate-TxIn + Byron→Shelley translation pot values](byron-duplicate-inputs-and-shelley-translation.md) — translateToShelley zeroes fee/deposit/treasury pots; reserves absorb burned Byron fees (re-verified 2026-07-06)
 
 ## CBOR Set-Duplicate Decoding

@@ -2,6 +2,8 @@
 
 ## Plutus (Builtins / ScriptContext / Wire Format / V4 status)
 - [plutus-v4-dijkstra-witness-set-and-scriptcontext-status.md](plutus-v4-dijkstra-witness-set-and-scriptcontext-status.md) — witness key8 unwired; ledger V4==V3 verbatim; plutus's newer V4.Contexts (PR#7846) unadopted; both scaffolding
+- [dijkstra-ppu-keys-38-39-and-auxdata-key5.md](dijkstra-ppu-keys-38-39-and-auxdata-key5.md) — PPU 38 maxPledgeLeverage=MaxPledgeLeverage(StrictMaybe NonNegativeInterval, null-or-tag30); 39 minPoolMargin=plain UnitInterval; auxdata key5 CBOR-live but eraMaxLanguage=V3 drops it from getAlonzoTxAuxDataScripts
+- [alonzo-auxdata-decoder-full-key-guard-and-cddl-audit.md](alonzo-auxdata-decoder-full-key-guard-and-cddl-audit.md) — SUPERSEDES key-5-only framing above: keys 2/3/4/5 ALL guardPlutus-gated (PV>=5/7/9/12); decodeSparseKeyed+Coders SparseKeyed BOTH hard-reject unknown keys (#1013-class); CDDL genuinely caps 2/3/4/5 per era Alonzo->Dijkstra, enforced via PV not era-branch
 - [v1v2-scriptcontext-conway-gates.md](v1v2-scriptcontext-conway-gates.md) — guardConwayFeaturesForPlutusV1V2 -> BadTranslation hard-rejects tx; Conway drops 2/3 Babbage V1 restrictions, keeps InlineDatumsNotSupported
 - [nocostmodel-collecterror-native-script-exclusion.md](nocostmodel-collecterror-native-script-exclusion.md) — NoCostModel via per-script `Map.lookup`; native scripts never touch CostModels; can hide behind NoRedeemer
 - [plutus-data-integer-cbor-bignum-threshold.md](plutus-data-integer-cbor-bignum-threshold.md) — Data::I plain-int threshold `[-(2^64)..2^64-1]`; dugite #952 truncated via `as u64`, corrupting script_data_hash
@@ -48,6 +50,10 @@
 - [new-epoch-state-cbor.md](new-epoch-state-cbor.md) — NewEpochState CBOR field-by-field
 - [cardano-ledger-types-wire-format.md](cardano-ledger-types-wire-format.md) — hash/key types, address header-byte table, MaryValue, script tags, PParams array(31), Rational tag(30)
 
+## CERTS / GOV Phase-1 Rules (Conway)
+- [conway-certs-rule-dispatch-and-withdrawal-split.md](conway-certs-rule-dispatch-and-withdrawal-split.md) — CERTS(2 ctors)->CERT(3 ctors, pure dispatcher)->DELEG/POOL/GOVCERT; PV11 hardfork moves WithdrawalsNotInRewardsCERTS into LEDGER as ConwayWithdrawalsMissingAccounts(tag8)/ConwayIncompleteWithdrawals(tag9); certs threaded strictly in tx-body order
+- [conway-gov-rule-verbatim-checks.md](conway-gov-rule-verbatim-checks.md) — conwayGovTransition full top-to-bottom order; guardrails-hash SNothing==SNothing REQUIRED; UnelectedCommitteeVoters(PV11+) vs VotersDoNotExist use DIFFERENT committee sets; two separate bootstrap-vote gates; runClause-confirmed accumulation (no short-circuit)
+
 ## Governance (Conway / CIP-1694)
 - [drep-dormant-epoch-expiry-exact-mechanism.md](drep-dormant-epoch-expiry-exact-mechanism.md) — numDormantEpochs bump-at-submission (Certs.hs, NOT ratify-check); dRepAcceptedRatio = bare `reCurrentEpoch > drepExpiry`
 - [drep-pulser-ratification.md](drep-pulser-ratification.md) — pulser snapshot at END of EPOCH rule, pulse spreads 4k blocks, RATIFY at finishDRepPulser
@@ -59,8 +65,13 @@
 - [conway-instant-stake-ptr-exclusion.md](conway-instant-stake-ptr-exclusion.md) — ConwayInstantStake has NO sisPtrStake, dropped via HFC `_other`
 - [bounded-ratio-decode-bounds-and-enact-totality.md](bounded-ratio-decode-bounds-and-enact-totality.md) — UnitInterval rejects n>d; NonNegativeInterval no upper bound; ENACT is total field-merge, no re-validation
 
+## Version Pinning (which commit does a cardano-node release actually ship)
+- [CHaP dependency-pinning methodology](chap-dependency-pinning-methodology.md) — cardano-node 11.x has NO git pin for cardano-ledger/cardano-api; resolve via CHaP `meta.toml` github.rev + timestamp vs index-state
+- [POOLREAP active-purge verified for cn 11.0.1](poolreap-active-purge-verified-11-0-1.md) — removeStakePoolDelegations clears delegation pointer in SAME transition as pool removal; NOT master-only, live since shelley 1.17.0.0 (2025-09); resolveActiveInstantStakeCredentials drops undelegated creds from ssTotalActiveStake entirely
+
 ## Rewards / Epoch Transition
-- [epoch-nonce-tickn-deep-dive.md](epoch-nonce-tickn-deep-dive.md) / [epoch-nonce-calculation.md](epoch-nonce-calculation.md) — eta0 formula, freeze window per era (3k/f thru Babbage, 4k/f Conway+)
+- [epoch-nonce-tickn-deep-dive.md](epoch-nonce-tickn-deep-dive.md) / [epoch-nonce-calculation.md](epoch-nonce-calculation.md) — eta0 formula, freeze window per era (3k/f thru Babbage, 4k/f Conway+). CORRECTED: see next entry, this file's old section 3 only showed per-block bookkeeping, not the epoch combine.
+- [praos-epoch-boundary-nonce-no-extraentropy.md](praos-epoch-boundary-nonce-no-extraentropy.md) — Praos.hs `tickChainDepState` (Babbage/Conway/Dijkstra) is 2-term `candidateNonce ⭒ lastEpochBlockNonce`, NO extraEntropy; TPraos TICKN's 3-term formula is Shelley..Alonzo ONLY. ppExtraEntropy is not even a PParams field past Alonzo (`notSupportedInThisEraL`).
 - [nonintegral-ln-algorithm.md](nonintegral-ln-algorithm.md) — ln' uses continued fraction NOT Taylor series; exact Rational vs f64 in dugite
 - [reward-iteration-deep-dive.md](reward-iteration-deep-dive.md) — startStep iterates GO snapshot, genesis pool 2-epoch warm-up, 6 zero-reward
 - [monetary-expansion-rupd.md](monetary-expansion-rupd.md) — deltaR1/eta/expectedBlocks, block counting, Conway d=0

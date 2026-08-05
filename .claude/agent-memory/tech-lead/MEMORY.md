@@ -1,5 +1,11 @@
 # Tech Lead Agent Memory
 
+## Conway N2C LSQ + Mempool-Reject Audit (2026-08-05)
+- [Full LSQ/mempool audit](issue-1018-1027-lsq-mempool-audit-2026-08-05.md) — #1018 tag-33 GetFuturePParams hardcoded + #1019 ensWithdrawals hardcoded empty (both FIXED); #1020 NextEpochChange/ensCommittee live-not-frozen, #1023 MIR/GenesisDeleg accept-where-Haskell-rejects (P1), #1025 residual generic ScriptFailed arms, #1027 `query ledger-state` LIVE-VERIFIED undecodable, zero test coverage (all FILED). Methodology: cli-parity.csv hash-history as a free vacuous-vs-real oracle; throwaway single-node devnet for cheap live round-trips.
+
+## Conway Epoch/NEWEPOCH Pipeline Audit (2026-08-05)
+- [Full NEWEPOCH audit](audit-conway-epoch-newepoch-pipeline-2026-08-05.md) — #1017 test-path committee-prune gap (fixed) + #1016 misattributed comment (fixed) + #1015 Babbage nonce formula wrongly folds extraEntropy (filed, dormant). Extensive clean negatives: reward floor chain, zero-block-pool gate, RATIFY ordering, POOLREAP, deposits/obligation. Version-pin discipline: master HEAD != cardano-node 11.0.1's actual pin — check this repo's own conformance-corpus SHA first.
+
 ## Dijkstra Sub-Transaction Rules (2026-08-05)
 - [#1011 SUBCERTS/SUBDELEG/SUBPOOL/SUBGOVCERT/SUBENTITIES landed](issue-1011-dijkstra-subcerts-subpool-subgovcert.md) — clone-then-mutate-or-discard pattern (imbl+Arc make CertSubState/GovSubState clones cheap) beats extracting the top-level validator; SUBGOV+mint stay guarded (too large for one issue)
 

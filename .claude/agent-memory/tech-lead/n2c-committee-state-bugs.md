@@ -1,8 +1,20 @@
 ---
 name: committee-state-encoding-bugs
-description: Remaining bugs in CommitteeMembersState and gov-state encoding after the Hash32→28 fix in e8b58c9
+description: STALE as of 2026-08-05 — bugs 1-3 below are all FIXED (see issue-1018-1027-lsq-mempool-audit-2026-08-05.md for the current, real gap: NextEpochChange hardcoded)
 type: project
 ---
+
+**STALE — verify before use.** All three bugs below were confirmed FIXED by
+direct code read + a passing regression test
+(`test_committee_state_script_hot_credential_type_propagated`,
+`crates/dugite-node/src/node/n2c_query/governance.rs`) during the 2026-08-05
+LSQ audit. `committee_expiration` IS the outer iteration map, hot credential
+type IS tracked via `script_committee_hot_credentials`, and the wire encoder
+IS field-correct. The REAL remaining gap in this query as of 2026-08-05 is
+different: `CommitteeMemberState`'s `NextEpochChange` field is hardcoded to
+`NoChangeExpected` for every member — see
+[issue-1018-1027-lsq-mempool-audit-2026-08-05.md](issue-1018-1027-lsq-mempool-audit-2026-08-05.md)
+(filed as #1020). Kept below for historical context only.
 
 After the e8b58c9 fix (Hash32-padded credential hashes truncated to 28 bytes), the following issues remain in governance query responses:
 
