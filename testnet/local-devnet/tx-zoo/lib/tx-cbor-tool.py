@@ -19,6 +19,13 @@ Subcommands
   body-hash --in FILE                 blake2b-256 of the tx BODY span (== the txid)
   dup-input --in FILE --out FILE      duplicate one entry of the tx-body input set
                                       [--index N] [--copies K]
+  show-certs --in FILE                dump each certificate's own tag integer
+  splice-cert-tag --in FILE --out FILE --tag T [--index N]
+                                      overwrite one certificate's tag integer
+                                      (its first array element) with T,
+                                      leaving the rest of the certificate byte-
+                                      for-byte untouched — arity intentionally
+                                      does not match T's real shape (#1034)
   sign      --in FILE --out FILE --signing-key-file K [-k K2 ...]
                                       attach vkey witnesses, replacing the
                                       witness set, leaving every other byte of
@@ -230,6 +237,95 @@ def dup_input(buf, index=0, copies=2):
     )
 
 
+def body_field_span(buf, bstart, bend, key):
+    """Generalised `input_set_span`: locate ANY integer-keyed tx-body array
+    field (e.g. key 4 = certificates), not just key 0 (inputs).
+
+    Returns (head_start, items_start, end, count, is_tagged) — the EXACT
+    same 5-tuple shape and field order as `input_set_span` (`head_start` is
+    the array head's own position, after any tag(258) wrapper; `items_start`
+    is the position of the first element), so callers can reuse
+    `element_spans(buf, items_start, count)` unchanged.
+
+    Added for #1034 (19-era-negatives): splicing a certificate's own tag
+    byte needs to find the *certs* field (key 4), which is otherwise byte-
+    for-byte identical machinery to `input_set_span`'s key-0 walk. Kept as
+    a separate function rather than rewriting `input_set_span` in terms of
+    it, so `dup-input` (relied on by 08f) cannot regress from this change.
+    """
+    major, arg, pos = _head(buf, bstart)
+    if major != MT_MAP:
+        raise CborError("tx body is not a map (major %d)" % major)
+    if arg == INDEFINITE:
+        raise CborError("indefinite-length tx body map is not supported")
+    for _ in range(arg):
+        kstart = pos
+        kmajor, karg, kpos = _head(buf, kstart)
+        vstart = skip(buf, kstart)
+        vend = skip(buf, vstart)
+        if kmajor == MT_UINT and karg == key:
+            vpos = vstart
+            tagged = False
+            vmajor, varg, vnext = _head(buf, vpos)
+            if vmajor == MT_TAG:
+                tagged = True
+                vpos = vnext
+                vmajor, varg, vnext = _head(buf, vpos)
+            if vmajor != MT_ARRAY:
+                raise CborError(
+                    "tx-body field %d is not an array (major %d)" % (key, vmajor)
+                )
+            return vpos, vnext, vend, varg, tagged
+        pos = vend
+    raise CborError("tx body has no field (key %d)" % key)
+
+
+CERT_FIELD_KEY = 4
+
+
+def splice_cert_tag(buf, index=0, new_tag=6):
+    """Return new tx bytes with certificate `index`'s own array-tag integer
+    (its FIRST element — the constructor discriminator, e.g. 0 = StakeReg,
+    7 = ConwayRegCert) overwritten with `new_tag`.
+
+    Deliberately does NOT touch anything else about the certificate entry:
+    not its arity, not its remaining fields. cardano-ledger's Conway
+    certificate decoder (see era_conway.rs, #1023) dispatches on the tag
+    integer FIRST and hard-fails immediately for tag 5 (GenesisKeyDelegation)
+    or 6 (MIR) before it would ever look at the rest of the array — so a
+    donor certificate whose remaining fields don't match the target tag's
+    real shape (e.g. splicing a 3-element `reg_deposit_cert` [7, cred,
+    deposit] to tag 6, whose real shape is 2-element [6, [pot, target]]) is
+    exactly the point: the decoder must reject at the TAG, before arity is
+    ever examined. This is #1034's regression pin for #1023.
+    """
+    bstart, bend = body_span(buf)
+    _head_start, items_start, _end, count, _tagged = body_field_span(
+        buf, bstart, bend, CERT_FIELD_KEY
+    )
+    spans = element_spans(buf, items_start, count)
+    n = len(spans)
+    if n == 0:
+        raise CborError("tx has no certificates to splice")
+    if index >= n:
+        raise CborError("cert index %d out of range (count=%d)" % (index, n))
+    cstart, cend = spans[index]
+    cmajor, carg, cpos = _head(buf, cstart)
+    if cmajor != MT_ARRAY:
+        raise CborError(
+            "certificate entry %d is not an array (major %d)" % (index, cmajor)
+        )
+    if carg == INDEFINITE or carg == 0:
+        raise CborError("certificate entry %d has no tag element to splice" % index)
+    tag_major, _tag_val, tag_end = _head(buf, cpos)
+    if tag_major != MT_UINT:
+        raise CborError(
+            "certificate %d tag is not a uint (major %d)" % (index, tag_major)
+        )
+    new_tag_bytes = encode_head(MT_UINT, new_tag)
+    return buf[:cpos] + new_tag_bytes + buf[tag_end:]
+
+
 TAG_SET = 258
 
 
@@ -415,6 +511,36 @@ def describe(buf):
     }
 
 
+def describe_certs(buf):
+    """List each certificate's own tag integer (the constructor
+    discriminator). Used by #1034 (19-era-negatives) to confirm a splice
+    landed on the intended tag before the modified body is re-signed and
+    submitted — asserting on the wire bytes rather than trusting the splice
+    silently did the right thing.
+    """
+    bstart, bend = body_span(buf)
+    try:
+        _head_start, items_start, _end, count, tagged = body_field_span(
+            buf, bstart, bend, CERT_FIELD_KEY
+        )
+    except CborError:
+        return {"cert_count": 0, "cert_tags": [], "certs_tagged_258": False}
+    spans = element_spans(buf, items_start, count)
+    tags = []
+    for cstart, cend in spans:
+        cmajor, carg, cpos = _head(buf, cstart)
+        if cmajor == MT_ARRAY and carg not in (INDEFINITE, 0):
+            tmajor, tval, _tp = _head(buf, cpos)
+            tags.append(tval if tmajor == MT_UINT else None)
+        else:
+            tags.append(None)
+    return {
+        "cert_count": len(spans),
+        "cert_tags": tags,
+        "certs_tagged_258": tagged,
+    }
+
+
 # ---------------------------------------------------------------------------
 # Envelope I/O
 # ---------------------------------------------------------------------------
@@ -469,6 +595,25 @@ def main(argv=None):
     p_dup.add_argument("--index", type=int, default=0)
     p_dup.add_argument("--copies", type=int, default=2)
 
+    p_certs = sub.add_parser(
+        "show-certs", help="print each certificate's own tag integer as JSON"
+    )
+    p_certs.add_argument("--in", dest="inp", required=True)
+
+    p_splice = sub.add_parser(
+        "splice-cert-tag",
+        help="overwrite one certificate's tag integer with an arbitrary "
+             "value, leaving its remaining fields (and their arity) "
+             "untouched — see #1034 (19-era-negatives)",
+    )
+    p_splice.add_argument("--in", dest="inp", required=True)
+    p_splice.add_argument("--out", dest="out", required=True)
+    p_splice.add_argument("--index", type=int, default=0)
+    p_splice.add_argument(
+        "--tag", type=int, required=True,
+        help="new certificate tag, e.g. 6 (MIR) or 5 (GenesisKeyDelegation)",
+    )
+
     p_sign = sub.add_parser("sign", help="attach vkey witnesses to the given body")
     p_sign.add_argument("--in", dest="inp", required=True)
     p_sign.add_argument("--out", dest="out", required=True)
@@ -491,6 +636,14 @@ def main(argv=None):
             return 0
         if args.cmd == "body-hash":
             print(body_hash(buf).hex())
+            return 0
+        if args.cmd == "show-certs":
+            print(json.dumps(describe_certs(buf), indent=2))
+            return 0
+        if args.cmd == "splice-cert-tag":
+            new = splice_cert_tag(buf, index=args.index, new_tag=args.tag)
+            write_envelope(args.out, new, env)
+            print(json.dumps(describe_certs(new), indent=2))
             return 0
         if args.cmd == "redeemers":
             rs = redeemer_purposes(buf)
