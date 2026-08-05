@@ -70,40 +70,51 @@ rm -f "$TMP"
 [ -z "$TOKEN_TXIN" ] && { zoo_fail "could not locate the token-bearing UTxO"; zoo_record "$NAME" FAIL "$MINT_TXID" "no-token-utxo"; exit 1; }
 
 # ---- Step 2: an unrelated Plutus spend, collateralised by the token UTxO. ----
+#
+# MUST use build-raw with NO --tx-out-return-collateral / --tx-total-collateral
+# declared at all. `transaction build` (auto mode) computes a collateral_return
+# output that returns the ENTIRE undeclared token balance back to the payer —
+# i.e. it neutralises the deliberately-tokenized collateral input, since the
+# Haskell (and dugite) rule is on the NET (input minus return), not on the
+# raw collateral input's composition. With auto-build, net tokens == 0 and the
+# tx is legitimately ACCEPTED by both implementations — that is not a dugite
+# bug, it just means auto-build silently defeats this test's premise. Omitting
+# collateral_return entirely keeps the token in the NET balance, which is the
+# only way to force `isAdaOnly (collBalance <-> return)` to see a non-zero
+# residual.
 SCRIPT="$ZOO_DIR/lib/plutus/always-true-v2.plutus"
 [ -s "$SCRIPT" ] || { zoo_record_env_skip "$NAME" "missing-script-binary $(basename "$SCRIPT")"; exit 0; }
 PAIR=$(plutus_lock "$SCRIPT" inline 5000000) || { zoo_record "$NAME" FAIL "" "lock"; exit 1; }
-SCRIPT_TXIN=${PAIR%% *}
+SCRIPT_TXIN=${PAIR%% *}; SCRIPT_AMT=${PAIR##* }
 
 REDEEMER="$ZOO_BUILT/$NAME.redeemer.json"
 echo '{"int": 0}' > "$REDEEMER"
+# (steps, memory) — cardano-cli's --tx-in-execution-units tuple order,
+# confirmed live via dugite-relay's ScriptFailed budget-exhaustion log
+# ("cpu_remaining" tracked the FIRST tuple element). always-true-v2 needs
+# ~1,893,779 steps / ~5,894 mem in practice (from a real cardano-cli
+# auto-build estimate) despite the script logic being trivial — CEK
+# evaluation overhead for datum/redeemer decoding dominates. 1,000,000 was
+# under-provisioned on steps and would silently swap this test's real
+# assertion for a budget-exhausted ScriptFailed if it ever reached Phase-2.
+EXUNITS="(2000000,1000000)"
+FEE=2000000
+REG_OUT=$((SCRIPT_AMT - FEE))
+PPARAMS=$(zoo_pparams_file)
 RAW="$ZOO_BUILT/$NAME.raw"
 
-if cardano-cli conway transaction build \
-        --testnet-magic "$LD_MAGIC" --socket-path "$ZOO_SOCKET" \
-        --tx-in "$SCRIPT_TXIN" \
-        --tx-in-script-file "$SCRIPT" \
-        --tx-in-inline-datum-present \
-        --tx-in-redeemer-file "$REDEEMER" \
-        --tx-in-collateral "$TOKEN_TXIN" \
-        --tx-out "${ADDR}+2000000" \
-        --change-address "$ADDR" \
-        --out-file "$RAW" >/dev/null 2> "$ZOO_LOGS/$NAME.err"; then
-    SIGNED="$ZOO_BUILT/$NAME.signed"
-    cardano-cli conway transaction sign --testnet-magic "$LD_MAGIC" \
-        --tx-body-file "$RAW" --signing-key-file "$ZOO_PAY_SKEY" --out-file "$SIGNED" >/dev/null
-    expect_utxo_rejection "$NAME" "$SIGNED" "$WANT"
-    exit $?
-fi
+cardano-cli conway transaction build-raw \
+    --tx-in "$SCRIPT_TXIN" --tx-in-script-file "$SCRIPT" \
+    --tx-in-inline-datum-present --tx-in-redeemer-file "$REDEEMER" \
+    --tx-in-execution-units "$EXUNITS" \
+    --tx-in-collateral "$TOKEN_TXIN" \
+    --tx-out "${ADDR}+${REG_OUT}" \
+    --fee "$FEE" \
+    --protocol-params-file "$PPARAMS" \
+    --out-file "$RAW" >/dev/null 2> "$ZOO_LOGS/$NAME.err" \
+    || { zoo_fail "build-raw: $(tail -2 "$ZOO_LOGS/$NAME.err")"; zoo_record "$NAME" FAIL "" "build"; exit 1; }
+SIGNED="$ZOO_BUILT/$NAME.signed"
+cardano-cli conway transaction sign --testnet-magic "$LD_MAGIC" \
+    --tx-body-file "$RAW" --signing-key-file "$ZOO_PAY_SKEY" --out-file "$SIGNED" >/dev/null
 
-# cardano-cli's `transaction build` can refuse locally once it resolves the
-# collateral UTxO's composition — that is still the rule firing, just at the
-# client instead of the node.
-if grep -qi "$WANT\|non-ada\|non ada\|only.*ada\|ada.*only" "$ZOO_LOGS/$NAME.err"; then
-    zoo_ok "$NAME: refused at build ($WANT)"
-    zoo_record "$NAME" PASS "" "rejected-$WANT-at-build"
-    exit 0
-fi
-zoo_fail "$NAME: build failed for a reason unrelated to $WANT: $(tail -2 "$ZOO_LOGS/$NAME.err")"
-zoo_record "$NAME" FAIL "" "build-failed-not-$WANT"
-exit 1
+expect_utxo_rejection "$NAME" "$SIGNED" "$WANT" "no-collateral-return-declared, net collateral carries the token"

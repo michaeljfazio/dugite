@@ -46,6 +46,21 @@ expect_utxo_rejection() {
         zoo_record "$name" FAIL "" "degraded-to-mempool-failure-want-$want"
         return 1
     fi
+    # A raw wire-decode failure (cardano-cli's own CDDL decoder choking on a
+    # malformed rejection payload) must be labelled as such, not run through
+    # the generic constructor-name regex below — that regex's `Babbage[A-Za-z]+`
+    # alternative spuriously matches inert era-name tokens inside the
+    # DeserialiseFailure's HardFork-combinator boilerplate (e.g. "BabbageEra"
+    # from "ShelleyBlock (Praos StandardCrypto) BabbageEra"), which reads as a
+    # real-but-wrong predicate name and hides a wire-corruption bug behind a
+    # misleading "wrong reason" report.
+    if echo "$out" | grep -q 'DeserialiseFailure'; then
+        local decfail
+        decfail=$(echo "$out" | grep -oE 'DeserialiseFailure [0-9]+ "[^"]*"' | head -1)
+        zoo_fail "$name: node's rejection reply is malformed CBOR ($decfail) instead of $want — wire-encoder bug, not a wrong reason"
+        zoo_record "$name" FAIL "" "malformed-cbor-reply-want-$want"
+        return 1
+    fi
     local got
     got=$(echo "$out" | grep -oE '\(?Conway[A-Za-z]*Failure[^)]*|Babbage[A-Za-z]+|[A-Za-z]+UTxO|[A-Za-z]+UTXOW?|[A-Za-z]+DELEG' \
           | head -1 | tr -d ',' | cut -c1-110)
