@@ -547,8 +547,15 @@ fn decode_gov_action_state(
     let pool_votes = decode_pool_vote_map(r)?;
 
     // [4] gasProposalProcedure — array(4) [deposit, return_addr, gov_action, anchor]
-    // Mirrors the tx-body encoding; reuse the existing decoder.
-    let procedure = crate::decode::era_conway::read_proposal_procedure(r)?;
+    // Mirrors the tx-body encoding; reuse the existing decoder. This module
+    // decodes `ConwayGovState` specifically (see the module doc comment), so
+    // the embedded `protocol_param_update`'s valid key set (issue #1013) is
+    // Conway's (0-11, 16-33) — a Haskell-dumped fixture legitimately using a
+    // Dijkstra-only key (34+) here would mean the fixture is not actually a
+    // ConwayGovState, which should surface as a decode error, not be silently
+    // widened to accept it.
+    let procedure =
+        crate::decode::era_conway::read_proposal_procedure(r, dugite_primitives::Era::Conway)?;
 
     // [5] gasProposedIn — uint
     let proposed_in = EpochNo(r.read_uint()?);

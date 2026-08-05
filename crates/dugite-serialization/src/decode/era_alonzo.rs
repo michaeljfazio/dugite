@@ -514,7 +514,9 @@ pub(crate) fn decode_alonzo_tx_body(
                 // update = [proposed_protocol_parameter_updates, epoch]
                 // Decoded so the boundary handler can apply pre-Conway PPUPs.
                 // See `era_shelley::read_pre_conway_update_proposal` and #624.
-                update = Some(read_pre_conway_update_proposal(r)?);
+                // `era` (Allegra/Mary/Alonzo here) selects the embedded PPU's
+                // valid key set (issue #1013).
+                update = Some(read_pre_conway_update_proposal(r, era)?);
             }
             7 => {
                 auxiliary_data_hash = Some(read_hash32(r)?);

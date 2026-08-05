@@ -5691,7 +5691,12 @@ mod tests {
                 0x05, // 5
             ];
 
-            let ppu = ppu_from_cbor(&cbor).expect("PParamUpdate CBOR with keys 34-37 must decode");
+            // `ppu_from_cbor` now takes an `Era` (issue #1013 — keys 34-37 are
+            // Dijkstra-only; a Conway-era decode of this exact CBOR must
+            // reject). This test is specifically about the Dijkstra additions,
+            // so `Era::Dijkstra` is the only correct choice here.
+            let ppu = ppu_from_cbor(&cbor, dugite_primitives::Era::Dijkstra)
+                .expect("PParamUpdate CBOR with keys 34-37 must decode under Era::Dijkstra");
 
             // Verify all four fields are decoded correctly.
             assert_eq!(

@@ -64,13 +64,64 @@ use std::collections::BTreeMap;
 /// and generation continues. A fuzz generator that could return `Err` would
 /// turn every short input into a silent skip, which is the failure shape this
 /// whole work stream exists to remove.
-/// Which `protocol_param_update` wire type to generate for.
+/// Which era's `protocol_param_update` key set to generate for.
+///
+/// Issue #1013: dugite's decoder became era-gated (it used to accept a
+/// single "union of pre-Conway keys" / "union of Conway+Dijkstra keys" and
+/// silently skip anything outside even that), so a generator that ignores
+/// sub-era differences now produces bytes its own target decoder legitimately
+/// rejects — a permanent false positive, not a finding. Every valid key
+/// range below is oracle-verified against `IntersectMBO/cardano-ledger` at
+/// pinned commit `4849c13d6f70e5ab46add9af6e0ec5c537b61f69` (see
+/// `read_protocol_param_update` / `read_pre_conway_protocol_param_update` in
+/// `dugite-serialization` for the full per-key citation).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum PpuShape {
-    /// Conway and later: keys 0-11, 16-33, plus the Dijkstra additions 34-37.
+    /// Shelley/Allegra/Mary: keys 0-16, no gaps (`eraPParams = shelleyPParams`
+    /// verbatim for all three).
+    ShelleyFamily,
+    /// Alonzo: keys 0-14, 16-24. Gap: 15 (`min_utxo_value`, replaced by
+    /// `coinsPerUTxOWord` at key 17). KEEPS `d`(12)/`extra_entropy`(13),
+    /// unlike Babbage.
+    Alonzo,
+    /// Babbage: keys 0-11, 14, 16-24. Gaps: 12, 13, 15 (`d`, `extra_entropy`,
+    /// `min_utxo_value` all `notSupportedInThisEraL`).
+    Babbage,
+    /// Conway: keys 0-11, 16-33. Gaps: 12, 13, 14, 15 (same four as Dijkstra
+    /// — `ppGovProtocolVersion { ppUpdate = Nothing }`).
     Conway,
-    /// Shelley..Babbage: keys 0-24, including 12-15.
-    PreConway,
+    /// Dijkstra: keys 0-11, 16-37 (dugite-supported subset — upstream also
+    /// defines 38/39, `ProtocolParamUpdate` has no fields for them yet).
+    /// Same four gaps as Conway.
+    Dijkstra,
+}
+
+impl PpuShape {
+    /// The era to decode a `Self`-shaped PPU's wire bytes as.
+    pub fn era(self) -> Era {
+        match self {
+            // Any of Shelley/Allegra/Mary decodes an identical key set —
+            // Shelley is the representative choice.
+            PpuShape::ShelleyFamily => Era::Shelley,
+            PpuShape::Alonzo => Era::Alonzo,
+            PpuShape::Babbage => Era::Babbage,
+            PpuShape::Conway => Era::Conway,
+            PpuShape::Dijkstra => Era::Dijkstra,
+        }
+    }
+
+    /// The `PpuShape` whose key set matches `era` exactly, for callers that
+    /// know a concrete pre-Conway `Era` (e.g. [`Gen::update_proposal`], which
+    /// generates for the SAME era the enclosing transaction body claims).
+    pub fn for_era(era: Era) -> PpuShape {
+        match era {
+            Era::Byron | Era::Shelley | Era::Allegra | Era::Mary => PpuShape::ShelleyFamily,
+            Era::Alonzo => PpuShape::Alonzo,
+            Era::Babbage => PpuShape::Babbage,
+            Era::Conway => PpuShape::Conway,
+            Era::Dijkstra => PpuShape::Dijkstra,
+        }
+    }
 }
 
 pub struct Gen<'a> {
@@ -296,7 +347,7 @@ impl<'a> Gen<'a> {
         acct
     }
 
-    /// Every `ProtocolParamUpdate` key, 0 through 37.
+    /// Every `ProtocolParamUpdate` key valid under `Era::Conway`.
     ///
     /// This is the shape #951 lived in. The PPU key 26 encoder wrote the ten
     /// `drep_voting_thresholds` elements in the WRONG ORDER — it dropped
@@ -312,20 +363,26 @@ impl<'a> Gen<'a> {
         self.ppu_for(PpuShape::Conway)
     }
 
-    /// A `ProtocolParamUpdate` restricted to one era's key set.
+    /// A `ProtocolParamUpdate` restricted to one era's EXACT key set (issue
+    /// #1013 — dugite's decoder became era-gated at a per-key granularity,
+    /// not merely "pre-Conway vs Conway+", so a generator that ignores
+    /// sub-era gaps produces bytes its own target decoder now legitimately
+    /// rejects, a permanent false positive rather than a finding):
     ///
-    /// The two wire types genuinely differ, and generating a field the target
-    /// encoder is not specified to emit would produce a permanent false
-    /// positive rather than a finding:
-    ///
-    /// - keys 12-15 (`d`, `extra_entropy`, `protocol_version`,
-    ///   `min_utxo_value`) exist only Shelley..Babbage — Conway drops
-    ///   decentralisation and extra entropy, moves protocol_version into the
-    ///   HardForkInitiation action, and replaces min_utxo_value with
-    ///   coinsPerUTxOByte at key 17
-    /// - keys 25-33 (the voting thresholds and governance parameters) and
-    ///   34-37 (the Dijkstra ref-script parameters) do not exist pre-Conway
+    /// - keys 12/13 (`d`/`extra_entropy`): Shelley/Allegra/Mary/Alonzo only
+    ///   (Babbage drops both)
+    /// - key 14 (`protocol_version`): every pre-Conway era, dropped in Conway+
+    ///   (moved into the HardForkInitiation action)
+    /// - key 15 (`min_utxo_value`): Shelley/Allegra/Mary ONLY (Alonzo replaces
+    ///   it with `coinsPerUTxOWord` at key 17)
+    /// - keys 17-24 (Plutus cost/execution params): Alonzo/Babbage/Conway/
+    ///   Dijkstra only — Shelley/Allegra/Mary predate Plutus
+    /// - keys 25-33 (voting thresholds, governance params): Conway/Dijkstra
+    ///   only
+    /// - keys 34-37 (Dijkstra ref-script params): Dijkstra only
     pub fn ppu_for(&mut self, shape: PpuShape) -> ProtocolParamUpdate {
+        use PpuShape::*;
+
         // Populate nearly always: the point is a dense map, not a realistic one.
         macro_rules! opt {
             ($self:ident, $e:expr) => {
@@ -337,8 +394,18 @@ impl<'a> Gen<'a> {
             };
         }
 
-        let pre = shape == PpuShape::PreConway;
-        let conway = shape == PpuShape::Conway;
+        // Keys 12/13 — Shelley/Allegra/Mary/Alonzo; Babbage drops both.
+        let has_d_entropy = matches!(shape, ShelleyFamily | Alonzo);
+        // Key 14 — every pre-Conway era; Conway/Dijkstra drop it.
+        let has_protocol_version = matches!(shape, ShelleyFamily | Alonzo | Babbage);
+        // Key 15 — Shelley/Allegra/Mary only.
+        let has_min_utxo_value = matches!(shape, ShelleyFamily);
+        // Keys 17-24 — Plutus-era cost/execution params.
+        let has_plutus_params = matches!(shape, Alonzo | Babbage | Conway | Dijkstra);
+        // Keys 25-33 — Conway governance params.
+        let has_governance = matches!(shape, Conway | Dijkstra);
+        // Keys 34-37 — Dijkstra ref-script params.
+        let has_dijkstra_refscript = matches!(shape, Dijkstra);
 
         // Keys 25 and 26 are POSITIONAL ARRAYS — five pool thresholds and ten
         // DRep thresholds — not fifteen independent map keys. A partial group
@@ -350,19 +417,19 @@ impl<'a> Gen<'a> {
         // values are drawn INDEPENDENTLY so any permutation between encoder
         // and decoder surfaces as two fields swapping values.
         let mut drep_group: [Option<Rational>; 10] = Default::default();
-        if conway && self.chance(230) {
+        if has_governance && self.chance(230) {
             for slot in drep_group.iter_mut() {
                 *slot = Some(self.rational());
             }
         }
         let mut pool_group: [Option<Rational>; 5] = Default::default();
-        if conway && self.chance(230) {
+        if has_governance && self.chance(230) {
             for slot in pool_group.iter_mut() {
                 *slot = Some(self.rational());
             }
         }
         // Both halves of key 14 together, or neither.
-        let pv = if pre && self.chance(230) {
+        let pv = if has_protocol_version && self.chance(230) {
             Some(self.u64())
         } else {
             None
@@ -382,34 +449,54 @@ impl<'a> Gen<'a> {
             rho: opt!(self, self.rational()),
             tau: opt!(self, self.rational()),
             min_pool_cost: opt!(self, self.lovelace()),
-            ada_per_utxo_byte: opt!(self, self.lovelace()),
+            ada_per_utxo_byte: has_plutus_params
+                .then(|| opt!(self, self.lovelace()))
+                .flatten(),
             // Key 15 — decoded then DROPPED before #919. Key 17 is
             // coinsPerUTxOWord pre-Babbage and coinsPerUTxOByte after.
-            min_utxo_value: pre.then(|| opt!(self, self.lovelace())).flatten(),
-            cost_models: opt!(self, self.cost_models()),
-            execution_costs: opt!(
-                self,
-                ExUnitPrices {
-                    mem_price: self.rational(),
-                    step_price: self.rational(),
-                }
-            ),
-            max_tx_ex_units: opt!(self, self.ex_units()),
-            max_block_ex_units: opt!(self, self.ex_units()),
-            max_val_size: opt!(self, self.u64()),
-            collateral_percentage: opt!(self, self.u64()),
-            max_collateral_inputs: opt!(self, self.u64()),
-            min_fee_ref_script_cost_per_byte: conway.then(|| opt!(self, self.rational())).flatten(),
-            d: pre.then(|| opt!(self, self.rational())).flatten(),
-            extra_entropy: pre.then(|| opt!(self, self.hash32())).flatten(),
+            min_utxo_value: has_min_utxo_value
+                .then(|| opt!(self, self.lovelace()))
+                .flatten(),
+            cost_models: has_plutus_params
+                .then(|| opt!(self, self.cost_models()))
+                .flatten(),
+            execution_costs: has_plutus_params
+                .then(|| {
+                    opt!(
+                        self,
+                        ExUnitPrices {
+                            mem_price: self.rational(),
+                            step_price: self.rational(),
+                        }
+                    )
+                })
+                .flatten(),
+            max_tx_ex_units: has_plutus_params
+                .then(|| opt!(self, self.ex_units()))
+                .flatten(),
+            max_block_ex_units: has_plutus_params
+                .then(|| opt!(self, self.ex_units()))
+                .flatten(),
+            max_val_size: has_plutus_params.then(|| opt!(self, self.u64())).flatten(),
+            collateral_percentage: has_plutus_params.then(|| opt!(self, self.u64())).flatten(),
+            max_collateral_inputs: has_plutus_params.then(|| opt!(self, self.u64())).flatten(),
+            min_fee_ref_script_cost_per_byte: has_governance
+                .then(|| opt!(self, self.rational()))
+                .flatten(),
+            d: has_d_entropy.then(|| opt!(self, self.rational())).flatten(),
+            extra_entropy: has_d_entropy.then(|| opt!(self, self.hash32())).flatten(),
             // protocol_version is ONE wire key carrying [major, minor], so the
             // two halves must be present or absent together — a lone major
             // cannot be represented and would be a false positive.
             protocol_version_major: pv,
             protocol_version_minor: pv,
-            drep_deposit: conway.then(|| opt!(self, self.lovelace())).flatten(),
-            gov_action_deposit: conway.then(|| opt!(self, self.lovelace())).flatten(),
-            gov_action_lifetime: conway.then(|| opt!(self, self.u64())).flatten(),
+            drep_deposit: has_governance
+                .then(|| opt!(self, self.lovelace()))
+                .flatten(),
+            gov_action_deposit: has_governance
+                .then(|| opt!(self, self.lovelace()))
+                .flatten(),
+            gov_action_lifetime: has_governance.then(|| opt!(self, self.u64())).flatten(),
             // Key 26 — the ten DRep voting thresholds, in the order Haskell's
             // `EncCBOR DRepVotingThresholds` writes them. All ten are drawn
             // independently so a permutation is observable.
@@ -430,15 +517,23 @@ impl<'a> Gen<'a> {
             pvt_committee_no_confidence: pool_group[2].clone(),
             pvt_hard_fork: pool_group[3].clone(),
             pvt_pp_security_group: pool_group[4].clone(),
-            min_committee_size: conway.then(|| opt!(self, self.u64())).flatten(),
-            committee_term_limit: conway.then(|| opt!(self, self.u64())).flatten(),
-            drep_activity: conway.then(|| opt!(self, self.u64())).flatten(),
+            min_committee_size: has_governance.then(|| opt!(self, self.u64())).flatten(),
+            committee_term_limit: has_governance.then(|| opt!(self, self.u64())).flatten(),
+            drep_activity: has_governance.then(|| opt!(self, self.u64())).flatten(),
             // Dijkstra keys 34-37.
-            max_ref_script_size_per_block: conway.then(|| opt!(self, self.u32())).flatten(),
-            max_ref_script_size_per_tx: conway.then(|| opt!(self, self.u32())).flatten(),
+            max_ref_script_size_per_block: has_dijkstra_refscript
+                .then(|| opt!(self, self.u32()))
+                .flatten(),
+            max_ref_script_size_per_tx: has_dijkstra_refscript
+                .then(|| opt!(self, self.u32()))
+                .flatten(),
             // NonZero Word32 upstream.
-            ref_script_cost_stride: conway.then(|| opt!(self, self.u32().max(1))).flatten(),
-            ref_script_cost_multiplier: conway.then(|| opt!(self, self.rational())).flatten(),
+            ref_script_cost_stride: has_dijkstra_refscript
+                .then(|| opt!(self, self.u32().max(1)))
+                .flatten(),
+            ref_script_cost_multiplier: has_dijkstra_refscript
+                .then(|| opt!(self, self.rational()))
+                .flatten(),
         }
     }
 
@@ -1370,7 +1465,7 @@ impl Gen<'_> {
             // Body key 6 — pre-Conway only. Conway replaces the
             // genesis-delegate update mechanism with governance
             // proposal_procedures (key 20), so a Conway body must not carry it.
-            update: (pre_conway && self.chance(180)).then(|| self.update_proposal()),
+            update: (pre_conway && self.chance(180)).then(|| self.update_proposal(era)),
             voting_procedures: if has_conway_gov {
                 voting_procedures
             } else {
@@ -1693,17 +1788,23 @@ impl Gen<'_> {
     /// decoded it, so a pre-Conway transaction carrying one re-encoded into a
     /// body missing key 6 and changed its own transaction id. Found by this
     /// generator's sibling target; the fix is in `encode_update_proposal`.
-    pub fn update_proposal(&mut self) -> UpdateProposal {
+    ///
+    /// `era` is the ENCLOSING transaction's era (always < `Era::Conway` — the
+    /// only callers gate on `pre_conway`). Issue #1013: the embedded PPU's
+    /// valid key set is now era-gated at the sub-era level (Shelley/Allegra/
+    /// Mary vs Alonzo vs Babbage genuinely differ), so this must generate the
+    /// SAME sub-era's shape the containing body claims — a Shelley body
+    /// carrying an Alonzo-shaped update (e.g. `cost_models`) is a shape the
+    /// real decoder now rejects, which would be a permanent false positive.
+    pub fn update_proposal(&mut self, era: Era) -> UpdateProposal {
+        let shape = PpuShape::for_era(era);
         let n = self.collection_len(6).max(1);
         let mut proposed_updates = Vec::new();
         for _ in 0..n {
             // `genesishash` is bstr(28) on the wire; the decoder stores it via
             // `Hash28::to_hash32_padded`, so a full-width Hash32 would come
             // back truncated.
-            proposed_updates.push((
-                self.hash28().to_hash32_padded(),
-                self.ppu_for(PpuShape::PreConway),
-            ));
+            proposed_updates.push((self.hash28().to_hash32_padded(), self.ppu_for(shape)));
         }
         // Keyed by genesis hash on the wire — duplicates collapse.
         let mut seen = Vec::new();
