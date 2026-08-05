@@ -106,6 +106,7 @@
 - [P1 commands](cli-p1-commands.md) — calculate-min-fee, calculate-min-required-utxo, policyid, pool-params, slot-number, kes-period-info
 - [#998 CIP-0094 poll commands NOT implemented](issue-998-cip94-poll-commands-removed.md) — cardano-cli deleted them May 2025 (PR #1178); closed not-planned. Follow-up #1006: CLI surface-enumeration gate.
 - [#1006 CLI surface-parity gate built](issue-1006-cli-surface-parity-gate.md) — recursive `--help` walker; 2 parser bugs found by running it (empty-key bash assoc-array, ANSI/blank-line block terminator); 82 real gaps filed as #1008.
+- [#1008 first implementation pass](issue-1008-cli-surface-parity-implementation.md) — 69/151→77/149; `hash` cmd group + version + drep metadata-hash (Plutus hash needs the CBOR bstr wrapper RETAINED, not stripped); alias-only renames invisible to walker (must make cardano-cli's name primary); walker verified NOT misclassifying positional alternatives (386/386 leaves checked).
 
 ## TUI
 - [Layout polish](tui-layout-polish.md) — wide mode, kv_aligned patterns, Monokai theme, RTT bar

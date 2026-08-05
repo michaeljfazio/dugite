@@ -93,6 +93,10 @@ enum Commands {
     Genesis(commands::genesis::GenesisCmd),
     /// Text-view file commands
     TextView(commands::text_view::TextViewCmd),
+    /// Compute hashes to pass to the various --*-hash arguments of commands
+    Hash(commands::hash::HashCmd),
+    /// Show the dugite-cli version
+    Version,
 }
 
 /// `byron key <subcommand>` — mirror the cardano-cli `byron key` nesting.
@@ -124,6 +128,15 @@ impl Commands {
             Commands::Node(cmd) => cmd.run(),
             Commands::Genesis(cmd) => cmd.run(),
             Commands::TextView(cmd) => cmd.run(),
+            Commands::Hash(cmd) => cmd.run(),
+            Commands::Version => {
+                // Mirrors cardano-cli's `version` subcommand (distinct from
+                // its `--version`/`-V` flag, though both print the same
+                // string upstream) — dugite reports its OWN identity rather
+                // than impersonating cardano-cli's version string. #1008.
+                println!("dugite-cli {}", env!("CARGO_PKG_VERSION"));
+                Ok(())
+            }
         }
     }
 }
