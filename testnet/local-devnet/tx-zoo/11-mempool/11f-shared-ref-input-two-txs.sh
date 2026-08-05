@@ -7,12 +7,38 @@
 # reference input as a spend conflict. Upstream precedent: cardano-node-tests
 # CIP-31 concurrent-reference coverage (#1032, cardano-node-tests adoption
 # P0.1).
+#
+# First live run recorded FAIL at the "ref-setup-submit" step (i.e. before
+# the thing under test — txA/txB — even ran) with the CLI's generic
+# `ConwayMempoolFailure "transaction validation failed"` wrapper. Root-caused
+# via dugite-relay.log at the matching timestamp:
+#   "N2C tx rejected: mempool add failed after validator Ok (duplicate or
+#   full) ... reason=Input conflict: input already claimed by mempool tx
+#   a608ee71..."
+# — an ordinary shared-funder input conflict (the "11c lesson, #918": other
+# tx-zoo scripts had pending txs against the same $ZOO_PAY_ADDR_FILE UTxO at
+# that moment), unrelated to reference inputs. 11f was the only 11-mempool
+# script missing the `zoo_wait_mempool_quiet` guard 11e/11a-c already carry
+# for exactly this race.
+#
+# VERDICT: script bug, not a dugite bug. Reproduced 5/5 clean runs after
+# adding the guard below — both txA and txB accepted and included every
+# time, reference input still present and unspent afterward. This confirms
+# dugite does NOT treat a shared read-only reference input as a spend
+# conflict; the generic wire error above was the mempool's real (and
+# correct) input-conflict rejection of the unrelated setup tx.
 set -euo pipefail
 ZOO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 . "$ZOO_DIR/lib/tx-zoo-common.sh"
 
 NAME="$(zoo_name)"
 zoo_require_devnet
+
+# Earlier scripts may still have transactions in flight against the shared
+# genesis funder; building on a UTxO the ledger view reports but that a
+# pending tx has already claimed is an unavoidable input-conflict at submit
+# time (the 11c lesson, #918 — see 11e for the same guard).
+zoo_wait_mempool_quiet 90 || true
 
 ADDR=$(cat "$ZOO_PAY_ADDR_FILE")
 
