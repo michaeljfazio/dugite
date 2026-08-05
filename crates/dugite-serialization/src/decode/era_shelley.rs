@@ -633,32 +633,39 @@ fn read_shelley_value(r: &mut Reader<'_>) -> Result<Value, SerializationError> {
 }
 
 /// Read a multiasset map: `{ policy_id(28) => { asset_name => uint } }`.
+///
+/// Both map levels use `read_map` (handles definite AND indefinite CBOR map
+/// forms) rather than `read_map_header()?.unwrap_or(0)`, which silently
+/// decoded an indefinite-length map (`encode_map_open`'s form above 23
+/// entries, #932/#938) as zero entries and desynced the reader for
+/// everything after — the same shape as `read_mir_cert`'s historical
+/// mainnet-Shelley-MIR-cert bug and `read_withdrawals` just above.
 fn read_multiasset_map_u64(
     r: &mut Reader<'_>,
 ) -> Result<BTreeMap<Hash28, BTreeMap<AssetName, u64>>, SerializationError> {
     let mut result = BTreeMap::new();
-    let n = r.read_map_header()?;
-    let count = n.unwrap_or(0) as usize;
-    for _ in 0..count {
-        // policy_id: 28 bytes
-        let policy_bytes = r.read_bytes()?;
-        let policy =
+    let policy_pairs = r.read_map(
+        |r| {
+            let policy_bytes = r.read_bytes()?;
             Hash28::try_from(policy_bytes).map_err(|_| SerializationError::InvalidLength {
                 expected: 28,
                 got: policy_bytes.len(),
-            })?;
-        // { asset_name => quantity }
-        let mut assets: BTreeMap<AssetName, u64> = BTreeMap::new();
-        let an = r.read_map_header()?;
-        let asset_count = an.unwrap_or(0) as usize;
-        for _ in 0..asset_count {
-            let name_bytes = r.read_bytes_owned()?;
-            let qty = r.read_uint()?;
-            let asset_name = AssetName::new(name_bytes).map_err(|_| {
-                SerializationError::CborDecode("multiasset: asset name too long".into())
-            })?;
-            assets.insert(asset_name, qty);
-        }
+            })
+        },
+        |r| {
+            r.read_map(
+                |r| {
+                    let name_bytes = r.read_bytes_owned()?;
+                    AssetName::new(name_bytes).map_err(|_| {
+                        SerializationError::CborDecode("multiasset: asset name too long".into())
+                    })
+                },
+                |r| r.read_uint(),
+            )
+        },
+    )?;
+    for (policy, asset_pairs) in policy_pairs {
+        let mut assets: BTreeMap<AssetName, u64> = asset_pairs.into_iter().collect();
         // Haskell `decodeMultiAsset` for decoder version < 9 (Mary/Allegra era
         // CBOR) prunes zero-quantity assets and drops policies whose asset map
         // becomes (or arrives) empty — `pruneZeroMultiAsset`/`filterMultiAsset`
@@ -673,16 +680,20 @@ fn read_multiasset_map_u64(
 }
 
 /// Read `withdrawals = { reward_account_bytes => coin }`.
+///
+/// `read_map` handles both the definite and indefinite CBOR map forms — the
+/// same fix already applied to `read_mir_cert`'s target map after mainnet's
+/// first Shelley MIR certs (an indefinite-length map) were found to silently
+/// decode as zero entries under the previous `read_map_header().unwrap_or(0)`
+/// pattern, desyncing the reader for everything after. `encode_map_open`
+/// switches to indefinite form above 23 entries (`ENCODE_MAP_DEFINITE_MAX`,
+/// #932/#938's `encodeMap` semantics), so a >23-entry withdrawals map is
+/// exactly the shape dugite's own encoder can produce and this decoder
+/// previously could not read back — found live by `fuzz_structured_tx_encode`
+/// once the generator started reaching >23-entry maps.
 fn read_withdrawals(r: &mut Reader<'_>) -> Result<BTreeMap<Vec<u8>, Lovelace>, SerializationError> {
-    let mut result = BTreeMap::new();
-    let n = r.read_map_header()?;
-    let count = n.unwrap_or(0) as usize;
-    for _ in 0..count {
-        let account = r.read_bytes_owned()?;
-        let coin = Lovelace(r.read_uint()?);
-        result.insert(account, coin);
-    }
-    Ok(result)
+    let pairs = r.read_map(|r| r.read_bytes_owned(), |r| r.read_uint().map(Lovelace))?;
+    Ok(pairs.into_iter().collect())
 }
 
 // ============================================================================
@@ -1241,18 +1252,20 @@ fn read_native_script(r: &mut Reader<'_>) -> Result<NativeScript, SerializationE
 /// Decode the auxiliary_data_set map: `{ tx_index => auxiliary_data }`.
 ///
 /// Returns a `BTreeMap<u32, AuxiliaryData>` keyed by transaction index.
+///
+/// `read_map` handles both the definite and indefinite CBOR map forms.
+/// This map is keyed by EVERY transaction index in the block that carries
+/// auxiliary data, so a block with more than 23 such transactions is
+/// exactly the >23-entry case `encode_map_open` switches to indefinite
+/// form for (#932/#938) — the previous `read_map_header()?.unwrap_or(0)`
+/// silently decoded that as zero entries and desynced the reader for
+/// everything after, the same shape as `read_withdrawals`/
+/// `read_multiasset_map_u64` just above.
 fn decode_aux_data_map(
     r: &mut Reader<'_>,
 ) -> Result<BTreeMap<u32, AuxiliaryData>, SerializationError> {
-    let mut result = BTreeMap::new();
-    let n = r.read_map_header()?;
-    let count = n.unwrap_or(0) as usize;
-    for _ in 0..count {
-        let tx_idx = r.read_uint()? as u32;
-        let aux = decode_auxiliary_data(r)?;
-        result.insert(tx_idx, aux);
-    }
-    Ok(result)
+    let pairs = r.read_map(|r| r.read_uint().map(|n| n as u32), decode_auxiliary_data)?;
+    Ok(pairs.into_iter().collect())
 }
 
 /// Decode a Shelley/Mary auxiliary data value.
@@ -1470,9 +1483,34 @@ pub(crate) fn read_pre_conway_protocol_param_update(
     r: &mut Reader<'_>,
 ) -> Result<ProtocolParamUpdate, SerializationError> {
     let mut ppu = ProtocolParamUpdate::default();
+    // Indefinite-map-aware, matching `decode_shelley_tx_body`'s own key-loop
+    // a few hundred lines above (and unlike the previous
+    // `read_map_header()?.unwrap_or(0)` here, which silently decoded an
+    // indefinite-length map — `encode_map_open`'s >23-entry form, #932/#938
+    // — as zero entries and desynced the reader for everything after; the
+    // same bug shape as `read_withdrawals`/`read_multiasset_map_u64`/
+    // `decode_aux_data_map` above). A pre-Conway PPU has ~30 possible keys,
+    // so a proposal setting more than 23 of them at once is exactly the
+    // case this was blind to.
     let map_len = r.read_map_header()?;
-    let n = map_len.unwrap_or(0) as usize;
-    for _ in 0..n {
+    let n_entries = match map_len {
+        Some(n) => n as i64,
+        None => -1, // indefinite map
+    };
+    let mut i = 0i64;
+    loop {
+        if n_entries >= 0 && i >= n_entries {
+            break;
+        }
+        if n_entries < 0 {
+            let ty = r.peek_major()?;
+            if ty == Type::Break {
+                r.skip()?;
+                break;
+            }
+        }
+        i += 1;
+
         let key = r.read_uint()?;
         match key {
             0 => ppu.min_fee_a = Some(r.read_uint()?),
@@ -1665,6 +1703,125 @@ mod tests {
         let mut r3 = Reader::new(&empty);
         let ppu3 = read_pre_conway_protocol_param_update(&mut r3).unwrap();
         assert_eq!(ppu3.extra_entropy, None);
+    }
+
+    // -------------------------------------------------------------------
+    // Indefinite-length map decoding (found by `fuzz_structured_tx_encode`
+    // once its generator started reaching >23-entry maps; same bug shape
+    // as `read_mir_cert`'s historical mainnet-Shelley-MIR-cert fix).
+    //
+    // `encode_map_open` (#932/#938, mirroring Haskell's `encodeMap`) emits
+    // an INDEFINITE-length map header for maps with more than 23 entries.
+    // `read_map_header()?.unwrap_or(0)` treats ANY indefinite map as ZERO
+    // entries regardless of its actual size, so a 2-entry indefinite map
+    // is sufficient to reproduce the bug without needing 24 real entries —
+    // these tests hand-build the smallest reproducer rather than the
+    // large fixture that would be needed to force the encoder's own
+    // threshold. `read_map`/the indefinite-aware loop must decode the
+    // SAME logical content whether the map arrived definite or indefinite.
+    // -------------------------------------------------------------------
+
+    fn cbor_bytes_indef_map2(entries: [(&[u8], &[u8]); 2]) -> Vec<u8> {
+        let mut v = vec![0xbf]; // indefinite map open
+        for (k, val) in entries {
+            v.extend(cbor_bytes(k));
+            v.extend_from_slice(val);
+        }
+        v.push(0xff); // break
+        v
+    }
+
+    #[test]
+    fn read_withdrawals_accepts_indefinite_length_map() {
+        let acct_a = [0xe0u8; 29];
+        let acct_b = [0xe1u8; 29];
+        let cbor = cbor_bytes_indef_map2([(&acct_a, &cbor_uint(5)), (&acct_b, &cbor_uint(7))]);
+        let mut r = Reader::new(&cbor);
+        let withdrawals = read_withdrawals(&mut r).expect("indefinite withdrawals map must decode");
+        assert_eq!(withdrawals.len(), 2, "PRE-FIX this decoded as 0 entries");
+        assert_eq!(withdrawals.get(acct_a.as_slice()), Some(&Lovelace(5)));
+        assert_eq!(withdrawals.get(acct_b.as_slice()), Some(&Lovelace(7)));
+    }
+
+    #[test]
+    fn read_multiasset_map_u64_accepts_indefinite_length_outer_and_inner_maps() {
+        let policy_a = [0x11u8; 28];
+        let policy_b = [0x22u8; 28];
+        let asset_name = b"tok";
+        // Inner asset map is ALSO indefinite, exercising both levels at once.
+        let mut inner_a = vec![0xbf];
+        inner_a.extend(cbor_bytes(asset_name));
+        inner_a.extend(cbor_uint(9));
+        inner_a.push(0xff);
+        let mut inner_b = vec![0xbf];
+        inner_b.extend(cbor_bytes(asset_name));
+        inner_b.extend(cbor_uint(3));
+        inner_b.push(0xff);
+
+        let mut cbor = vec![0xbf]; // outer indefinite map
+        cbor.extend(cbor_bytes(&policy_a));
+        cbor.extend(inner_a);
+        cbor.extend(cbor_bytes(&policy_b));
+        cbor.extend(inner_b);
+        cbor.push(0xff);
+
+        let mut r = Reader::new(&cbor);
+        let assets =
+            read_multiasset_map_u64(&mut r).expect("indefinite multiasset map must decode");
+        assert_eq!(assets.len(), 2, "PRE-FIX this decoded as 0 policies");
+        let name = AssetName::new(asset_name.to_vec()).unwrap();
+        assert_eq!(
+            assets
+                .get(&Hash28::from_bytes(policy_a))
+                .and_then(|m| m.get(&name)),
+            Some(&9)
+        );
+        assert_eq!(
+            assets
+                .get(&Hash28::from_bytes(policy_b))
+                .and_then(|m| m.get(&name)),
+            Some(&3)
+        );
+    }
+
+    #[test]
+    fn decode_aux_data_map_accepts_indefinite_length_map() {
+        // { 0 : <empty aux data>, 2 : <empty aux data> } as an indefinite map.
+        let empty_aux = cbor_arr(&[&cbor_arr(&[]), &cbor_arr(&[])]); // metadata{}, [native_scripts]
+        let mut cbor = vec![0xbf];
+        cbor.extend(cbor_uint(0));
+        cbor.extend(cbor_map0()); // aux-data shorthand: bare metadata map form
+        cbor.extend(cbor_uint(2));
+        cbor.extend(cbor_map0());
+        cbor.push(0xff);
+        let _ = empty_aux; // (kept for documentation of the array-form alternative; unused here)
+
+        let mut r = Reader::new(&cbor);
+        let aux_map = decode_aux_data_map(&mut r).expect("indefinite aux-data-set map must decode");
+        assert_eq!(aux_map.len(), 2, "PRE-FIX this decoded as 0 entries");
+        assert!(aux_map.contains_key(&0));
+        assert!(aux_map.contains_key(&2));
+    }
+
+    #[test]
+    fn pre_conway_ppu_accepts_indefinite_length_map() {
+        // { 7: e_max, 8: n_opt } as an indefinite map.
+        let mut cbor = vec![0xbf];
+        cbor.extend(cbor_uint(7));
+        cbor.extend(cbor_uint(100));
+        cbor.extend(cbor_uint(8));
+        cbor.extend(cbor_uint(150));
+        cbor.push(0xff);
+
+        let mut r = Reader::new(&cbor);
+        let ppu =
+            read_pre_conway_protocol_param_update(&mut r).expect("indefinite PPU map must decode");
+        assert_eq!(
+            ppu.e_max,
+            Some(100),
+            "PRE-FIX this decoded as None (0 entries read)"
+        );
+        assert_eq!(ppu.n_opt, Some(150));
     }
 
     /// Build a minimal Shelley block CBOR for testing (inner, after envelope stripping).
