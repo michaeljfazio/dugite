@@ -252,7 +252,7 @@ enum MachineState {
   4. Returns `Value::Con(result)` or `UplcError::BuiltinFailure`.
 - A single `bigint_to_bounded(b: &BigInt, max: usize) -> Result<usize, UplcError>` chokepoint covers every place a script-controlled `BigInt` becomes a `usize` (`IndexByteString`, `SliceByteString`, `ShiftByteString`, `RotateByteString`, `ReadBit`, `WriteBits`, `ReplicateByte`, `FindFirstSetBit`, `IntegerToByteString`). The function caps at `min(64 KiB, mem_budget_remaining / 8)` so a script can't drain the mem budget via a single fat allocation.
 - BLS12-381: `blst` is the implementation. Subgroup checks are wired through `Compressable::uncompress`. Inputs in the wrong subgroup → `UplcError::BuiltinFailure`. Cross-platform reproducibility is verified in CI on x86_64 + aarch64 via the IntersectMBO conformance corpus.
-- ed25519: `ed25519-dalek` with the "no malleability check" path (Cardano accepts the pre-RFC-8032 weak verifier — confirmed via the cardano-base `cardano-crypto-praos` source). TODO at implementation time: cross-check against conformance vectors.
+- ed25519: `ed25519-dalek`'s `verify_strict`. cardano-base implements Ed25519 DSIGN over libsodium's `crypto_sign_verify_detached`, which rejects small-order and non-canonical public keys and small-order `R`; the permissive `Verifier::verify` path accepts an identity-point key with a zero signature for *any* message. Fixed in #997 — do not relax this back to `verify`.
 - secp256k1: `k256` (pure-Rust) used for both ECDSA and Schnorr to avoid the secp256k1-sys C dep. Will validate against CIP-49 test vectors.
 
 ### PlutusData (`src/data.rs` + `src/data/codec.rs`)

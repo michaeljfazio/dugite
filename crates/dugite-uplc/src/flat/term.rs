@@ -438,10 +438,9 @@ fn decode_term_inner(r: &mut BitReader<'_>, depth: usize) -> FlatResult<Term> {
         6 => Ok(Term::Error),
         7 => {
             let raw = r.read_bits8(BUILTIN_TAG_WIDTH)?;
-            // BuiltinId::from_u8 is the placeholder stub for now —
-            // it returns `Internal`, which propagates as a typed
-            // error to the caller. When UPLC-4 wires the table the
-            // happy path here lights up automatically.
+            // `from_u8` covers the full builtin table (0..=100) and rejects
+            // anything above it with a typed error rather than wrapping or
+            // panicking — pinned by `term::tests::from_u8_round_trip_full_table`.
             let id = BuiltinId::from_u8(raw)?;
             Ok(Term::Builtin(id))
         }
