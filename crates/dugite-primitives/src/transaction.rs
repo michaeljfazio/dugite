@@ -1092,31 +1092,61 @@ impl AccountBalanceInterval {
     }
 }
 
-/// Nested sub-transaction (Dijkstra TxBody key 23, `Tx SubTx era`).
+/// Nested sub-transaction (Dijkstra TxBody key 23, `OMap TxId (Tx SubTx era)`).
 ///
-/// Mirrors the relevant fragment of upstream `DijkstraSubTxBodyRaw` — the
-/// subset that affects the UTxO state machine when SUBLEDGERS folds over
-/// the OMap. The fields we model are exactly those the SUB-rule pipeline
-/// reads on a sub-tx body: spend inputs, outputs, optional witness-set
-/// reference inputs, optional validity interval. Witnesses, scripts, mint,
-/// certs and governance fields are NOT modelled here because Phase 3.1 of
-/// issue #475 is scoped to "deserialize + on-disk apply" and the dugite
-/// SUB-rule implementation routes those through the parent tx's Conway
-/// pipeline. Lifting the wire shape one layer at a time avoids a 600-line
-/// patch to every TxBody-literal call site in the workspace.
+/// Mirrors the FULL upstream `DijkstraSubTxBodyRaw` (18 of the 24
+/// `DijkstraTxBodyRaw` fields; a sub-tx structurally cannot carry `fee` /
+/// `collateralInputs` / `collateralReturn` / `totalCollateral` — no fee
+/// field at all, the parent pays — or `subTransactions`, since sub-txs do
+/// not nest) plus the wrapping `DijkstraSubTx`'s own independent witness
+/// set and auxiliary data. Oracle-verified against `IntersectMBO/
+/// cardano-ledger` pinned SHA `4849c13d6f70e5ab46add9af6e0ec5c537b61f69`
+/// (#1010) — `eras/dijkstra/impl/src/Cardano/Ledger/Dijkstra/TxBody.hs`
+/// (key table) and `Tx.hs` lines 88-115 (`DijkstraSubTx { dstBody, dstWits,
+/// dstAuxData }`). See the doc comment on
+/// `crates::eras::dijkstra::apply_sub_transactions` for the full
+/// SUBUTXOW/SUBCERTS/SUBGOV rule-chain context this unblocks.
 ///
-/// Wire shape: a CBOR map keyed by the upstream `DijkstraSubTxBodyRaw`
-/// integer keys (subset):
-///   - 0  : set<transaction_input>   — spend inputs (required)
-///   - 1  : [* transaction_output]   — outputs (required)
-///   - 3  : ttl (optional)
-///   - 8  : validity_interval_start (optional)
-///   - 18 : set<transaction_input>   — reference inputs (optional)
-///   - 7  : auxiliary_data_hash      (optional)
+/// **Wire placement**: NOT a block-segwit sibling of the top-level tx.
+/// Lives embedded inside the PARENT's own body at TxBody key 23, each
+/// entry a plain 3-element record `[body, wits, auxData]` — see
+/// `decode_sub_transactions` in `dugite-serialization`.
+///
+/// **Not yet modelled**: TxBody key 24 (`required_top_level_guards` —
+/// `dstbrRequiredTopLevelGuards`, a Dijkstra-only concept with no Conway
+/// analog and a non-obvious wire shape,
+/// `encodeMap encCBOR (encodeNullStrictMaybe encCBOR)`). A sub-tx carrying
+/// key 24 is rejected outright at decode (fail-closed, not silently
+/// discarded) rather than guessed at.
+///
+/// Complete `DijkstraSubTxBodyRaw` key table (verbatim field names in
+/// parens):
+///   - 0  : inputs (`dstbrSpendInputs`) — required
+///   - 1  : outputs (`dstbrOutputs`) — required
+///   - 3  : ttl (`dstbrVldt` upper)
+///   - 4  : certificates (`dstbrCerts`)
+///   - 5  : withdrawals (`dstbrWithdrawals`)
+///   - 7  : auxiliary_data_hash (`dstbrAuxDataHash`)
+///   - 8  : validity_interval_start (`dstbrVldt` lower)
+///   - 9  : mint (`dstbrMint`)
+///   - 11 : script_data_hash (`dstbrScriptIntegrityHash`)
+///   - 14 : guards (`dstbrGuards` — NOT required_signers; Dijkstra removes
+///     the classic required-signers field entirely and reuses key 14 for
+///     `OSet (Credential Guard)` instead)
+///   - 15 : network_id (`dstbrNetworkId`)
+///   - 18 : reference_inputs (`dstbrReferenceInputs`)
+///   - 19 : voting_procedures (`dstbrVotingProcedures`)
+///   - 20 : proposal_procedures (`dstbrProposalProcedures`)
+///   - 21 : treasury_value (`dstbrCurrentTreasuryValue`)
+///   - 22 : donation (`dstbrTreasuryDonation`)
+///   - 25 : direct_deposits (`dstbrDirectDeposits`)
+///   - 26 : account_balance_intervals (`dstbrAccountBalanceIntervals`)
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct SubTransaction {
     /// The TxId this sub-transaction is keyed under inside the parent
-    /// TxBody's OMap. Computed as `blake2b_256(raw_sub_body_cbor)`.
+    /// TxBody's OMap. Computed as `blake2b_256(raw_sub_body_cbor)` — the
+    /// BODY's hash only (never the wrapping `[body,wits,auxData]` record),
+    /// matching Cardano's universal TxId-is-body-hash-only convention.
     ///
     /// Populated by the decoder; ignored by the encoder (the key is taken
     /// from this field on the way out, so a round-trip is byte-stable as
@@ -1125,18 +1155,54 @@ pub struct SubTransaction {
     pub inputs: Vec<TransactionInput>,
     pub outputs: Vec<TransactionOutput>,
     pub ttl: Option<SlotNo>,
+    #[serde(default)]
+    pub certificates: Vec<Certificate>,
+    #[serde(default)]
+    pub withdrawals: BTreeMap<Vec<u8>, Lovelace>,
     pub validity_interval_start: Option<SlotNo>,
+    #[serde(default)]
+    pub mint: BTreeMap<PolicyId, BTreeMap<AssetName, i64>>,
+    #[serde(default)]
+    pub script_data_hash: Option<Hash32>,
+    #[serde(default)]
+    pub guards: Vec<Credential>,
+    #[serde(default)]
+    pub network_id: Option<u8>,
     pub reference_inputs: Vec<TransactionInput>,
+    #[serde(default)]
+    pub voting_procedures: BTreeMap<Voter, BTreeMap<GovActionId, VotingProcedure>>,
+    #[serde(default)]
+    pub proposal_procedures: Vec<ProposalProcedure>,
+    #[serde(default)]
+    pub treasury_value: Option<Lovelace>,
+    #[serde(default)]
+    pub donation: Option<Lovelace>,
+    #[serde(default)]
+    pub direct_deposits: BTreeMap<Vec<u8>, Lovelace>,
+    #[serde(default)]
+    pub account_balance_intervals: Vec<(Credential, AccountBalanceInterval)>,
     pub auxiliary_data_hash: Option<AuxiliaryDataHash>,
-    /// Raw CBOR bytes of the sub-tx body, captured at decode time, used
-    /// for byte-exact re-encoding and TxId recomputation. `None` when the
+    /// The sub-tx's OWN independent witness set (`dstWits`) — settles its
+    /// OWN spend authorization, never the parent's. Same TYPE as the
+    /// top-level `Transaction::witness_set` (Haskell's `TxWits DijkstraEra`
+    /// is unparameterized by TopTx/SubTx level), but a genuinely separate
+    /// VALUE per sub-tx.
+    #[serde(default)]
+    pub witness_set: TransactionWitnessSet,
+    /// The sub-tx's OWN auxiliary data (`dstAuxData`), independent of the
+    /// parent's.
+    #[serde(default)]
+    pub auxiliary_data: Option<AuxiliaryData>,
+    /// Raw CBOR bytes of the sub-tx BODY ONLY (not the wrapping
+    /// `[body,wits,auxData]` record), captured at decode time, used for
+    /// byte-exact re-encoding and TxId recomputation. `None` when the
     /// sub-tx was constructed in-memory.
     #[serde(default, skip_serializing)]
     pub raw_body_cbor: Option<Vec<u8>>,
 }
 
 /// Transaction witness set
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct TransactionWitnessSet {
     pub vkey_witnesses: Vec<VKeyWitness>,
     pub native_scripts: Vec<NativeScript>,
