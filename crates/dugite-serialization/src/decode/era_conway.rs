@@ -742,53 +742,53 @@ pub(crate) fn decode_conway_tx_body(
 
 /// Decode the Dijkstra `sub_transactions` field (TxBody key 23).
 ///
-/// Wire shape is the CBOR encoding of `OMap TxId (Tx SubTx era)`:
+/// Wire shape is the CBOR encoding of `OMap TxId (Tx SubTx era)` — a bare
+/// ARRAY of values (Haskell `OMap` never encodes its keys; they are
+/// reconstructed via `HasOKey.toOKey`, #936). Each VALUE is a
+/// `DijkstraSubTx` — a plain 3-element record `[body, wits, auxData]`
+/// (oracle-verified #1010, `Tx.hs` lines 88-115 + the general
+/// `DecCBOR (Annotator (Tx l DijkstraEra))` instance, `decodeRecordNamed
+/// "DijkstraSubTx" (const 3)`), **not** a bare body map — a sub-tx has its
+/// own independent witness set (`dstWits`) and auxiliary data
+/// (`dstAuxData`), just like a top-level `Tx`. This mirrors exactly how
+/// the standalone top-level `[body, witness_set, (is_valid,) aux_data]`
+/// array is decoded a few hundred lines above
+/// (`decode_dijkstra_transaction`/`decode_conway_transaction`) — same
+/// per-element shape (`KeepRaw` body, `decode_conway_witness_set`,
+/// null-or-value aux data), just without the `is_valid` slot (sub-txs
+/// never had one; CIP-0167 only affects the top-level envelope).
 ///
-/// ```text
-/// map { tx_id : bstr(32) => sub_tx_body : map {...} }
-/// ```
-///
-/// We map each entry to a [`dugite_primitives::transaction::SubTransaction`]:
-///   - the OMap key becomes [`SubTransaction::tx_id`],
-///   - the value is a Dijkstra-SubTx-shaped map (see [`decode_sub_tx_body`]).
-///
-/// The body bytes are captured verbatim so the [`SubTransaction::raw_body_cbor`]
-/// field stays byte-exact across a round-trip. We also assert (in debug only)
-/// that `blake2b_256(raw_body_cbor) == tx_id` for the entries that carry the
-/// hash; mismatches surface as a strict decode error to mirror the Haskell
-/// `OMap.HasOKey` invariant.
+/// The sub-tx's TxId (`toOKey`) is the hash of its BODY bytes only —
+/// never the whole 3-element record — matching Cardano's universal
+/// TxId-is-body-hash-only convention (confirmed: sub-txs are "keyed in
+/// the OMap by its own TxId, derived the normal way, from its own body
+/// hash"). `libs/cardano-data/.../OMap/Strict.hs`'s
+/// `decodeListLikeEnforceNoDuplicates` rejects a repeated reconstructed
+/// key outright, mirrored here via `seen`.
 fn decode_sub_transactions(
     r: &mut Reader<'_>,
 ) -> Result<Vec<dugite_primitives::transaction::SubTransaction>, SerializationError> {
     use dugite_primitives::transaction::SubTransaction;
-
-    // Haskell `OMap` is a LIST of values on the wire — the keys are never
-    // encoded, they are reconstructed from each value via `HasOKey.toOKey`
-    // (#936). `libs/cardano-data/src/Data/OMap/Strict.hs`:
-    //
-    //   instance (EncCBOR v, Ord k) => EncCBOR (OMap k v) where
-    //     encCBOR omap = encodeStrictSeq encCBOR (toStrictSeq omap)
-    //
-    //   decodeOMap decValue =
-    //     decodeListLikeEnforceNoDuplicates decodeListLenOrIndef (flip snoc) ...
-    //
-    // `decodeListLenOrIndef` accepts either list header form, and
-    // `EnforceNoDuplicates` rejects a repeated reconstructed key outright.
     use std::collections::HashSet;
 
     let mut out: Vec<SubTransaction> = Vec::new();
     let mut seen: HashSet<Hash32> = HashSet::new();
 
     r.for_each_array_item(|r| {
-        // The value is the SubTx body, captured raw so the reconstructed key
-        // is the hash of exactly the bytes that were on the wire.
+        // DijkstraSubTx = [body, wits, auxData] — array(3), verbatim shape
+        // of decodeRecordNamed "DijkstraSubTx" (const 3).
+        let arr_len = r.read_array_header()?;
+        if !matches!(arr_len, Some(3)) {
+            return Err(SerializationError::CborDecode(format!(
+                "Dijkstra sub-tx: expected array(3) [body, wits, auxData], got {arr_len:?}"
+            )));
+        }
+
+        // 1. Body — capture raw bytes for TxId computation. This span is
+        // exactly the body's own bytes (KeepRaw scopes to the inner
+        // parser's consumption), never the wits/auxData that follow.
         let body_raw = KeepRaw::parse_with(r, decode_sub_tx_body)?;
         let mut sub = body_raw.value;
-
-        // `toOKey` for `Tx SubTx era` is the sub-transaction id, i.e. the
-        // hash of its body bytes. Deriving it (rather than reading it from a
-        // wire key) makes the old "key smuggling" check structurally
-        // impossible: a body can only ever appear under its own id.
         sub.tx_id = blake2b_256(body_raw.raw);
         sub.raw_body_cbor = Some(body_raw.raw.to_vec());
 
@@ -798,6 +798,21 @@ fn decode_sub_transactions(
                 sub.tx_id.to_hex()
             )));
         }
+
+        // 2. Witness set — the sub-tx's OWN, independent of the parent's.
+        sub.witness_set = decode_conway_witness_set(r, Era::Dijkstra)?;
+
+        // 3. Auxiliary data — StrictMaybe: null, or a value.
+        sub.auxiliary_data = {
+            let ty = r.peek_major()?;
+            if ty == Type::Null {
+                r.read_null()?;
+                None
+            } else {
+                Some(decode_auxiliary_data(r)?)
+            }
+        };
+
         out.push(sub);
         Ok(())
     })?;
@@ -805,30 +820,38 @@ fn decode_sub_transactions(
     Ok(out)
 }
 
-/// Decode a Dijkstra SubTx body (`DijkstraSubTxBodyRaw`), keyed subset.
+/// Decode a Dijkstra SubTx body (`DijkstraSubTxBodyRaw`).
 ///
-/// Only the keys that affect dugite's SUB UTxO pipeline are extracted
-/// (#1010: extending `SubTransaction` to carry the rest — certs,
-/// withdrawals, mint, governance procedures, guards, direct deposits,
-/// account-balance intervals, network_id, script_integrity_hash — is
-/// tracked as a `dugite-primitives` follow-on; see the module doc comment
-/// on `crates/dugite-ledger/src/eras/dijkstra.rs`).
+/// Oracle-verified key table against `IntersectMBO/cardano-ledger` pinned
+/// SHA `4849c13d6f70e5ab46add9af6e0ec5c537b61f69` (#1010) — see the doc
+/// comment on `dugite_primitives::transaction::SubTransaction` for the
+/// full table with upstream field names. Every key here reuses the EXACT
+/// same decode helper the top-level Dijkstra/Conway tx body uses for the
+/// identically-numbered field a few hundred lines above
+/// (`decode_conway_tx_body`) — same wire shape, same key number, per the
+/// oracle's direct comparison of both `encodeTxBodyRaw` clauses.
 ///
-/// Any OTHER key HARD REJECTS, matching this file's own established
-/// pattern for the top-level tx body's unknown-key catch-all a few lines
-/// above (`{era:?} tx body: unknown/invalid key {key}`) and upstream's
-/// `SparseKeyed` `decoderByKey _ -> Nothing -> failMsg`. Before #1010 this
-/// arm silently `r.skip()`-ped any key it didn't model: a sub-tx carrying
-/// certs/mint/withdrawals/votes decoded SUCCESSFULLY with all of that
-/// discarded, then applied with none of those effects — the parent OMap
-/// key's hash-of-bytes invariant keeps the TxId correct while the APPLIED
-/// LEDGER STATE silently diverges from what the same bytes mean upstream.
-/// That is strictly worse than a decode failure: both nodes agree on the
-/// id and disagree on the ledger. Fail-closed (reject) until the field is
-/// actually modelled, per this project's standing reject-over-silent-skip
-/// rule (see e.g. #1000's PlutusV4 paths, which all fail closed the same
-/// way for the identical reason).
-fn decode_sub_tx_body(
+/// Key 24 (`required_top_level_guards` /
+/// `dstbrRequiredTopLevelGuards`) is a Dijkstra-only concept with no
+/// Conway analog and a wire shape (`encodeMap encCBOR
+/// (encodeNullStrictMaybe encCBOR)`) not yet modelled on
+/// `SubTransaction` — deliberately left unmodelled rather than guessed
+/// at. It, and every other unknown key (including the GADT-excluded
+/// TopTx-only keys 2/13/16/17/23/27 — a sub-tx has no fee/collateral/
+/// nested-sub-tx fields at all, confirmed by the decoder's own required-key
+/// list `SSubTx -> [(0,"inputs"),(1,"outputs")]`), HARD REJECTS, matching
+/// this file's own established pattern for the top-level tx body's
+/// unknown-key catch-all a few lines above (`{era:?} tx body:
+/// unknown/invalid key {key}`) and upstream's `SparseKeyed` `decoderByKey
+/// _ -> Nothing -> failMsg`. Before #1010 this arm silently `r.skip()`-ped
+/// ANY key it didn't model — a sub-tx carrying certs/mint/withdrawals/
+/// votes decoded SUCCESSFULLY with all of that discarded, then applied
+/// with none of those effects: the parent OMap key's hash-of-bytes
+/// invariant keeps the TxId correct while the APPLIED LEDGER STATE
+/// silently diverges from what the same bytes mean upstream. That is
+/// strictly worse than a decode failure: both nodes agree on the id and
+/// disagree on the ledger.
+pub(crate) fn decode_sub_tx_body(
     r: &mut Reader<'_>,
 ) -> Result<dugite_primitives::transaction::SubTransaction, SerializationError> {
     use dugite_primitives::transaction::SubTransaction;
@@ -863,27 +886,98 @@ fn decode_sub_tx_body(
             3 => {
                 sub.ttl = Some(SlotNo(r.read_uint()?));
             }
+            4 => {
+                // certificates: set<certificate> — same shape/key as the
+                // top-level body's own key 4.
+                sub.certificates = r.read_set_strict(|r| read_conway_certificate(r))?;
+            }
+            5 => {
+                // withdrawals: { reward_account => coin }
+                sub.withdrawals = read_withdrawals(r)?;
+            }
             7 => {
                 sub.auxiliary_data_hash = Some(read_hash32(r)?);
             }
             8 => {
                 sub.validity_interval_start = Some(SlotNo(r.read_uint()?));
             }
+            9 => {
+                // mint: { policy_id => { asset_name => i64 } }
+                sub.mint = read_mint_map(r)?;
+            }
+            11 => {
+                // script_integrity_hash
+                sub.script_data_hash = Some(read_hash32(r)?);
+            }
+            14 => {
+                // guards: OSet (Credential Guard) — identical wire shape
+                // to the top-level body's own key 14 (bare bstr(28) =>
+                // VerificationKey, or array(2)[type,h28] => full
+                // Credential). Dijkstra removed the classic
+                // required-signers field entirely, so — unlike the
+                // top-level decoder — there is no required_signers subset
+                // to also populate here.
+                sub.guards = r.read_set_strict(|r| {
+                    let ty = r.peek_major()?;
+                    match ty {
+                        Type::Array | Type::ArrayIndef => read_stake_credential(r),
+                        Type::Bytes | Type::BytesIndef => {
+                            let h28 = read_hash28(r)?;
+                            Ok(Credential::VerificationKey(h28))
+                        }
+                        other => Err(SerializationError::CborDecode(format!(
+                            "sub-tx guards (key 14): expected bstr or array, got {other:?}"
+                        ))),
+                    }
+                })?;
+            }
+            15 => {
+                // network_id
+                let raw = r.read_uint()?;
+                sub.network_id = match raw {
+                    0 | 1 => Some(raw as u8),
+                    _ => None,
+                };
+            }
             18 => {
                 sub.reference_inputs = r.read_set_strict(read_tx_input)?;
             }
-            // Every other DijkstraSubTxBodyRaw key (certs, withdrawals,
-            // mint, script_integrity_hash, guards, network_id,
-            // voting/proposal procedures, treasury_value, donation,
-            // direct_deposits, account_balance_intervals — #1010) is
-            // unmodelled. Reject rather than silently discard: see the
-            // doc comment above this function for why.
+            19 => {
+                // voting_procedures: { voter => { gov_action_id => voting_procedure } }
+                sub.voting_procedures = read_voting_procedures(r)?;
+            }
+            20 => {
+                // proposal_procedures: OSet<proposal_procedure>
+                sub.proposal_procedures = r.read_set_strict(|r| read_proposal_procedure(r))?;
+            }
+            21 => {
+                // current_treasury_value
+                sub.treasury_value = Some(read_lovelace(r)?);
+            }
+            22 => {
+                // treasury_donation
+                sub.donation = Some(read_lovelace(r)?);
+            }
+            25 => {
+                // direct_deposits — wire-symmetric with withdrawals (key 5).
+                sub.direct_deposits = read_withdrawals(r)?;
+            }
+            26 => {
+                // account_balance_intervals
+                sub.account_balance_intervals = decode_account_balance_intervals(r)?;
+            }
+            // Key 24 (required_top_level_guards) and every GADT-excluded
+            // TopTx-only key (2 fee, 13 collateral, 16 collateral_return,
+            // 17 total_collateral, 23 sub_transactions, 27
+            // starting_account_balance_intervals) — see the doc comment
+            // above for why these hard-reject rather than skip.
             _ => {
                 return Err(SerializationError::CborDecode(format!(
-                    "Dijkstra sub-tx body: unmodelled key {key} (#1010 — \
-                     SubTransaction does not yet carry this field; refusing \
-                     to silently discard its effects rather than accept a \
-                     sub-tx whose applied state would diverge from upstream)"
+                    "Dijkstra sub-tx body: unmodelled or structurally-invalid key {key} \
+                     (#1010 — either unmodelled on SubTransaction, or a TopTx-only field \
+                     that cannot appear on a sub-tx at all; refusing to silently discard \
+                     its effects rather than accept a sub-tx whose applied state would \
+                     diverge from upstream)"
                 )));
             }
         }
@@ -4125,18 +4219,19 @@ mod tests {
 
     // ── #1010: unmodelled Dijkstra SubTx body keys must hard-reject ────────────
     //
-    // Before #1010, `decode_sub_tx_body`'s catch-all silently `r.skip()`-ped any
-    // key it didn't model (certs, withdrawals, mint, guards, network_id,
-    // voting/proposal procedures, treasury_value, donation, direct_deposits,
-    // account_balance_intervals, script_integrity_hash). A sub-tx carrying any
-    // of those decoded SUCCESSFULLY with the field discarded, then applied with
-    // none of its effects — worse than a decode failure, since both nodes agree
-    // on the reconstructed TxId (hash of the raw bytes) and silently disagree on
-    // the resulting ledger state.
+    // Before #1010 part 1, `decode_sub_tx_body`'s catch-all silently
+    // `r.skip()`-ped any key it didn't model. Part 2 then added the full
+    // field set EXCEPT key 24 (`required_top_level_guards`, a Dijkstra-only
+    // concept with no Conway analog and a wire shape not yet modelled — see
+    // the doc comment on `SubTransaction`), which remains a genuine,
+    // documented, fail-closed gap. certs/withdrawals/mint/guards/
+    // network_id/voting+proposal procedures/treasury_value/donation/
+    // direct_deposits/account_balance_intervals/script_integrity_hash are
+    // now all modelled — see `dijkstra_sub_tx_body_round_trips_every_field`
+    // below.
 
     /// Build a minimal valid Dijkstra SubTx body CBOR map carrying only keys
-    /// 0 (inputs) and 1 (outputs), both empty, plus one EXTRA key/value pair
-    /// that the decoder does not model.
+    /// 0 (inputs) and 1 (outputs), both empty, plus one EXTRA key/value pair.
     fn sub_tx_body_with_extra_key(extra_key: u64, extra_value: &[u8]) -> Vec<u8> {
         let mut data = vec![0xa3]; // map(3)
         data.extend(cbor_uint(0));
@@ -4149,74 +4244,189 @@ mod tests {
     }
 
     #[test]
-    fn dijkstra_sub_tx_body_rejects_unmodelled_certs_key() {
-        // Key 4 (certs) — an empty array is a syntactically valid `certs`
-        // value; the decoder must still reject purely because key 4 is
-        // unmodelled, before ever looking at the value's shape.
-        let data = sub_tx_body_with_extra_key(4, &[0x80]);
+    fn dijkstra_sub_tx_body_rejects_unmodelled_key_24_required_top_level_guards() {
+        // Key 24 (`required_top_level_guards`) — the one field #1010 part 2
+        // deliberately left unmodelled (no Conway analog, non-obvious wire
+        // shape). An empty map is a syntactically plausible value; the
+        // decoder must still reject purely because key 24 is unmodelled.
+        let data = sub_tx_body_with_extra_key(24, &[0xa0]);
         let mut r = Reader::new(&data);
         let result = decode_sub_tx_body(&mut r);
         assert!(
             matches!(result, Err(SerializationError::CborDecode(_))),
-            "sub-tx body with unmodelled key 4 (certs) must be rejected, got {result:?}"
+            "sub-tx body with unmodelled key 24 must be rejected, got {result:?}"
         );
         let msg = format!("{:?}", result.unwrap_err());
         assert!(
-            msg.contains("unmodelled key 4") && msg.contains("#1010"),
+            msg.contains("24") && msg.contains("#1010"),
             "error must name the offending key and the tracking issue, got: {msg}"
         );
     }
 
     #[test]
-    fn dijkstra_sub_tx_body_rejects_unmodelled_withdrawals_key() {
-        // Key 5 (withdrawals) — an empty map is a syntactically valid value.
-        let data = sub_tx_body_with_extra_key(5, &[0xa0]);
-        let mut r = Reader::new(&data);
-        let result = decode_sub_tx_body(&mut r);
-        assert!(
-            matches!(result, Err(SerializationError::CborDecode(_))),
-            "sub-tx body with unmodelled key 5 (withdrawals) must be rejected, got {result:?}"
-        );
+    fn dijkstra_sub_tx_body_rejects_topx_only_keys() {
+        // Keys 2 (fee), 13 (collateral), 16 (collateral_return), 17
+        // (total_collateral), 23 (sub_transactions — no nested sub-txs), 27
+        // (starting_account_balance_intervals) are GADT-excluded from
+        // DijkstraSubTxBodyRaw entirely — a sub-tx cannot carry them at all,
+        // not even in principle. Each must hard-reject.
+        for key in [2u64, 13, 16, 17, 23, 27] {
+            let data = sub_tx_body_with_extra_key(key, &[0x00]);
+            let mut r = Reader::new(&data);
+            let result = decode_sub_tx_body(&mut r);
+            assert!(
+                matches!(result, Err(SerializationError::CborDecode(_))),
+                "sub-tx body with TopTx-only key {key} must be rejected, got {result:?}"
+            );
+        }
     }
 
     #[test]
-    fn dijkstra_sub_tx_body_rejects_unmodelled_voting_procedures_key() {
-        // Key 19 (voting_procedures) — an empty map is a syntactically valid
-        // value. Exercises the governance-family gap specifically, since
-        // that's the SUBGOV surface #1010 is ultimately about.
-        let data = sub_tx_body_with_extra_key(19, &[0xa0]);
-        let mut r = Reader::new(&data);
-        let result = decode_sub_tx_body(&mut r);
-        assert!(
-            matches!(result, Err(SerializationError::CborDecode(_))),
-            "sub-tx body with unmodelled key 19 (voting_procedures) must be rejected, got {result:?}"
-        );
-    }
-
-    #[test]
-    fn dijkstra_sub_tx_body_still_accepts_modelled_keys() {
-        // Control: a body carrying ONLY modelled keys (0, 1, 3, 7, 8, 18)
-        // must still decode cleanly — the reject-arm change must not have
-        // widened to reject keys that ARE handled.
-        let mut data = vec![0xa6]; // map(6)
+    fn dijkstra_sub_tx_body_round_trips_flat_fields() {
+        // The flat/scalar #1010-part-2 keys (9 mint, 11 script_integrity_hash,
+        // 15 network_id, 21 treasury_value, 22 donation, 5 withdrawals, 25
+        // direct_deposits), hand-built per the oracle-verified key table
+        // (NOT a same-process round trip) so a shared wrong shape on both
+        // halves cannot hide behind agreement (#951 caveat). The nested/
+        // compound fields (4 certs, 14 guards, 19/20 voting+proposal
+        // procedures, 26 account_balance_intervals) are covered by
+        // `dijkstra_sub_tx_body_round_trips_compound_fields_via_typed_encoder`
+        // below instead — those reuse the SAME already-independently-tested
+        // sub-encoders the top-level tx body uses (`encode_certificate`,
+        // `encode_voting_procedures`, …), so hand-rolling their nested CBOR
+        // byte-for-byte here would just be re-deriving already-covered
+        // ground with more room to get a bracket wrong.
+        let mut data = vec![0xaa]; // map(10): 0,1,3,5,9,11,15,21,22,25
         data.extend(cbor_uint(0));
         data.extend(vec![0x80]); // inputs
         data.extend(cbor_uint(1));
         data.extend(vec![0x80]); // outputs
         data.extend(cbor_uint(3));
-        data.extend(cbor_uint(100)); // ttl
+        data.extend(cbor_uint(999)); // ttl
+                                     // 5: withdrawals — { 29-byte reward_account => 5 }
+        data.extend(cbor_uint(5));
+        data.extend(vec![0xa1]);
+        data.extend(cbor_bytes(&[0xe0; 29]));
+        data.extend(cbor_uint(5));
+        // 9: mint — { policy(28B) => { assetname => -3 } }
+        data.extend(cbor_uint(9));
+        data.extend(vec![0xa1]);
+        data.extend(cbor_bytes(&[0x33; 28]));
+        data.extend(vec![0xa1]);
+        data.extend(cbor_bytes(b"tok"));
+        data.extend(vec![0x22]); // -3
+                                 // 11: script_integrity_hash (32B)
+        data.extend(cbor_uint(11));
+        data.extend(cbor_bytes(&[0x44; 32]));
+        // 15: network_id
+        data.extend(cbor_uint(15));
+        data.extend(cbor_uint(1));
+        // 21: treasury_value
+        data.extend(cbor_uint(21));
+        data.extend(cbor_uint(123_456));
+        // 22: donation
+        data.extend(cbor_uint(22));
+        data.extend(cbor_uint(789));
+        // 25: direct_deposits — { 29-byte reward_account => 7 }
+        data.extend(cbor_uint(25));
+        data.extend(vec![0xa1]);
+        data.extend(cbor_bytes(&[0xe1; 29]));
         data.extend(cbor_uint(7));
-        data.extend(cbor_bytes(&[0x11; 32])); // auxiliary_data_hash
-        data.extend(cbor_uint(8));
-        data.extend(cbor_uint(50)); // validity_interval_start
-        data.extend(cbor_uint(18));
-        data.extend(vec![0x80]); // reference_inputs
 
         let mut r = Reader::new(&data);
-        let sub = decode_sub_tx_body(&mut r)
-            .expect("sub-tx body with only modelled keys must still decode");
-        assert_eq!(sub.ttl.map(|s| s.0), Some(100));
-        assert_eq!(sub.validity_interval_start.map(|s| s.0), Some(50));
+        let sub = decode_sub_tx_body(&mut r).expect("flat-field sub-tx body must decode");
+
+        assert_eq!(sub.ttl.map(|s| s.0), Some(999));
+        assert_eq!(sub.withdrawals.len(), 1, "withdrawals (key 5)");
+        assert_eq!(sub.mint.len(), 1, "mint (key 9)");
+        assert_eq!(
+            sub.script_data_hash,
+            Some(Hash32::from_bytes([0x44; 32])),
+            "script_integrity_hash (key 11)"
+        );
+        assert_eq!(sub.network_id, Some(1), "network_id (key 15)");
+        assert_eq!(sub.treasury_value.map(|c| c.0), Some(123_456), "key 21");
+        assert_eq!(sub.donation.map(|c| c.0), Some(789), "key 22");
+        assert_eq!(sub.direct_deposits.len(), 1, "direct_deposits (key 25)");
+    }
+
+    #[test]
+    fn dijkstra_sub_tx_body_round_trips_compound_fields_via_typed_encoder() {
+        // Certs (4), guards (14), voting_procedures (19), proposal_procedures
+        // (20), account_balance_intervals (26) — built as typed values and
+        // pushed through the REAL `encode_sub_tx_body` (oracle-verified key
+        // numbers, and the exact same `encode_certificate`/
+        // `encode_voting_procedures`/`encode_ordered_set` calls the
+        // top-level tx body already uses and is independently fixture-tested
+        // against, elsewhere in this crate) then the real `decode_sub_tx_body`.
+        // This is a same-process round trip for the COMPOUND SHAPES (the
+        // #951 caveat applies to those specifically), but the key NUMBERS
+        // are the oracle-verified ones already asserted individually in
+        // `dijkstra_sub_tx_body_round_trips_flat_fields` and the
+        // `dijkstra_sub_tx_body_rejects_*` tests, and the sub-encoders
+        // themselves are shared, previously-verified code, not new guesses.
+        use dugite_primitives::credentials::Credential;
+        use dugite_primitives::hash::Hash28;
+        use dugite_primitives::transaction::{
+            AccountBalanceInterval, GovActionId, ProposalProcedure, SubTransaction, Vote, Voter,
+            VotingProcedure,
+        };
+        use dugite_primitives::value::Lovelace;
+        use std::collections::BTreeMap;
+
+        let cred = Credential::VerificationKey(Hash28::from_bytes([0x21; 28]));
+        let mut voting_procedures = BTreeMap::new();
+        let mut inner = BTreeMap::new();
+        inner.insert(
+            GovActionId {
+                transaction_id: Hash32::from_bytes([0x77; 32]),
+                action_index: 0,
+            },
+            VotingProcedure {
+                vote: Vote::No,
+                anchor: None,
+            },
+        );
+        voting_procedures.insert(Voter::DRep(cred.clone()), inner);
+
+        let sub = SubTransaction {
+            inputs: vec![],
+            outputs: vec![],
+            certificates: vec![Certificate::StakeRegistration(cred.clone())],
+            guards: vec![cred.clone()],
+            voting_procedures,
+            proposal_procedures: vec![ProposalProcedure {
+                deposit: Lovelace(500_000_000),
+                return_addr: vec![0xe0; 29],
+                gov_action: dugite_primitives::transaction::GovAction::InfoAction,
+                anchor: dugite_primitives::transaction::Anchor {
+                    url: "https://example.test".to_string(),
+                    data_hash: Hash32::from_bytes([0x99; 32]),
+                },
+            }],
+            account_balance_intervals: vec![(cred, AccountBalanceInterval::at_least(Lovelace(1)))],
+            ..Default::default()
+        };
+
+        let encoded = crate::encode::transaction::encode_sub_tx_body(&sub);
+        let mut r = Reader::new(&encoded);
+        let decoded =
+            decode_sub_tx_body(&mut r).expect("typed-encoded compound sub-tx body must decode");
+
+        assert_eq!(decoded.certificates, sub.certificates, "certs (key 4)");
+        assert_eq!(decoded.guards, sub.guards, "guards (key 14)");
+        assert_eq!(
+            decoded.voting_procedures, sub.voting_procedures,
+            "voting_procedures (key 19)"
+        );
+        assert_eq!(
+            decoded.proposal_procedures, sub.proposal_procedures,
+            "proposal_procedures (key 20)"
+        );
+        assert_eq!(
+            decoded.account_balance_intervals, sub.account_balance_intervals,
+            "account_balance_intervals (key 26)"
+        );
     }
 
     #[test]

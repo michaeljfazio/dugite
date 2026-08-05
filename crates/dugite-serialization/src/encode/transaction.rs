@@ -952,20 +952,19 @@ pub(super) fn encode_transaction_body_for_era(body: &TransactionBody, era: Era) 
     //     encCBOR omap = encodeStrictSeq encCBOR (toStrictSeq omap)
     //
     // `encodeStrictSeq` is `variableListLenEncoding`, hence the open/close
-    // pair rather than a fixed definite header (#938).
-    //
-    // When a sub-tx was decoded from chain we round-trip its raw body bytes
-    // verbatim, so the reconstructed id is byte-exact; when it was
-    // constructed in-memory we synthesise a body via `encode_sub_tx_body`.
+    // pair rather than a fixed definite header (#938). Each element is a
+    // full `DijkstraSubTx` = `[body, wits, auxData]` record (#1010), not a
+    // bare body map — see `encode_sub_tx_entry`. When a sub-tx was decoded
+    // from chain, its BODY portion round-trips via `raw_body_cbor`
+    // verbatim (so the reconstructed TxId stays byte-exact); the
+    // witness_set/auxiliary_data are always freshly encoded from the
+    // parsed fields (dugite does not separately capture their raw bytes).
     if emit_sub_transactions {
         let len = body.sub_transactions.len();
         buf.extend(encode_uint(23));
         buf.extend(encode_array_open(len));
         for sub in &body.sub_transactions {
-            match &sub.raw_body_cbor {
-                Some(bytes) => buf.extend_from_slice(bytes),
-                None => buf.extend(encode_sub_tx_body(sub)),
-            }
+            buf.extend(encode_sub_tx_entry(sub));
         }
         encode_array_close(&mut buf, len);
     }
@@ -1030,13 +1029,25 @@ fn encode_account_balance_interval(
     buf
 }
 
-/// Encode a Dijkstra SubTx body as the upstream `DijkstraSubTxBodyRaw`
-/// CBOR map (subset of keys we currently model — keys 0/1/3/7/8/18). Other
-/// keys are not emitted by the in-memory path; if you need them, decode
-/// the body once and let the round-trip path reuse `raw_body_cbor`.
-fn encode_sub_tx_body(sub: &dugite_primitives::transaction::SubTransaction) -> Vec<u8> {
+/// Encode a Dijkstra SubTx body as the upstream `DijkstraSubTxBodyRaw` CBOR
+/// map — the full oracle-verified field set (#1010; see the doc comment on
+/// `dugite_primitives::transaction::SubTransaction` for the key table).
+/// Every key here uses the EXACT same encode call as the top-level Dijkstra
+/// body's identically-numbered field (`encode_transaction_body_for_era`),
+/// confirmed by the oracle's direct comparison of both `encodeTxBodyRaw`
+/// clauses (TopTx and SubTx share the same key numbers for shared fields).
+///
+/// Key 24 (`required_top_level_guards`) is not modelled on `SubTransaction`
+/// and therefore never emitted — see that struct's doc comment.
+pub(crate) fn encode_sub_tx_body(sub: &dugite_primitives::transaction::SubTransaction) -> Vec<u8> {
     let mut count = 2; // inputs + outputs (always present)
     if sub.ttl.is_some() {
+        count += 1;
+    }
+    if !sub.certificates.is_empty() {
+        count += 1;
+    }
+    if !sub.withdrawals.is_empty() {
         count += 1;
     }
     if sub.auxiliary_data_hash.is_some() {
@@ -1045,7 +1056,37 @@ fn encode_sub_tx_body(sub: &dugite_primitives::transaction::SubTransaction) -> V
     if sub.validity_interval_start.is_some() {
         count += 1;
     }
+    if !sub.mint.is_empty() {
+        count += 1;
+    }
+    if sub.script_data_hash.is_some() {
+        count += 1;
+    }
+    if !sub.guards.is_empty() {
+        count += 1;
+    }
+    if sub.network_id.is_some() {
+        count += 1;
+    }
     if !sub.reference_inputs.is_empty() {
+        count += 1;
+    }
+    if !sub.voting_procedures.is_empty() {
+        count += 1;
+    }
+    if !sub.proposal_procedures.is_empty() {
+        count += 1;
+    }
+    if sub.treasury_value.is_some() {
+        count += 1;
+    }
+    if sub.donation.is_some() {
+        count += 1;
+    }
+    if !sub.direct_deposits.is_empty() {
+        count += 1;
+    }
+    if !sub.account_balance_intervals.is_empty() {
         count += 1;
     }
 
@@ -1069,6 +1110,21 @@ fn encode_sub_tx_body(sub: &dugite_primitives::transaction::SubTransaction) -> V
         buf.extend(encode_uint(3));
         buf.extend(encode_uint(ttl.0));
     }
+    // 4: certificates — OSet, order-preserving, same as top-level key 4.
+    if !sub.certificates.is_empty() {
+        buf.extend(encode_uint(4));
+        buf.extend(encode_ordered_set(&sub.certificates, encode_certificate));
+    }
+    // 5: withdrawals
+    if !sub.withdrawals.is_empty() {
+        buf.extend(encode_uint(5));
+        buf.extend(encode_map_open(sub.withdrawals.len()));
+        for (addr, amount) in &sub.withdrawals {
+            buf.extend(encode_bytes(addr));
+            buf.extend(encode_uint(amount.0));
+        }
+        encode_map_close(&mut buf, sub.withdrawals.len());
+    }
     // 7: auxiliary_data_hash
     if let Some(h) = &sub.auxiliary_data_hash {
         buf.extend(encode_uint(7));
@@ -1079,6 +1135,37 @@ fn encode_sub_tx_body(sub: &dugite_primitives::transaction::SubTransaction) -> V
         buf.extend(encode_uint(8));
         buf.extend(encode_uint(s.0));
     }
+    // 9: mint
+    if !sub.mint.is_empty() {
+        buf.extend(encode_uint(9));
+        buf.extend(encode_mint(&sub.mint));
+    }
+    // 11: script_integrity_hash
+    if let Some(hash) = &sub.script_data_hash {
+        buf.extend(encode_uint(11));
+        buf.extend(encode_hash32(hash));
+    }
+    // 14: guards — OSet (Credential Guard). No legacy required_signers
+    // fallback here (unlike the top-level encoder): SubTransaction only
+    // ever carries `guards`, matching Dijkstra's removal of the classic
+    // required-signers field.
+    if !sub.guards.is_empty() {
+        let mut entries = sub.guards.clone();
+        entries.sort();
+        entries.dedup();
+        buf.extend(encode_uint(14));
+        buf.extend(encode_tag(258));
+        buf.extend(encode_array_open(entries.len()));
+        for cred in &entries {
+            buf.extend(super::certificate::encode_credential(cred));
+        }
+        encode_array_close(&mut buf, entries.len());
+    }
+    // 15: network_id
+    if let Some(nid) = sub.network_id {
+        buf.extend(encode_uint(15));
+        buf.extend(encode_uint(nid as u64));
+    }
     // 18: reference_inputs
     if !sub.reference_inputs.is_empty() {
         buf.extend(encode_uint(18));
@@ -1087,6 +1174,68 @@ fn encode_sub_tx_body(sub: &dugite_primitives::transaction::SubTransaction) -> V
             &sub.reference_inputs,
             crate::cbor::encode_tx_input,
         ));
+    }
+    // 19: voting_procedures
+    if !sub.voting_procedures.is_empty() {
+        buf.extend(encode_uint(19));
+        buf.extend(encode_voting_procedures(&sub.voting_procedures));
+    }
+    // 20: proposal_procedures
+    if !sub.proposal_procedures.is_empty() {
+        buf.extend(encode_uint(20));
+        buf.extend(encode_ordered_set(
+            &sub.proposal_procedures,
+            encode_proposal_procedure,
+        ));
+    }
+    // 21: treasury_value
+    if let Some(treasury) = sub.treasury_value {
+        buf.extend(encode_uint(21));
+        buf.extend(encode_uint(treasury.0));
+    }
+    // 22: donation (treasury_donation)
+    if let Some(donation) = sub.donation {
+        buf.extend(encode_uint(22));
+        buf.extend(encode_uint(donation.0));
+    }
+    // 25: direct_deposits
+    if !sub.direct_deposits.is_empty() {
+        buf.extend(encode_uint(25));
+        buf.extend(encode_map_open(sub.direct_deposits.len()));
+        for (addr, amount) in &sub.direct_deposits {
+            buf.extend(encode_bytes(addr));
+            buf.extend(encode_uint(amount.0));
+        }
+        encode_map_close(&mut buf, sub.direct_deposits.len());
+    }
+    // 26: account_balance_intervals
+    if !sub.account_balance_intervals.is_empty() {
+        buf.extend(encode_uint(26));
+        buf.extend(encode_map_open(sub.account_balance_intervals.len()));
+        for (cred, iv) in &sub.account_balance_intervals {
+            buf.extend(super::certificate::encode_credential(cred));
+            buf.extend(encode_account_balance_interval(iv));
+        }
+        encode_map_close(&mut buf, sub.account_balance_intervals.len());
+    }
+    buf
+}
+
+/// Encode a full `DijkstraSubTx` entry: `[body, wits, auxData]` — the
+/// wrapping record around a `DijkstraSubTxBodyRaw` (#1010; oracle-verified
+/// `Tx.hs` lines 88-115). Mirrors `encode_dijkstra_transaction`'s own
+/// `[body, witness_set, aux_data]` shape exactly, minus the `is_valid`
+/// slot a sub-tx never had.
+fn encode_sub_tx_entry(sub: &dugite_primitives::transaction::SubTransaction) -> Vec<u8> {
+    let mut buf = encode_array_header(3);
+    match &sub.raw_body_cbor {
+        Some(bytes) => buf.extend_from_slice(bytes),
+        None => buf.extend(encode_sub_tx_body(sub)),
+    }
+    buf.extend(encode_witness_set_for_era(&sub.witness_set, Era::Dijkstra));
+    match &sub.auxiliary_data {
+        Some(aux) => buf.extend(encode_auxiliary_data(aux)),
+        None => buf.extend(encode_null()),
     }
     buf
 }
