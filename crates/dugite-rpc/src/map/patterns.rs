@@ -15,6 +15,12 @@
 //! `UtxoPredicate::default()` as the "all UTxOs" wildcard. We mirror
 //! that semantics here so an unset `predicate` field in a request
 //! matches every candidate.
+//!
+//! Two `TxPattern` leaves (`consumes`, `has_certificate`) are not
+//! evaluated by the matcher at all — see
+//! [`tx_predicate_has_unsupported_leaf`], which `WatchTx` /
+//! `WatchMempool` call to REJECT a request naming either rather than
+//! silently under-filter it.
 
 use dugite_primitives::transaction::Transaction;
 
