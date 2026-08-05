@@ -2163,4 +2163,64 @@ mod tests {
         assert!(matches!(decoded.datum, OutputDatum::DatumHash(_)));
         assert!(decoded.is_legacy);
     }
+
+    // ── #1023: Babbage is the era immediately before Conway and shares its
+    //    certificate decoder with Allegra/Mary/Alonzo via
+    //    `era_alonzo::read_alonzo_cert_inner` (see the key-4 arm of
+    //    `decode_babbage_tx_body` above) — this is the sharpest edge case
+    //    for the era boundary, since a Babbage->Conway hard-fork replay
+    //    crosses it directly. Full tx-body-level (not just isolated
+    //    cert-reader) proof that MIR/GenesisKeyDelegation still decode here,
+    //    unchanged by the Conway-only fix.
+
+    #[test]
+    fn babbage_tx_body_with_genesis_key_delegation_cert_still_decodes() {
+        let mut cert = vec![0x84]; // array(4)
+        cert.extend(cbor_uint(5));
+        cert.extend(cbor_bytes(&[0x01; 28]));
+        cert.extend(cbor_bytes(&[0x02; 28]));
+        cert.extend(cbor_bytes(&[0x03; 32]));
+        let mut certs_arr = vec![0x81]; // array(1)
+        certs_arr.extend(&cert);
+
+        let mut tb = vec![0xa2]; // map(2): inputs + certificates
+        tb.extend(cbor_uint(0));
+        tb.push(0x80); // inputs []
+        tb.extend(cbor_uint(4));
+        tb.extend(&certs_arr);
+
+        let raw = KeepRaw::parse_with(&mut Reader::new(&tb), |r| decode_babbage_tx_body(r))
+            .expect("Babbage tx body with GenesisKeyDelegation cert must still decode");
+        assert_eq!(raw.value.certificates.len(), 1);
+        assert!(matches!(
+            raw.value.certificates[0],
+            dugite_primitives::transaction::Certificate::GenesisKeyDelegation { .. }
+        ));
+    }
+
+    #[test]
+    fn babbage_tx_body_with_mir_cert_still_decodes() {
+        let mut mir_cert = vec![0x82]; // outer array(2)
+        mir_cert.extend(cbor_uint(6));
+        let mut mir = vec![0x82];
+        mir.extend(cbor_uint(0)); // source = Reserves
+        mir.extend(cbor_uint(9999));
+        mir_cert.extend(&mir);
+        let mut certs_arr = vec![0x81];
+        certs_arr.extend(&mir_cert);
+
+        let mut tb = vec![0xa2];
+        tb.extend(cbor_uint(0));
+        tb.push(0x80);
+        tb.extend(cbor_uint(4));
+        tb.extend(&certs_arr);
+
+        let raw = KeepRaw::parse_with(&mut Reader::new(&tb), |r| decode_babbage_tx_body(r))
+            .expect("Babbage tx body with MIR cert must still decode");
+        assert_eq!(raw.value.certificates.len(), 1);
+        assert!(matches!(
+            raw.value.certificates[0],
+            dugite_primitives::transaction::Certificate::MoveInstantaneousRewards { .. }
+        ));
+    }
 }
