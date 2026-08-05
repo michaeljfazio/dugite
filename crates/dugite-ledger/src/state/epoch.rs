@@ -1,6 +1,6 @@
 use super::governance::{
-    epoch_boundary_governance_step, expire_committee_members, ratify_at_boundary,
-    update_dormant_epochs, update_drep_activity,
+    epoch_boundary_governance_step, expire_committee_members, prune_committee_state,
+    ratify_at_boundary, update_dormant_epochs, update_drep_activity,
 };
 use super::{LedgerState, StakeSnapshot};
 use dugite_primitives::hash::{Hash28, Hash32};
@@ -626,6 +626,16 @@ impl LedgerState {
         // Expire committee members that have passed their expiration epoch.
         expire_committee_members(new_epoch, &mut self.gov);
 
+        // Prune committee hot-key authorizations and resignations to the
+        // POST-enactment committee membership (Haskell `updateCommitteeState`,
+        // Conway/Rules/Epoch.hs — runs unconditionally every epoch boundary
+        // after enactment; wipes all hot-key auths on an enacted NoConfidence).
+        // This call was previously present ONLY in the production boundary
+        // path (`eras/conway.rs`), so a unit test driving `process_epoch_transition`
+        // could not observe committee hot-key/resignation pruning at all —
+        // exactly the test-vs-production drift class #977/#985 called out.
+        prune_committee_state(&mut self.gov);
+
         // The Conway EPOCH governance step: reset `futurePParams` (#977) then
         // freeze this boundary's DRep/ratification snapshots and pulser
         // (#988). Both live in ONE shared function precisely so this
@@ -1232,6 +1242,53 @@ mod tests {
              (before={}, after={})",
             before.0,
             after.0
+        );
+    }
+
+    // ── Test 3b: committee-state pruning must run on this path too ──────────
+
+    /// `process_epoch_transition` must prune committee hot-key authorizations
+    /// for cold credentials that are no longer committee members, exactly as
+    /// the production `EraRulesImpl::process_epoch_transition` path does via
+    /// `prune_committee_state` (Haskell `updateCommitteeState`,
+    /// Conway/Rules/Epoch.hs — runs unconditionally every epoch boundary).
+    ///
+    /// Before this fix, `prune_committee_state` was called ONLY from
+    /// `eras/conway.rs`'s production boundary — this test-only helper skipped
+    /// it entirely, so a unit test driving epoch transitions through this
+    /// path could never observe (or catch a regression in) hot-key/resignation
+    /// pruning. Exactly the test-vs-production drift class #977/#985 warn
+    /// about: this test is RED without the `prune_committee_state` call in
+    /// `process_epoch_transition` and GREEN with it.
+    #[test]
+    fn test_process_epoch_transition_prunes_stale_committee_hot_keys() {
+        let mut state = new_state();
+
+        let cold_a = Hash32::from_bytes([1u8; 32]);
+        let cold_b = Hash32::from_bytes([2u8; 32]);
+        let hot_a = Hash32::from_bytes([11u8; 32]);
+        let hot_b = Hash32::from_bytes([12u8; 32]);
+
+        let gov_state = Arc::make_mut(&mut state.gov.governance);
+        // Only cold_a is still a committee member; cold_b was removed by an
+        // (already-applied) UpdateCommittee action but its hot-key auth was
+        // never pruned yet.
+        gov_state.committee_expiration.insert(cold_a, EpochNo(900));
+        gov_state.committee_hot_keys.insert(cold_a, hot_a);
+        gov_state.committee_hot_keys.insert(cold_b, hot_b);
+
+        state.process_epoch_transition(EpochNo(1));
+
+        let g = &state.gov.governance;
+        assert_eq!(
+            g.committee_hot_keys.get(&cold_a),
+            Some(&hot_a),
+            "cold_a is still a member — its hot-key auth must be retained"
+        );
+        assert!(
+            !g.committee_hot_keys.contains_key(&cold_b),
+            "cold_b is no longer a member — its hot-key auth must be pruned \
+             at the epoch boundary (Haskell updateCommitteeState)"
         );
     }
 
