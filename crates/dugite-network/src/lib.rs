@@ -459,6 +459,34 @@ pub enum TxValidationError {
         prev_action_id: Option<String>,
         proposal: Box<dugite_primitives::transaction::ProposalProcedure>,
     },
+    /// One element of `MissingRedeemers`' payload: the purpose whose redeemer
+    /// is absent, paired with the script hash it would have run.
+    ///
+    /// Haskell: `NonEmpty (PlutusPurpose AsItem era, ScriptHash)`.
+    /// `AsItem` is `newtype AsItem ix it = AsItem { unAsItem :: it }` with a
+    /// NEWTYPE-derived `EncCBOR`, so it encodes the ITEM ONLY — the index is a
+    /// phantom type parameter and never reaches the wire. That is the whole
+    /// difference from `ExtraRedeemers`, which is `AsIx` and encodes the index.
+    /// Getting this backwards would produce a frame cardano-cli cannot decode.
+    MissingRedeemersUTXOW {
+        entries: Vec<(PlutusPurposeItem, String)>,
+    },
+    /// `MalformedProposal` (GOV tag 1): a `ParameterChange` proposal's
+    /// `PParamsUpdate` fails `ppuWellFormed`.
+    ///
+    /// Haskell's payload is `MalformedProposal (GovAction era)` — the WHOLE
+    /// governance action, so the encoder needs the value itself rather than a
+    /// reason string. `dugite_ledger::validation::ValidationError` carries the
+    /// offending proposal's INDEX (#1025), which `dugite-node` uses to look the
+    /// action back up in `tx.body.proposal_procedures`; that is what makes this
+    /// well-defined for a tx carrying several proposals, where a reason string
+    /// alone could not say which one failed.
+    ///
+    /// Boxed for the same hot-path enum-size reason as
+    /// `InvalidPrevGovActionId`'s payload above.
+    MalformedProposalGOV {
+        action: Box<dugite_primitives::transaction::GovAction>,
+    },
     /// `DisallowedVoters` (GOV tag 5): a voter type is not authorised for
     /// the action type of the referenced governance action.
     ///
@@ -894,6 +922,41 @@ pub enum TxValidationError {
     Multiple(Vec<TxValidationError>),
     /// Catch-all for other validation failures.
     Other(String),
+}
+
+/// The ITEM half of a `PlutusPurpose AsItem` — the value the missing redeemer
+/// would have been executed for.
+///
+/// `ConwayPlutusPurpose` (cardano-ledger `Conway/Scripts.hs`) has an
+/// `EncCBORGroup` instance with `listLen _ = 2`, so each purpose encodes as
+/// `array(2)[tag, item]` with these constructor tags:
+///
+/// | Constructor        | Tag | Item                |
+/// |--------------------|-----|---------------------|
+/// | `ConwaySpending`   | 0   | `TxIn`              |
+/// | `ConwayMinting`    | 1   | `PolicyID`          |
+/// | `ConwayCertifying` | 2   | `TxCert era`        |
+/// | `ConwayWithdrawing`| 3   | `AccountAddress`    |
+/// | `ConwayVoting`     | 4   | `Voter`             |
+/// | `ConwayProposing`  | 5   | `ProposalProcedure` |
+///
+/// Spending is absent here on purpose: dugite's missing-redeemer check raises
+/// only the five non-spend purposes (see
+/// `dugite_ledger::validation::collateral`), so a `Spending` arm would be
+/// dead code that could not be exercised — and therefore could not be
+/// verified.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PlutusPurposeItem {
+    /// Tag 1 — the `PolicyID`, which for a minting purpose IS the script hash.
+    Minting { policy_id: String },
+    /// Tag 2 — the whole certificate.
+    Certifying(Box<dugite_primitives::transaction::Certificate>),
+    /// Tag 3 — the 29-byte reward account, hex.
+    Withdrawing { account: String },
+    /// Tag 4 — the voter.
+    Voting(Box<dugite_primitives::transaction::Voter>),
+    /// Tag 5 — the whole proposal procedure.
+    Proposing(Box<dugite_primitives::transaction::ProposalProcedure>),
 }
 
 impl std::fmt::Display for TxValidationError {

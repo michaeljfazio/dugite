@@ -4488,7 +4488,7 @@ mod tests {
         assert!(
             errors
                 .iter()
-                .any(|e| matches!(e, ValidationError::MissingRedeemer { tag, index: 0 } if tag == "Reward")),
+                .any(|e| matches!(e, ValidationError::MissingRedeemer { tag, index: 0, .. } if tag == "Reward")),
             "Expected MissingRedeemer {{ tag: Reward, index: 0 }}, got: {errors:?}"
         );
     }
@@ -4718,7 +4718,7 @@ mod tests {
 
         assert!(
             errors.iter().any(
-                |e| matches!(e, ValidationError::MissingRedeemer { tag, index: 0 } if tag == "Mint")
+                |e| matches!(e, ValidationError::MissingRedeemer { tag, index: 0, .. } if tag == "Mint")
             ),
             "Expected MissingRedeemer {{ tag: Mint, index: 0 }}, got: {errors:?}"
         );
@@ -4969,14 +4969,14 @@ mod tests {
         // The second policy (index 1) is missing a Mint redeemer.
         assert!(
             errors.iter().any(
-                |e| matches!(e, ValidationError::MissingRedeemer { tag, index: 1 } if tag == "Mint")
+                |e| matches!(e, ValidationError::MissingRedeemer { tag, index: 1, .. } if tag == "Mint")
             ),
             "Expected MissingRedeemer {{ tag: Mint, index: 1 }}, got: {errors:?}"
         );
         // The first policy (index 0) has a redeemer and must not trigger an error.
         assert!(
             !errors.iter().any(
-                |e| matches!(e, ValidationError::MissingRedeemer { tag, index: 0 } if tag == "Mint")
+                |e| matches!(e, ValidationError::MissingRedeemer { tag, index: 0, .. } if tag == "Mint")
             ),
             "Index 0 redeemer present; must not trigger MissingRedeemer: {errors:?}"
         );
@@ -5780,7 +5780,7 @@ mod tests {
         assert!(
             errors
                 .iter()
-                .any(|e| matches!(e, ValidationError::MissingRedeemer { tag, index: 0 } if tag == "Cert")),
+                .any(|e| matches!(e, ValidationError::MissingRedeemer { tag, index: 0, .. } if tag == "Cert")),
             "Expected MissingRedeemer {{ tag: Cert, index: 0 }} for ConwayStakeDeregistration with Script credential, got: {errors:?}"
         );
     }
@@ -6006,7 +6006,7 @@ mod tests {
         assert!(
             errors
                 .iter()
-                .any(|e| matches!(e, ValidationError::MissingRedeemer { tag, index: 0 } if tag == "Cert")),
+                .any(|e| matches!(e, ValidationError::MissingRedeemer { tag, index: 0, .. } if tag == "Cert")),
             "Expected MissingRedeemer {{ tag: Cert, index: 0 }} for StakeDeregistration with Script credential, got: {errors:?}"
         );
     }
@@ -6238,7 +6238,7 @@ mod tests {
         assert!(
             errors.iter().any(|e| matches!(
                 e,
-                ValidationError::MissingRedeemer { tag, index: 0 } if tag == "Cert"
+                ValidationError::MissingRedeemer { tag, index: 0, .. } if tag == "Cert"
             )),
             "deposit-bearing ConwayStakeRegistration with Script credential must \
              require a Cert redeemer, got: {errors:?}"
@@ -6512,14 +6512,14 @@ mod tests {
         assert!(
             errors
                 .iter()
-                .any(|e| matches!(e, ValidationError::MissingRedeemer { tag, index: 2 } if tag == "Cert")),
+                .any(|e| matches!(e, ValidationError::MissingRedeemer { tag, index: 2, .. } if tag == "Cert")),
             "Expected MissingRedeemer {{ tag: Cert, index: 2 }} for StakeDelegation, got: {errors:?}"
         );
 
         // Index 0 (StakeRegistration) must NOT fire.
         assert!(
             !errors.iter().any(
-                |e| matches!(e, ValidationError::MissingRedeemer { tag, index: 0 } if tag == "Cert")
+                |e| matches!(e, ValidationError::MissingRedeemer { tag, index: 0, .. } if tag == "Cert")
             ),
             "StakeRegistration at index 0 must not require a Cert redeemer, got: {errors:?}"
         );
@@ -6527,7 +6527,7 @@ mod tests {
         // Index 1 (ConwayStakeDeregistration) has a redeemer — must NOT fire.
         assert!(
             !errors.iter().any(
-                |e| matches!(e, ValidationError::MissingRedeemer { tag, index: 1 } if tag == "Cert")
+                |e| matches!(e, ValidationError::MissingRedeemer { tag, index: 1, .. } if tag == "Cert")
             ),
             "Index 1 has a Cert redeemer; must not trigger MissingRedeemer, got: {errors:?}"
         );
@@ -6647,7 +6647,7 @@ mod tests {
         assert!(
             reg_errors
                 .iter()
-                .any(|e| matches!(e, ValidationError::MissingRedeemer { tag, index: 0 } if tag == "Cert")),
+                .any(|e| matches!(e, ValidationError::MissingRedeemer { tag, index: 0, .. } if tag == "Cert")),
             "Expected MissingRedeemer {{ tag: Cert, index: 0 }} for RegDRep with Script credential, got: {reg_errors:?}"
         );
 
@@ -6728,7 +6728,7 @@ mod tests {
         assert!(
             unreg_errors
                 .iter()
-                .any(|e| matches!(e, ValidationError::MissingRedeemer { tag, index: 0 } if tag == "Cert")),
+                .any(|e| matches!(e, ValidationError::MissingRedeemer { tag, index: 0, .. } if tag == "Cert")),
             "Expected MissingRedeemer {{ tag: Cert, index: 0 }} for UnregDRep with Script credential, got: {unreg_errors:?}"
         );
     }
@@ -6837,7 +6837,7 @@ mod tests {
         assert!(
             errors
                 .iter()
-                .any(|e| matches!(e, ValidationError::MissingRedeemer { tag, index: 0 } if tag == "Cert")),
+                .any(|e| matches!(e, ValidationError::MissingRedeemer { tag, index: 0, .. } if tag == "Cert")),
             "Expected MissingRedeemer {{ tag: Cert, index: 0 }} for CommitteeColdResign with Script cold credential, got: {errors:?}"
         );
     }
@@ -6967,7 +6967,7 @@ mod tests {
         assert!(
             errors
                 .iter()
-                .any(|e| matches!(e, ValidationError::MissingRedeemer { tag, index: 0 } if tag == "Vote")),
+                .any(|e| matches!(e, ValidationError::MissingRedeemer { tag, index: 0, .. } if tag == "Vote")),
             "Expected MissingRedeemer {{ tag: Vote, index: 0 }} for Script DRep voter, got: {errors:?}"
         );
     }
@@ -7229,7 +7229,7 @@ mod tests {
         assert!(
             errors
                 .iter()
-                .any(|e| matches!(e, ValidationError::MissingRedeemer { tag, index: 0 } if tag == "Vote")),
+                .any(|e| matches!(e, ValidationError::MissingRedeemer { tag, index: 0, .. } if tag == "Vote")),
             "Expected MissingRedeemer {{ tag: Vote, index: 0 }} when only index 1 has a redeemer, got: {errors:?}"
         );
     }
@@ -7597,7 +7597,7 @@ mod tests {
         assert!(
             errors
                 .iter()
-                .any(|e| matches!(e, ValidationError::MissingRedeemer { tag, index: 0 } if tag == "Propose")),
+                .any(|e| matches!(e, ValidationError::MissingRedeemer { tag, index: 0, .. } if tag == "Propose")),
             "Expected MissingRedeemer {{ tag: Propose, index: 0 }} for ParameterChange with policy_hash, got: {errors:?}"
         );
     }
@@ -7716,7 +7716,7 @@ mod tests {
         assert!(
             errors
                 .iter()
-                .any(|e| matches!(e, ValidationError::MissingRedeemer { tag, index: 0 } if tag == "Propose")),
+                .any(|e| matches!(e, ValidationError::MissingRedeemer { tag, index: 0, .. } if tag == "Propose")),
             "Expected MissingRedeemer {{ tag: Propose, index: 0 }} for TreasuryWithdrawals with policy_hash, got: {errors:?}"
         );
     }

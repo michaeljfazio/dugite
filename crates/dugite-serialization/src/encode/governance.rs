@@ -67,7 +67,12 @@ pub(crate) fn encode_voting_procedures(
     buf
 }
 
-pub(crate) fn encode_voter(voter: &Voter) -> Vec<u8> {
+/// Encode a `Voter` byte-exactly (`array(2)[discriminator, hash28]`).
+///
+/// `pub` for the same reason as [`encode_gov_action`]: `dugite-network`'s
+/// LocalTxSubmission rejection encoder needs it to emit the `ConwayVoting`
+/// arm of a `PlutusPurpose AsItem` inside `MissingRedeemers` (#1025).
+pub fn encode_voter(voter: &Voter) -> Vec<u8> {
     let mut buf = encode_array_header(2);
     match voter {
         Voter::ConstitutionalCommittee(cred) => {
@@ -141,7 +146,14 @@ pub fn encode_proposal_procedure(pp: &ProposalProcedure) -> Vec<u8> {
     buf
 }
 
-pub(crate) fn encode_gov_action(action: &GovAction) -> Vec<u8> {
+/// Encode a bare `GovAction` byte-exactly per Haskell `EncCBOR (GovAction era)`.
+///
+/// `pub` (not `pub(crate)`) for the same reason as
+/// [`encode_proposal_procedure`]: `dugite-network`'s LocalTxSubmission
+/// rejection encoder needs it to emit a byte-exact `MalformedProposal`
+/// (GOV tag 1), whose Haskell payload is the whole `GovAction` (#1025).
+/// Sharing the transaction-body encoder is what keeps the two byte-identical.
+pub fn encode_gov_action(action: &GovAction) -> Vec<u8> {
     match action {
         GovAction::ParameterChange {
             prev_action_id,

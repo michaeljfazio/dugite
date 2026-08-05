@@ -997,6 +997,26 @@ impl Node {
                 .as_ref()
                 .map(|id| (id.transaction_id.as_ref().to_vec(), id.action_index)),
             committee,
+            // `DState.dsGenDelegs` — the LIVE map, not the genesis file. The two
+            // agree on a Conway chain (GenesisKeyDelegation certs are gone), but
+            // the ledger's copy is the one that tracks pre-Conway updates.
+            gen_delegs: {
+                let mut entries: Vec<(Vec<u8>, Vec<u8>, Vec<u8>)> = ls
+                    .genesis_delegates
+                    .iter()
+                    .map(|(gkey, (dkey, vrf))| {
+                        (
+                            gkey.as_ref().to_vec(),
+                            dkey.as_ref().to_vec(),
+                            vrf.as_ref().to_vec(),
+                        )
+                    })
+                    .collect();
+                // Haskell encodes this as a `Map`, whose CBOR key order is
+                // ascending; the ledger holds it in a `HashMap`.
+                entries.sort_by(|a, b| a.0.cmp(&b.0));
+                entries
+            },
             constitution_url: ls
                 .gov
                 .governance
