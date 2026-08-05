@@ -23,7 +23,6 @@
 
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
-use std::time::Duration;
 
 /// Returns true for IPs that should NEVER be accepted from P2P peer-sharing
 /// or ledger-published relay records: loopback, unspecified (0.0.0.0/::),
@@ -78,7 +77,6 @@ use dugite_network::{PeerManager, PeerSource, PeerState};
 
 /// Diffusion mode — whether the node accepts inbound connections.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)] // InitiatorOnly variant for networking rewrite
 pub enum DiffusionMode {
     /// Only initiate outbound connections (relay behind NAT).
     InitiatorOnly,
@@ -86,46 +84,40 @@ pub enum DiffusionMode {
     InitiatorAndResponder,
 }
 
-/// Network timeout configuration.
-#[derive(Debug, Clone)]
-#[allow(dead_code)] // used by networking rewrite
-pub struct TimeoutConfig {
-    /// Timeout for TCP connection establishment.
-    pub connect_timeout: Duration,
-    /// Timeout for handshake negotiation.
-    pub handshake_timeout: Duration,
-    /// KeepAlive ping interval.
-    pub keepalive_interval: Duration,
-    /// Timeout before closing an idle connection at tip.
-    pub await_reply_timeout: Duration,
-}
-
-impl Default for TimeoutConfig {
-    fn default() -> Self {
-        Self {
-            connect_timeout: Duration::from_secs(10),
-            handshake_timeout: Duration::from_secs(30),
-            keepalive_interval: Duration::from_secs(30),
-            await_reply_timeout: Duration::from_secs(135),
-        }
-    }
-}
-
 /// Configuration for the node's peer management.
+///
+/// `diffusion_mode` is read by [`NodePeerManager`]. The remaining fields are
+/// populated from live config at construction (`Node::run`, see
+/// `node/mod.rs`) but not yet consulted here: governor targets flow through
+/// the separate `PeerTargets`/`Governor::update_targets` path instead (see
+/// `node/mod.rs`'s governor tick), and `peer_sharing_enabled`/`network_magic`
+/// are threaded directly to the handshake/peer-sharing call sites rather than
+/// read back off this struct. Kept (not deleted) because real config values
+/// already flow into them at construction — issue #1003 follow-up: either
+/// wire them into `NodePeerManager` or drop them from this struct.
 #[derive(Debug, Clone)]
-#[allow(dead_code)] // fields used by networking rewrite
 pub struct PeerManagerConfig {
     /// Diffusion mode (InitiatorOnly or InitiatorAndResponder).
     pub diffusion_mode: DiffusionMode,
-    /// Whether peer sharing is enabled.
+    /// Whether peer sharing is enabled. Not yet read back by
+    /// `NodePeerManager` — see the struct-level doc comment.
+    #[allow(dead_code)]
     pub peer_sharing_enabled: bool,
-    /// Target number of hot (active) peers.
+    /// Target number of hot (active) peers. Not yet read back by
+    /// `NodePeerManager` — see the struct-level doc comment.
+    #[allow(dead_code)]
     pub target_hot_peers: usize,
-    /// Target number of warm (established but not active) peers.
+    /// Target number of warm (established but not active) peers. Not yet
+    /// read back by `NodePeerManager` — see the struct-level doc comment.
+    #[allow(dead_code)]
     pub target_warm_peers: usize,
-    /// Target number of known (cold + warm + hot) peers.
+    /// Target number of known (cold + warm + hot) peers. Not yet read back
+    /// by `NodePeerManager` — see the struct-level doc comment.
+    #[allow(dead_code)]
     pub target_known_peers: usize,
-    /// Network magic for handshake validation.
+    /// Network magic for handshake validation. Not yet read back by
+    /// `NodePeerManager` — see the struct-level doc comment.
+    #[allow(dead_code)]
     pub network_magic: u64,
 }
 
@@ -149,18 +141,8 @@ pub enum ConnectionDirection {
     Inbound,
 }
 
-/// Category of a peer for big ledger peer tracking.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)] // used by networking rewrite
-pub enum PeerCategory {
-    Normal,
-    BigLedgerPeer,
-    LocalRoot,
-}
-
 /// A local root peer group from the topology configuration.
 #[derive(Debug, Clone)]
-#[allow(dead_code)] // fields used by networking rewrite
 pub struct LocalRootGroupInfo {
     /// Name of the group (for logging/display).
     pub name: String,
@@ -191,8 +173,13 @@ pub struct LocalRootGroupInfo {
 ///
 /// Byron EBBs share a slot with the first block of the epoch and need
 /// special handling during sync.
+///
+/// Its only consumer is `sync::Node::process_forward_blocks`, which is
+/// itself dead code (superseded by `apply_fetched_block`; see the "no
+/// callers" note at `sync.rs:1039`) — not a networking-rewrite promise.
+/// Tracked for cleanup alongside that function (#1003 follow-up).
 #[derive(Debug, Clone)]
-#[allow(dead_code)] // used by networking rewrite
+#[allow(dead_code)]
 pub struct EbbInfo {
     /// Slot of the EBB (same as the first block of the epoch).
     pub slot: u64,
@@ -201,87 +188,6 @@ pub struct EbbInfo {
     /// Epoch number this EBB marks the boundary of.
     pub epoch: u64,
 }
-
-/// Result from a pipelined header batch request.
-#[derive(Debug)]
-#[allow(dead_code)] // used by networking rewrite
-pub enum HeaderBatchResult {
-    /// A batch of headers was received.
-    Headers(Vec<HeaderInfo>),
-    /// The chain rolled backward to a point.
-    RollBack { slot: u64, hash: [u8; 32] },
-    /// We're at the chain tip — waiting for new blocks.
-    Await,
-}
-
-/// Information about a received block header.
-#[derive(Debug, Clone)]
-#[allow(dead_code)] // used by networking rewrite
-pub struct HeaderInfo {
-    /// Raw header CBOR bytes.
-    pub header: Vec<u8>,
-    /// Slot number.
-    pub slot: u64,
-    /// Block header hash.
-    pub hash: [u8; 32],
-    /// Block number (height).
-    pub block_number: u64,
-    /// Tip slot reported by the server.
-    pub tip_slot: u64,
-}
-
-// ─── Error Types ─────────────────────────────────────────────────────────────
-
-/// Errors from N2N client operations.
-#[derive(Debug)]
-#[allow(dead_code)] // used by networking rewrite
-pub enum ClientError {
-    /// TCP connection failed.
-    Connection(String),
-    /// Handshake negotiation failed.
-    Handshake(String),
-    /// Protocol error during operation.
-    Protocol(String),
-    /// Connection timed out.
-    Timeout,
-    /// Connection was closed by the remote peer.
-    Closed,
-}
-
-impl std::fmt::Display for ClientError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Connection(e) => write!(f, "connection: {e}"),
-            Self::Handshake(e) => write!(f, "handshake: {e}"),
-            Self::Protocol(e) => write!(f, "protocol: {e}"),
-            Self::Timeout => write!(f, "timeout"),
-            Self::Closed => write!(f, "connection closed"),
-        }
-    }
-}
-
-impl std::error::Error for ClientError {}
-
-/// Errors from duplex peer connection operations.
-#[derive(Debug)]
-#[allow(dead_code)] // used by networking rewrite
-pub enum DuplexError {
-    /// The underlying client connection failed.
-    Connection(ClientError),
-    /// The peer was disconnected.
-    Disconnected,
-}
-
-impl std::fmt::Display for DuplexError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Connection(e) => write!(f, "duplex: {e}"),
-            Self::Disconnected => write!(f, "duplex: peer disconnected"),
-        }
-    }
-}
-
-impl std::error::Error for DuplexError {}
 
 // ─── Node Peer Manager ───────────────────────────────────────────────────────
 
@@ -485,11 +391,22 @@ impl NodePeerManager {
         self.rollback_below_immutable_witnesses.iter()
     }
 
-    /// Drop matured entries from the fresh-inbound map (optional GC pass).
-    /// `peer_disconnected` already clears entries when peers leave, so this
-    /// is mainly useful for long-running connections.  Exposed for tests
-    /// and operator-driven introspection.
-    #[allow(dead_code)]
+    /// Drop matured entries from the fresh-inbound map.
+    ///
+    /// `peer_disconnected` already clears entries when peers leave, but for a
+    /// long-running inbound connection an entry sits in the map — matured,
+    /// but present — for the connection's entire lifetime, since maturity
+    /// alone never removes it (`fresh_inbound_set` filters matured entries
+    /// out at read time rather than popping them). Without this call the
+    /// per-tick `fresh_inbound_set` scan grows with the count of ALL inbound
+    /// peers ever accepted this run, not just the currently-immature ones.
+    ///
+    /// Mirrors upstream `Ouroboros.Network.InboundGovernor`'s
+    /// `maturedPeers`/`OrdPSQ.atMostView`, which eagerly pops entries out of
+    /// `freshDuplexPeers` into `matureDuplexPeers` on its own wake arm inside
+    /// the governor's main STM loop — not a read-time filter. Called once per
+    /// governor tick from `Node::run` (`node/mod.rs`), alongside
+    /// `gc_divergence_witnesses`.
     pub fn gc_fresh_inbound(&mut self, now: std::time::Instant) -> usize {
         let before = self.fresh_inbound.len();
         self.fresh_inbound
@@ -498,7 +415,9 @@ impl NodePeerManager {
     }
 
     /// Read-only count of in-flight (still-immature) inbound peers — for
-    /// diagnostics + metrics.
+    /// diagnostics + metrics. Exercised directly by unit tests below; no
+    /// production caller currently reads the count (only the set via
+    /// `fresh_inbound_set`).
     #[allow(dead_code)]
     pub fn fresh_inbound_count(&self) -> usize {
         self.fresh_inbound.len()
@@ -618,7 +537,6 @@ impl NodePeerManager {
     /// redirect honest nodes onto local intranet hosts. Static-topology
     /// loopback peers (co-located BP+relay) are added via
     /// [`add_local_root_group`] and are not subject to this filter.
-    #[allow(dead_code)] // used by networking rewrite
     pub fn add_shared_peer(&mut self, addr: SocketAddr) {
         if self.is_self_addr(addr) {
             return;
@@ -810,7 +728,6 @@ impl NodePeerManager {
     /// Called during simultaneous open detection — an inbound connection arrives
     /// while we already have an outbound connection to the same peer. The
     /// connection transitions to `DuplexConn` matching Haskell's `DuplexState`.
-    #[allow(dead_code)] // Will be used when full simultaneous-open handling is implemented
     pub fn mark_peer_duplex(&mut self, addr: &SocketAddr) {
         if self.conn_states.contains_key(addr) {
             self.conn_states.insert(*addr, ConnectionState::DuplexConn);
@@ -881,7 +798,6 @@ impl NodePeerManager {
     }
 
     /// Record a handshake RTT measurement.
-    #[allow(dead_code)] // used by networking rewrite
     pub fn record_handshake_rtt(&mut self, addr: &SocketAddr, rtt_ms: f64) {
         if let Some(peer) = self.inner.get_peer_mut(addr) {
             peer.update_latency(rtt_ms);
@@ -913,15 +829,6 @@ impl NodePeerManager {
         use dugite_network::peer::PeerState;
         let candidates = self.inner.peers_in_state(PeerState::Hot);
         self.inner.is_preferred_fetch_peer(addr, &candidates, top_k)
-    }
-
-    /// Record blocks fetched from a peer.
-    #[allow(dead_code)] // used by networking rewrite
-    pub fn record_block_fetch(&mut self, addr: &SocketAddr, blocks: usize) {
-        if let Some(peer) = self.inner.get_peer_mut(addr) {
-            peer.record_success();
-            let _ = blocks; // future: track per-peer block counts
-        }
     }
 
     /// Collect current EWMA latency values (ms) for all connected peers
@@ -1295,43 +1202,10 @@ impl NodePeerManager {
         self.conn_states.keys().copied().collect()
     }
 
-    /// Get the category of a peer.
-    #[allow(dead_code)] // used by networking rewrite
-    pub fn peer_category(&self, addr: &SocketAddr) -> Option<PeerCategory> {
-        self.inner.get_peer(addr)?;
-        for group in &self.local_root_groups {
-            if group.addrs.contains(addr) {
-                return Some(PeerCategory::LocalRoot);
-            }
-        }
-        if self.big_ledger_peers.contains(addr) {
-            return Some(PeerCategory::BigLedgerPeer);
-        }
-        Some(PeerCategory::Normal)
-    }
-
-    /// Find an inbound duplex connection from the same IP.
-    #[allow(dead_code)] // used by networking rewrite
-    pub fn find_inbound_duplex_by_ip(&self, ip: std::net::IpAddr) -> Option<SocketAddr> {
-        self.conn_states
-            .iter()
-            .find(|(addr, state)| {
-                addr.ip() == ip
-                    && matches!(
-                        state,
-                        ConnectionState::InboundIdle(DataFlow::Duplex)
-                            | ConnectionState::InboundState(DataFlow::Duplex)
-                            | ConnectionState::DuplexConn
-                    )
-            })
-            .map(|(addr, _)| *addr)
-    }
-
     /// Get the effective diffusion mode for a specific peer.
     ///
     /// If the peer belongs to a local root group with an explicit diffusion mode,
     /// that override is used. Otherwise, falls back to the node-level config.
-    #[allow(dead_code)] // will be used by P2P governor handshake logic
     pub fn effective_diffusion_mode(&self, addr: &SocketAddr) -> DiffusionMode {
         for group in &self.local_root_groups {
             if group.addrs.contains(addr) {
@@ -1353,7 +1227,6 @@ impl NodePeerManager {
 
     /// Whether a peer can be shared via the PeerSharing protocol.
     /// Returns false for peers in local root groups with advertise=false.
-    #[allow(dead_code)] // will be used by PeerSharing protocol
     pub fn is_advertisable(&self, addr: &SocketAddr) -> bool {
         for group in &self.local_root_groups {
             if group.addrs.contains(addr) {
@@ -2430,6 +2303,65 @@ mod tests {
         let now = std::time::Instant::now();
         let fresh = pm.fresh_inbound_set(now + std::time::Duration::from_secs(15 * 60 + 1));
         assert!(!fresh.contains(&addr));
+    }
+
+    /// #1003 — `gc_fresh_inbound` must actually SHRINK the underlying map
+    /// once entries mature, not merely agree that they're no longer
+    /// "fresh" when asked. `fresh_inbound_set`'s read-time filter already
+    /// makes maturity observable without any GC call (this same window is
+    /// exercised above by `inbound_peer_matures_after_15_minutes`) — the
+    /// only thing `gc_fresh_inbound` adds is bounding the map's SIZE for a
+    /// peer that never disconnects, so the assertion here is specifically
+    /// about `fresh_inbound_count()` (backed by `self.fresh_inbound.len()`)
+    /// dropping, which nothing else in the API can produce for a
+    /// still-connected peer.
+    #[test]
+    fn gc_fresh_inbound_shrinks_map_after_maturation() {
+        let mut pm = NodePeerManager::new(PeerManagerConfig::default());
+        let addr: SocketAddr = "203.0.113.5:3001".parse().unwrap();
+        pm.peer_connected(&addr, ConnectionDirection::Inbound);
+        assert_eq!(pm.fresh_inbound_count(), 1);
+
+        let now = std::time::Instant::now();
+
+        // Still within the maturation window: GC removes nothing, the
+        // entry is both "fresh" AND present in the map.
+        let removed_early = pm.gc_fresh_inbound(now + std::time::Duration::from_secs(60));
+        assert_eq!(removed_early, 0, "must not evict an immature entry");
+        assert_eq!(pm.fresh_inbound_count(), 1);
+
+        // Past the maturation window, peer still connected (no
+        // peer_disconnected call — that path is covered separately by
+        // `disconnect_clears_fresh_inbound`). Before GC, the entry is
+        // provably still IN the map even though it no longer reads as
+        // fresh, which is exactly the standing-cost `gc_fresh_inbound`'s
+        // doc comment describes.
+        let after_maturity = now + std::time::Duration::from_secs(15 * 60 + 1);
+        assert!(
+            !pm.fresh_inbound_set(after_maturity).contains(&addr),
+            "matured peer must already read as non-fresh before any GC"
+        );
+        assert_eq!(
+            pm.fresh_inbound_count(),
+            1,
+            "matured entry is filtered at read time, not yet removed from the map"
+        );
+
+        // GC must now observably shrink the map: both its return value AND
+        // fresh_inbound_count() must reflect the removal.
+        let removed = pm.gc_fresh_inbound(after_maturity);
+        assert_eq!(
+            removed, 1,
+            "gc_fresh_inbound must report the one matured entry it evicted"
+        );
+        assert_eq!(
+            pm.fresh_inbound_count(),
+            0,
+            "gc_fresh_inbound must actually remove the matured entry from the map"
+        );
+
+        // A second GC pass on an already-clean map removes nothing further.
+        assert_eq!(pm.gc_fresh_inbound(after_maturity), 0);
     }
 
     /// Governor-initiated disconnect goes Hot/Warm → Cooling → Cold:

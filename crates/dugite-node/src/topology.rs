@@ -141,13 +141,19 @@ impl LocalRootGroup {
 
 /// Detailed peer info extracted from topology for the peer manager
 #[derive(Debug, Clone)]
-#[allow(dead_code)] // fields used by networking rewrite (peer management)
 pub struct TopologyPeer {
     pub address: String,
     pub port: u16,
     /// Topology source category for this peer
     pub _source: TopologyPeerSource,
     pub trustable: bool,
+    /// Exercised directly by the `test_detailed_peers` unit test below; no
+    /// production reader currently consults it. The live PeerSharing gate
+    /// (`NodePeerManager::is_advertisable`) reads a *different*
+    /// `advertise` — `networking::LocalRootGroupInfo::advertise`, sourced
+    /// directly from `LocalRootGroup::advertise` at group-resolution time
+    /// (`node/mod.rs`), not from this per-peer copy.
+    #[allow(dead_code)]
     pub advertise: bool,
     /// Whether this peer is behind a firewall (inbound-only)
     pub _behind_firewall: bool,

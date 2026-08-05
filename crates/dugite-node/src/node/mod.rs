@@ -8,13 +8,22 @@
 //! - [`query`]  — N2C LocalStateQuery response building (`update_query_state`)
 //! - [`sync`]   — Pipelined ChainSync loop, block processing, rollback, replay
 
-#[allow(dead_code)] // networking rewrite module, wired in soon
+// NOTE: these two module-level `dead_code` allows are themselves stale for
+// the modules' own top-level items — `ConnectionLifecycleManager` and
+// `PeerConnection` are both heavily used in production. Left in place
+// because a module-level `#[allow]` suppresses the lint recursively: lifting
+// it surfaces a separate, pre-existing set of dead code *inside* these files
+// (e.g. `PeerConnection::has_warm_protocols`/`has_hot_protocols`,
+// `FetchedBlock::tip_slot`/`tip_hash`/`tip_block_number`) that is out of
+// scope for #1003 (peer-manager methods in `networking.rs`) and deserves
+// its own audit rather than a drive-by fix here.
+#[allow(dead_code)]
 pub(crate) mod connection_lifecycle;
 pub(crate) mod epoch;
 pub(crate) mod ledger_view;
 pub(crate) mod n2c_query;
 pub(crate) mod networking;
-#[allow(dead_code)] // networking rewrite module, wired in soon
+#[allow(dead_code)]
 pub(crate) mod peer_connection;
 pub(crate) mod query;
 pub(crate) mod serve;
@@ -5441,6 +5450,14 @@ impl Node {
                         // GC stale witnesses first so the count reflects
                         // recent events only.
                         pm.gc_divergence_witnesses(now, DIVERGENCE_WINDOW);
+                        // GC matured entries out of the fresh-inbound map so
+                        // the per-tick `fresh_inbound_set` scan below stays
+                        // bounded by currently-immature peers rather than
+                        // every inbound peer accepted this run (#1003).
+                        // Mirrors upstream InboundGovernor's own wake arm
+                        // that eagerly pops matured entries out of
+                        // `freshDuplexPeers` into `matureDuplexPeers`.
+                        pm.gc_fresh_inbound(now);
                         let witnesses = pm.divergence_witness_count(now, DIVERGENCE_WINDOW);
                         if witnesses >= DIVERGENCE_PEER_THRESHOLD {
                             // Snapshot the witness details for the error
