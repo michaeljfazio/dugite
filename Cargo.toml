@@ -110,6 +110,12 @@ tonic-prost = "0.14"
 prost = "0.14"
 prost-types = "0.14"
 tonic-prost-build = "0.14"
+# Runtime reflection over the same FileDescriptorSet already emitted by
+# `dugite-rpc/build.rs` for tonic-reflection. `dugite-rpc::masking` uses it
+# to apply `google.protobuf.FieldMask` generically (walk-and-clear over
+# `DynamicMessage`) instead of hand-writing per-response-type pruning code
+# for all ~110 vendored utxorpc messages — one mechanism, not N copies.
+prost-reflect = "0.16"
 
 # Networking
 tokio-tungstenite = "0.24"
