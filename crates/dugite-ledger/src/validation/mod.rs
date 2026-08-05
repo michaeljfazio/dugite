@@ -859,14 +859,33 @@ pub enum ValidationError {
     NotYetValid { current_slot: u64, valid_from: u64 },
     #[error("Script validation failed: {0}")]
     ScriptFailed(String),
-    #[error("Insufficient collateral")]
-    InsufficientCollateral,
+    /// Haskell `InsufficientCollateral DeltaCoin Coin` (Conway
+    /// `ConwayUtxoPredFailure` tag 12). `balance` is the collateral balance
+    /// actually present (sum of collateral inputs minus `collateral_return`,
+    /// kept as a SIGNED value since an over-declared `collateral_return` can
+    /// drive it negative — see `effective_collateral` in
+    /// [`collateral::check_collateral`]); `required` is
+    /// `ceil(fee * collateral_percentage / 100)`.
+    ///
+    /// Without these two fields the failure could not be wire-encoded and
+    /// degraded to the generic `ConwayMempoolFailure` fallback (#1050).
+    #[error("Insufficient collateral: balance={balance}, required={required}")]
+    InsufficientCollateral { balance: i128, required: u64 },
     #[error("Too many collateral inputs: max={max}, actual={actual}")]
     TooManyCollateralInputs { max: u64, actual: u64 },
     #[error("Collateral input not found in UTxO set: {0}")]
     CollateralNotFound(String),
-    #[error("Collateral input contains tokens (must be pure ADA): {0}")]
-    CollateralHasTokens(String),
+    /// Haskell `CollateralContainsNonADA (Value era)` (Conway
+    /// `ConwayUtxoPredFailure` tag 15) — the FULL multi-asset `Value`
+    /// Haskell's `validateCollateralContainsNonADA` reports: either the raw
+    /// sum of collateral-input `Value`s, or — only when the collateral
+    /// INPUTS are ada-only but `collateral_return` itself carries tokens —
+    /// the return output's own `Value`. Oracle-verified against
+    /// `Cardano.Ledger.Babbage.Rules.Utxo` (#1050): this is NEVER the netted
+    /// (inputs minus return) balance in the general case, so a plain string
+    /// reason could not carry the wire payload.
+    #[error("Collateral input contains tokens (must be pure ADA): {0:?}")]
+    CollateralHasTokens(dugite_primitives::value::Value),
     #[error("Collateral mismatch: total_collateral={declared}, effective={computed}")]
     CollateralMismatch { declared: u64, computed: u64 },
     #[error("Reference input not found in UTxO set: {0}")]

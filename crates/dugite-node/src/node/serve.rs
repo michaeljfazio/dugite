@@ -941,7 +941,9 @@ pub(crate) fn convert_validation_error(
             valid_from,
         },
         VE::ScriptFailed(reason) => TxValidationError::ScriptFailed { reason },
-        VE::InsufficientCollateral => TxValidationError::InsufficientCollateral,
+        VE::InsufficientCollateral { balance, required } => {
+            TxValidationError::InsufficientCollateral { balance, required }
+        }
         VE::TooManyCollateralInputs { max, actual } => {
             TxValidationError::TooManyCollateralInputs { max, actual }
         }
@@ -958,7 +960,7 @@ pub(crate) fn convert_validation_error(
             ),
         },
         VE::CollateralNotFound(input) => TxValidationError::CollateralNotFound { input },
-        VE::CollateralHasTokens(input) => TxValidationError::CollateralHasTokens { input },
+        VE::CollateralHasTokens(value) => TxValidationError::CollateralHasTokens { value },
         VE::CollateralMismatch { declared, computed } => {
             TxValidationError::CollateralMismatch { declared, computed }
         }
@@ -1781,8 +1783,43 @@ mod tests {
             }
         ));
 
-        let e = convert_validation_error(VE::InsufficientCollateral);
-        assert!(matches!(e, TxValidationError::InsufficientCollateral));
+        let e = convert_validation_error(VE::InsufficientCollateral {
+            balance: -500,
+            required: 1_500_000,
+        });
+        assert!(matches!(
+            e,
+            TxValidationError::InsufficientCollateral {
+                balance: -500,
+                required: 1_500_000,
+            }
+        ));
+
+        // `VE::CollateralHasTokens` must carry the offending `Value` straight
+        // through to the wire-facing variant — the whole point of #1050 is
+        // that a plain reason string can no longer represent this payload.
+        let mut multi_asset = std::collections::BTreeMap::new();
+        multi_asset.insert(
+            dugite_primitives::hash::Hash28::from_bytes([0x11; 28]),
+            std::collections::BTreeMap::from([(
+                dugite_primitives::value::AssetName(b"x".to_vec()),
+                7u64,
+            )]),
+        );
+        let value = dugite_primitives::value::Value {
+            coin: dugite_primitives::value::Lovelace(123),
+            multi_asset,
+        };
+        let e = convert_validation_error(VE::CollateralHasTokens(value.clone()));
+        match e {
+            TxValidationError::CollateralHasTokens { value: got } => {
+                assert_eq!(
+                    got, value,
+                    "the exact offending Value must survive conversion"
+                );
+            }
+            other => panic!("expected CollateralHasTokens, got {other:?}"),
+        }
 
         let e = convert_validation_error(VE::NoInputs);
         assert!(matches!(e, TxValidationError::NoInputs));
