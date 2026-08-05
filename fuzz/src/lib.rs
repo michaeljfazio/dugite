@@ -898,14 +898,43 @@ impl Gen<'_> {
         }
     }
 
+    /// A Dijkstra-context transaction output — map form and PlutusV4 script
+    /// refs both always valid. Only safe for call sites that know they are
+    /// exclusively Dijkstra (e.g. sub-transaction outputs, which have no
+    /// meaning in any other era); anything era-parametric must call
+    /// `tx_output_for` directly with explicit flags. See that function's
+    /// doc comment for why `allow_plutus_v4` cannot default to `true`.
     pub fn tx_output(&mut self) -> TransactionOutput {
-        self.tx_output_for(true)
+        self.tx_output_for(true, true)
     }
 
     /// A transaction output. `allow_map_form` is false before Babbage, where
     /// the post-Alonzo map encoding (and therefore inline datums and script
     /// references) does not exist.
-    pub fn tx_output_for(&mut self, allow_map_form: bool) -> TransactionOutput {
+    ///
+    /// `allow_plutus_v4` gates `ScriptRef::PlutusV4` generation. Despite
+    /// V1/V2/V3 being decodable regardless of era (`era_babbage.rs`'s
+    /// standalone `read_script_ref`, used only for pure-Babbage-tagged
+    /// transactions, accepts tags 0-3 unconditionally), that decoder has
+    /// NO tag-4 arm — only `era_conway.rs`'s `read_script_ref` (used for
+    /// BOTH Conway- and Dijkstra-tagged bodies via the shared
+    /// `decode_conway_tx_body`) does. A Babbage-era output carrying a V4
+    /// script ref is therefore genuinely encoder/decoder-inconsistent
+    /// (the #948 shape) — found live by this generator once V4 generation
+    /// was added without era-gating it: `encode_transaction` happily
+    /// emits the bytes, `decode_transaction` for era Babbage rejects them
+    /// with "script_ref: unknown type 4". `allow_plutus_v4` must be
+    /// `false` whenever the output could land in a Babbage-tagged body —
+    /// i.e. `era >= Era::Conway`, not `era >= Era::Dijkstra`: Conway
+    /// itself round-trips a V4 script ref fine at the wire level (the
+    /// shared decoder does not language-gate it; that happens one layer
+    /// up, at Phase-1/Phase-2 validation), even though V4 has no meaning
+    /// there semantically.
+    pub fn tx_output_for(
+        &mut self,
+        allow_map_form: bool,
+        allow_plutus_v4: bool,
+    ) -> TransactionOutput {
         // The two output encodings are not interchangeable, and `is_legacy`
         // selects between them:
         //
@@ -935,18 +964,19 @@ impl Gen<'_> {
             }
         };
 
-        let script_ref = (!is_legacy && self.chance(100)).then(|| match self.choice(5) {
-            0 => ScriptRef::NativeScript(self.native_script(2)),
-            1 => ScriptRef::PlutusV1(self.bytes(64)),
-            2 => ScriptRef::PlutusV2(self.bytes(64)),
-            3 => ScriptRef::PlutusV3(self.bytes(64)),
-            // PlutusV4 (Dijkstra, issue #1000) — wire tag 4. Structurally
-            // decodable under any era (the decoder doesn't era-gate this
-            // arm; PV-gating happens one layer up, at Phase-1/Phase-2
-            // validation via `ledger_language_introduced_in`), so it's
-            // safe to generate regardless of which era this output lands
-            // in — same as the pre-existing V1/V2/V3 arms above.
-            _ => ScriptRef::PlutusV4(self.bytes(64)),
+        let script_ref = (!is_legacy && self.chance(100)).then(|| {
+            let variants = if allow_plutus_v4 { 5 } else { 4 };
+            match self.choice(variants) {
+                0 => ScriptRef::NativeScript(self.native_script(2)),
+                1 => ScriptRef::PlutusV1(self.bytes(64)),
+                2 => ScriptRef::PlutusV2(self.bytes(64)),
+                3 => ScriptRef::PlutusV3(self.bytes(64)),
+                // PlutusV4 (Dijkstra, issue #1000) — wire tag 4. Only
+                // reachable when `allow_plutus_v4` is set; see the doc
+                // comment on `tx_output_for` for why it cannot be
+                // generated unconditionally like V1/V2/V3.
+                _ => ScriptRef::PlutusV4(self.bytes(64)),
+            }
         });
 
         TransactionOutput {
@@ -1136,6 +1166,12 @@ impl Gen<'_> {
         let has_alonzo_keys = era >= Era::Alonzo; // 11, 13, 14, 15
         let has_babbage_keys = era >= Era::Babbage; // 16, 17, 18
         let has_conway_gov = era >= Era::Conway; // 19-22
+                                                 // PlutusV4 script refs are wire-decodable from era_conway.rs's
+                                                 // shared `read_script_ref` (used for BOTH Conway and Dijkstra
+                                                 // bodies) but NOT from era_babbage.rs's standalone one (used only
+                                                 // for pure-Babbage-tagged transactions, which lacks a tag-4 arm)
+                                                 // — see the doc comment on `Gen::tx_output_for`.
+        let allow_plutus_v4 = era >= Era::Conway;
         let inputs = self.collection_len(30);
         let outputs = self.collection_len(24);
         let certs = self.collection_len(19);
@@ -1242,8 +1278,25 @@ impl Gen<'_> {
             }
             // `sub_transactions` is an OMap keyed by TxId; duplicates are
             // rejected (`EnforceNoDuplicates`) and the decoder derives each key
-            // from the sub-body's own bytes.
-            sub_txs = dedup_preserving_order(sub_txs);
+            // from the sub-body's OWN bytes — which excludes `witness_set` and
+            // `auxiliary_data` (those are separate elements of the
+            // `[body, wits, auxData]` record, #1010). A plain
+            // `dedup_preserving_order` (full-struct equality) therefore
+            // UNDER-dedups: two generated sub-txs with identical body fields
+            // but different witness sets are NOT equal as Rust values, so
+            // nothing removes them, yet they encode to the same body bytes —
+            // hence the same TxId — and the real OMap-key-derivation the
+            // decoder performs correctly rejects the result as a duplicate.
+            // Dedup on the body-only projection instead, matching what
+            // actually determines the wire key.
+            sub_txs = dedup_preserving_order_by_key(sub_txs, |sub| {
+                let mut body_only = sub.clone();
+                body_only.tx_id = Default::default();
+                body_only.witness_set = TransactionWitnessSet::default();
+                body_only.auxiliary_data = None;
+                body_only.raw_body_cbor = None;
+                body_only
+            });
 
             let n = self.collection_len(8);
             for _ in 0..n {
@@ -1281,7 +1334,7 @@ impl Gen<'_> {
         let body = TransactionBody {
             inputs: input_set,
             outputs: (0..outputs)
-                .map(|_| self.tx_output_for(has_babbage_keys))
+                .map(|_| self.tx_output_for(has_babbage_keys, allow_plutus_v4))
                 .collect(),
             fee: self.lovelace(),
             ttl: self.chance(180).then(|| SlotNo(self.u64())),
@@ -1306,7 +1359,8 @@ impl Gen<'_> {
                 signer_set
             },
             network_id: (has_alonzo_keys && self.chance(128)).then(|| self.byte() & 1),
-            collateral_return: (has_babbage_keys && self.chance(128)).then(|| self.tx_output()),
+            collateral_return: (has_babbage_keys && self.chance(128))
+                .then(|| self.tx_output_for(true, allow_plutus_v4)),
             total_collateral: (has_babbage_keys && self.chance(128)).then(|| self.lovelace()),
             reference_inputs: if has_babbage_keys {
                 ref_input_set
@@ -1421,6 +1475,14 @@ pub fn normalise_for_comparison(tx: &mut Transaction) {
         sub.tx_id = Default::default();
         for output in &mut sub.outputs {
             clear_output_caches(output);
+        }
+        // #1010: a sub-tx has its OWN witness set / auxiliary data, subject
+        // to the exact same wire-bytes-cache rule as the top-level tx's.
+        sub.witness_set.raw_redeemers_cbor = None;
+        sub.witness_set.raw_plutus_data_cbor = None;
+        sub.witness_set.original_script_data_hash = None;
+        if let Some(aux) = sub.auxiliary_data.as_mut() {
+            aux.raw_cbor = None;
         }
     }
 
@@ -1539,6 +1601,21 @@ fn canonicalise_set_order(tx: &mut Transaction) {
     for sub in &mut tx.body.sub_transactions {
         sub.inputs.sort();
         sub.reference_inputs.sort();
+        // #1010: a sub-tx's own witness set goes through the SAME
+        // `encode_witness_set_for_era` as the top-level tx's, so its
+        // redeemers/plutus_data are canonicalised the identical way (see
+        // the comment at the top of this function). `sub.guards` needs no
+        // equivalent step here: unlike `tx.body.guards` (which can also
+        // arrive as the `required_signers` projection depending on era),
+        // a sub-tx's `guards` is the only in-memory view of its own key 14
+        // and the generator already produces it pre-sorted/deduped in the
+        // exact form `encode_sub_tx_body`'s key-14 arm re-sorts to anyway.
+        sub.witness_set
+            .redeemers
+            .sort_by_key(|r| (redeemer_tag_ord(&r.tag), r.index));
+        sub.witness_set
+            .plutus_data
+            .sort_by_cached_key(dugite_serialization::encode_plutus_data);
     }
 }
 
@@ -1570,6 +1647,31 @@ pub fn dedup_preserving_order<T: PartialEq>(items: Vec<T>) -> Vec<T> {
     let mut out: Vec<T> = Vec::with_capacity(items.len());
     for item in items {
         if !out.contains(&item) {
+            out.push(item);
+        }
+    }
+    out
+}
+
+/// Remove duplicates while preserving first-occurrence order, comparing by a
+/// PROJECTION of each item rather than the item's own `PartialEq`.
+///
+/// Needed where the wire-level uniqueness key is narrower than the full
+/// value — e.g. a Dijkstra sub-transaction's OMap key is derived from its
+/// BODY bytes alone (`witness_set`/`auxiliary_data` are separate elements
+/// of the wrapping `[body, wits, auxData]` record), so two generated
+/// sub-txs can be UNEQUAL as full `SubTransaction` values yet still collide
+/// on the wire key `dedup_preserving_order`'s plain `PartialEq` would miss.
+pub fn dedup_preserving_order_by_key<T, K: PartialEq>(
+    items: Vec<T>,
+    key_fn: impl Fn(&T) -> K,
+) -> Vec<T> {
+    let mut seen_keys: Vec<K> = Vec::with_capacity(items.len());
+    let mut out: Vec<T> = Vec::with_capacity(items.len());
+    for item in items {
+        let key = key_fn(&item);
+        if !seen_keys.contains(&key) {
+            seen_keys.push(key);
             out.push(item);
         }
     }
@@ -1620,10 +1722,32 @@ impl Gen<'_> {
     }
 
     /// A Dijkstra sub-transaction (body key 23).
+    ///
+    /// #1010 extended `SubTransaction` from 7 fields to the full
+    /// `DijkstraSubTxBodyRaw` set (certs/withdrawals/mint/script_data_hash/
+    /// guards/network_id/voting_procedures/proposal_procedures/
+    /// treasury_value/donation/direct_deposits/account_balance_intervals)
+    /// plus its own independent `witness_set`/`auxiliary_data` (a sub-tx has
+    /// its OWN `dstWits`, never the parent's). Every one of those is
+    /// generated here, reusing the SAME generator methods/blocks the
+    /// top-level `transaction()` uses for the identically-shaped body
+    /// field — not defaulted. A sub-tx is always Dijkstra-context (it has
+    /// no meaning in any other era), so unlike `transaction()` there is no
+    /// era gating to thread through `certificate_for`/`witness_set_for`/
+    /// `auxiliary_data_for`: they are called with `Era::Dijkstra`
+    /// unconditionally.
     pub fn sub_transaction(&mut self) -> SubTransaction {
         let inputs = self.collection_len(8);
         let outputs = self.collection_len(8);
         let ref_inputs = self.collection_len(4);
+        let certs = self.collection_len(6);
+        let withdrawal_count = self.collection_len(6);
+        let mint_policies = self.collection_len(3);
+        let voters = self.collection_len(3);
+        let proposals = self.collection_len(3);
+        let balance_interval_count = self.collection_len(4);
+        let direct_deposit_count = self.collection_len(4);
+        let guard_count = self.collection_len(8);
 
         let mut input_set: Vec<TransactionInput> = (0..inputs).map(|_| self.tx_input()).collect();
         input_set.sort();
@@ -1633,6 +1757,88 @@ impl Gen<'_> {
         ref_input_set.sort();
         ref_input_set.dedup();
 
+        // `certificates` / `proposal_procedures` are OSet (order preserving,
+        // no sort — mirrors `transaction()`'s cert_set/proposal_set).
+        let mut cert_set: Vec<Certificate> = Vec::new();
+        for _ in 0..certs {
+            let cert = self.certificate_for(Era::Dijkstra);
+            if !cert_set.contains(&cert) {
+                cert_set.push(cert);
+            }
+        }
+        let mut proposal_set: Vec<ProposalProcedure> = Vec::new();
+        for _ in 0..proposals {
+            let proposal = self.proposal_procedure();
+            if !proposal_set.contains(&proposal) {
+                proposal_set.push(proposal);
+            }
+        }
+
+        let mut withdrawals = BTreeMap::new();
+        for _ in 0..withdrawal_count {
+            withdrawals.insert(self.reward_account(), self.lovelace());
+        }
+
+        let mut mint: BTreeMap<PolicyId, BTreeMap<AssetName, i64>> = BTreeMap::new();
+        for _ in 0..mint_policies {
+            let policy = self.hash28();
+            let asset_count = self.collection_len(8);
+            let mut inner: BTreeMap<AssetName, i64> = BTreeMap::new();
+            for _ in 0..asset_count {
+                let quantity = match self.u64() as i64 {
+                    0 => 1,
+                    other => other,
+                };
+                inner.insert(AssetName(self.bytes(32)), quantity);
+            }
+            if !inner.is_empty() {
+                mint.insert(policy, inner);
+            }
+        }
+
+        let mut voting_procedures: BTreeMap<Voter, BTreeMap<GovActionId, VotingProcedure>> =
+            BTreeMap::new();
+        for _ in 0..voters {
+            let voter = self.voter();
+            let n = self.collection_len(3);
+            let mut inner = BTreeMap::new();
+            for _ in 0..n {
+                inner.insert(self.gov_action_id(), self.voting_procedure());
+            }
+            voting_procedures.insert(voter, inner);
+        }
+
+        let mut balance_intervals: Vec<(Credential, AccountBalanceInterval)> = Vec::new();
+        for _ in 0..balance_interval_count {
+            // At least one bound MUST be Some — the decoder rejects
+            // `[null, null]`, so generating it would be a false positive.
+            let (lower, upper) = match self.choice(3) {
+                0 => (Some(self.lovelace()), None),
+                1 => (None, Some(self.lovelace())),
+                _ => (Some(self.lovelace()), Some(self.lovelace())),
+            };
+            balance_intervals.push((self.credential(), AccountBalanceInterval { lower, upper }));
+        }
+        // Keyed by credential on the wire, so duplicates collapse.
+        let mut seen: Vec<Credential> = Vec::new();
+        balance_intervals.retain(|(cred, _)| {
+            if seen.contains(cred) {
+                false
+            } else {
+                seen.push(cred.clone());
+                true
+            }
+        });
+
+        let mut direct_deposits: BTreeMap<Vec<u8>, Lovelace> = BTreeMap::new();
+        for _ in 0..direct_deposit_count {
+            direct_deposits.insert(self.reward_account(), self.lovelace());
+        }
+
+        let mut guard_set: Vec<Credential> =
+            dedup_preserving_order((0..guard_count).map(|_| self.credential()).collect());
+        guard_set.sort();
+
         SubTransaction {
             // Recomputed by the decoder from the sub-body's own bytes, so the
             // generated value is irrelevant and is normalised out before
@@ -1641,9 +1847,25 @@ impl Gen<'_> {
             inputs: input_set,
             outputs: (0..outputs).map(|_| self.tx_output()).collect(),
             ttl: self.chance(160).then(|| SlotNo(self.u64())),
+            certificates: cert_set,
+            withdrawals,
             validity_interval_start: self.chance(160).then(|| SlotNo(self.u64())),
+            mint,
+            script_data_hash: self.chance(160).then(|| self.hash32()),
+            guards: guard_set,
+            network_id: self.chance(128).then(|| self.byte() & 1),
             reference_inputs: ref_input_set,
+            voting_procedures,
+            proposal_procedures: proposal_set,
+            treasury_value: self.chance(128).then(|| self.lovelace()),
+            donation: self.chance(128).then(|| self.lovelace()),
+            direct_deposits,
+            account_balance_intervals: balance_intervals,
             auxiliary_data_hash: self.chance(160).then(|| self.hash32()),
+            witness_set: self.witness_set_for(Era::Dijkstra),
+            auxiliary_data: self
+                .chance(160)
+                .then(|| self.auxiliary_data_for(Era::Dijkstra)),
             raw_body_cbor: None,
         }
     }
