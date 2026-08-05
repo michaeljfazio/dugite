@@ -36,22 +36,7 @@ _parity_ensure_csv() {
 # Maps query name → tracking issue URL.
 # Populated by individual test scripts using: KNOWN_DIVERGENCES[name]=url
 declare -gA KNOWN_DIVERGENCES=(
-    # --- Exposed 2026-08-02 by #953 -------------------------------------
-    # These three queries had been recorded as SKIP "pool1 id not found" in
-    # EVERY cli-parity run ever published, because setup.sh computed the pool
-    # id but never wrote keys/pool1/pool.id. Fixing that one-line setup gap
-    # made them run for the first time; all three diverged immediately. They
-    # are parked here (tracked, non-blocking) so the gate stays green on
-    # KNOWN state while the node bugs are fixed — NOT because they are benign.
-    [leadership-schedule]="https://github.com/michaeljfazio/dugite/issues/964"
-    #
-    # #964 — leadership-schedule returns a statistically UNRELATED schedule:
-    #        113 slots vs cardano's 200 (sigma ~0.48 vs ~1.0) and only 55 of
-    #        them shared, which is exactly the overlap two independent draws
-    #        would give. Forging itself is correct (~200 slots/epoch, every
-    #        block accepted by cardano-node) — the query path alone is wrong.
-    #
-    # Otherwise every comparable query is byte-identical to cardano-node 11.0.1.
+    # EMPTY — every comparable query is byte-identical to cardano-node 11.0.1.
     #
     # This array is ONLY for real divergences: both sides answered and the
     # answers differ. It must never be used to paper over an ERROR row (that
@@ -60,6 +45,18 @@ declare -gA KNOWN_DIVERGENCES=(
     # (#597 collected five of those for two months).
     #
     # Recently retired, do not re-add without a fresh two-sided diff:
+    #   leadership-schedule             both halves of the symptom (113 slots
+    #                                   vs 200, and only 55 shared) traced to
+    #                                   two GetPoolDistr2 defects: the
+    #                                   circulation denominator borrowed from
+    #                                   tag 37, and answering from live state
+    #                                   instead of the frozen `set` snapshot.
+    #                                   Fixing sigma alone produced byte-exact
+    #                                   parity including the slot set (#964).
+    #                                   `protocol-state/epoch-nonce` is now
+    #                                   compared every run, so the leading
+    #                                   alternative suspect is positively
+    #                                   excluded rather than untested
     #   pool-state, stake-snapshot      the pool-id filter was INERT: the
     #                                   argument is `Maybe (Set (KeyHash
     #                                   StakePool))` and the `Just` wrapper was

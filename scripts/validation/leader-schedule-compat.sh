@@ -23,15 +23,21 @@
 #     ./scripts/validation/leader-schedule-compat.sh \
 #         --socket-path ./haskell-node.sock
 #
-# Against dugite-node (the actual compat test — requires #403 to be fixed
-# so dugite-node can reach a stable listening socket):
+# Against dugite-node (the actual compat test):
 #
 #     ./scripts/validation/leader-schedule-compat.sh \
 #         --socket-path ./node.sock
 #
-# TODO(#408): once #403 lands and dugite-node's N2C listener is stable,
-# wire this script into CI against a dugite-node socket. Today we can
-# only validate the harness itself by running it against cardano-node.
+# Both original blockers are cleared — dugite-node's N2C listener is stable
+# and reaches a listening socket reliably. This script is NOT wired into CI,
+# because the coverage it was written for now lives in the devnet gate:
+# `tx-zoo/09-cli-parity/09t-leadership-schedule.sh` runs
+# `cardano-cli query leadership-schedule` against BOTH sockets and diffs the
+# answers on every devnet-validate run. That comparison is two-sided and
+# tip-pinned, which this one-socket-vs-golden harness is not.
+#
+# Keep this script for ad-hoc investigation against a captured golden; prefer
+# the cli-parity round for gating.
 #
 # Scope
 # -----
