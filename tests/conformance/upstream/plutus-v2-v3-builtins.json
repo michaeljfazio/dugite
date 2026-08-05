@@ -1,0 +1,18 @@
+{
+  "description": "PlutusV2 minting policy exercising byteStringToInteger, a V3-era builtin retroactively added to the PlutusV2 cost model. This is cardano-node-tests' own compiled artifact (plutus_common.BYTE_STRING_ROUNDTRIP_V2_REC / BYTE_STRING_ROUNDTRIP_V2_COST), used by tests_conway/test_update_plutusv2_builtins.py (via tests_plutus_v2/mint_raw.py::check_missing_builtin) to assert the builtin becomes usable once costModels.PlutusV2 grows to 185 entries. Vendored per the dugite #969/#970 no-third-party-compiler convention: this is IntersectMBO's own checked-in test data, not something dugite or Aiken compiled. Used by tx-zoo 18l-v2-script-v3-builtins.sh (#1033).",
+  "source_repo": "IntersectMBO/cardano-node-tests",
+  "source_path": "cardano_node_tests/tests/data/plutus/v2/byteStringToIntegerRoundtripPolicyV2.plutus",
+  "source_commit": "ad1430e3d3747ab48b2adac085e1845a8dab508c",
+  "source_url": "https://raw.githubusercontent.com/IntersectMBO/cardano-node-tests/ad1430e3d3747ab48b2adac085e1845a8dab508c/cardano_node_tests/tests/data/plutus/v2/byteStringToIntegerRoundtripPolicyV2.plutus",
+  "type": "PlutusScriptV2",
+  "cborHex": "5822582001000022325333573466e1ccde5251333792945200000100111200116375a005",
+  "scriptHash": "7185ac3c12f0dc1cb6c7cbe1fcdf77bfd0c7943c41e7f33e5469aad1",
+  "scriptHash_verified_with": "cardano-cli 11.0.0.0-darwin-aarch64 (git rev 97036a66bcf8c89f687ae57a048eecc0389977ef), `cardano-cli conway transaction policyid --script-file`",
+  "cborHex_wrapping_note": "This cborHex came from cardano-node-tests' OWN cardano-cli text envelope, already double-wrapped the way cardano-cli expects (an outer CBOR bstr(34) containing an inner bstr(32) of the flat-encoded script). Unlike plutus-examples.json's script_hex (a BARE flat-script hex that lib/build-plutus.sh's _wrap_cbor_bytes must wrap once more), this value must be dropped into the envelope's cborHex field VERBATIM -- re-wrapping it would produce a triple-wrapped script cardano-cli still loads, under yet another wrong hash (the #836/#969 vendoring trap).",
+  "execution_cost_reference": {
+    "per_time_steps": 168868800,
+    "per_space_memory": 540612,
+    "fixed_cost_lovelace": 43369,
+    "source": "cardano_node_tests/tests/plutus_common.py :: BYTE_STRING_ROUNDTRIP_V2_COST (informational only -- tx-zoo uses `transaction build` local evaluation instead of hardcoding these)"
+  }
+}
