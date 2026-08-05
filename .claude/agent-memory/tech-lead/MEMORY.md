@@ -1,5 +1,11 @@
 # Tech Lead Agent Memory
 
+## PoolRetirement + OutputTooSmall wire gaps (2026-08-06)
+- [StakePoolNotRegisteredOnKeyPOOL + BabbageOutputTooSmallUTxO](issue-pool-retirement-output-too-small-wire-gaps.md) — retirement of unregistered pool used the DELEG predicate not POOL (same condition, different rule, different wire nesting); OutputTooSmall had a TxValidationError variant but ZERO encoder arm at all. Retirement-epoch bounds check (StakePoolRetirementWrongEpochPOOL) was ALREADY correct — do not re-audit. Confirms the #1025 enrich_validation_errors aggregation pattern a 3rd time.
+
+## tx-zoo 18-plutus-edges (2026-08-06)
+- [#1033 implementation](issue-1033-plutus-edges-tx-zoo-category.md) — 12 scripts + _edge-helper.sh (expect_utxo_rejection, mirrors _cert-neg-helper.sh) + one vendored non-plutus-examples.json artifact (byteStringToIntegerRoundtripPolicyV2, gh api search/code trace, ALREADY-double-wrapped cborHex — do NOT re-wrap). Real finding: dugite Rule 5 (phase1.rs) never checks collateral_return against minUTxO at all (Haskell BabbageOutputTooSmallUTxO) — 18d will likely FAIL live, that's the intended signal. ScriptsNotPaidUTxO / NotAllowedSupplementalDatums / V1+refinput Conway inversion all CONFIRMED already correct in dugite (oracle-verified) — higher confidence than the issue text assumed.
+
 ## Conway Cert Tags 5/6 Decode Reject (2026-08-05)
 - [#1023 fix + #1029 Dijkstra follow-up](issue-1023-conway-cert-tags-5-6-decode-reject.md) — MIR/GenesisKeyDelegation hard-reject at Conway/Dijkstra decode, clean era-type-swap not PV-gated (unlike #1014 next door); Dijkstra ALSO removes tags 0/1 (filed #1029, not fixed — unreleased era); fuzz generator + encoder-test coverage gaps found and closed. Traps: `;`+bare-echo swallows exit code same as `| tail`; idling on background jobs w/o interim report; merge-tree-diff check validates pre-merge CI run still applies post-merge.
 

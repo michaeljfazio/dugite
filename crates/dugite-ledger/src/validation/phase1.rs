@@ -1350,7 +1350,7 @@ pub(super) fn run_phase1_rules(
     // (and thus under-charges the minimum for) any multi-asset or
     // datum/script-ref carrying output (issue #810).
     // ------------------------------------------------------------------
-    for output in &body.outputs {
+    for (output_index, output) in body.outputs.iter().enumerate() {
         let has_datum_hash = matches!(output.datum, OutputDatum::DatumHash(_));
         let output_size_bytes = if params.protocol_version_major >= 7 {
             match &output.raw_cbor {
@@ -1365,6 +1365,7 @@ pub(super) fn run_phase1_rules(
             errors.push(ValidationError::OutputTooSmall {
                 minimum: min_utxo.0,
                 actual: output.value.coin.0,
+                output_index,
             });
         }
     }

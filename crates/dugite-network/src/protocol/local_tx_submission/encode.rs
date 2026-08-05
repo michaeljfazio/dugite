@@ -738,6 +738,16 @@ fn encode_conway_ledger_pred_failure(enc: &mut Encoder<&mut Vec<u8>>, err: &TxVa
         }
 
         // ══ #979: typed POOL failures (hand-rolled arities) ═════════════
+        TxValidationError::StakePoolNotRegisteredOnKeyPOOL { pool_id } => {
+            match parse_hex_28(pool_id) {
+                Some(h) => encode_pool_failure(enc, |e| {
+                    e.array(2).expect("infallible");
+                    e.u8(0).expect("infallible");
+                    e.bytes(&h).expect("infallible");
+                }),
+                None => partial_fallback(enc, err),
+            }
+        }
         TxValidationError::StakePoolCostTooLowPOOL { supplied, expected } => {
             encode_pool_failure(enc, |e| {
                 e.array(3).expect("infallible");
@@ -937,6 +947,27 @@ fn encode_conway_ledger_pred_failure(enc: &mut Encoder<&mut Vec<u8>>, err: &TxVa
                         e.writer_mut().extend_from_slice(out);
                     }
                     map_close(e, parsed.len());
+                });
+            }
+        }
+        TxValidationError::BabbageOutputTooSmallUTxO { outputs } => {
+            let parsed: Vec<(Vec<u8>, u64)> = outputs
+                .iter()
+                .filter_map(|(out_hex, min)| hex::decode(out_hex).ok().map(|raw| (raw, *min)))
+                .collect();
+            if parsed.len() != outputs.len() || parsed.is_empty() {
+                partial_fallback(enc, err);
+            } else {
+                // `NonEmpty (TxOut era, Coin)` — a LIST of array(2) pairs,
+                // NOT a set and NOT a map (the same TxOut could repeat).
+                encode_utxo_failure(enc, 21, |e| {
+                    list_open(e, parsed.len());
+                    for (raw, min) in &parsed {
+                        e.array(2).expect("infallible");
+                        e.writer_mut().extend_from_slice(raw);
+                        e.u64(*min).expect("infallible");
+                    }
+                    list_close(e, parsed.len());
                 });
             }
         }
@@ -1880,6 +1911,38 @@ mod tests {
         );
     }
 
+    /// `StakePoolNotRegisteredOnKeyPOOL` — POOL tag 0, ONE field, a bare
+    /// `KeyHash StakePool` bstr(28). Raised by `PoolRetirement` of an
+    /// unregistered pool (dugite #1023-class issue: distinct from
+    /// `DelegateeStakePoolNotRegisteredDELEG`, which is DELEG tag 6 above —
+    /// same "unregistered pool" condition, different rule, different wire
+    /// nesting).
+    #[test]
+    fn golden_stake_pool_not_registered_on_key_pool_is_pool_tag_0() {
+        let mut want = pool_prefix();
+        want.extend_from_slice(&[0x82, 0x00, 0x58, 0x1c]);
+        want.extend_from_slice(&[0x77; 28]);
+        assert_ledger_bytes(
+            &TxValidationError::StakePoolNotRegisteredOnKeyPOOL {
+                pool_id: hex::encode([0x77; 28]),
+            },
+            &want,
+            "StakePoolNotRegisteredOnKeyPOOL",
+        );
+    }
+
+    /// Malformed pool-id hex must fall back to the generic mempool failure
+    /// rather than emit a wrong-shaped typed frame.
+    #[test]
+    fn golden_stake_pool_not_registered_on_key_pool_falls_back_on_malformed_hex() {
+        let got = ledger_failure_bytes(&TxValidationError::StakePoolNotRegisteredOnKeyPOOL {
+            pool_id: "not-hex".to_string(),
+        });
+        // ConwayMempoolFailure: [7, text]
+        assert_eq!(got[0], 0x82);
+        assert_eq!(got[1], 0x07);
+    }
+
     /// POOL's `EncCBOR` is hand-rolled: `encodeListLen 3 <> 3 <> supplied <>
     /// expected`. There is no tag 2 in this rule.
     #[test]
@@ -2105,6 +2168,67 @@ mod tests {
             &want,
             "ScriptsNotPaidUTxOUTXO",
         );
+    }
+
+    /// `BabbageOutputTooSmallUTxO (NonEmpty (TxOut era, Coin))` — Conway
+    /// UTXO tag 21. A LIST of `array(2)[txout, min_coin]` pairs — neither a
+    /// set nor a map, unlike its UTXO-tag-13/10 neighbors above.
+    #[test]
+    fn golden_babbage_output_too_small_utxo() {
+        let raw = vec![0x82u8, 0x01, 0x02];
+        let mut want = vec![
+            0x82, 0x01, // Ledger: [1, ...]
+            0x82, 0x00, // Utxow: [0, ...]
+            0x82, 0x15, // Utxo: [21, list]  (0x15 = 21)
+            0x81, // list(1)
+            0x82, // pair: array(2)
+        ];
+        want.extend_from_slice(&raw); // the raw "TxOut" bytes, embedded verbatim
+        want.extend_from_slice(&[0x1A, 0x00, 0x0F, 0x42, 0x40]); // min_coin = 1_000_000
+        assert_ledger_bytes(
+            &TxValidationError::BabbageOutputTooSmallUTxO {
+                outputs: vec![(hex::encode(&raw), 1_000_000)],
+            },
+            &want,
+            "BabbageOutputTooSmallUTxO",
+        );
+    }
+
+    /// Multiple offending outputs aggregate into ONE `NonEmpty` list —
+    /// mirroring Haskell's per-tx (not per-output) predicate failure.
+    #[test]
+    fn golden_babbage_output_too_small_utxo_aggregates_multiple_outputs() {
+        let raw_a = vec![0x82u8, 0x0A, 0x0B];
+        let raw_b = vec![0x82u8, 0x0C, 0x0D];
+        let mut want = vec![
+            0x82, 0x01, 0x82, 0x00, 0x82, 0x15, // Ledger/Utxow/Utxo[21]
+            0x82, // list(2)
+            0x82, // pair 1: array(2)
+        ];
+        want.extend_from_slice(&raw_a);
+        want.push(0x01); // min_coin = 1
+        want.push(0x82); // pair 2: array(2)
+        want.extend_from_slice(&raw_b);
+        want.push(0x02); // min_coin = 2
+        assert_ledger_bytes(
+            &TxValidationError::BabbageOutputTooSmallUTxO {
+                outputs: vec![(hex::encode(&raw_a), 1), (hex::encode(&raw_b), 2)],
+            },
+            &want,
+            "BabbageOutputTooSmallUTxO (multiple outputs)",
+        );
+    }
+
+    /// Malformed output hex must fall back to the generic mempool failure
+    /// rather than emit a wrong-shaped typed frame.
+    #[test]
+    fn golden_babbage_output_too_small_utxo_falls_back_on_malformed_hex() {
+        let got = ledger_failure_bytes(&TxValidationError::BabbageOutputTooSmallUTxO {
+            outputs: vec![("not-hex".to_string(), 1_000_000)],
+        });
+        // ConwayMempoolFailure: [7, text]
+        assert_eq!(got[0], 0x82);
+        assert_eq!(got[1], 0x07);
     }
 
     /// `ZeroTreasuryWithdrawals (GovAction era)` — GOV tag 15. The field is
