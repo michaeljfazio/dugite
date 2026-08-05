@@ -30,8 +30,12 @@ pub(crate) fn handle_gov_state(state: &NodeStateSnapshot) -> QueryResult {
 /// Shared by `GetGovState` (tag 24) and `GetRatifyState` (tag 32) — tag 32
 /// needs the same `EnactState`, and building it a second time by hand is how
 /// tag 24's copy came to be a hardcoded empty pulser while tag 32's was real
-/// (#992).
-fn gov_state_snapshot(state: &NodeStateSnapshot) -> GovStateSnapshot {
+/// (#992). Also reused by `GetDebugEpochState`/`GetDebugNewEpochState` (tags
+/// 8/12, #1027) for the embedded `UTxOState.utxosGovState` field — the same
+/// "build it by hand a second time" trap that produced #992 is exactly what
+/// left `DebugNewEpochState`'s `GovState` slot as a bare `array(0)`
+/// placeholder for as long as it was.
+pub(crate) fn gov_state_snapshot(state: &NodeStateSnapshot) -> GovStateSnapshot {
     GovStateSnapshot {
         proposals: state.governance_proposals.clone(),
         committee: state.committee.clone(),

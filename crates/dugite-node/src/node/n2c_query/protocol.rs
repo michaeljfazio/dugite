@@ -392,7 +392,11 @@ pub(crate) fn handle_account_state(state: &NodeStateSnapshot) -> QueryResult {
 /// `array(4) [ChainAccountState, LedgerState, SnapShots, NonMyopic]`
 ///
 /// `ChainAccountState` = `array(2)[treasury, reserves]`
-/// `LedgerState`       = simplified placeholder (CBOR-skippable)
+/// `LedgerState`       = `array(2)[CertState, UTxOState]`, real `GovState`
+///                       + pool-retirement + DRep + committee data embedded
+///                       (#1027); every other sub-field this codebase does
+///                       not independently track is structurally-correct
+///                       but empty (see [`QueryResult::DebugEpochState`]).
 /// `SnapShots`         = `array(4)[mark, set, go, fee]` with real data
 /// `NonMyopic`         = `array(2)[likelihoods_map, reward_pot]`
 ///
@@ -408,6 +412,10 @@ pub(crate) fn handle_debug_epoch_state(state: &NodeStateSnapshot) -> QueryResult
         snap_set: Box::new(state.snap_set.clone()),
         snap_go: Box::new(state.snap_go.clone()),
         snap_fee: state.snap_fee,
+        gov: Box::new(super::governance::gov_state_snapshot(state)),
+        retiring: state.pending_retirements.clone(),
+        dreps: state.drep_entries.clone(),
+        committee: Box::new(state.committee.clone()),
     }
 }
 
@@ -437,6 +445,10 @@ pub(crate) fn handle_debug_new_epoch_state(state: &NodeStateSnapshot) -> QueryRe
         snap_fee: state.snap_fee,
         total_active_stake: state.total_active_stake,
         pool_distr: state.stake_pools.clone(),
+        gov: Box::new(super::governance::gov_state_snapshot(state)),
+        retiring: state.pending_retirements.clone(),
+        dreps: state.drep_entries.clone(),
+        committee: Box::new(state.committee.clone()),
     }
 }
 
