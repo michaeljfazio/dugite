@@ -212,7 +212,7 @@ fn decode_conway_block_mode(
     // -------------------------------------------------------------------------
     // 4. auxiliary_data_set
     // -------------------------------------------------------------------------
-    let aux_map = decode_aux_data_map(&mut r)?;
+    let aux_map = decode_aux_data_map(&mut r, era)?;
 
     // -------------------------------------------------------------------------
     // 5. invalid_txs — list of tx indices that failed phase-1.
@@ -819,7 +819,7 @@ fn decode_sub_transactions(
                 r.read_null()?;
                 None
             } else {
-                Some(decode_auxiliary_data(r)?)
+                Some(decode_auxiliary_data(r, Era::Dijkstra)?)
             }
         };
 
@@ -3053,9 +3053,13 @@ fn read_plutus_data_depth(
 
 fn decode_aux_data_map(
     r: &mut Reader<'_>,
+    era: Era,
 ) -> Result<BTreeMap<u32, AuxiliaryData>, SerializationError> {
     // Use read_map to handle both definite- and indefinite-length maps.
-    let pairs = r.read_map(|r| Ok(r.read_uint()? as u32), |r| decode_auxiliary_data(r))?;
+    let pairs = r.read_map(
+        |r| Ok(r.read_uint()? as u32),
+        |r| decode_auxiliary_data(r, era),
+    )?;
     Ok(pairs.into_iter().collect())
 }
 
@@ -3063,8 +3067,11 @@ fn decode_aux_data_map(
 ///
 /// Delegates to the shared decoder. This copy handled all three shapes but
 /// still skipped the ShelleyMa array's native scripts. Issue #984.
-fn decode_auxiliary_data(r: &mut Reader<'_>) -> Result<AuxiliaryData, SerializationError> {
-    super::era_alonzo::decode_alonzo_auxiliary_data(r)
+fn decode_auxiliary_data(
+    r: &mut Reader<'_>,
+    era: Era,
+) -> Result<AuxiliaryData, SerializationError> {
+    super::era_alonzo::decode_alonzo_auxiliary_data(r, era)
 }
 
 // ============================================================================
@@ -3130,7 +3137,7 @@ pub(crate) fn decode_conway_tx_standalone(
             r.read_null()?;
             None
         } else {
-            Some(decode_auxiliary_data(&mut r)?)
+            Some(decode_auxiliary_data(&mut r, era)?)
         }
     };
 
@@ -3217,7 +3224,7 @@ pub(crate) fn decode_dijkstra_tx_standalone(
             r.read_null()?;
             None
         } else {
-            Some(decode_auxiliary_data(&mut r)?)
+            Some(decode_auxiliary_data(&mut r, Era::Dijkstra)?)
         }
     };
 
