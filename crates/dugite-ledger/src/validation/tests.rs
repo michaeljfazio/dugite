@@ -16557,6 +16557,112 @@ mod tests {
         );
     }
 
+    /// PV11+ (Dijkstra, PV12) + V4 script + overlap → REJECT with
+    /// `ReferenceInputsNotDisjointFromInputs`, same as V3 above.
+    ///
+    /// Issue #1000: `IntersectMBO/cardano-ledger` @
+    /// `4849c13d6f70e5ab46add9af6e0ec5c537b61f69`,
+    /// `eras/dijkstra/impl/src/Cardano/Ledger/Dijkstra/TxInfo.hs` —
+    /// `instance EraPlutusTxInfo 'PlutusV4 DijkstraEra`'s `toPlutusTxInfo`
+    /// (`mkAnyLevelTxInfo`) calls `Conway.checkReferenceInputsNotDisjointFromInputs
+    /// txBody` UNCONDITIONALLY, identically to the V3 Dijkstra instance a few
+    /// lines above it in the same file. dugite's gate at
+    /// `validation/mod.rs` originally only matched `v == 3`
+    /// (`any_v3_executed`), so this exact scenario with a V4 script instead of
+    /// V3 was silently ACCEPTED — an accept-where-Haskell-rejects divergence.
+    ///
+    /// V4 has no witness-set slot (see `dugite_uplc::redeemer_resolve::
+    /// find_script_bytes`'s doc comment), so unlike the V1/V2/V3 tests above,
+    /// the script is provided via `script_ref` — the only real on-chain V4
+    /// surface.
+    #[test]
+    fn test_pv11_v4_overlap_rejected_with_disjointness_error() {
+        use dugite_primitives::address::EnterpriseAddress;
+        use dugite_primitives::credentials::Credential;
+        use dugite_primitives::network::NetworkId;
+        use dugite_primitives::transaction::ScriptRef;
+
+        let script_bytes = vec![0x49u8, 0x48, 0x01, 0x00, 0x00, 0x21, 0x20, 0x01];
+        let script_ref = ScriptRef::PlutusV4(script_bytes.clone());
+        // Hash prefix 0x04 (matches `compute_script_ref_hash`'s PlutusV4 arm) —
+        // computed directly here, same style as the V1/V2/V3 tests above
+        // (`blake2b_224_tagged(3, &script_bytes)`), to avoid a `super::`
+        // module-path dependency on `validation::scripts`.
+        let script_hash = dugite_primitives::hash::blake2b_224_tagged(4, &script_bytes);
+
+        let mut utxo_set = UtxoSet::new();
+        let input = TransactionInput {
+            transaction_id: Hash32::from_bytes([0x66; 32]),
+            index: 0,
+        };
+        let address = Address::Enterprise(EnterpriseAddress {
+            network: NetworkId::Mainnet,
+            payment: Credential::Script(script_hash),
+        });
+        utxo_set.insert(
+            input.clone(),
+            TransactionOutput {
+                address,
+                value: Value::lovelace(10_000_000),
+                datum: OutputDatum::None,
+                script_ref: Some(script_ref),
+                is_legacy: false,
+                raw_cbor: None,
+            },
+        );
+        let collateral = TransactionInput {
+            transaction_id: Hash32::from_bytes([0x9a; 32]),
+            index: 0,
+        };
+        utxo_set.insert(
+            collateral.clone(),
+            TransactionOutput {
+                address: Address::Byron(ByronAddress {
+                    payload: vec![0u8; 32],
+                }),
+                value: Value::lovelace(5_000_000),
+                datum: OutputDatum::None,
+                script_ref: None,
+                is_legacy: false,
+                raw_cbor: None,
+            },
+        );
+
+        // No witness-set script for V4 — resolved entirely via `script_ref`.
+        let mut tx = make_simple_tx(input.clone(), 9_000_000, 1_000_000);
+        tx.witness_set.redeemers = vec![Redeemer {
+            tag: RedeemerTag::Spend,
+            index: 0,
+            data: dugite_primitives::transaction::PlutusData::Integer(num_bigint::BigInt::from(
+                0i64,
+            )),
+            ex_units: ExUnits {
+                mem: 1_000_000,
+                steps: 1_000_000,
+            },
+        }];
+        tx.body.reference_inputs.push(input);
+        tx.body.collateral = vec![collateral];
+
+        let mut params = ProtocolParameters::mainnet_defaults();
+        params.protocol_version_major = 12; // Dijkstra — the only PV a V4 script is valid at.
+
+        let errors = validate_transaction(&tx, &utxo_set, &params, 100, 300, None)
+            .expect_err("V4 overlap at PV12 must be rejected");
+        assert!(
+            errors
+                .iter()
+                .any(|e| matches!(e, ValidationError::ReferenceInputsNotDisjointFromInputs(_))),
+            "expected ReferenceInputsNotDisjointFromInputs at PV12+V4, got {errors:?}"
+        );
+        assert!(
+            !errors
+                .iter()
+                .any(|e| matches!(e, ValidationError::ReferenceInputOverlapsInput(_))),
+            "phase-1 ReferenceInputOverlapsInput must not fire at PV12, got {errors:?}"
+        );
+    }
+
     // ── IsValidTagMismatch (#522) ─────────────────────────────────────────────
 
     /// A transaction with `is_valid=false` and NO Plutus scripts (no redeemers)
