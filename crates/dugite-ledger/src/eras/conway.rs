@@ -1454,7 +1454,17 @@ impl EraRules for ConwayRules {
 ///
 /// Non-Conway cert variants are ignored (no-op). Callers must invoke the
 /// Shelley-era handler separately for those.
-fn apply_conway_cert(
+///
+/// `pub(crate)` (rather than private) so the Dijkstra SUBCERT pipeline
+/// (`eras::dijkstra::apply_sub_transactions`) can reuse it verbatim — per
+/// the oracle-verified pin at `IntersectMBO/cardano-ledger`
+/// `4849c13d6f70e5ab46add9af6e0ec5c537b61f69`,
+/// `Rules/SubDeleg.hs`/`Rules/SubPool.hs`/`Rules/SubGovCert.hs` each
+/// wire `transitionRules = [Conway.conway*Transition]` — a LITERAL, direct
+/// reuse of the exact same Conway functions this file's `apply_valid_tx`
+/// (parent-tx path) already calls per cert. Reusing this function keeps
+/// both call sites byte-identical instead of drifting into two copies.
+pub(crate) fn apply_conway_cert(
     cert: &Certificate,
     current_epoch: EpochNo,
     certs: &mut CertSubState,
