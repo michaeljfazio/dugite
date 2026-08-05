@@ -71,6 +71,7 @@
 - [Committee state encoding bugs](n2c-committee-state-bugs.md) — open: wrong source map, hardcoded hot credential type
 
 ## N2N Protocol
+- [#1003 NodePeerManager dead-code audit](issue-1003-peermanager-dead-code-audit.md) — oracle-verified: no BlockFetch-success reward upstream (deleted), inbound-maturity GC IS upstream pattern (wired), no unified PeerCategory (deleted), no IP-only conn lookup (deleted). LIB vs BIN dead-code ground-truth methodology.
 - [ChainSync server direction bug](network-chainsync-direction-bug.md) — InitiatorAndResponder confusion; TxSubmission2 deadlock
 - [Duplex connection architecture](network-duplex-connection.md) — Phase 1+2 done; pallas plexer semantics
 - [Duplex Phase 3 integration](node-duplex-phase3.md) — into_pipelined() conversion; TxSubmission2 responder JoinHandle
@@ -100,6 +101,8 @@
 - [UTxO --tx-in query](cli-utxo-txin-query.md) — GetUTxOByTxIn (tag 15) wire format
 - [Stake address info](cli-stake-address-info.md) — server-side filtering via tag 10
 - [P1 commands](cli-p1-commands.md) — calculate-min-fee, calculate-min-required-utxo, policyid, pool-params, slot-number, kes-period-info
+- [#998 CIP-0094 poll commands NOT implemented](issue-998-cip94-poll-commands-removed.md) — cardano-cli deleted them May 2025 (PR #1178); closed not-planned. Follow-up #1006: CLI surface-enumeration gate.
+- [#1006 CLI surface-parity gate built](issue-1006-cli-surface-parity-gate.md) — recursive `--help` walker; 2 parser bugs found by running it (empty-key bash assoc-array, ANSI/blank-line block terminator); 82 real gaps filed as #1008.
 
 ## TUI
 - [Layout polish](tui-layout-polish.md) — wide mode, kv_aligned patterns, Monokai theme, RTT bar
