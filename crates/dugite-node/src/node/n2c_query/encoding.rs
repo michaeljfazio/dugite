@@ -396,10 +396,21 @@ pub(crate) fn encode_query_result_value(
         } => {
             encode_ratify_state(enc, gov, enacted, expired, *delayed);
         }
-        QueryResult::NoFuturePParams => {
-            // GetFuturePParams result: Maybe PParams = Nothing
-            // Haskell encodeMaybe: Nothing = encodeListLen 0 = empty array (0x80)
-            enc.array(0).ok();
+        QueryResult::FuturePParamsResult(payload) => {
+            // GetFuturePParams (tag 33) result: Maybe PParams, via Haskell's
+            // generic `encodeMaybe`: `array(0)` for Nothing, `array(1)[pp]`
+            // for `Just pp` — oracle-verified against
+            // `Ouroboros.Consensus.Shelley.Ledger.Query.queryFuturePParams`.
+            // NOT the 3-way FuturePParams sum tag used inside GetGovState.
+            match payload {
+                None => {
+                    enc.array(0).ok();
+                }
+                Some(pp) => {
+                    enc.array(1).ok();
+                    encode_protocol_params_cbor(enc, pp);
+                }
+            }
         }
         QueryResult::PoolDistr2 {
             pools,
@@ -1759,8 +1770,49 @@ fn encode_ratify_state(
     encode_protocol_params_cbor(enc, &gov.prev_pparams);
     // ensTreasury
     enc.u64(gov.treasury).ok();
-    // ensWithdrawals: empty map
-    enc.map(0).ok();
+    // ensWithdrawals: Map (Credential Staking) Coin.
+    //
+    // Oracle-verified (cardano-ledger `Conway/Governance/Internal.hs`
+    // `mkEnactState` / RATIFY's ENACT fold): this resets to empty only once
+    // per epoch boundary (`mkEnactState`, called from
+    // `setFreshDRepPulsingState`) and ACCUMULATES — via `Map.unionWith (<>)`
+    // — every `TreasuryWithdrawals` action accepted during that epoch's
+    // ratification pass. It is NOT "only transiently non-empty during
+    // ratification"; a client querying `GetRatifyState` at any point in an
+    // epoch where a withdrawal was accepted sees it until the next boundary
+    // applies it. Previously hardcoded empty here — correct only in the
+    // (overwhelmingly common, and therefore easy to mistake for "always")
+    // case where no withdrawal is queued; see #966 for the identical trap on
+    // `ensTreasury` itself.
+    //
+    // `enacted` (== the frozen `rsEnacted`/`gov.ratify_enacted`) already
+    // carries the full accepted-action list this pass decided on, so no new
+    // state is needed: filter it for `TreasuryWithdrawals` and re-key each
+    // 29-byte reward account as `Credential Staking` (header bit 0x10 per
+    // `dugite_ledger::eras::common::reward_account_to_hash`'s convention:
+    // 0xe0/0xe1 = key, 0xf0/0xf1 = script), summing amounts for a credential
+    // that appears in more than one accepted action this pass.
+    let mut ens_withdrawals: std::collections::BTreeMap<(u8, Vec<u8>), u64> =
+        std::collections::BTreeMap::new();
+    for (proposal, _gas_id) in enacted {
+        if let GovAction::TreasuryWithdrawals { withdrawals, .. } = &proposal.gov_action {
+            for (acct, coin) in withdrawals {
+                if acct.len() != 29 {
+                    continue; // malformed account; defensively skip rather than panic
+                }
+                let cred_type = if acct[0] & 0x10 != 0 { 1u8 } else { 0u8 };
+                let hash = acct[1..29].to_vec();
+                *ens_withdrawals.entry((cred_type, hash)).or_insert(0) += coin.0;
+            }
+        }
+    }
+    enc.map(ens_withdrawals.len() as u64).ok();
+    for ((cred_type, hash), coin) in &ens_withdrawals {
+        enc.array(2).ok();
+        enc.u8(*cred_type).ok();
+        enc.bytes(hash).ok();
+        enc.u64(*coin).ok();
+    }
     // ensPrevGovActionIds: GovRelation StrictMaybe = array(4)
     enc.array(4).ok();
     let roots = [
@@ -3011,6 +3063,181 @@ mod tests {
         assert_eq!(rd.array().unwrap(), Some(1), "rsExpired carries one id");
         rd.skip().unwrap();
         assert!(rd.bool().unwrap(), "rsDelayed must be the real value");
+    }
+
+    /// `ensWithdrawals` (EnactState field [5]) must be derived from every
+    /// `TreasuryWithdrawals` action in `rsEnacted`, not hardcoded empty.
+    ///
+    /// Oracle-verified against `mkEnactState` / RATIFY's ENACT fold
+    /// (`Conway/Governance/Internal.hs`): the map accumulates via
+    /// `Map.unionWith (<>)` across every accepted `TreasuryWithdrawals`
+    /// action in the pass, keyed by `Credential Staking` (not the raw
+    /// 29-byte reward account), and is visible for the REST of the epoch —
+    /// not just transiently during ratification.
+    #[test]
+    fn ratify_state_ens_withdrawals_from_enacted_treasury_withdrawals() {
+        use crate::node::n2c_query::types::{
+            CommitteeSnapshot, GovActionId, GovStateSnapshot, ProposalSnapshot,
+            ProtocolParamsSnapshot,
+        };
+        use dugite_primitives::transaction::GovAction;
+        use dugite_primitives::value::Lovelace;
+        use std::collections::BTreeMap;
+
+        let key_account = {
+            let mut a = vec![0xe0u8]; // key-hash reward account header
+            a.extend_from_slice(&[0x11; 28]);
+            a
+        };
+        let script_account = {
+            let mut a = vec![0xf1u8]; // script-hash reward account header
+            a.extend_from_slice(&[0x22; 28]);
+            a
+        };
+        let mut withdrawals_a: BTreeMap<Vec<u8>, Lovelace> = BTreeMap::new();
+        withdrawals_a.insert(key_account.clone(), Lovelace(1_000_000));
+        withdrawals_a.insert(script_account.clone(), Lovelace(2_000_000));
+
+        // A second accepted action re-pays the SAME key credential — must
+        // SUM (Map.unionWith (<>)), not overwrite.
+        let mut withdrawals_b: BTreeMap<Vec<u8>, Lovelace> = BTreeMap::new();
+        withdrawals_b.insert(key_account.clone(), Lovelace(500_000));
+
+        let make_proposal = |idx: u32, withdrawals: BTreeMap<Vec<u8>, Lovelace>| ProposalSnapshot {
+            tx_id: vec![0xAA; 32],
+            action_index: idx,
+            action_type: "TreasuryWithdrawals".to_string(),
+            proposed_epoch: 10,
+            expires_epoch: 16,
+            yes_votes: 5,
+            no_votes: 0,
+            abstain_votes: 0,
+            deposit: 100_000_000_000,
+            return_addr: vec![0xe0; 29],
+            anchor_url: "https://example.invalid/w.json".to_string(),
+            anchor_hash: vec![0x11; 32],
+            gov_action: GovAction::TreasuryWithdrawals {
+                withdrawals,
+                policy_hash: None,
+            },
+            committee_votes: Vec::new(),
+            drep_votes: Vec::new(),
+            spo_votes: Vec::new(),
+        };
+        let proposal_a = make_proposal(0, withdrawals_a);
+        let proposal_b = make_proposal(1, withdrawals_b);
+        let id_a = GovActionId {
+            tx_id: vec![0xAA; 32],
+            action_index: 0,
+        };
+        let id_b = GovActionId {
+            tx_id: vec![0xAA; 32],
+            action_index: 1,
+        };
+
+        let pp = Box::new(ProtocolParamsSnapshot::default());
+        let gov = GovStateSnapshot {
+            proposals: Vec::new(),
+            committee: CommitteeSnapshot::default(),
+            constitution_url: String::new(),
+            constitution_hash: vec![0u8; 32],
+            constitution_script: None,
+            cur_pparams: pp.clone(),
+            enact_cur_pparams: pp.clone(),
+            prev_pparams: pp,
+            enacted_pparam_update: None,
+            enacted_hard_fork: None,
+            enacted_committee: None,
+            enacted_constitution: None,
+            treasury: 999,
+            future_pparams_tag: 0,
+            future_pparams: None,
+            pulser_proposals: Vec::new(),
+            pulser_drep_distr: Vec::new(),
+            pulser_drep_state: Vec::new(),
+            pulser_pool_distr: Vec::new(),
+            ratify_enacted: vec![(proposal_a, id_a), (proposal_b, id_b)],
+            ratify_expired: Vec::new(),
+            ratify_delayed: false,
+        };
+
+        let encoded = encode_query_result(&QueryResult::RatifyState {
+            gov: Box::new(gov.clone()),
+            enacted: gov.ratify_enacted.clone(),
+            expired: gov.ratify_expired.clone(),
+            delayed: gov.ratify_delayed,
+        });
+        let inner = strip_wrappers_for_test(&encoded);
+        let mut dec = Decoder::new(&inner);
+        assert_eq!(dec.array().unwrap(), Some(4), "RatifyState is array(4)");
+
+        // [0] EnactState = array(7): walk to field [5] = ensWithdrawals.
+        assert_eq!(dec.array().unwrap(), Some(7), "EnactState is array(7)");
+        for _ in 0..5 {
+            dec.skip().unwrap(); // committee, constitution, curPParams, prevPParams, treasury
+        }
+        let map_len = dec
+            .map()
+            .unwrap()
+            .expect("ensWithdrawals is a definite map");
+        assert_eq!(
+            map_len, 2,
+            "ensWithdrawals must contain both credentials, not be hardcoded empty"
+        );
+        let mut entries: Vec<(u8, Vec<u8>, u64)> = Vec::new();
+        for _ in 0..map_len {
+            dec.array().unwrap(); // Credential = array(2)
+            let cred_type = dec.u8().unwrap();
+            let hash = dec.bytes().unwrap().to_vec();
+            let coin = dec.u64().unwrap();
+            entries.push((cred_type, hash, coin));
+        }
+        entries.sort();
+        assert_eq!(
+            entries,
+            vec![
+                (0u8, vec![0x11; 28], 1_500_000u64), // key credential: 1_000_000 + 500_000 summed
+                (1u8, vec![0x22; 28], 2_000_000u64), // script credential
+            ],
+            "amounts for a credential repeated across accepted actions must sum, \
+             and the account header byte must be resolved into the right \
+             Credential discriminator (0=key, 1=script)"
+        );
+    }
+
+    /// GetFuturePParams (tag 33) — oracle-verified as a bare `Maybe (PParams
+    /// era)` (`array(0)`/`array(1)[pp]`), a DIFFERENT shape from the 3-way
+    /// `FuturePParams` sum embedded in `GetGovState`. Before this fix the
+    /// handler was hardcoded to always answer `Nothing`, undetected by the
+    /// `future-pparams` cli-parity check because every recorded sample
+    /// happened to be genuinely empty.
+    #[test]
+    fn future_pparams_tag33_nothing() {
+        let encoded = encode_query_result(&QueryResult::FuturePParamsResult(None));
+        let inner = strip_wrappers_for_test(&encoded);
+        assert_eq!(inner, vec![0x80], "Nothing = array(0)");
+    }
+
+    #[test]
+    fn future_pparams_tag33_just_wraps_bare_pparams_no_extra_tag() {
+        use crate::node::n2c_query::types::ProtocolParamsSnapshot;
+        let pp = Box::new(ProtocolParamsSnapshot {
+            min_fee_a: 44,
+            min_fee_b: 155381,
+            ..ProtocolParamsSnapshot::default()
+        });
+        let encoded = encode_query_result(&QueryResult::FuturePParamsResult(Some(pp.clone())));
+        let inner = strip_wrappers_for_test(&encoded);
+        let mut dec = Decoder::new(&inner);
+        assert_eq!(dec.array().unwrap(), Some(1), "Just = array(1)");
+        // The payload is the bare PParams array(31) — no 3-way sum tag, no
+        // extra StrictMaybe wrapper (that shape belongs to GetGovState's
+        // embedded FuturePParams field, tag 24 field [5], not this query).
+        assert_eq!(
+            dec.array().unwrap(),
+            Some(31),
+            "payload is the bare PParams array(31), not tag-wrapped"
+        );
     }
 
     // ── Helper: strip the MsgResult [4, [result]] wrappers from a full
