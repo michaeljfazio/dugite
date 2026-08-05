@@ -1772,6 +1772,21 @@ impl Node {
                 std::sync::Arc::make_mut(&mut ledger.gov.governance)
                     .committee_expiration
                     .insert(cold_key, dugite_primitives::EpochNo(*expiration));
+                // `ConwayGenesis::committee_members` encodes the credential KIND
+                // in byte 28 (0x01 = script), but every consumer reads it from
+                // `script_committee_credentials` instead — two representations
+                // of one fact. Seeding only the first left `committee-state`,
+                // `gov-state` and `ledger-state` reporting a genesis script
+                // member as `keyHash-…` where cardano-node says `scriptHash-…`
+                // (preview's sole genesis CC member is a script hash).
+                //
+                // `main.rs`'s fresh-ledger path already did this; `Node::new` —
+                // the path a real node takes — did not.
+                if hash_bytes[28] == 0x01 {
+                    std::sync::Arc::make_mut(&mut ledger.gov.governance)
+                        .script_committee_credentials
+                        .insert(cold_key);
+                }
             }
             debug!(
                 "Seeded {} initial committee members from Conway genesis",

@@ -416,6 +416,7 @@ pub(crate) fn handle_debug_epoch_state(state: &NodeStateSnapshot) -> QueryResult
         retiring: state.pending_retirements.clone(),
         dreps: state.drep_entries.clone(),
         committee: Box::new(state.committee.clone()),
+        gen_delegs: state.gen_delegs.clone(),
     }
 }
 
@@ -449,6 +450,7 @@ pub(crate) fn handle_debug_new_epoch_state(state: &NodeStateSnapshot) -> QueryRe
         retiring: state.pending_retirements.clone(),
         dreps: state.drep_entries.clone(),
         committee: Box::new(state.committee.clone()),
+        gen_delegs: state.gen_delegs.clone(),
     }
 }
 

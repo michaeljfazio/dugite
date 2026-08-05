@@ -308,10 +308,11 @@ pub(crate) fn encode_query_result_value(
             retiring,
             dreps,
             committee,
+            gen_delegs,
         } => {
             encode_debug_epoch_state(
                 enc, *treasury, *reserves, snap_mark, snap_set, snap_go, *snap_fee, gov, retiring,
-                dreps, committee,
+                dreps, committee, gen_delegs,
             );
         }
         QueryResult::DebugNewEpochState {
@@ -330,6 +331,7 @@ pub(crate) fn encode_query_result_value(
             retiring,
             dreps,
             committee,
+            gen_delegs,
         } => {
             encode_debug_new_epoch_state(
                 enc,
@@ -348,6 +350,7 @@ pub(crate) fn encode_query_result_value(
                 retiring,
                 dreps,
                 committee,
+                gen_delegs,
             );
         }
         QueryResult::DebugChainDepState {
@@ -2098,6 +2101,7 @@ fn encode_ledger_state(
     retiring: &[(Vec<u8>, u64)],
     dreps: &[crate::node::n2c_query::types::DRepSnapshot],
     committee: &crate::node::n2c_query::types::CommitteeSnapshot,
+    gen_delegs: &[(Vec<u8>, Vec<u8>, Vec<u8>)],
 ) {
     enc.array(2).ok();
 
@@ -2126,11 +2130,21 @@ fn encode_ledger_state(
     // DState = array(4)[dsAccounts, dsFutureGenDelegs, dsGenDelegs, dsIRewards]
     enc.array(4).ok();
     enc.map(0).ok(); // dsAccounts (ConwayAccounts) — per-credential balance/deposit/pool-deleg/drep-deleg, not tracked here
-    enc.map(0).ok(); // dsFutureGenDelegs
-    enc.map(0).ok(); // dsGenDelegs
-                     // InstantaneousRewards = array(4)[reserves_map, treasury_map, delta_reserves, delta_treasury].
-                     // Structurally always-present even though MIR certificates were removed
-                     // from Conway's own CDDL (#1023) — always empty/zero on a real Conway chain.
+    enc.map(0).ok(); // dsFutureGenDelegs — pending GenesisKeyDelegations; always empty on Conway (the cert is gone, #1023)
+                     // dsGenDelegs — REAL data: Map<genesis_key_hash(28) -> GenDelegPair>,
+                     // where `GenDelegPair = array(2)[delegate_key_hash(28), vrf_key_hash(32)]`.
+                     // A real cardano-node answers with the full map (7 entries on preview);
+                     // this was previously hardcoded `map(0)`.
+    enc.map(gen_delegs.len() as u64).ok();
+    for (genesis_hash, delegate_hash, vrf_hash) in gen_delegs {
+        enc.bytes(genesis_hash).ok();
+        enc.array(2).ok();
+        enc.bytes(delegate_hash).ok();
+        enc.bytes(vrf_hash).ok();
+    }
+    // InstantaneousRewards = array(4)[reserves_map, treasury_map, delta_reserves, delta_treasury].
+    // Structurally always-present even though MIR certificates were removed
+    // from Conway's own CDDL (#1023) — always empty/zero on a real Conway chain.
     enc.array(4).ok();
     enc.map(0).ok();
     enc.map(0).ok();
@@ -2208,6 +2222,7 @@ fn encode_debug_epoch_state(
     retiring: &[(Vec<u8>, u64)],
     dreps: &[crate::node::n2c_query::types::DRepSnapshot],
     committee: &crate::node::n2c_query::types::CommitteeSnapshot,
+    gen_delegs: &[(Vec<u8>, Vec<u8>, Vec<u8>)],
 ) {
     // EpochState = array(4) [AccountState, LedgerState, SnapShots, NonMyopic]
     enc.array(4).ok();
@@ -2218,7 +2233,7 @@ fn encode_debug_epoch_state(
     enc.u64(reserves).ok();
 
     // [1] LedgerState — see `encode_ledger_state` (#1027).
-    encode_ledger_state(enc, gov, retiring, dreps, committee);
+    encode_ledger_state(enc, gov, retiring, dreps, committee, gen_delegs);
 
     // [2] SnapShots = array(4) [mark, set, go, fee]
     enc.array(4).ok();
@@ -2255,6 +2270,7 @@ fn encode_debug_new_epoch_state(
     retiring: &[(Vec<u8>, u64)],
     dreps: &[crate::node::n2c_query::types::DRepSnapshot],
     committee: &crate::node::n2c_query::types::CommitteeSnapshot,
+    gen_delegs: &[(Vec<u8>, Vec<u8>, Vec<u8>)],
 ) {
     // Full Haskell-compatible NewEpochState (array(7)):
     //
@@ -2301,7 +2317,7 @@ fn encode_debug_new_epoch_state(
     enc.u64(reserves).ok();
 
     // [3][1] LedgerState — see `encode_ledger_state` (#1027).
-    encode_ledger_state(enc, gov, retiring, dreps, committee);
+    encode_ledger_state(enc, gov, retiring, dreps, committee, gen_delegs);
 
     // [3][2] SnapShots = array(4) [mark, set, go, fee]
     enc.array(4).ok();
@@ -2329,6 +2345,22 @@ fn encode_debug_new_epoch_state(
     // entirely. `individualTotalPoolStake` is the pool's own absolute stake
     // in lovelace, which is already `pool.stake` (the same value used as the
     // ratio's numerator) — no new data needed, just the missing field.
+    // `pdTotalActiveStake` is a `NonZero Coin` upstream, NOT a plain Coin:
+    //
+    //   data PoolDistr = PoolDistr
+    //     { unPoolDistr        :: !(Map (KeyHash StakePool) IndividualPoolStake)
+    //     , pdTotalActiveStake :: !(NonZero Coin) }
+    //
+    // (cardano-ledger `libs/cardano-ledger-core/.../State/PoolDistr.hs`.)
+    // A literal `0` therefore fails to DECODE — `NonZero`'s reader rejects it
+    // — so on a chain with no active stake (origin, or any pre-delegation
+    // epoch) the whole `NewEpochState` reply became undecodable. The `.max(1)`
+    // clamp was already applied to the ratio DENOMINATOR on the line below and
+    // simply never reached the encoded field; a real cardano-node at the same
+    // point emits `1` here for exactly this reason.
+    //
+    // The same clamp is applied by `encode_stake_snapshots` (tag 20) — see
+    // `test_stake_snapshots_zero_totals_encode_as_one`.
     let total = total_active_stake.max(1);
     enc.array(2).ok();
     enc.map(pool_distr.len() as u64).ok();
@@ -2339,7 +2371,7 @@ fn encode_debug_new_epoch_state(
         enc.u64(pool.stake).ok();
         enc.bytes(&pool.vrf_keyhash).ok();
     }
-    enc.u64(total_active_stake).ok();
+    enc.u64(total).ok();
 
     // [6] StashedAVVMAddresses = () = CBOR null. See the doc comment above.
     enc.null().ok();
@@ -3037,6 +3069,7 @@ mod tests {
             retiring,
             dreps,
             committee: Box::new(committee),
+            gen_delegs: vec![(vec![0x11u8; 28], vec![0x22u8; 28], vec![0x33u8; 32])],
         };
 
         let encoded = encode_query_result(&result);
@@ -3125,7 +3158,27 @@ mod tests {
         assert_eq!(dec.array().unwrap(), Some(4), "DState must be array(4)");
         assert_eq!(dec.map().unwrap(), Some(0)); // dsAccounts
         assert_eq!(dec.map().unwrap(), Some(0)); // dsFutureGenDelegs
-        assert_eq!(dec.map().unwrap(), Some(0)); // dsGenDelegs
+                                                 // dsGenDelegs must carry the REAL genesis-delegation map. It was
+                                                 // hardcoded `map(0)` until #1027; a real cardano-node answers with the
+                                                 // full map (7 entries on preview), so an empty one is a content
+                                                 // divergence, not an upstream-matching omission.
+        assert_eq!(
+            dec.map().unwrap(),
+            Some(1),
+            "dsGenDelegs must carry the real genesis delegations"
+        );
+        assert_eq!(dec.bytes().unwrap(), &[0x11u8; 28], "genesis key hash");
+        assert_eq!(
+            dec.array().unwrap(),
+            Some(2),
+            "GenDelegPair must be array(2)[delegate_key_hash, vrf_key_hash]"
+        );
+        assert_eq!(
+            dec.bytes().unwrap(),
+            &[0x22u8; 28],
+            "delegate key hash (28)"
+        );
+        assert_eq!(dec.bytes().unwrap(), &[0x33u8; 32], "VRF key hash (32)");
         assert_eq!(
             dec.array().unwrap(),
             Some(4),
@@ -3203,6 +3256,63 @@ mod tests {
             "StashedAVVMAddresses must be CBOR null (0xf6), not array(0)"
         );
         dec.null().unwrap();
+    }
+
+    /// #1027 root cause: `PoolDistr.pdTotalActiveStake` is a `NonZero Coin`
+    /// upstream, so a literal `0` makes the WHOLE `NewEpochState` reply
+    /// undecodable — which is exactly what `cardano-cli query ledger-state`
+    /// hit on any chain with no active stake (origin, or any pre-delegation
+    /// epoch). A real cardano-node at the same point emits `1`.
+    ///
+    /// This is deliberately asserted on the ENCODED BYTES rather than on the
+    /// snapshot value: the `.max(1)` clamp already existed for the ratio
+    /// denominator and simply never reached the encoded field, so a test that
+    /// only checked the clamp's input would have passed against the bug.
+    #[test]
+    fn pool_distr_total_active_stake_is_never_encoded_as_zero() {
+        use crate::node::n2c_query::types::GovStateSnapshot;
+
+        let result = QueryResult::DebugNewEpochState {
+            epoch: 0,
+            blocks_made_prev: vec![],
+            blocks_made_cur: vec![],
+            treasury: 0,
+            reserves: 15_000_000_000_000_000,
+            snap_mark: Box::new(SnapshotStakeData::default()),
+            snap_set: Box::new(SnapshotStakeData::default()),
+            snap_go: Box::new(SnapshotStakeData::default()),
+            snap_fee: 0,
+            // The origin case: no pools, so no active stake.
+            total_active_stake: 0,
+            pool_distr: vec![],
+            gov: Box::new(GovStateSnapshot::default()),
+            retiring: vec![],
+            dreps: vec![],
+            committee: Box::new(CommitteeSnapshot::default()),
+            gen_delegs: vec![],
+        };
+
+        let encoded = encode_query_result(&result);
+        let mut dec = Decoder::new(&encoded);
+        dec.array().unwrap(); // MsgResult array(2)
+        dec.u32().unwrap(); // 4
+        dec.array().unwrap(); // HFC success array(1)
+        assert_eq!(dec.array().unwrap(), Some(7)); // NewEpochState
+        dec.u64().unwrap(); // [0] EpochNo
+        dec.skip().unwrap(); // [1] BlocksMade prev
+        dec.skip().unwrap(); // [2] BlocksMade cur
+        dec.skip().unwrap(); // [3] EpochState
+        dec.skip().unwrap(); // [4] StrictMaybe RewardUpdate
+
+        // [5] PoolDistr = array(2)[map, pdTotalActiveStake]
+        assert_eq!(dec.array().unwrap(), Some(2));
+        assert_eq!(dec.map().unwrap(), Some(0), "no pools at origin");
+        assert_eq!(
+            dec.u64().unwrap(),
+            1,
+            "pdTotalActiveStake is a NonZero Coin upstream — encoding 0 makes \
+             the entire NewEpochState reply undecodable by cardano-cli"
+        );
     }
 
     /// GOLDEN (#977): `futurePParams` must encode as a real tagged sum.
