@@ -1,0 +1,33 @@
+# kes-round.allowed-errors — checked-in allowlist for assert_no_other_errors  (#1037/#1041)
+#
+# One extended-regex per line; blank lines and `#` comments are ignored
+# (lib/expect-log-errors.sh's assert_no_other_errors). Every entry here is an
+# ERROR-class line (per $LOG_ERROR_PATTERN in
+# .claude/skills/devnet-validate/scripts/lib/log-level-counts.sh) that
+# kes-round.sh EXPECTS on dugite-bp's log because the round deliberately
+# provoked it. Each entry here has a matching expect_log_errors call in
+# kes-round.sh — an allowlist entry without one would silently widen the net
+# for no reason.
+
+# Step 2 (#1037): once dugite-bp's KES key evolves past maxKESEvolutions,
+# every subsequent VRF-elected slot bails out of forge_block() with this
+# exact message (crates/dugite-node/src/forge.rs:344-351), logged at ERROR by
+# the TraceForgeStateUpdateError wrapper around the forge_block() call site
+# (crates/dugite-node/src/node/mod.rs, ~line 10560-10570). This is the fault
+# under test — see the matching expect_log_errors in step 2. Left un-anchored
+# at the tail (no "> max ..." suffix) so a future change to
+# slotsPerKESPeriod/maxKESEvolutions in the genesis overlay doesn't also need
+# an edit here.
+TraceForgeStateUpdateError: block forging failed: KES key expired
+
+# Steps 3-5 each SIGTERM dugite-bp and relaunch it via
+# restart-dugite-bp.sh with new KES/opcert files. dugite-bp's own graceful-
+# shutdown path logs this at ERROR if it exceeds its internal 30s
+# flush/persist/quiesce budget before forcing exit
+# (crates/dugite-node/src/node/mod.rs:6190). kes-round.sh's own
+# stop_dugite_bp() already waits up to 40s for the process to die before
+# proceeding, so this should not fire in the common case — allowlisted
+# defensively for a slow CI runner, since a restart that is merely SLOW is
+# not the defect this round exists to catch (the round's own post-restart
+# forging/adoption checks are the load-bearing assertions, not this line).
+Graceful shutdown \(flush/persist/quiesce\) timed out after 30s, forcing exit
