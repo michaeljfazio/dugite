@@ -1,0 +1,4 @@
+{
+  "_comment": "Conway spec overlay for gov-enactment-round Act 3 (#1036/#1039). Merged as the third layer via LD_CONWAY_SPEC_EXTRA. govActionLifetime=2 makes governance-action EXPIRY affordable at 400-slot epochs (the checked-in default of 6 puts expiry ~40 min out, past any round budget). Note: ALL actions in the round see the short lifetime — Acts 1/2 must land their votes within 2 epochs of submission.",
+  "govActionLifetime": 2
+}
