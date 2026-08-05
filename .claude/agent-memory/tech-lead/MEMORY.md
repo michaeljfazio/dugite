@@ -1,5 +1,11 @@
 # Tech Lead Agent Memory
 
+## #1050/#1051 fix: collateral + refinput wire arms (2026-08-06)
+- [Full fix writeup](issue-1050-1051-collateral-refinput-wire-fixes.md) — implements the gaps found by the shakedown below. InsufficientCollateral/CollateralHasTokens now carry balance+required / the offending Value; CollateralContainsNonADA's payload formula is NOT the netted balance (oracle got this wrong on first pass, corrected on follow-up — record both the firing condition AND payload formula, they're different subexpressions). BabbageNonDisjointRefInputs de-Set-tagged; the OLD golden test PINNED the bug (only checked the tag number). `n2c_client::decode_reject_reason` is the one crate-visible round-trip surface.
+
+## tx-zoo 18/19 live shakedown, #1050/#1051 (2026-08-06)
+- [Full shakedown notes](issue-1050-1051-18-19-tx-zoo-shakedown.md) — CollateralHasTokens + InsufficientCollateral: zero encoder arms (#1050, 4th confirmation of the #1025 pattern). BabbageNonDisjointRefInputs tag 22: payload wrongly wrapped in CBOR tag-258 Set marker when Haskell field is plain NonEmpty list — cardano-cli DECODE CRASHES, not just generic-fallback (#1051, worse class). 4 script-construction bugs fixed (build auto-balance neutralizing token collateral, wrong ExtraneousScriptWitnessesUTXOW premise, EXUNITS tuple order is (steps,mem) not (mem,steps) + under-provisioned). Trap: worktree was NOT exclusively held — a concurrent process edited the same files live throughout; converged on identical conclusions but made run-all.sh's aggregate summary unreliable as a point-in-time oracle.
+
 ## PoolRetirement + OutputTooSmall wire gaps (2026-08-06)
 - [StakePoolNotRegisteredOnKeyPOOL + BabbageOutputTooSmallUTxO](issue-pool-retirement-output-too-small-wire-gaps.md) — retirement of unregistered pool used the DELEG predicate not POOL (same condition, different rule, different wire nesting); OutputTooSmall had a TxValidationError variant but ZERO encoder arm at all. Retirement-epoch bounds check (StakePoolRetirementWrongEpochPOOL) was ALREADY correct — do not re-audit. Confirms the #1025 enrich_validation_errors aggregation pattern a 3rd time.
 

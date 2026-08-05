@@ -249,7 +249,21 @@ pub enum TxValidationError {
     ScriptFailed {
         reason: String,
     },
-    InsufficientCollateral,
+    /// `InsufficientCollateral DeltaCoin Coin` (Conway `ConwayUtxoPredFailure`
+    /// tag 12) — `balance` is the collateral balance actually present (may be
+    /// NEGATIVE if `collateral_return` over-declares), `required` is
+    /// `ceil(fee * collateralPercentage / 100)`.
+    ///
+    /// `DeltaCoin` is `newtype DeltaCoin = DeltaCoin Integer` with a
+    /// newtype-derived `EncCBOR` — a bare SIGNED CBOR integer, no array or
+    /// group wrapper (oracle-verified, #1050). Field order in the Sum
+    /// encoding is `DeltaCoin` (balance) then `Coin` (required), matching
+    /// dugite's own N2C decoder (`n2c_client.rs` tag 12) which already reads
+    /// `[balance_delta, required]` in that order.
+    InsufficientCollateral {
+        balance: i128,
+        required: u64,
+    },
     TooManyCollateralInputs {
         max: u64,
         actual: u64,
@@ -257,8 +271,16 @@ pub enum TxValidationError {
     CollateralNotFound {
         input: String,
     },
+    /// `CollateralContainsNonADA (Value era)` (Conway `ConwayUtxoPredFailure`
+    /// tag 15) — the FULL multi-asset `Value` Haskell reports (oracle-
+    /// verified against `Cardano.Ledger.Babbage.Rules.Utxo`, #1050): either
+    /// the raw sum of collateral-input `Value`s, or — only when the
+    /// collateral inputs are ada-only but `collateral_return` itself carries
+    /// tokens — the return output's own `Value`. NEVER the netted (inputs
+    /// minus return) balance in the general case, so a bare `input: String`
+    /// could never carry this payload.
     CollateralHasTokens {
-        input: String,
+        value: dugite_primitives::value::Value,
     },
     CollateralMismatch {
         declared: u64,

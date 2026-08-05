@@ -1380,7 +1380,7 @@ impl LedgerState {
                                     ValidationError::InputNotFound(_)
                                         | ValidationError::CollateralNotFound(_)
                                         | ValidationError::CollateralMismatch { .. }
-                                        | ValidationError::InsufficientCollateral
+                                        | ValidationError::InsufficientCollateral { .. }
                                         | ValidationError::ValueNotConserved { .. }
                                         | ValidationError::MultiAssetNotConserved { .. }
                                 )
