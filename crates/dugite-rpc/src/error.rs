@@ -28,8 +28,9 @@ pub enum RpcError {
     #[error("not found: {0}")]
     NotFound(String),
 
-    /// The operation is not implemented in this milestone — used by every
-    /// service stub during M1.A until later milestones land.
+    /// The operation is a deliberate gap, not a bug: e.g. `SearchUtxos`
+    /// with no usable predicate, or a `LedgerContext` capability the
+    /// host doesn't support.
     #[error("unimplemented: {0}")]
     Unimplemented(&'static str),
 

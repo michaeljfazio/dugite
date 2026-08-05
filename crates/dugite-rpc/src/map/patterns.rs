@@ -15,6 +15,12 @@
 //! `UtxoPredicate::default()` as the "all UTxOs" wildcard. We mirror
 //! that semantics here so an unset `predicate` field in a request
 //! matches every candidate.
+//!
+//! Two `TxPattern` leaves (`consumes`, `has_certificate`) are not
+//! evaluated by the matcher at all — see
+//! [`tx_predicate_has_unsupported_leaf`], which `WatchTx` /
+//! `WatchMempool` call to REJECT a request naming either rather than
+//! silently under-filter it.
 
 use dugite_primitives::transaction::Transaction;
 
@@ -168,6 +174,45 @@ fn matches_asset_pattern(
 
 // ─── WatchTx tx-level matcher ────────────────────────────────────────────
 
+/// Whether `pat` (or any sub-pattern nested under `not` / `all_of` /
+/// `any_of`) names a `TxPattern` leaf this matcher cannot evaluate:
+/// `consumes` (needs resolved-input UTxO data the mempool-only watch
+/// paths don't have) or `has_certificate` (needs a certificate-type
+/// matcher — 8 `CertificatePattern` variants against
+/// `dugite_primitives::transaction::Certificate` — that hasn't been
+/// built).
+///
+/// Both `WatchTx` and `WatchMempool` call this BEFORE subscribing and
+/// reject the request outright (`Status::unimplemented`) when it's
+/// `true`, rather than silently evaluate the predicate with those two
+/// leaves quietly matching everything. A client filtering on
+/// `consumes`/`has_certificate` would otherwise get every tx that
+/// matches their OTHER criteria, plus every tx that doesn't touch the
+/// input/certificate they actually asked about — the exact
+/// silently-matches-everything failure class issue #1004 exists to
+/// close for the predicate as a whole; a leaf silently dropping out of
+/// an AND clause is the same bug at finer grain, so it gets the same
+/// fail-closed treatment. Recursing through the combinators means a
+/// client can't smuggle the unsupported leaf past a wrapping `all_of`/
+/// `any_of`/`not`.
+pub fn tx_predicate_has_unsupported_leaf(pat: &v1beta::watch::TxPredicate) -> bool {
+    let leaf_unsupported = pat
+        .r#match
+        .as_ref()
+        .and_then(|any| any.chain.as_ref())
+        .is_some_and(|chain| match chain {
+            v1beta::watch::any_chain_tx_pattern::Chain::Cardano(tx_pat) => {
+                tx_pat.consumes.is_some() || tx_pat.has_certificate.is_some()
+            }
+        });
+    if leaf_unsupported {
+        return true;
+    }
+    pat.not.iter().any(tx_predicate_has_unsupported_leaf)
+        || pat.all_of.iter().any(tx_predicate_has_unsupported_leaf)
+        || pat.any_of.iter().any(tx_predicate_has_unsupported_leaf)
+}
+
 /// Top-level entry point for `WatchTx`: evaluate `predicate` against
 /// the supplied parsed transaction. `None` predicate matches every tx.
 pub fn matches_tx_predicate(
@@ -249,10 +294,12 @@ fn matches_cardano_tx_pattern(pat: &v1beta::cardano::TxPattern, tx: &Transaction
             return false;
         }
     }
-    // `consumes` requires resolved-input data we don't have on the
-    // mempool path. Tx-level WatchTx is "outputs + mint" today; the
-    // input-side match is documented in `docs/src/running/utxo-rpc.md`
-    // as the WatchTx limitation.
+    // `consumes` and `has_certificate` are intentionally NOT evaluated
+    // here — a request containing either is rejected up front by
+    // `tx_predicate_has_unsupported_leaf` before this function is ever
+    // called, so reaching here with one set would silently under-filter.
+    // Documented in `docs/src/running/utxo-rpc.md` as the WatchTx/
+    // WatchMempool limitation.
     true
 }
 
@@ -403,5 +450,95 @@ mod tests {
             asset_name: None,
         };
         assert!(matches_asset_pattern(&pat, &out.value));
+    }
+
+    // ─── tx_predicate_has_unsupported_leaf ─────────────────────────────
+
+    fn tx_predicate_matching(tx_pat: v1beta::cardano::TxPattern) -> v1beta::watch::TxPredicate {
+        v1beta::watch::TxPredicate {
+            r#match: Some(v1beta::watch::AnyChainTxPattern {
+                chain: Some(v1beta::watch::any_chain_tx_pattern::Chain::Cardano(tx_pat)),
+            }),
+            not: vec![],
+            all_of: vec![],
+            any_of: vec![],
+        }
+    }
+
+    #[test]
+    fn supported_leaf_only_is_not_flagged() {
+        let pat = tx_predicate_matching(v1beta::cardano::TxPattern {
+            has_address: Some(v1beta::cardano::AddressPattern {
+                exact_address: Some(vec![1, 2, 3]),
+                payment_part: None,
+                delegation_part: None,
+            }),
+            ..Default::default()
+        });
+        assert!(!tx_predicate_has_unsupported_leaf(&pat));
+    }
+
+    #[test]
+    fn consumes_is_flagged_unsupported() {
+        let pat = tx_predicate_matching(v1beta::cardano::TxPattern {
+            consumes: Some(v1beta::cardano::TxOutputPattern::default()),
+            ..Default::default()
+        });
+        assert!(tx_predicate_has_unsupported_leaf(&pat));
+    }
+
+    #[test]
+    fn has_certificate_is_flagged_unsupported() {
+        let pat = tx_predicate_matching(v1beta::cardano::TxPattern {
+            has_certificate: Some(v1beta::cardano::CertificatePattern {
+                certificate_type: Some(
+                    v1beta::cardano::certificate_pattern::CertificateType::AnyStakeCredential(
+                        vec![1; 28],
+                    ),
+                ),
+            }),
+            ..Default::default()
+        });
+        assert!(tx_predicate_has_unsupported_leaf(&pat));
+    }
+
+    #[test]
+    fn unsupported_leaf_nested_under_all_of_is_still_flagged() {
+        // A client can't smuggle `consumes` past a wrapping combinator.
+        let inner = tx_predicate_matching(v1beta::cardano::TxPattern {
+            consumes: Some(v1beta::cardano::TxOutputPattern::default()),
+            ..Default::default()
+        });
+        let outer = v1beta::watch::TxPredicate {
+            all_of: vec![inner],
+            ..Default::default()
+        };
+        assert!(tx_predicate_has_unsupported_leaf(&outer));
+    }
+
+    #[test]
+    fn unsupported_leaf_nested_under_any_of_is_still_flagged() {
+        let inner = tx_predicate_matching(v1beta::cardano::TxPattern {
+            has_certificate: Some(v1beta::cardano::CertificatePattern::default()),
+            ..Default::default()
+        });
+        let outer = v1beta::watch::TxPredicate {
+            any_of: vec![inner],
+            ..Default::default()
+        };
+        assert!(tx_predicate_has_unsupported_leaf(&outer));
+    }
+
+    #[test]
+    fn unsupported_leaf_nested_under_not_is_still_flagged() {
+        let inner = tx_predicate_matching(v1beta::cardano::TxPattern {
+            consumes: Some(v1beta::cardano::TxOutputPattern::default()),
+            ..Default::default()
+        });
+        let outer = v1beta::watch::TxPredicate {
+            not: vec![inner],
+            ..Default::default()
+        };
+        assert!(tx_predicate_has_unsupported_leaf(&outer));
     }
 }
