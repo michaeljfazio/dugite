@@ -1,5 +1,8 @@
 # Tech Lead Agent Memory
 
+## Conway Phase-1 Transaction Validation Audit (2026-08-05)
+- [Full Phase-1 audit](issue-1021-1022-1024-1026-1028-conway-phase1-audit.md) — #1021 ProposalCantFollow (GOV tag 10, zero Phase-1 impl) + #1022 TooManyCollateralInputs wrongly gated behind has_plutus_scripts + #1024 ConwayTxRefScriptsSizeTooBig (per-tx 200KiB cap) missing entirely (all 3 FIXED, RED-GREEN verified, 26 new tests); #1026 DisallowedProposalDuringBootstrap (PV9-only, unreachable today) + #1028 InvalidGuardrailsScriptHash None-vs-SNothing ambiguity (unreachable while all 3 genesis configs seed a guardrail) both FILED not fixed. CERTS/DELEG/POOL/GOVCERT and ~17/19 GOV predicates confirmed CORRECT (clean negatives, do not re-audit). Trap: adding ValidationError variants broke an exhaustive match invisible to `cargo build --workspace --lib` — only `--all-targets`/clippy catches it.
+
 ## Conway N2C LSQ + Mempool-Reject Audit (2026-08-05)
 - [Full LSQ/mempool audit](issue-1018-1027-lsq-mempool-audit-2026-08-05.md) — #1018 tag-33 GetFuturePParams hardcoded + #1019 ensWithdrawals hardcoded empty (both FIXED); #1020 NextEpochChange/ensCommittee live-not-frozen, #1023 MIR/GenesisDeleg accept-where-Haskell-rejects (P1), #1025 residual generic ScriptFailed arms, #1027 `query ledger-state` LIVE-VERIFIED undecodable, zero test coverage (all FILED). Methodology: cli-parity.csv hash-history as a free vacuous-vs-real oracle; throwaway single-node devnet for cheap live round-trips.
 
