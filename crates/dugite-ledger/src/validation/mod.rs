@@ -847,6 +847,38 @@ pub enum ValidationError {
     ReferenceInputNotFound(String),
     #[error("Reference input overlaps with regular input: {0}")]
     ReferenceInputOverlapsInput(String),
+    /// Conway LEDGER rule: the total non-distinct reference-script size
+    /// reachable from a transaction's spending inputs AND reference inputs
+    /// (Haskell `txNonDistinctRefScriptsSize`, the same primitive dugite
+    /// already uses for the CIP-0112 tiered ref-script FEE) exceeds the
+    /// fixed 200 KiB per-transaction cap.
+    ///
+    /// Per Haskell `validateRefScriptSize`
+    /// (`eras/conway/impl/src/Cardano/Ledger/Conway/Rules/Ledger.hs:456-471`):
+    ///
+    /// ```haskell
+    /// validateRefScriptSize pp utxo tx =
+    ///   let totalRefScriptSize = txNonDistinctRefScriptsSize utxo tx
+    ///       maxRefScriptSizePerTx = fromIntegral $ pp ^. ppMaxRefScriptSizePerTxG
+    ///    in failureUnless (totalRefScriptSize <= maxRefScriptSizePerTx) $
+    ///         ConwayTxRefScriptsSizeTooBig
+    ///           Mismatch { mismatchSupplied = totalRefScriptSize, mismatchExpected = maxRefScriptSizePerTx }
+    /// ```
+    ///
+    /// `ppMaxRefScriptSizePerTxG` is a Conway-era CONSTANT (`200 * 1024` =
+    /// 204800 bytes) — not a live/governance-updatable protocol parameter
+    /// until Dijkstra. This is a SEPARATE, ADDITIONAL, per-TRANSACTION cap
+    /// from dugite's existing per-BLOCK 1 MiB `BodyRefScriptsSizeTooBig`
+    /// check (`eras/conway.rs`, Conway BBODY rule) — before this, dugite had
+    /// no per-transaction cap at all, so a single oversized-ref-script
+    /// transaction (well under the block-wide 1 MiB limit) was silently
+    /// accepted where cardano-node rejects it outright. See dugite issue
+    /// #1024.
+    #[error(
+        "ConwayTxRefScriptsSizeTooBig: total ref-script size {actual} exceeds \
+         per-transaction maximum {maximum}"
+    )]
+    RefScriptsSizeTooBig { maximum: u64, actual: u64 },
     /// Phase-2 PlutusV3 `TxInfo` translation failure: `inputs ∩ reference_inputs`
     /// is non-empty.  Introduced by Haskell `cardano-ledger` PR #5011 at PV >= 11.
     /// Surfaces on the wire as a `BadTranslation` carrying
@@ -1192,6 +1224,46 @@ pub enum ValidationError {
         action_type: &'static str,
         prev_action_id: Option<GovActionId>,
         proposal: Box<ProposalProcedure>,
+    },
+    /// Conway GOV rule: a `HardForkInitiation` proposal's target protocol
+    /// version does not `pvCanFollow` its resolved base version.
+    ///
+    /// Haskell (`Conway.Rules.Gov`, `processProposal`):
+    ///
+    /// ```haskell
+    /// let badHardFork = do
+    ///       (prevGaid, newProtVer, prevProtVer) <-
+    ///         preceedingHardFork @era pp prevGovActionIds proposals pProcGovAction
+    ///       guard (not (pvCanFollow prevProtVer newProtVer))
+    ///       Just $ ProposalCantFollow @era prevGaid $
+    ///         Mismatch { mismatchSupplied = newProtVer, mismatchExpected = prevProtVer }
+    /// failOnJust badHardFork injectFailure
+    /// ```
+    ///
+    /// `failOnJust` registers a predicate failure exactly like
+    /// `InvalidPrevGovActionId`'s `failBecause` — the whole transaction (and
+    /// any block carrying it) is invalid, not just the offending proposal.
+    /// Without this Phase-1 check, dugite could admit and forge such a tx;
+    /// cardano-node would reject the resulting block with `ConwayGovFailure
+    /// (ProposalCantFollow …)` and never recover on reconnect — the
+    /// `#996`-class wedge one purpose earlier. See dugite issue #1021.
+    ///
+    /// Skipped when `enacted_gov_roots` is `None` (the same lenient default
+    /// used by `InvalidPrevGovActionId`).
+    ///
+    /// Reference: Haskell `ProposalCantFollow` (`ConwayGovPredFailure` tag
+    /// 10) in `eras/conway/impl/src/Cardano/Ledger/Conway/Rules/Gov.hs`.
+    #[error(
+        "ProposalCantFollow: proposal index {action_index} target protocol version \
+         {target_major}.{target_minor} cannot follow base {base_major}.{base_minor}"
+    )]
+    ProposalCantFollow {
+        action_index: u32,
+        prev_action_id: Option<GovActionId>,
+        target_major: u64,
+        target_minor: u64,
+        base_major: u64,
+        base_minor: u64,
     },
     /// Conway GOV rule (PV >= 11 only): one or more `ConstitutionalCommittee`
     /// votes carry a hot credential whose backing cold credential is NOT in
@@ -2847,6 +2919,39 @@ pub fn validate_transaction_with_context(
     // -------------------------------------------------------------------
     if params.protocol_version_major >= 9 && !tx.body.proposal_procedures.is_empty() {
         // -------------------------------------------------------------------
+        // ProposalCantFollow: a HardForkInitiation proposal's target protocol
+        // version must legally follow its resolved base version (Haskell
+        // `badHardFork` / `pvCanFollow`, checked BEFORE `InvalidPrevGovActionId`
+        // in `processProposal` — see `conway::hardfork_proposal_cant_follow`).
+        // -------------------------------------------------------------------
+        for (idx, proposal) in tx.body.proposal_procedures.iter().enumerate() {
+            if let Some((target_major, target_minor, base_major, base_minor)) =
+                conway::hardfork_proposal_cant_follow(
+                    &proposal.gov_action,
+                    idx,
+                    &tx.body.proposal_procedures,
+                    tx.hash,
+                    &context,
+                    params.protocol_version_major,
+                    params.protocol_version_minor,
+                )
+            {
+                let prev_action_id = match &proposal.gov_action {
+                    GovAction::HardForkInitiation { prev_action_id, .. } => prev_action_id.clone(),
+                    _ => None,
+                };
+                extra_errors.push(ValidationError::ProposalCantFollow {
+                    action_index: idx as u32,
+                    prev_action_id,
+                    target_major,
+                    target_minor,
+                    base_major,
+                    base_minor,
+                });
+            }
+        }
+
+        // -------------------------------------------------------------------
         // InvalidPrevGovActionId: every lineal-purpose proposal must chain
         // correctly onto its purpose.
         //
@@ -4167,6 +4272,13 @@ pub fn validate_transaction_with_pools(
     // witness script (no Plutus content at all) must still be checked.
     // The function self-gates on "has any witness script" internally.
     scripts::check_extraneous_script_witnesses(tx, utxo_set, &mut errors);
+
+    // Rule 11 (max collateral inputs count): Haskell's `TooManyCollateralInputs`
+    // is checked UNCONDITIONALLY (`Babbage/Utxo.hs:412`, a plain `runTest`, not
+    // nested inside `feesOK`'s `unless (null redeemers)` gate) — a transaction
+    // with no Plutus content at all but an over-long `collateral` field is
+    // still rejected by cardano-node. See `collateral::check_max_collateral_inputs`.
+    collateral::check_max_collateral_inputs(tx, params, &mut errors);
 
     // ------------------------------------------------------------------
     // Rules 11, 11b, 11c — Plutus-transaction-specific checks
