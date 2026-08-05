@@ -213,9 +213,13 @@ updated, or vice versa) are caught by code review against the diff.
   fee-estimation use cases but may diverge slightly from cardano-node
   on the high end.
 * `WatchTx` / `WatchMempool` filter on tx output fields (`produces` /
-  `has_address` / `moves_asset`) and minting (`mints_asset`) — but not
-  on *resolved* inputs (`consumes` / `has_certificate`) since those
-  require live UTxO lookups against pending mempool txs.
+  `has_address` / `moves_asset`) and minting (`mints_asset`). Two
+  `TxPattern` leaves are not implemented: `consumes` (needs resolved-input
+  UTxO data unavailable on the mempool-only watch path) and
+  `has_certificate` (needs a certificate-type matcher not yet built). A
+  request naming either — anywhere, including nested under `not` /
+  `all_of` / `any_of` — is **rejected** with `UNIMPLEMENTED` before it
+  ever subscribes, rather than silently accepted and under-filtered.
 * `WatchTx` is **mempool-sourced**, not chain-sourced: it streams
   `MempoolEvent::Added` (pre-confirmation), matching
   `SubmitService.WatchMempool`'s semantics rather than the proto's own
