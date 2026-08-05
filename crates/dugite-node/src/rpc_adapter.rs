@@ -67,7 +67,7 @@ fn decimal_to_rational(x: f64) -> Option<(i32, u32)> {
     let denominator = SCALE / divisor;
     i32::try_from(numerator)
         .ok()
-        .and_then(|n| u32::try_from(denominator).ok().map(|d| (n, d)))
+        .zip(u32::try_from(denominator).ok())
 }
 
 fn gcd(a: i64, b: i64) -> i64 {

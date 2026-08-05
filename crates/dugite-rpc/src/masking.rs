@@ -313,7 +313,7 @@ fn prune_value(value: &mut Value, tree: &MaskNode) {
         }
         Value::Map(entries) => {
             // Map<_, Message> — same elementwise treatment as List.
-            for (_, v) in entries.iter_mut() {
+            for v in entries.values_mut() {
                 if let Value::Message(nested) = v {
                     prune(nested, tree);
                 }
