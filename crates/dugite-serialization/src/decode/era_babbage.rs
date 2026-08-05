@@ -467,8 +467,12 @@ fn decode_babbage_tx_body(r: &mut Reader<'_>) -> Result<TransactionBody, Seriali
                 // Decoded so the boundary handler can apply pre-Conway PPUPs
                 // (Babbage retained the legacy PPUP path until Conway).
                 // See `era_shelley::read_pre_conway_update_proposal` and #624.
+                // This function only ever decodes a Babbage tx body, so the
+                // embedded PPU's valid key set (issue #1013) is unconditionally
+                // `Era::Babbage`.
                 update = Some(crate::decode::era_shelley::read_pre_conway_update_proposal(
                     r,
+                    Era::Babbage,
                 )?);
             }
             7 => {
@@ -715,33 +719,38 @@ fn read_babbage_legacy_output(r: &mut Reader<'_>) -> Result<TransactionOutput, S
 ///   ? 3 : script_ref,     ; tag(24) bytes(script_cbor)
 /// }
 /// ```
+///
+/// **Unknown keys are HARD-REJECTED** (issue #1013's sweep — the SAME defect
+/// class as the `ProtocolParamUpdate` decoder, found by checking every other
+/// sparse-keyed decoder in this crate). Oracle-verified against
+/// `IntersectMBO/cardano-ledger` at pinned commit
+/// `4849c13d6f70e5ab46add9af6e0ec5c537b61f69`,
+/// `eras/babbage/impl/src/Cardano/Ledger/Babbage/TxOut.hs:606-659`:
+/// `decodeTxOut` is `SparseKeyed`/`decodeSparseKeyed` (both branches, same
+/// `natVersion @12` combinator split as `PParamsUpdate`) with
+/// `bodyFields n = invalidField n` / `decoderByKey _ -> Nothing` for any key
+/// outside 0-3, and `requiredFields = [(0, "addr")]` — key 0 is mandatory,
+/// which dugite already enforces below. `type TxOut ConwayEra = BabbageTxOut
+/// ConwayEra` and `type TxOut DijkstraEra = BabbageTxOut DijkstraEra`
+/// (`Conway/TxOut.hs`, `Dijkstra/TxOut.hs`) — Conway and Dijkstra reuse this
+/// exact decoder verbatim, so no era gating is needed here (unlike PPU): the
+/// key set 0-3 is identical Babbage through Dijkstra. This is reachable by
+/// EVERY post-Alonzo transaction output, not just governance transactions —
+/// more reachable than the PPU bug this issue was filed for.
+///
+/// Routed through `for_each_field_entry` (issue #1012's primitive) rather
+/// than the hand-rolled definite/indefinite loop this function used to carry
+/// — the duplicated loop is exactly the "N-copies trap" this codebase tracks;
+/// this also picks up duplicate-key rejection for free (Haskell's
+/// `Set Word`-tracked `SparseKeyed`/`decodeSparseKeyed` reject a repeated key
+/// too, un-gated by protocol version).
 fn read_babbage_map_output(r: &mut Reader<'_>) -> Result<TransactionOutput, SerializationError> {
-    let map_len = r.read_map_header()?;
-    let n_entries = match map_len {
-        Some(n) => n as i64,
-        None => -1,
-    };
-
     let mut address: Option<Address> = None;
     let mut value = dugite_primitives::value::Value::lovelace(0);
     let mut datum = OutputDatum::None;
     let mut script_ref: Option<ScriptRef> = None;
 
-    let mut i = 0i64;
-    loop {
-        if n_entries >= 0 && i >= n_entries {
-            break;
-        }
-        if n_entries < 0 {
-            let ty = r.peek_major()?;
-            if ty == Type::Break {
-                r.skip()?;
-                break;
-            }
-        }
-        i += 1;
-
-        let key = r.read_uint()?;
+    r.for_each_field_entry(|r, key| {
         match key {
             0 => {
                 let addr_bytes = r.read_bytes_owned()?;
@@ -763,10 +772,13 @@ fn read_babbage_map_output(r: &mut Reader<'_>) -> Result<TransactionOutput, Seri
                 script_ref = Some(read_script_ref(r)?);
             }
             _ => {
-                r.skip()?;
+                return Err(SerializationError::CborDecode(format!(
+                    "post_alonzo_transaction_output: unknown/invalid key {key}"
+                )));
             }
         }
-    }
+        Ok(())
+    })?;
 
     let address = address.ok_or_else(|| {
         SerializationError::CborDecode("babbage map output: missing address (key 0)".into())
@@ -2076,6 +2088,62 @@ mod tests {
             decoded.script_ref.unwrap(),
             ScriptRef::PlutusV2(_)
         ));
+    }
+
+    /// Issue #1013's sweep finding: `post_alonzo_transaction_output` is
+    /// SparseKeyed 0-3 in Haskell (`invalidField` catch-all, same shape as
+    /// `ProtocolParamUpdate` — oracle-verified, see the `read_babbage_map_output`
+    /// doc comment), so an unrecognized key must hard-reject. This is
+    /// reachable by every post-Alonzo transaction output, not just
+    /// governance transactions.
+    #[test]
+    fn babbage_map_output_unknown_key_rejected() {
+        let addr_bytes: Vec<u8> = {
+            let mut v = vec![0x60];
+            v.extend_from_slice(&[0u8; 28]);
+            v
+        };
+        // {0: addr, 4: 0} — key 4 does not exist in BabbageTxOut.
+        let mut out = vec![0xa2];
+        out.extend(cbor_uint(0));
+        out.extend(cbor_bytes(&addr_bytes));
+        out.extend(cbor_uint(4));
+        out.extend(cbor_uint(0));
+
+        let mut r = Reader::new(&out);
+        let result = read_babbage_tx_output(&mut r);
+        assert!(
+            matches!(result, Err(SerializationError::CborDecode(_))),
+            "unknown babbage map-output key 4 must be rejected, got {result:?}"
+        );
+    }
+
+    /// The `for_each_field_entry` migration (issue #1013 — replacing the
+    /// hand-rolled definite/indefinite loop this function used to carry)
+    /// picks up duplicate-key rejection for free; pin it so a future
+    /// refactor cannot silently drop it.
+    #[test]
+    fn babbage_map_output_duplicate_key_rejected() {
+        let addr_bytes: Vec<u8> = {
+            let mut v = vec![0x60];
+            v.extend_from_slice(&[0u8; 28]);
+            v
+        };
+        // {0: addr, 1: 5, 1: 7} — key 1 (value) twice.
+        let mut out = vec![0xa3];
+        out.extend(cbor_uint(0));
+        out.extend(cbor_bytes(&addr_bytes));
+        out.extend(cbor_uint(1));
+        out.extend(cbor_uint(5));
+        out.extend(cbor_uint(1));
+        out.extend(cbor_uint(7));
+
+        let mut r = Reader::new(&out);
+        let result = read_babbage_tx_output(&mut r);
+        assert!(
+            matches!(result, Err(SerializationError::CborDecode(_))),
+            "duplicate babbage map-output key 1 must be rejected, got {result:?}"
+        );
     }
 
     #[test]
