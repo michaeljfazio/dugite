@@ -220,6 +220,40 @@ strip_era_prefix() {
     echo "${toks[*]}"
 }
 
+# ─── Structural-equivalence collapse (#1008) ───────────────────────────────
+#
+# The walker compares literal path STRINGS, so it cannot tell "cardano-cli
+# reaches this capability via N subcommands" from "dugite-cli reaches the
+# identical capability via one command with a positional argument" — those
+# are genuinely the same surface, described two different ways. Rewriting a
+# cardano-cli path here to dugite-cli's path for that SAME capability is
+# reporting reality, not relaxing the check: the rewritten form must still
+# be something dugite-cli can actually do, verified below per rule. This is
+# NOT the place to paper over a real flag/behavior gap — see #1008's triage
+# comment for cases (byron key convert-*, governance action create-hardfork)
+# that looked like naming differences but turned out to have a materially
+# narrower flag surface on dugite's side, and were deliberately NOT collapsed
+# here.
+#
+# Rule 1: `query tx-mempool info|next-tx|tx-exists` (3 cardano-cli
+# subcommands of `tx-mempool`) -> `query tx-mempool` (one dugite-cli command
+# taking `info`/`next-tx`/`tx-exists` as a positional argument, default
+# `info`). Verified: `dugite-cli query tx-mempool --help` documents exactly
+# these three values, and `tx-exists` (renamed from dugite's prior `has-tx`
+# to match cardano-cli's own vocabulary as part of #1008) is a real,
+# reachable code path in `commands/query.rs`, not just a parsed-and-dropped
+# flag.
+collapse_structural_equivalents() {
+    case "$1" in
+    "query tx-mempool info" | "query tx-mempool next-tx" | "query tx-mempool tx-exists")
+        echo "query tx-mempool"
+        ;;
+    *)
+        echo "$1"
+        ;;
+    esac
+}
+
 # ─── Preflight: both binaries must at least run ───────────────────────────
 
 if ! command -v "$CARDANO_CLI_BIN" >/dev/null 2>&1 && [[ ! -x "$CARDANO_CLI_BIN" ]]; then
@@ -275,7 +309,7 @@ DC_NORM_FILE=$(mktemp)
 trap 'rm -f "$CC_RAW_FILE" "$DC_RAW_FILE" "$CC_NORM_FILE" "$DC_NORM_FILE"' EXIT
 
 while IFS= read -r p; do
-    strip_era_prefix "$p"
+    collapse_structural_equivalents "$(strip_era_prefix "$p")"
 done <"$CC_RAW_FILE" | sort -u >"$CC_NORM_FILE"
 
 while IFS= read -r p; do
