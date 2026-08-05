@@ -58,8 +58,11 @@ pub enum UplcError {
         reason: String,
     },
 
-    /// PlutusV3 only: the script returned a value other than `Unit`.
-    #[error("PlutusV3 script returned non-Unit value")]
+    /// PlutusV3/PlutusV4 only: the script returned a value other than
+    /// `Unit`. V4 shares this check with V3 — see
+    /// `crate::redeemer_resolve::ScriptLanguage`'s doc comment (issue
+    /// #1000, oracle-verified V4-is-V3-semantics).
+    #[error("PlutusV3/V4 script returned non-Unit value")]
     NonUnitReturn,
 
     /// An unbound de Bruijn variable was found by the eager `checkScope`
