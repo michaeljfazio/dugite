@@ -807,9 +807,27 @@ fn decode_sub_transactions(
 
 /// Decode a Dijkstra SubTx body (`DijkstraSubTxBodyRaw`), keyed subset.
 ///
-/// Only the keys that affect dugite's SUB UTxO pipeline are extracted; the
-/// rest are skipped for forward compatibility. The full SubTx schema (certs,
-/// gov, mint, …) is tracked under follow-on phases of issue #475.
+/// Only the keys that affect dugite's SUB UTxO pipeline are extracted
+/// (#1010: extending `SubTransaction` to carry the rest — certs,
+/// withdrawals, mint, governance procedures, guards, direct deposits,
+/// account-balance intervals, network_id, script_integrity_hash — is
+/// tracked as a `dugite-primitives` follow-on; see the module doc comment
+/// on `crates/dugite-ledger/src/eras/dijkstra.rs`).
+///
+/// Any OTHER key HARD REJECTS, matching this file's own established
+/// pattern for the top-level tx body's unknown-key catch-all a few lines
+/// above (`{era:?} tx body: unknown/invalid key {key}`) and upstream's
+/// `SparseKeyed` `decoderByKey _ -> Nothing -> failMsg`. Before #1010 this
+/// arm silently `r.skip()`-ped any key it didn't model: a sub-tx carrying
+/// certs/mint/withdrawals/votes decoded SUCCESSFULLY with all of that
+/// discarded, then applied with none of those effects — the parent OMap
+/// key's hash-of-bytes invariant keeps the TxId correct while the APPLIED
+/// LEDGER STATE silently diverges from what the same bytes mean upstream.
+/// That is strictly worse than a decode failure: both nodes agree on the
+/// id and disagree on the ledger. Fail-closed (reject) until the field is
+/// actually modelled, per this project's standing reject-over-silent-skip
+/// rule (see e.g. #1000's PlutusV4 paths, which all fail closed the same
+/// way for the identical reason).
 fn decode_sub_tx_body(
     r: &mut Reader<'_>,
 ) -> Result<dugite_primitives::transaction::SubTransaction, SerializationError> {
@@ -854,16 +872,19 @@ fn decode_sub_tx_body(
             18 => {
                 sub.reference_inputs = r.read_set_strict(read_tx_input)?;
             }
-            // Other Dijkstra SubTx keys (4 certs, 5 withdrawals, 9 mint,
-            // 11 script_integrity_hash, 14 guards, 15 network_id, 19/20
-            // voting/proposal, 21 treasury_value, 22 donation, 24
-            // required_top_level_guards, 25 direct_deposits, 26
-            // account_balance_intervals) are skipped at Phase 3.1. The
-            // hash invariant on the parent OMap key still pins the bytes
-            // so a later phase that extends this decoder cannot quietly
-            // alter behaviour for an already-stored sub-tx.
+            // Every other DijkstraSubTxBodyRaw key (certs, withdrawals,
+            // mint, script_integrity_hash, guards, network_id,
+            // voting/proposal procedures, treasury_value, donation,
+            // direct_deposits, account_balance_intervals — #1010) is
+            // unmodelled. Reject rather than silently discard: see the
+            // doc comment above this function for why.
             _ => {
-                r.skip()?;
+                return Err(SerializationError::CborDecode(format!(
+                    "Dijkstra sub-tx body: unmodelled key {key} (#1010 — \
+                     SubTransaction does not yet carry this field; refusing \
+                     to silently discard its effects rather than accept a \
+                     sub-tx whose applied state would diverge from upstream)"
+                )));
             }
         }
     }
@@ -4100,6 +4121,102 @@ mod tests {
         assert!(body.sub_transactions.is_empty());
         assert!(body.direct_deposits.is_empty());
         assert!(body.account_balance_intervals.is_empty());
+    }
+
+    // ── #1010: unmodelled Dijkstra SubTx body keys must hard-reject ────────────
+    //
+    // Before #1010, `decode_sub_tx_body`'s catch-all silently `r.skip()`-ped any
+    // key it didn't model (certs, withdrawals, mint, guards, network_id,
+    // voting/proposal procedures, treasury_value, donation, direct_deposits,
+    // account_balance_intervals, script_integrity_hash). A sub-tx carrying any
+    // of those decoded SUCCESSFULLY with the field discarded, then applied with
+    // none of its effects — worse than a decode failure, since both nodes agree
+    // on the reconstructed TxId (hash of the raw bytes) and silently disagree on
+    // the resulting ledger state.
+
+    /// Build a minimal valid Dijkstra SubTx body CBOR map carrying only keys
+    /// 0 (inputs) and 1 (outputs), both empty, plus one EXTRA key/value pair
+    /// that the decoder does not model.
+    fn sub_tx_body_with_extra_key(extra_key: u64, extra_value: &[u8]) -> Vec<u8> {
+        let mut data = vec![0xa3]; // map(3)
+        data.extend(cbor_uint(0));
+        data.extend(vec![0x80]); // inputs: empty array
+        data.extend(cbor_uint(1));
+        data.extend(vec![0x80]); // outputs: empty array
+        data.extend(cbor_uint(extra_key));
+        data.extend_from_slice(extra_value);
+        data
+    }
+
+    #[test]
+    fn dijkstra_sub_tx_body_rejects_unmodelled_certs_key() {
+        // Key 4 (certs) — an empty array is a syntactically valid `certs`
+        // value; the decoder must still reject purely because key 4 is
+        // unmodelled, before ever looking at the value's shape.
+        let data = sub_tx_body_with_extra_key(4, &[0x80]);
+        let mut r = Reader::new(&data);
+        let result = decode_sub_tx_body(&mut r);
+        assert!(
+            matches!(result, Err(SerializationError::CborDecode(_))),
+            "sub-tx body with unmodelled key 4 (certs) must be rejected, got {result:?}"
+        );
+        let msg = format!("{:?}", result.unwrap_err());
+        assert!(
+            msg.contains("unmodelled key 4") && msg.contains("#1010"),
+            "error must name the offending key and the tracking issue, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn dijkstra_sub_tx_body_rejects_unmodelled_withdrawals_key() {
+        // Key 5 (withdrawals) — an empty map is a syntactically valid value.
+        let data = sub_tx_body_with_extra_key(5, &[0xa0]);
+        let mut r = Reader::new(&data);
+        let result = decode_sub_tx_body(&mut r);
+        assert!(
+            matches!(result, Err(SerializationError::CborDecode(_))),
+            "sub-tx body with unmodelled key 5 (withdrawals) must be rejected, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn dijkstra_sub_tx_body_rejects_unmodelled_voting_procedures_key() {
+        // Key 19 (voting_procedures) — an empty map is a syntactically valid
+        // value. Exercises the governance-family gap specifically, since
+        // that's the SUBGOV surface #1010 is ultimately about.
+        let data = sub_tx_body_with_extra_key(19, &[0xa0]);
+        let mut r = Reader::new(&data);
+        let result = decode_sub_tx_body(&mut r);
+        assert!(
+            matches!(result, Err(SerializationError::CborDecode(_))),
+            "sub-tx body with unmodelled key 19 (voting_procedures) must be rejected, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn dijkstra_sub_tx_body_still_accepts_modelled_keys() {
+        // Control: a body carrying ONLY modelled keys (0, 1, 3, 7, 8, 18)
+        // must still decode cleanly — the reject-arm change must not have
+        // widened to reject keys that ARE handled.
+        let mut data = vec![0xa6]; // map(6)
+        data.extend(cbor_uint(0));
+        data.extend(vec![0x80]); // inputs
+        data.extend(cbor_uint(1));
+        data.extend(vec![0x80]); // outputs
+        data.extend(cbor_uint(3));
+        data.extend(cbor_uint(100)); // ttl
+        data.extend(cbor_uint(7));
+        data.extend(cbor_bytes(&[0x11; 32])); // auxiliary_data_hash
+        data.extend(cbor_uint(8));
+        data.extend(cbor_uint(50)); // validity_interval_start
+        data.extend(cbor_uint(18));
+        data.extend(vec![0x80]); // reference_inputs
+
+        let mut r = Reader::new(&data);
+        let sub = decode_sub_tx_body(&mut r)
+            .expect("sub-tx body with only modelled keys must still decode");
+        assert_eq!(sub.ttl.map(|s| s.0), Some(100));
+        assert_eq!(sub.validity_interval_start.map(|s| s.0), Some(50));
     }
 
     #[test]
