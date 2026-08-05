@@ -96,41 +96,76 @@ pub struct ParamsView {
 
 /// Opaque era-history view returned by [`LedgerContext::era_history`].
 ///
-/// Deliberately minimal today: [`EraSummary`] carries only `start`
-/// (`first_slot`), not an era's `end` boundary or its `PParams` — both
-/// of which `QueryService.ReadEraSummary`'s wire shape has room for and
-/// currently emits unset. Tracked as
-/// <https://github.com/michaeljfazio/dugite/issues/1009> (needs
-/// `dugite-node`-side plumbing outside this crate).
+/// Issue #1009: `EraSummary` now carries both the `start` AND `end`
+/// boundary (previously `end` was always unset, and `start` itself was
+/// missing `epoch`/`time_ms` — the mapper hardcoded both to zero). The
+/// one field still deliberately absent is `protocol_params` (the
+/// `PParams` in force during that era): dugite's ledger only retains the
+/// CURRENT era's params, not a per-era history, so there is nothing
+/// truthful to populate for past eras. Left `None` — a documented
+/// absence, not a silent one; see `crate::map::pparams` for the current
+/// live view (`QueryService.ReadParams`, which does not have this gap).
 #[derive(Clone, Debug, Default)]
 pub struct EraHistoryView {
-    /// Era boundaries: `(era, first_slot, slot_length_ms, epoch_length_slots)`
-    /// for each era the chain has crossed, in chronological order.
     pub summaries: Vec<EraSummary>,
+}
+
+/// One era boundary (used for both `EraSummary::start` and `::end`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct EraBoundaryView {
+    /// Milliseconds since the Unix epoch (wall-clock), not relative to
+    /// system start — the proto field (`EraBoundary.time`) is an
+    /// absolute ms timestamp.
+    pub time_ms: u64,
+    pub slot: u64,
+    pub epoch: u64,
 }
 
 #[derive(Clone, Copy, Debug)]
 pub struct EraSummary {
     pub era: Era,
-    pub first_slot: u64,
+    pub start: EraBoundaryView,
+    /// `None` for the current (open) era — matches
+    /// `dugite_consensus::era_history::EraSummaryEntry::end`.
+    pub end: Option<EraBoundaryView>,
     pub slot_length_ms: u32,
     pub epoch_length_slots: u32,
 }
 
 /// Opaque genesis view returned by [`LedgerContext::genesis`].
 ///
-/// Deliberately minimal today: `cardano.Genesis` (the utxorpc wire
-/// shape) has 34 fields spanning Byron/Shelley/Alonzo/Conway; this view
-/// carries 3, so `QueryService.ReadGenesis` answers with a near-empty
-/// message. Widening this needs `dugite-ledger::CombinedGenesis`
-/// threaded through the `dugite-node`-side `LedgerContext` impl — outside
-/// this crate. Tracked as
-/// <https://github.com/michaeljfazio/dugite/issues/1009>.
+/// Issue #1009: carries the full Shelley-genesis section of
+/// `cardano.Genesis` (14 of its 34 fields) — the Shelley genesis struct
+/// is retained for the node's lifetime (`Node::shelley_genesis`), so
+/// this is real data, not derived/guessed. Byron (9 fields: `avvm_distr`,
+/// `boot_stakeholders`, `heavy_delegation`, `vss_certs`, ...), Alonzo (7:
+/// `cost_models`, `execution_prices`, ...), and Conway (10: `committee`,
+/// `constitution`, `drep_voting_thresholds`, ...) sections remain
+/// unpopulated — DELIBERATELY, not silently: those genesis structs are
+/// parsed once during `Node::new()` and dropped rather than retained,
+/// which is real additional lifecycle plumbing (mirroring what
+/// `shelley_genesis` already does) beyond this issue's scope. `gen_delegs`
+/// / `initial_funds` / `staking` (Shelley genesis fields that exist but
+/// are `HashMap`-shaped, mostly empty on real networks, and only
+/// meaningful for custom devnets) are also left out for the same reason
+/// — real, bounded follow-up work, not implemented here.
 #[derive(Clone, Debug, Default)]
 pub struct GenesisView {
     pub network_magic: u32,
+    pub network_id: String,
     pub system_start_unix: i64,
     pub security_param: u32,
+    pub epoch_length: u32,
+    pub slot_length: u32,
+    pub max_lovelace_supply: u64,
+    pub max_kes_evolutions: u32,
+    pub slots_per_kes_period: u32,
+    pub update_quorum: u32,
+    /// `(numerator, denominator)` reconstructed from the genesis JSON's
+    /// decimal `activeSlotsCoeff` (e.g. `0.05` -> `(1, 20)`) — see
+    /// `dugite-node`'s `rpc_adapter.rs` for the conversion. `None` if the
+    /// value couldn't be reconstructed as a clean rational.
+    pub active_slots_coeff: Option<(i32, u32)>,
 }
 
 /// Outcome of a transaction submission.

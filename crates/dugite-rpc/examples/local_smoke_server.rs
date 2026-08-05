@@ -108,10 +108,16 @@ impl LedgerContext for DemoContext {
         })
     }
     async fn era_history(&self) -> Result<EraHistoryView, RpcError> {
+        use dugite_rpc::EraBoundaryView;
         Ok(EraHistoryView {
             summaries: vec![EraSummary {
                 era: Era::Conway,
-                first_slot: 0,
+                start: EraBoundaryView {
+                    time_ms: 1_666_656_000_000,
+                    slot: 0,
+                    epoch: 0,
+                },
+                end: None,
                 slot_length_ms: 1000,
                 epoch_length_slots: 432_000,
             }],
@@ -120,8 +126,16 @@ impl LedgerContext for DemoContext {
     async fn genesis(&self) -> Result<GenesisView, RpcError> {
         Ok(GenesisView {
             network_magic: 2,
+            network_id: "Testnet".to_string(),
             system_start_unix: 1_666_656_000,
             security_param: 432,
+            epoch_length: 86_400,
+            slot_length: 1,
+            max_lovelace_supply: 45_000_000_000_000_000,
+            max_kes_evolutions: 62,
+            slots_per_kes_period: 129_600,
+            update_quorum: 5,
+            active_slots_coeff: Some((1, 20)),
         })
     }
     async fn submit_tx(&self, _: u16, _: &[u8]) -> SubmitOutcome {

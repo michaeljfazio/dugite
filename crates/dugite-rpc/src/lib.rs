@@ -39,9 +39,9 @@ pub mod tip_feed;
 
 pub use config::{RpcConfig, RpcTlsConfig};
 pub use context::{
-    EraHistoryView, EraSummary, EvalOutcome, GenesisView, LedgerContext, LedgerStateView,
-    ParamsView, RawBlock, RawTx, RedeemerPurpose, RedeemerReport, SubmitOutcome, TipInfo,
-    UtxoSnapshot,
+    EraBoundaryView, EraHistoryView, EraSummary, EvalOutcome, GenesisView, LedgerContext,
+    LedgerStateView, ParamsView, RawBlock, RawTx, RedeemerPurpose, RedeemerReport, SubmitOutcome,
+    TipInfo, UtxoSnapshot,
 };
 pub use error::RpcError;
 pub use mempool_feed::{MempoolEvent, MempoolFeed, MempoolRemoveReason};
