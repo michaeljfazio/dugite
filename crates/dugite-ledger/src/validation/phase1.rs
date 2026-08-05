@@ -1637,6 +1637,44 @@ pub(super) fn run_phase1_rules(
     }
 
     // ------------------------------------------------------------------
+    // Rule 9c: Per-transaction reference-script size cap
+    //          (Haskell `ConwayTxRefScriptsSizeTooBig`, Conway LEDGER rule)
+    //
+    // The total non-distinct reference-script size reachable from a
+    // transaction's spending inputs AND reference inputs (the SAME
+    // `txNonDistinctRefScriptsSize` primitive already used for the
+    // CIP-0112 tiered ref-script FEE below) must not exceed a fixed
+    // 200 KiB (204800 byte) per-transaction cap.
+    //
+    // Per Haskell `validateRefScriptSize`
+    // (`eras/conway/impl/src/Cardano/Ledger/Conway/Rules/Ledger.hs:456-471`):
+    // `ppMaxRefScriptSizePerTxG` is a Conway-era CONSTANT (`200 * 1024`),
+    // not a live protocol parameter until Dijkstra — so this is a fixed
+    // threshold, not something read from `params`.
+    //
+    // This is a SEPARATE, additional cap from dugite's existing per-BLOCK
+    // 1 MiB `BodyRefScriptsSizeTooBig` check (`eras/conway.rs`, Conway
+    // BBODY rule, which sums ref-script size across every tx in a block) —
+    // a single oversized-ref-script transaction well under the block-wide
+    // limit was previously accepted at Phase-1 where cardano-node rejects
+    // it outright.
+    // ------------------------------------------------------------------
+    if params.protocol_version_major >= 9 {
+        const MAX_REF_SCRIPT_SIZE_PER_TX: u64 = 200 * 1024;
+        let total_ref_script_size = super::scripts::calculate_ref_script_size(
+            &body.inputs,
+            &body.reference_inputs,
+            utxo_set,
+        );
+        if total_ref_script_size > MAX_REF_SCRIPT_SIZE_PER_TX {
+            errors.push(ValidationError::RefScriptsSizeTooBig {
+                maximum: MAX_REF_SCRIPT_SIZE_PER_TX,
+                actual: total_ref_script_size,
+            });
+        }
+    }
+
+    // ------------------------------------------------------------------
     // Rule 9b: Witness completeness
     // ------------------------------------------------------------------
     if errors.is_empty() {
@@ -2791,6 +2829,172 @@ mod tests {
                 .iter()
                 .any(|e| matches!(e, ValidationError::ReferenceInputNotFound(_))),
             "PV 11: expected ReferenceInputNotFound, got {errors:?}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Test — Rule 9c: per-transaction reference-script size cap
+    //        (Haskell `ConwayTxRefScriptsSizeTooBig`)
+    // -----------------------------------------------------------------------
+    #[test]
+    fn test_ref_script_size_over_per_tx_cap_rejected() {
+        let (mut utxo_set, mut tx, input) = make_valid_tx();
+        // Attach an oversized PlutusV3 reference script (204_801 bytes, one
+        // over the 200 KiB = 204_800 byte cap) to the spent input's own UTxO.
+        let big_script = vec![0u8; 204_801];
+        let mut utxo_output = utxo_set.lookup(&input).unwrap().clone();
+        utxo_output.script_ref = Some(dugite_primitives::transaction::ScriptRef::PlutusV3(
+            big_script,
+        ));
+        utxo_set.insert(input.clone(), utxo_output);
+        tx.body.fee = Lovelace(0); // avoid coupling to the fee formula
+        tx.body.outputs[0].value = Value::lovelace(10_000_000);
+
+        let params = ProtocolParameters::mainnet_defaults(); // PV 9
+        let errors = validate_transaction(&tx, &utxo_set, &params, 100, 300, None).unwrap_err();
+        assert!(
+            errors.iter().any(|e| matches!(
+                e,
+                ValidationError::RefScriptsSizeTooBig {
+                    maximum: 204_800,
+                    actual: 204_801
+                }
+            )),
+            "expected RefScriptsSizeTooBig{{maximum:204800,actual:204801}}, got {errors:?}"
+        );
+    }
+
+    #[test]
+    fn test_ref_script_size_at_per_tx_cap_accepted() {
+        let (mut utxo_set, mut tx, input) = make_valid_tx();
+        // Exactly at the cap (204_800 bytes) must NOT trigger the check
+        // (Haskell: `totalRefScriptSize <= maxRefScriptSizePerTx`).
+        let exact_script = vec![0u8; 204_800];
+        let mut utxo_output = utxo_set.lookup(&input).unwrap().clone();
+        utxo_output.script_ref = Some(dugite_primitives::transaction::ScriptRef::PlutusV3(
+            exact_script,
+        ));
+        utxo_set.insert(input.clone(), utxo_output);
+        tx.body.fee = Lovelace(0);
+        tx.body.outputs[0].value = Value::lovelace(10_000_000);
+
+        let params = ProtocolParameters::mainnet_defaults();
+        let errors = validate_transaction(&tx, &utxo_set, &params, 100, 300, None)
+            .err()
+            .unwrap_or_default();
+        assert!(
+            !errors
+                .iter()
+                .any(|e| matches!(e, ValidationError::RefScriptsSizeTooBig { .. })),
+            "exactly-at-cap ref script size must NOT trigger RefScriptsSizeTooBig, got {errors:?}"
+        );
+    }
+
+    #[test]
+    fn test_ref_script_size_skipped_pre_conway() {
+        // The cap is a Conway-era constant (`ppMaxRefScriptSizePerTxG`) — it
+        // does not exist pre-Conway, so must not fire at PV < 9.
+        let (mut utxo_set, mut tx, input) = make_valid_tx();
+        let big_script = vec![0u8; 204_801];
+        let mut utxo_output = utxo_set.lookup(&input).unwrap().clone();
+        utxo_output.script_ref = Some(dugite_primitives::transaction::ScriptRef::PlutusV1(
+            big_script,
+        ));
+        utxo_set.insert(input.clone(), utxo_output);
+        tx.body.fee = Lovelace(0);
+        tx.body.outputs[0].value = Value::lovelace(10_000_000);
+
+        let mut params = ProtocolParameters::mainnet_defaults();
+        params.protocol_version_major = 8; // Babbage
+        let result = validate_transaction(&tx, &utxo_set, &params, 100, 300, None);
+        let errors = result.err().unwrap_or_default();
+        assert!(
+            !errors
+                .iter()
+                .any(|e| matches!(e, ValidationError::RefScriptsSizeTooBig { .. })),
+            "pre-Conway (PV8) must never fire RefScriptsSizeTooBig, got {errors:?}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Test — Rule 11: max collateral inputs, checked UNCONDITIONALLY
+    //        (Haskell `TooManyCollateralInputs`, not gated on Plutus content)
+    // -----------------------------------------------------------------------
+    #[test]
+    fn test_too_many_collateral_inputs_on_non_plutus_tx_rejected() {
+        // A transaction with NO Plutus scripts and NO redeemers, but a
+        // `collateral` field declaring more inputs than `max_collateral_inputs`.
+        // Haskell's `TooManyCollateralInputs` is checked unconditionally
+        // (`Babbage/Utxo.hs:412`), not gated on `redeemers` being non-empty —
+        // before this fix dugite's `check_collateral` (and hence this
+        // predicate) only ran when `has_plutus_scripts(tx)` was true, so this
+        // tx was silently ACCEPTED.
+        let (mut utxo_set, mut tx, _) = make_valid_tx();
+        let mut collateral = Vec::new();
+        for i in 0u8..4 {
+            let col_input = TransactionInput {
+                transaction_id: Hash32::from_bytes([0xF0 + i; 32]),
+                index: 0,
+            };
+            utxo_set.insert(
+                col_input.clone(),
+                TransactionOutput {
+                    address: Address::Byron(dugite_primitives::address::ByronAddress {
+                        payload: vec![0x82, 0x00, 0x01],
+                    }),
+                    value: Value::lovelace(5_000_000),
+                    datum: OutputDatum::None,
+                    script_ref: None,
+                    is_legacy: false,
+                    raw_cbor: None,
+                },
+            );
+            collateral.push(col_input);
+        }
+        tx.body.collateral = collateral;
+
+        let mut params = ProtocolParameters::mainnet_defaults();
+        params.max_collateral_inputs = 3;
+        let errors = validate_transaction(&tx, &utxo_set, &params, 100, 300, None).unwrap_err();
+        assert!(
+            errors.iter().any(|e| matches!(
+                e,
+                ValidationError::TooManyCollateralInputs { max: 3, actual: 4 }
+            )),
+            "a non-Plutus tx with too many collateral inputs must be rejected, got {errors:?}"
+        );
+    }
+
+    #[test]
+    fn test_collateral_field_ignored_when_within_limit_on_non_plutus_tx() {
+        let (mut utxo_set, mut tx, _) = make_valid_tx();
+        let col_input = TransactionInput {
+            transaction_id: Hash32::from_bytes([0xF9u8; 32]),
+            index: 0,
+        };
+        utxo_set.insert(
+            col_input.clone(),
+            TransactionOutput {
+                address: Address::Byron(dugite_primitives::address::ByronAddress {
+                    payload: vec![0x82, 0x00, 0x01],
+                }),
+                value: Value::lovelace(5_000_000),
+                datum: OutputDatum::None,
+                script_ref: None,
+                is_legacy: false,
+                raw_cbor: None,
+            },
+        );
+        tx.body.collateral = vec![col_input];
+
+        let params = ProtocolParameters::mainnet_defaults(); // max_collateral_inputs default is well above 1
+        let result = validate_transaction(&tx, &utxo_set, &params, 100, 300, None);
+        let errors = result.err().unwrap_or_default();
+        assert!(
+            !errors
+                .iter()
+                .any(|e| matches!(e, ValidationError::TooManyCollateralInputs { .. })),
+            "a single collateral input within the limit must not trigger TooManyCollateralInputs, got {errors:?}"
         );
     }
 

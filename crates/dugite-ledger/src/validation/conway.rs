@@ -574,6 +574,103 @@ pub(super) fn is_vote_on_expired_action(
     current_epoch > proposal.expires_after_epoch.0
 }
 
+/// Returns `Some((target_major, target_minor, base_major, base_minor))` when
+/// `action` is a `HardForkInitiation` whose target `ProtVer` does NOT
+/// `pvCanFollow` its resolved base version — i.e. the proposal must be
+/// rejected with `ProposalCantFollow`. Returns `None` for any non-HardFork
+/// action, or a `HardForkInitiation` whose base is unresolved or whose
+/// target legally follows.
+///
+/// Implements Haskell `preceedingHardFork`
+/// (`eras/conway/impl/src/Cardano/Ledger/Conway/Rules/Gov.hs:673-694`)'s
+/// three-way base resolution followed by
+/// [`crate::state::governance::pv_can_follow`] (the same formula reused —
+/// NOT reimplemented — from the live block-apply GOV rule so the
+/// reachability arithmetic has one source of truth):
+///
+///  1. `hf_prev == ctx.enacted_gov_roots.hard_fork` (the proposal's prev
+///     pointer matches the currently-ENACTED HardFork root), OR the
+///     proposed major version already jumps more than one step past the
+///     CURRENT on-chain major — base = the live `(cur_major, cur_minor)`.
+///     The second disjunct is a deliberate short-circuit: it forbids
+///     compounding two major-version bumps within one live proposal set,
+///     even when a same-purpose ancestor is in flight.
+///  2. Otherwise, `hf_prev` must resolve to another `HardForkInitiation`,
+///     either an EARLIER proposal in this same transaction (Haskell folds
+///     `processProposal` over the tx's proposals in order, so proposal N
+///     may chain onto proposal N-1's OWN target version) or an on-chain
+///     active (in-flight) proposal — base = that sibling's target
+///     `ProtVer`.
+///  3. Base unresolved (`hf_prev` missing, or does not resolve to a
+///     `HardForkInitiation`) — no `ProposalCantFollow` here; that
+///     malformed-ancestor shape is instead caught by the separate
+///     structural [`ValidationError::InvalidPrevGovActionId`] check.
+///
+/// Silently skipped when `ctx.enacted_gov_roots` is `None` (the same
+/// lenient default used by the sibling `InvalidPrevGovActionId` check).
+///
+/// Reference: Haskell `ProposalCantFollow` (`ConwayGovPredFailure` tag 10,
+/// `Conway/Rules/Gov.hs:193-199`), raised from `badHardFork` inside
+/// `processProposal` (`Conway/Rules/Gov.hs:483-499`). Without this check, a
+/// `HardForkInitiation` proposal with an illegal version jump is admitted
+/// to dugite's mempool and forged into a block; cardano-node rejects the
+/// WHOLE TRANSACTION (and therefore the block) via `ConwayGovFailure
+/// (ProposalCantFollow …)` — the `#996`-class wedge, where a Haskell peer
+/// re-requests the same block on every reconnect and never recovers.
+pub(super) fn hardfork_proposal_cant_follow(
+    action: &GovAction,
+    idx: usize,
+    proposals: &[ProposalProcedure],
+    tx_hash: Hash32,
+    ctx: &ValidationContext,
+    cur_major: u64,
+    cur_minor: u64,
+) -> Option<(u64, u64, u64, u64)> {
+    let GovAction::HardForkInitiation {
+        prev_action_id: hf_prev,
+        protocol_version: (tgt_major, tgt_minor),
+    } = action
+    else {
+        return None;
+    };
+
+    let roots = ctx.enacted_gov_roots.as_ref()?;
+
+    let base: Option<(u64, u64)> =
+        if hf_prev.as_ref() == roots.hard_fork.as_ref() || *tgt_major > cur_major + 1 {
+            Some((cur_major, cur_minor))
+        } else {
+            hf_prev.as_ref().and_then(|prev| {
+                let sibling_action: Option<&GovAction> =
+                    if prev.transaction_id == tx_hash && (prev.action_index as usize) < idx {
+                        proposals
+                            .get(prev.action_index as usize)
+                            .map(|p| &p.gov_action)
+                    } else {
+                        ctx.active_proposals
+                            .as_ref()
+                            .and_then(|m| m.get(prev))
+                            .map(|ap| &ap.gov_action)
+                    };
+                match sibling_action {
+                    Some(GovAction::HardForkInitiation {
+                        protocol_version, ..
+                    }) => Some(*protocol_version),
+                    _ => None,
+                }
+            })
+        };
+
+    match base {
+        Some((bm, bn))
+            if !crate::state::governance::pv_can_follow(bm, bn, *tgt_major, *tgt_minor) =>
+        {
+            Some((*tgt_major, *tgt_minor, bm, bn))
+        }
+        _ => None,
+    }
+}
+
 /// Returns `true` when the proposal's `return_addr` references a stake
 /// credential that is not registered in `ctx.reward_accounts`.
 ///
@@ -946,7 +1043,7 @@ mod tests {
     use dugite_primitives::value::Lovelace;
 
     use super::*;
-    use crate::validation::ActiveProposal;
+    use crate::validation::{ActiveProposal, EnactedGovRoots};
 
     // ---------------------------------------------------------------------------
     // Helpers
@@ -2211,6 +2308,204 @@ mod tests {
         assert!(
             !is_vote_on_expired_action(&action_id, &ctx),
             "Predicate must skip (return false) when active_proposals is None"
+        );
+    }
+
+    // ---------------------------------------------------------------------------
+    // hardfork_proposal_cant_follow — ProposalCantFollow (Conway GOV)
+    //
+    // Worked examples byte-verified against
+    // `.claude/agent-memory/cardano-ledger-oracle/hardfork-pvcanfollow-exact-mechanics.md`
+    // (live-verified against `preceedingHardFork`, Gov.hs:673-694).
+    // ---------------------------------------------------------------------------
+
+    fn hf_action(prev: Option<GovActionId>, target: (u64, u64)) -> GovAction {
+        GovAction::HardForkInitiation {
+            prev_action_id: prev,
+            protocol_version: target,
+        }
+    }
+
+    #[test]
+    fn test_hardfork_cant_follow_genesis_root_major_bump_valid() {
+        // Current (9,0). Proposal targets (10,0) with prev=None and no
+        // enacted HardFork root yet -> matches disjunct 1 (root match) ->
+        // base=(9,0) -> pvCanFollow(9,0 -> 10,0) = true -> not rejected.
+        let action = hf_action(None, (10, 0));
+        let ctx = ValidationContext::new().with_enacted_gov_roots(EnactedGovRoots::default());
+        let result = hardfork_proposal_cant_follow(
+            &action,
+            0,
+            &[],
+            Hash32::from_bytes([0x01; 32]),
+            &ctx,
+            9,
+            0,
+        );
+        assert!(
+            result.is_none(),
+            "genesis-root major bump (9,0)->(10,0) must be accepted, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_hardfork_cant_follow_genesis_root_double_major_bump_rejected() {
+        // Current (9,0). Proposal targets (11,0) with prev=None -> matches
+        // disjunct 1 (root match) -> base=(9,0) -> pvCanFollow(9,0 -> 11,0)
+        // = false (skips a major version) -> rejected.
+        let action = hf_action(None, (11, 0));
+        let ctx = ValidationContext::new().with_enacted_gov_roots(EnactedGovRoots::default());
+        let result = hardfork_proposal_cant_follow(
+            &action,
+            0,
+            &[],
+            Hash32::from_bytes([0x01; 32]),
+            &ctx,
+            9,
+            0,
+        );
+        assert_eq!(
+            result,
+            Some((11, 0, 9, 0)),
+            "genesis-root double major bump (9,0)->(11,0) must be rejected"
+        );
+    }
+
+    #[test]
+    fn test_hardfork_cant_follow_same_tx_chain_minor_bump_valid() {
+        // Oracle worked example 2: current (9,0). Proposal A (idx 0):
+        // prev=None, target=(10,0) — root-anchored, valid. Proposal B
+        // (idx 1) in the SAME tx: prev=A's id, target=(10,1) — chains onto
+        // A's OWN target (10,0), pvCanFollow(10,0 -> 10,1) = true -> valid.
+        let tx_hash = Hash32::from_bytes([0x02; 32]);
+        let a_id = GovActionId {
+            transaction_id: tx_hash,
+            action_index: 0,
+        };
+        let proposal_a = ProposalProcedure {
+            deposit: Lovelace(0),
+            return_addr: vec![0xe0; 29],
+            gov_action: hf_action(None, (10, 0)),
+            anchor: anchor_stub(),
+        };
+        let proposal_b_action = hf_action(Some(a_id), (10, 1));
+        let proposals = vec![proposal_a];
+        let ctx = ValidationContext::new().with_enacted_gov_roots(EnactedGovRoots::default());
+        let result =
+            hardfork_proposal_cant_follow(&proposal_b_action, 1, &proposals, tx_hash, &ctx, 9, 0);
+        assert!(
+            result.is_none(),
+            "same-tx minor bump chained onto an in-flight major bump must be accepted, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_hardfork_cant_follow_same_tx_chain_double_major_bump_rejected() {
+        // Oracle worked example 3: same setup as above, but B instead
+        // targets (11,0) — attempting to chain a SECOND major bump onto A
+        // before A is enacted. newMajor(11) > succVersion(9)=10, so the
+        // short-circuit forces base back to the LIVE current (9,0)
+        // (bypassing the chain lookup entirely) -> pvCanFollow(9,0 -> 11,0)
+        // = false -> rejected.
+        let tx_hash = Hash32::from_bytes([0x03; 32]);
+        let a_id = GovActionId {
+            transaction_id: tx_hash,
+            action_index: 0,
+        };
+        let proposal_a = ProposalProcedure {
+            deposit: Lovelace(0),
+            return_addr: vec![0xe0; 29],
+            gov_action: hf_action(None, (10, 0)),
+            anchor: anchor_stub(),
+        };
+        let proposal_b_action = hf_action(Some(a_id), (11, 0));
+        let proposals = vec![proposal_a];
+        let ctx = ValidationContext::new().with_enacted_gov_roots(EnactedGovRoots::default());
+        let result =
+            hardfork_proposal_cant_follow(&proposal_b_action, 1, &proposals, tx_hash, &ctx, 9, 0);
+        assert_eq!(
+            result,
+            Some((11, 0, 9, 0)),
+            "chaining a second major bump onto an in-flight major bump must be rejected \
+             (base forced back to live current, not A's target), got {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_hardfork_cant_follow_active_onchain_parent_chain() {
+        // prev references an on-chain ACTIVE (in-flight) HardForkInitiation
+        // proposal (not same-tx) -> base = that proposal's own target.
+        let parent_id = GovActionId {
+            transaction_id: Hash32::from_bytes([0x04; 32]),
+            action_index: 0,
+        };
+        let mut active: HashMap<GovActionId, ActiveProposal> = HashMap::new();
+        active.insert(
+            parent_id.clone(),
+            ActiveProposal {
+                gov_action: hf_action(None, (10, 0)),
+                return_addr: vec![0xe0; 29],
+                deposit: Lovelace(0),
+                expires_after_epoch: EpochNo(100),
+                proposed_in_epoch: EpochNo(1),
+            },
+        );
+        let action = hf_action(Some(parent_id), (10, 1));
+        let ctx = ValidationContext::new()
+            .with_enacted_gov_roots(EnactedGovRoots::default())
+            .with_active_proposals(active);
+        let result = hardfork_proposal_cant_follow(
+            &action,
+            0,
+            &[],
+            Hash32::from_bytes([0x05; 32]),
+            &ctx,
+            9,
+            0,
+        );
+        assert!(
+            result.is_none(),
+            "minor bump chained onto an active on-chain HardFork parent must be accepted, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_hardfork_cant_follow_non_hardfork_action_never_fires() {
+        let action = GovAction::InfoAction;
+        let ctx = ValidationContext::new().with_enacted_gov_roots(EnactedGovRoots::default());
+        let result = hardfork_proposal_cant_follow(
+            &action,
+            0,
+            &[],
+            Hash32::from_bytes([0x06; 32]),
+            &ctx,
+            9,
+            0,
+        );
+        assert!(
+            result.is_none(),
+            "non-HardFork actions must never fire this predicate"
+        );
+    }
+
+    #[test]
+    fn test_hardfork_cant_follow_skipped_when_enacted_gov_roots_none() {
+        // Lenient default: no enacted_gov_roots plumbed in -> predicate
+        // never fires, matching the sibling InvalidPrevGovActionId check.
+        let action = hf_action(None, (11, 0)); // would otherwise be rejected
+        let ctx = ValidationContext::new();
+        let result = hardfork_proposal_cant_follow(
+            &action,
+            0,
+            &[],
+            Hash32::from_bytes([0x07; 32]),
+            &ctx,
+            9,
+            0,
+        );
+        assert!(
+            result.is_none(),
+            "predicate must be skipped when enacted_gov_roots is None"
         );
     }
 

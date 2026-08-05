@@ -18031,4 +18031,139 @@ mod tests {
             "predicate must be skipped when enacted_gov_roots is None"
         );
     }
+
+    // =====================================================================
+    // ProposalCantFollow (Conway GOV tag 10) — end-to-end wiring
+    // =====================================================================
+    //
+    // Haskell's `badHardFork` in `processProposal` fails the WHOLE
+    // transaction (`failOnJust ... injectFailure`) when a HardForkInitiation
+    // proposal's target ProtVer does not `pvCanFollow` its resolved base.
+    // Before this fix, `crates/dugite-ledger/src/validation/` had NO check
+    // for this predicate at all — dugite's Phase-1 mempool admission would
+    // accept a HardForkInitiation proposing an illegal version jump (e.g.
+    // skipping a major version), which cardano-node rejects outright. A
+    // dugite block-producer forging such a tx would mint a block every
+    // Haskell peer rejects and never re-requests successfully — the
+    // `#996`-class wedge one purpose earlier.
+
+    fn hf_proposal(prev: Option<GovActionId>, target: (u64, u64)) -> ProposalProcedure {
+        ProposalProcedure {
+            deposit: Lovelace(100_000_000_000),
+            return_addr: vec![0xE0; 29],
+            gov_action: GovAction::HardForkInitiation {
+                prev_action_id: prev,
+                protocol_version: target,
+            },
+            anchor: Anchor {
+                url: String::new(),
+                data_hash: Hash32::ZERO,
+            },
+        }
+    }
+
+    /// Run Phase-1 (at PV 10, matching `conway_pparams_pv10`) and report
+    /// whether `ProposalCantFollow` fired.
+    fn proposal_cant_follow_fires(
+        proposals: Vec<ProposalProcedure>,
+        roots: Option<EnactedGovRoots>,
+    ) -> bool {
+        let params = conway_pparams_pv10(); // (10, 0)
+        let utxo_set = UtxoSet::new();
+        let tx = make_gov_tx(proposals, BTreeMap::new());
+        let mut context = ValidationContext::new().with_epoch(5);
+        if let Some(r) = roots {
+            context = context.with_enacted_gov_roots(r);
+        }
+        match validate_transaction_with_context(&tx, &utxo_set, &params, 100, 500, None, context) {
+            Ok(_) => false,
+            Err(errors) => errors
+                .iter()
+                .any(|e| matches!(e, ValidationError::ProposalCantFollow { .. })),
+        }
+    }
+
+    /// Genesis-root major bump (10,0) -> (11,0): legal, must NOT fire.
+    #[test]
+    fn proposal_cant_follow_accepts_legal_major_bump() {
+        assert!(
+            !proposal_cant_follow_fires(
+                vec![hf_proposal(None, (11, 0))],
+                Some(EnactedGovRoots::default())
+            ),
+            "a legal (curMajor+1, 0) HardForkInitiation must be accepted"
+        );
+    }
+
+    /// Genesis-root double major bump (10,0) -> (12,0): illegal, must fire
+    /// and reject the WHOLE transaction (not just drop the proposal).
+    #[test]
+    fn proposal_cant_follow_rejects_illegal_double_major_bump() {
+        assert!(
+            proposal_cant_follow_fires(
+                vec![hf_proposal(None, (12, 0))],
+                Some(EnactedGovRoots::default())
+            ),
+            "a HardForkInitiation skipping a major version must be rejected at Phase-1 — \
+             cardano-node rejects it via ConwayGovFailure (ProposalCantFollow …)"
+        );
+    }
+
+    /// Genesis-root illegal minor skip (10,0) -> (10,2): must fire.
+    #[test]
+    fn proposal_cant_follow_rejects_illegal_minor_skip() {
+        assert!(
+            proposal_cant_follow_fires(
+                vec![hf_proposal(None, (10, 2))],
+                Some(EnactedGovRoots::default())
+            ),
+            "a HardForkInitiation skipping a minor version must be rejected"
+        );
+    }
+
+    /// Legal minor bump (10,0) -> (10,1): must NOT fire.
+    #[test]
+    fn proposal_cant_follow_accepts_legal_minor_bump() {
+        assert!(
+            !proposal_cant_follow_fires(
+                vec![hf_proposal(None, (10, 1))],
+                Some(EnactedGovRoots::default())
+            ),
+            "a legal (curMajor, curMinor+1) HardForkInitiation must be accepted"
+        );
+    }
+
+    /// Chaining onto the enacted HardFork root with a legal step is
+    /// accepted.
+    #[test]
+    fn proposal_cant_follow_accepts_chaining_onto_enacted_root() {
+        let root = gid(0x21, 0);
+        let roots = EnactedGovRoots {
+            hard_fork: Some(root.clone()),
+            ..Default::default()
+        };
+        assert!(
+            !proposal_cant_follow_fires(vec![hf_proposal(Some(root), (11, 0))], Some(roots)),
+            "chaining onto the enacted HardFork root with a legal major bump must be accepted"
+        );
+    }
+
+    /// Lenient default: skipped entirely when `enacted_gov_roots` is None,
+    /// matching every sibling GOV predicate's convention.
+    #[test]
+    fn proposal_cant_follow_skipped_without_roots_context() {
+        assert!(
+            !proposal_cant_follow_fires(vec![hf_proposal(None, (12, 0))], None),
+            "predicate must be skipped when enacted_gov_roots is None"
+        );
+    }
+
+    /// Non-HardFork proposals never trip this predicate regardless of PV.
+    #[test]
+    fn proposal_cant_follow_ignores_non_hardfork_actions() {
+        assert!(
+            !proposal_cant_follow_fires(vec![pc_proposal(None)], Some(EnactedGovRoots::default())),
+            "a ParameterChange proposal must never trip ProposalCantFollow"
+        );
+    }
 }
