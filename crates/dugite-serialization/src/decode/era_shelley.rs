@@ -1290,7 +1290,7 @@ fn decode_aux_data_map(
 /// entirely empty auxiliary data — metadata included — and its ShelleyMa arm
 /// skipped the native scripts. Issue #984.
 fn decode_auxiliary_data(r: &mut Reader<'_>) -> Result<AuxiliaryData, SerializationError> {
-    super::era_alonzo::decode_alonzo_auxiliary_data(r)
+    super::era_alonzo::decode_alonzo_auxiliary_data(r, Era::Shelley)
 }
 
 // ============================================================================

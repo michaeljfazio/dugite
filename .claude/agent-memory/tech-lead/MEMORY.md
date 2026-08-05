@@ -5,6 +5,8 @@
 
 ## Conway Epoch/NEWEPOCH Pipeline Audit (2026-08-05)
 - [Full NEWEPOCH audit](audit-conway-epoch-newepoch-pipeline-2026-08-05.md) — #1017 test-path committee-prune gap (fixed) + #1016 misattributed comment (fixed) + #1015 Babbage nonce formula wrongly folds extraEntropy (filed, dormant). Extensive clean negatives: reward floor chain, zero-block-pool gate, RATIFY ordering, POOLREAP, deposits/obligation. Version-pin discipline: master HEAD != cardano-node 11.0.1's actual pin — check this repo's own conformance-corpus SHA first.
+## #1014 aux-data key set (2026-08-05)
+- [AlonzoTxAuxData shared decoder + guardPlutus PV gate](issue-1014-auxdata-key5-shared-decoder-pv-gate.md) — ONE decoder across all eras, keys 2-5 individually PV-gated (5/7/9/12), not per-era key sets; ceiling model works today but is fragile to a future non-Plutus-gated key. Dijkstra key 5 deliberately capped at 4 (no `plutus_v4_scripts` field yet).
 
 ## Dijkstra Sub-Transaction Rules (2026-08-05)
 - [#1011 SUBCERTS/SUBDELEG/SUBPOOL/SUBGOVCERT/SUBENTITIES landed](issue-1011-dijkstra-subcerts-subpool-subgovcert.md) — clone-then-mutate-or-discard pattern (imbl+Arc make CertSubState/GovSubState clones cheap) beats extracting the top-level validator; SUBGOV+mint stay guarded (too large for one issue)
