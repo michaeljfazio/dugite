@@ -1,0 +1,22 @@
+# Pinned so `just check` locally and CI lint with the SAME compiler.
+#
+# Without this, every workflow used `dtolnay/rust-toolchain@stable` and floated
+# to whatever stable was current, while developers linted with whatever they
+# happened to have installed. Any lint added in a newer release then passed
+# locally and failed CI — which is exactly what happened on 2026-08-05, twice
+# in one push (`clippy::for_kv_map`, `clippy::manual_option_zip`): `just check`
+# was green on 1.95.0 while CI rejected the same tree on 1.97.0.
+#
+# rustup precedence puts this file (#4) above the `rustup default` (#5) that
+# `dtolnay/rust-toolchain` sets, so CI honours it. It does NOT override a
+# `+toolchain` shorthand (#1), so `cargo +nightly fuzz run` in fuzz.yml keeps
+# working on nightly as fuzzing requires.
+#
+# `.github/workflows/*.yml` pin the same version so the action installs
+# components and cross-compile targets onto THIS toolchain rather than a
+# different one. `cargo xtask` enforces that they agree — see
+# `xtask/tests/toolchain_pin_coverage.rs`. Bump both together, or that test
+# fails.
+[toolchain]
+channel = "1.97.0"
+components = ["clippy", "rustfmt", "llvm-tools-preview"]
