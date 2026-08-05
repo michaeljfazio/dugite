@@ -1448,14 +1448,32 @@ pub(crate) fn decode_alonzo_aux_data_map(
 /// `AuxiliaryData` has no `plutus_v4_scripts` field — Dijkstra is unreleased
 /// and its param set is still moving, so key 5 stays a documented
 /// fail-closed gap here (capped at 4, matching Conway) rather than guessing
-/// at wire format for an unmodelled field. Byron/Shelley/Allegra/Mary never
-/// legitimately emit the tag-259 shape at all (their own `TxAuxData` types
-/// are structurally different — a bare map or `[metadata, scripts]` array,
-/// with no `Tag` constructor whatsoever, so a real peer's decoder would
-/// reject the shape outright, not just an out-of-range key within it); this
-/// decoder is shared across every era in dugite's implementation (#984), so
-/// they get the same conservative key cap as a defense in depth, not because
-/// upstream defines a wider set for them.
+/// at wire format for an unmodelled field. This is a KNOWN, INTENTIONAL
+/// deviation from upstream, tracked in #1014: upstream's `guardPlutus
+/// PlutusV4` would accept key 5 the moment decoder PV reaches 12 (Dijkstra),
+/// dugite's ceiling will not until the field is added. Harmless while
+/// Dijkstra is unreleased; becomes a false reject at Dijkstra activation if
+/// left unfixed — do not close #1014 on this decoder alone.
+///
+/// Byron/Shelley/Allegra/Mary never legitimately emit the tag-259 shape at
+/// all (their own `TxAuxData` types are structurally different — a bare map
+/// or `[metadata, scripts]` array, with no `Tag` constructor whatsoever, so
+/// a real peer's decoder would reject the shape outright, not just an
+/// out-of-range key within it); this decoder is shared across every era in
+/// dugite's implementation (#984), so they get the same conservative key cap
+/// as a defense in depth, not because upstream defines a wider set for them.
+///
+/// **Mechanism caveat**: this cap is a per-era CEILING; upstream's real
+/// mechanism is "all of keys 0-5 always have a match arm, keys 2-5
+/// individually PV-gated inside their own arm" — a shared decoder plus a
+/// guard, not a per-era key SET. The two models agree for every key that
+/// exists today because every gated key happens to be Plutus-version-shaped
+/// and every era's floor lines up with the corresponding `guardPlutus`
+/// threshold (see the table above). They are not the same model: if
+/// upstream ever adds a NEW aux-data key that is NOT PV-gated (unlike every
+/// key 0-5 today), a ceiling here would silently reject it while upstream
+/// accepts — re-derive this function from the live `auxDataField`/
+/// `decoderByKey` table rather than assuming a wider ceiling is correct.
 fn max_aux_data_key(era: Era) -> u64 {
     match era {
         Era::Byron | Era::Shelley | Era::Allegra | Era::Mary => 1,
