@@ -1039,6 +1039,13 @@ mod tests {
     // because the tests asserted the encoder's (wrong) output shape instead of
     // testing the round-trip. This exercises every Conway certificate variant
     // against the real decoder so the same asymmetry cannot recur silently.
+    //
+    // #1023 added the two tags this test previously omitted (PoolRegistration
+    // tag 3, VoteRegDeleg tag 12), so all 17 tags still valid in Conway
+    // (0-4, 7-18 — tags 5/6 were REMOVED, see
+    // `era_conway::tests::conway_certificate_tag5_genesis_key_delegation_rejected`
+    // / `conway_certificate_tag6_mir_rejected`) are now exercised, not 15 of
+    // them.
 
     #[test]
     fn every_conway_certificate_round_trips_through_our_own_decoder() {
@@ -1122,6 +1129,29 @@ mod tests {
             Certificate::RegStakeVoteDeleg {
                 credential: key.clone(),
                 pool_hash: pool,
+                drep: drep_key.clone(),
+                deposit: Lovelace(2_000_000),
+            },
+            // #1023: the two tags this test previously omitted, rounding
+            // out coverage to all 17 tags still valid in Conway (0-4, 7-18
+            // minus the removed 5/6). Without these, "every Conway
+            // certificate round-trips" was true of 15 tags, not all of them.
+            Certificate::PoolRegistration(PoolParams {
+                operator: pool,
+                vrf_keyhash: Hash32::from_bytes([0x66; 32]),
+                pledge: Lovelace(1_000_000),
+                cost: Lovelace(340_000_000),
+                margin: Rational {
+                    numerator: 1,
+                    denominator: 20,
+                },
+                reward_account: vec![0xe0; 29],
+                pool_owners: vec![Hash28::from_bytes([0x77; 28])],
+                relays: vec![],
+                pool_metadata: None,
+            }),
+            Certificate::VoteRegDeleg {
+                credential: key.clone(),
                 drep: drep_key.clone(),
                 deposit: Lovelace(2_000_000),
             },

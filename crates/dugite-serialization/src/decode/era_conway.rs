@@ -63,10 +63,10 @@ use dugite_primitives::hash::{blake2b_256, Hash28, Hash32};
 use dugite_primitives::time::{BlockNo, SlotNo};
 use dugite_primitives::transaction::{
     Anchor, AuxiliaryData, BootstrapWitness, Certificate, Constitution, CostModels, DRep,
-    ExUnitPrices, ExUnits, GovAction, GovActionId, MIRSource, MIRTarget, NativeScript, OutputDatum,
-    PlutusData, PoolParams, ProposalProcedure, ProtocolParamUpdate, Rational, Redeemer,
-    RedeemerTag, Transaction, TransactionBody, TransactionInput, TransactionOutput,
-    TransactionWitnessSet, VKeyWitness, Vote, Voter, VotingProcedure,
+    ExUnitPrices, ExUnits, GovAction, GovActionId, NativeScript, OutputDatum, PlutusData,
+    PoolParams, ProposalProcedure, ProtocolParamUpdate, Rational, Redeemer, RedeemerTag,
+    Transaction, TransactionBody, TransactionInput, TransactionOutput, TransactionWitnessSet,
+    VKeyWitness, Vote, Voter, VotingProcedure,
 };
 use dugite_primitives::value::{AssetName, Lovelace, Value};
 use minicbor::data::Type;
@@ -1567,8 +1567,8 @@ pub fn reference_native_script_original_bytes(output_cbor: &[u8]) -> Option<Vec<
 /// 2 = stake_delegation          (Shelley legacy)
 /// 3 = pool_registration         (Shelley legacy)
 /// 4 = pool_retirement           (Shelley legacy)
-/// 5 = genesis_key_delegation    (Shelley legacy, deprecated)
-/// 6 = move_instantaneous_reward (Shelley legacy, deprecated)
+/// 5 = genesis_key_delegation    REMOVED — hard decode failure (see below)
+/// 6 = move_instantaneous_reward REMOVED — hard decode failure (see below)
 /// 7 = reg (Conway: stake reg + deposit)
 /// 8 = unreg (Conway: stake unreg + refund)
 /// 9 = vote_deleg (Conway: delegate vote to DRep)
@@ -1582,6 +1582,45 @@ pub fn reference_native_script_original_bytes(output_cbor: &[u8]) -> Option<Vec<
 /// 17 = unreg_drep (Conway: DRep deregistration)
 /// 18 = update_drep (Conway: DRep update)
 /// ```
+///
+/// ## Issue #1023 — tags 5 and 6 are hard decode failures, not accepted legacy
+///
+/// Oracle-verified verbatim against `IntersectMBO/cardano-ledger` at pinned
+/// SHA `4849c13d6f70e5ab46add9af6e0ec5c537b61f69`
+/// (`eras/conway/impl/src/Cardano/Ledger/Conway/TxCert.hs:719-726`):
+///
+/// ```haskell
+/// decCBOR = decodeRecordSum "ConwayTxCert" $ \case
+///   t
+///     | 0 <= t && t < 3 -> shelleyTxCertDelegDecoder t
+///     | 3 <= t && t < 5 -> poolTxCertDecoder t
+///     | t == 5 -> fail "Genesis delegation certificates are no longer supported"
+///     | t == 6 -> fail "MIR certificates are no longer supported"
+///     | 7 <= t -> conwayTxCertDelegDecoder t
+///   t -> invalidKey t
+/// ```
+///
+/// This is a clean, unconditional, era-scoped `fail` — NOT protocol-version
+/// gated (no `ifDecoderVersionAtLeast`/`natVersion` anywhere near this
+/// match). `ConwayTxCert` is also a disjoint Haskell TYPE from
+/// `ShelleyTxCert` (`type TxCert ConwayEra = ConwayTxCert ConwayEra`, with
+/// only 3 constructors: `ConwayTxCertDeleg | ConwayTxCertPool |
+/// ConwayTxCertGov` — no MIR/GenesisDeleg constructor exists at all), so the
+/// removal is structural, not merely a decoder-side check. Every pre-Conway
+/// era (Shelley/Allegra/Mary/Alonzo/Babbage) instead aliases
+/// `type TxCert <Era> = ShelleyTxCert <Era>`
+/// (`eras/babbage/impl/.../Babbage/TxCert.hs:12`, and identically for the
+/// other four), whose decoder (`Shelley/TxCert.hs:475-487`) accepts both
+/// tags unconditionally. Tags 0-4 and 7-18 are UNCHANGED — Conway's decoder
+/// literally imports and calls the same `shelleyTxCertDelegDecoder` /
+/// `poolTxCertDecoder` functions Shelley uses for 0-4.
+///
+/// dugite mirrors this via era-scoped decoder DISPATCH (this function is
+/// Conway/Dijkstra-only; `era_shelley`/`era_alonzo` keep accepting 5/6
+/// unchanged for Shelley through Babbage) rather than a runtime PV check —
+/// matching upstream's own mechanism (GHC instance resolution on the era
+/// type, not a version branch inside one decoder).
+///
 /// Test-only re-export of [`read_conway_certificate`] so the encoder's
 /// round-trip test can prove `encode_certificate` produces bytes THIS decoder
 /// accepts. #948 was exactly this asymmetry going unnoticed.
@@ -1628,26 +1667,27 @@ fn read_conway_certificate(r: &mut Reader<'_>) -> Result<Certificate, Serializat
             Ok(Certificate::PoolRetirement { pool_hash, epoch })
         }
         5 => {
-            // GenesisKeyDelegation — Shelley CDDL:
-            //   (5, genesishash, genesis_delegate_hash, vrf_keyhash)
-            // genesishash / genesis_delegate_hash are 28-byte KEY hashes
-            // ($hash28); only vrf_keyhash is 32 bytes. Stored zero-padded in
-            // the Hash32 enum fields (the ledger consumer truncates back to
-            // 28 — see certificates.rs GenesisKeyDelegation). Reading them
-            // as Hash32 broke at the first real cert on mainnet (slot
-            // 66137371, the pre-Vasil genesis-delegate rotations).
-            let genesis_hash = read_hash28_cert(r)?.to_hash32_padded();
-            let delegate_hash = read_hash28_cert(r)?.to_hash32_padded();
-            let vrf_keyhash = read_hash32(r)?;
-            Ok(Certificate::GenesisKeyDelegation {
-                genesis_hash,
-                genesis_delegate_hash: delegate_hash,
-                vrf_keyhash,
-            })
+            // #1023: Genesis delegation certificates were REMOVED from
+            // ConwayTxCert. Oracle-verified `ConwayTxCert.hs:723`:
+            //   | t == 5 -> fail "Genesis delegation certificates are no
+            //                     longer supported"
+            // This is unconditional (not PV-gated) and structural (no
+            // `ConwayTxCert` constructor exists for it). A real
+            // cardano-node peer rejects this at CBOR decode, before Phase-1
+            // — mirror that exactly, with the same message, rather than
+            // falling through to the generic "unknown type" arm below.
+            Err(SerializationError::CborDecode(
+                "certificate: Genesis delegation certificates are no longer supported".into(),
+            ))
         }
         6 => {
-            let cert = read_mir_cert(r)?;
-            Ok(cert)
+            // #1023: MIR certificates were REMOVED from ConwayTxCert.
+            // Oracle-verified `ConwayTxCert.hs:724`:
+            //   | t == 6 -> fail "MIR certificates are no longer supported"
+            // Same unconditional/structural removal as tag 5 above.
+            Err(SerializationError::CborDecode(
+                "certificate: MIR certificates are no longer supported".into(),
+            ))
         }
         // ── Conway certificates ───────────────────────────────────────────────
         7 => {
@@ -1870,43 +1910,6 @@ pub(crate) fn read_anchor(r: &mut Reader<'_>) -> Result<Anchor, SerializationErr
 /// PV9+ rejects duplicate set elements.
 fn read_pool_params(r: &mut Reader<'_>) -> Result<PoolParams, SerializationError> {
     super::era_shelley::read_pool_params_inner(r, true)
-}
-
-fn read_mir_cert(r: &mut Reader<'_>) -> Result<Certificate, SerializationError> {
-    let arr_len = r.read_array_header()?;
-    if !matches!(arr_len, Some(2)) {
-        return Err(SerializationError::CborDecode(format!(
-            "mir: expected array(2), got {arr_len:?}"
-        )));
-    }
-    let source_disc = r.read_uint()?;
-    let source = match source_disc {
-        0 => MIRSource::Reserves,
-        1 => MIRSource::Treasury,
-        other => {
-            return Err(SerializationError::CborDecode(format!(
-                "mir: unknown source {other}"
-            )));
-        }
-    };
-    let ty = r.peek_major()?;
-    let target = match ty {
-        Type::Map | Type::MapIndef => {
-            // Use read_map to handle both definite- and indefinite-length maps.
-            let pairs = r.read_map(|r| read_stake_credential(r), |r| Ok(r.read_int()? as i64))?;
-            MIRTarget::StakeCredentials(pairs)
-        }
-        Type::U8 | Type::U16 | Type::U32 | Type::U64 => {
-            let coin = r.read_uint()?;
-            MIRTarget::OtherAccountingPot(coin)
-        }
-        other => {
-            return Err(SerializationError::CborDecode(format!(
-                "mir target: expected map or uint, got {other}"
-            )));
-        }
-    };
-    Ok(Certificate::MoveInstantaneousRewards { source, target })
 }
 
 // ============================================================================
@@ -4277,6 +4280,337 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    // ── #1023: Conway hard-rejects MIR (tag 6) and GenesisKeyDelegation
+    //    (tag 5) at decode — oracle-verified `ConwayTxCert.hs:719-726`
+    //    (`IntersectMBO/cardano-ledger@4849c13d6f70e5ab46add9af6e0ec5c537b61f69`).
+    //    Pre-Conway eras keep accepting both unchanged (see
+    //    `era_shelley.rs`/`era_alonzo.rs`/`era_babbage.rs` tests) — this is a
+    //    hard era boundary, not a blanket removal.
+
+    #[test]
+    fn conway_certificate_tag5_genesis_key_delegation_rejected() {
+        // Same wire shape as the real mainnet Shelley cert (block 7492516,
+        // slot 66137371) exercised by
+        // `era_shelley::shelley_genesis_key_delegation_real_mainnet_cert` —
+        // proves this is a REAL cert type Haskell no longer decodes in
+        // Conway, not a synthetic edge case.
+        let mut data = vec![0x84]; // array(4)
+        data.extend(cbor_uint(5));
+        data.extend(cbor_bytes(&[0x01; 28])); // genesis key hash
+        data.extend(cbor_bytes(&[0x02; 28])); // delegate key hash
+        data.extend(cbor_bytes(&[0x03; 32])); // vrf keyhash
+
+        let mut r = Reader::new(&data);
+        let err = read_conway_certificate(&mut r)
+            .expect_err("Conway must hard-reject GenesisKeyDelegation (tag 5)");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("Genesis delegation certificates are no longer supported"),
+            "error message must mirror Haskell's ConwayTxCert.hs fail text, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn conway_certificate_tag6_mir_rejected() {
+        // [6, [0, 9999]] — MIR OtherAccountingPot, Reserves -> Treasury.
+        let mut data = vec![0x82]; // outer array(2)
+        data.extend(cbor_uint(6));
+        let mut mir = vec![0x82];
+        mir.extend(cbor_uint(0)); // source = Reserves
+        mir.extend(cbor_uint(9999)); // target = coin
+        data.extend(&mir);
+
+        let mut r = Reader::new(&data);
+        let err = read_conway_certificate(&mut r).expect_err("Conway must hard-reject MIR (tag 6)");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("MIR certificates are no longer supported"),
+            "error message must mirror Haskell's ConwayTxCert.hs fail text, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn conway_certificate_tag6_mir_stake_credentials_variant_also_rejected() {
+        // Confirm rejection happens before any target-shape parsing (map
+        // form), not just the simpler uint-coin form above.
+        let mut data = vec![0x82];
+        data.extend(cbor_uint(6));
+        let mut mir = vec![0x82];
+        mir.extend(cbor_uint(0));
+        mir.push(0xa1); // map(1)
+        mir.push(0x82);
+        mir.extend(cbor_uint(0));
+        mir.extend(cbor_bytes(&[0x09; 28]));
+        mir.push(0x20); // delta = -1
+        data.extend(&mir);
+
+        let mut r = Reader::new(&data);
+        assert!(read_conway_certificate(&mut r).is_err());
+    }
+
+    /// Every OTHER Conway certificate tag (the full valid set, 0-4 and
+    /// 7-18) must still decode — this is the companion guard to the two
+    /// reject tests above: the fix must be scoped to exactly tags 5/6, not
+    /// accidentally widen into a stricter unknown-tag rejection or leave a
+    /// sibling tag behind (#1012/#1013's "fixed one instance, left the rest"
+    /// trap). Complements `every_conway_certificate_round_trips_through_our_own_decoder`
+    /// in `encode/certificate.rs` (encoder round-trip); this one exercises
+    /// every tag directly against hand-built wire bytes.
+    #[test]
+    fn conway_certificate_every_other_tag_still_decodes() {
+        let cred_bytes = |b: u8| {
+            let mut c = vec![0x82];
+            c.extend(cbor_uint(0));
+            c.extend(cbor_bytes(&[b; 28]));
+            c
+        };
+        let drep_abstain = {
+            let mut d = vec![0x81];
+            d.extend(cbor_uint(2));
+            d
+        };
+
+        let cases: Vec<(u64, Vec<u8>)> = vec![
+            // 0: StakeRegistration [0, cred]
+            (0, {
+                let mut d = vec![0x82];
+                d.extend(cbor_uint(0));
+                d.extend(cred_bytes(0x01));
+                d
+            }),
+            // 1: StakeDeregistration [1, cred]
+            (1, {
+                let mut d = vec![0x82];
+                d.extend(cbor_uint(1));
+                d.extend(cred_bytes(0x02));
+                d
+            }),
+            // 2: StakeDelegation [2, cred, pool_hash]
+            (2, {
+                let mut d = vec![0x83];
+                d.extend(cbor_uint(2));
+                d.extend(cred_bytes(0x03));
+                d.extend(cbor_bytes(&[0x04; 28]));
+                d
+            }),
+            // 4: PoolRetirement [4, pool_hash, epoch]
+            (4, {
+                let mut d = vec![0x83];
+                d.extend(cbor_uint(4));
+                d.extend(cbor_bytes(&[0x05; 28]));
+                d.extend(cbor_uint(500));
+                d
+            }),
+            // 7: ConwayStakeRegistration [7, cred, deposit]
+            (7, {
+                let mut d = vec![0x83];
+                d.extend(cbor_uint(7));
+                d.extend(cred_bytes(0x06));
+                d.extend(cbor_uint(2_000_000));
+                d
+            }),
+            // 8: ConwayStakeDeregistration [8, cred, refund]
+            (8, {
+                let mut d = vec![0x83];
+                d.extend(cbor_uint(8));
+                d.extend(cred_bytes(0x07));
+                d.extend(cbor_uint(2_000_000));
+                d
+            }),
+            // 9: VoteDelegation [9, cred, drep]
+            (9, {
+                let mut d = vec![0x83];
+                d.extend(cbor_uint(9));
+                d.extend(cred_bytes(0x08));
+                d.extend(&drep_abstain);
+                d
+            }),
+            // 10: StakeVoteDelegation [10, cred, pool_hash, drep]
+            (10, {
+                let mut d = vec![0x84];
+                d.extend(cbor_uint(10));
+                d.extend(cred_bytes(0x09));
+                d.extend(cbor_bytes(&[0x0a; 28]));
+                d.extend(&drep_abstain);
+                d
+            }),
+            // 11: RegStakeDeleg [11, cred, pool_hash, deposit]
+            (11, {
+                let mut d = vec![0x84];
+                d.extend(cbor_uint(11));
+                d.extend(cred_bytes(0x0b));
+                d.extend(cbor_bytes(&[0x0c; 28]));
+                d.extend(cbor_uint(2_000_000));
+                d
+            }),
+            // 12: VoteRegDeleg [12, cred, drep, deposit]
+            (12, {
+                let mut d = vec![0x84];
+                d.extend(cbor_uint(12));
+                d.extend(cred_bytes(0x0d));
+                d.extend(&drep_abstain);
+                d.extend(cbor_uint(2_000_000));
+                d
+            }),
+            // 13: RegStakeVoteDeleg [13, cred, pool_hash, drep, deposit]
+            (13, {
+                let mut d = vec![0x85];
+                d.extend(cbor_uint(13));
+                d.extend(cred_bytes(0x0e));
+                d.extend(cbor_bytes(&[0x0f; 28]));
+                d.extend(&drep_abstain);
+                d.extend(cbor_uint(2_000_000));
+                d
+            }),
+            // 14: CommitteeHotAuth [14, cold_cred, hot_cred]
+            (14, {
+                let mut d = vec![0x83];
+                d.extend(cbor_uint(14));
+                d.extend(cred_bytes(0x10));
+                d.extend(cred_bytes(0x11));
+                d
+            }),
+            // 15: CommitteeColdResign [15, cold_cred, null]
+            (15, {
+                let mut d = vec![0x83];
+                d.extend(cbor_uint(15));
+                d.extend(cred_bytes(0x12));
+                d.push(0xf6); // null anchor
+                d
+            }),
+            // 16: RegDRep [16, cred, deposit, null]
+            (16, {
+                let mut d = vec![0x84];
+                d.extend(cbor_uint(16));
+                d.extend(cred_bytes(0x13));
+                d.extend(cbor_uint(500_000_000));
+                d.push(0xf6);
+                d
+            }),
+            // 17: UnregDRep [17, cred, refund]
+            (17, {
+                let mut d = vec![0x83];
+                d.extend(cbor_uint(17));
+                d.extend(cred_bytes(0x14));
+                d.extend(cbor_uint(500_000_000));
+                d
+            }),
+            // 18: UpdateDRep [18, cred, null]
+            (18, {
+                let mut d = vec![0x83];
+                d.extend(cbor_uint(18));
+                d.extend(cred_bytes(0x15));
+                d.push(0xf6);
+                d
+            }),
+        ];
+
+        let mut failures = Vec::new();
+        for (tag, bytes) in &cases {
+            let mut r = Reader::new(bytes);
+            if let Err(e) = read_conway_certificate(&mut r) {
+                failures.push(format!("tag {tag} FAILED to decode: {e}"));
+            }
+        }
+        assert!(
+            failures.is_empty(),
+            "every non-removed Conway cert tag must still decode:\n  {}",
+            failures.join("\n  ")
+        );
+
+        // Tag 3 (PoolRegistration) has a large variable-length body
+        // (pool_params) that's awkward to hand-encode inline above; cover it
+        // via the real encoder instead, matching the pattern used by
+        // `every_conway_certificate_round_trips_through_our_own_decoder`.
+        let pool_cert = Certificate::PoolRegistration(dugite_primitives::transaction::PoolParams {
+            operator: Hash28::from_bytes([0x20; 28]),
+            vrf_keyhash: Hash32::from_bytes([0x21; 32]),
+            pledge: Lovelace(1_000_000),
+            cost: Lovelace(340_000_000),
+            margin: Rational {
+                numerator: 1,
+                denominator: 20,
+            },
+            reward_account: vec![0xe0; 29],
+            pool_owners: vec![Hash28::from_bytes([0x22; 28])],
+            relays: vec![],
+            pool_metadata: None,
+        });
+        let enc = crate::encode_certificate(&pool_cert);
+        let mut r = Reader::new(&enc);
+        read_conway_certificate(&mut r).expect("tag 3 PoolRegistration must still decode");
+    }
+
+    /// End-to-end guard at the actual mempool-submission entry point
+    /// (`decode_transaction`), not just the isolated cert reader — proves a
+    /// Conway tx carrying a MIR cert is rejected exactly where N2C tx
+    /// submission would reject it.
+    #[test]
+    fn conway_standalone_tx_with_mir_cert_rejected_at_decode() {
+        // Minimal Conway tx body: just certificates (key 4) = [MIR cert].
+        let mut mir_cert = vec![0x82];
+        mir_cert.extend(cbor_uint(6));
+        let mut mir = vec![0x82];
+        mir.extend(cbor_uint(0));
+        mir.extend(cbor_uint(9999));
+        mir_cert.extend(&mir);
+
+        let mut body = vec![0xa1]; // map(1)
+        body.extend(cbor_uint(4));
+        body.push(0x81); // plain array(1) of certs — read_set_strict accepts untagged
+        body.extend(&mir_cert);
+
+        let mut tx = vec![0x84]; // [body, witness_set, is_valid, aux]
+        tx.extend(&body);
+        tx.push(0xa0); // empty witness set
+        tx.push(0xf5); // is_valid = true
+        tx.push(0xf6); // no aux data
+
+        let result = crate::decode::decode_transaction(6, &tx);
+        assert!(
+            result.is_err(),
+            "Conway standalone tx with a MIR cert must be rejected at decode"
+        );
+        assert!(result.unwrap_err().to_string().contains("MIR"));
+    }
+
+    /// Same end-to-end guard for Dijkstra (era_id 7) — `read_conway_certificate`
+    /// is shared between Conway and Dijkstra tx-body decode (both top-level
+    /// `certificates` and sub-tx `certificates`), and Dijkstra's own
+    /// `DijkstraTxCert` decoder independently hard-rejects tags 5/6 with the
+    /// identical messages (oracle-verified
+    /// `eras/dijkstra/impl/src/Cardano/Ledger/Dijkstra/TxCert.hs`), so the
+    /// shared decoder is correct for both eras.
+    #[test]
+    fn dijkstra_standalone_tx_with_genesis_key_delegation_cert_rejected_at_decode() {
+        let mut cert = vec![0x84];
+        cert.extend(cbor_uint(5));
+        cert.extend(cbor_bytes(&[0x01; 28]));
+        cert.extend(cbor_bytes(&[0x02; 28]));
+        cert.extend(cbor_bytes(&[0x03; 32]));
+
+        let mut body = vec![0xa1];
+        body.extend(cbor_uint(4));
+        body.push(0x81);
+        body.extend(&cert);
+
+        // Dijkstra standalone tx (CIP-0167): [body, witness_set, aux] — 3 elements.
+        let mut tx = vec![0x83];
+        tx.extend(&body);
+        tx.push(0xa0);
+        tx.push(0xf6);
+
+        let result = crate::decode::decode_transaction(7, &tx);
+        assert!(
+            result.is_err(),
+            "Dijkstra standalone tx with a GenesisKeyDelegation cert must be rejected at decode"
+        );
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("Genesis delegation"));
     }
 
     // ── Conway protocol_param_update ──────────────────────────────────────────
