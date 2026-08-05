@@ -231,8 +231,28 @@ impl Default for Blake2b256Hasher {
 /// The tag byte indicates the script version:
 /// 0 = NativeScript, 1 = PlutusV1, 2 = PlutusV2, 3 = PlutusV3, 4 = PlutusV4.
 ///
-/// For Plutus scripts, `data` is the raw script bytes (the inner content
-/// of the CBOR bstr, NOT CBOR-encoded).
+/// For Plutus scripts, pass the script bytes **exactly as they appear in the
+/// witness set / `cborHex` — do NOT strip the leading CBOR byte-string
+/// header.** Plutus scripts are wire double-wrapped: the witness-set bstr's
+/// *content* is itself a CBOR bstr wrapping the flat-encoded program, and
+/// `cardano-api`'s `PlutusScriptSerialised.serialiseToCBOR` is an identity
+/// over that form rather than a further encode. So the hashed preimage
+/// retains the inner `0x58`/`0x59`/`0x5a` header.
+///
+/// Stripping it first is the intuitive-looking "get to the bare flat bytes"
+/// move and it silently produces a DIFFERENT, WRONG script hash — every
+/// address, policy id and witness lookup derived from it then mismatches.
+///
+/// Verified against cardano-ledger's own compiled-script corpus
+/// (`tests/conformance/upstream/plutus-examples.json`): `alwaysSucceedsNoDatum`
+/// V1 has `script_hex` beginning `582d…`, and
+/// `blake2b_224(0x01 || <those bytes as-is>)` reproduces upstream's recorded
+/// `script_hash` `6bd534d2…`, while the header-stripped variant matches no tag.
+///
+/// (This doc previously claimed the opposite — "the inner content of the CBOR
+/// bstr, NOT CBOR-encoded". No call site ever followed it; every production
+/// caller in `validation/scripts.rs` passes the bytes as-is, which is why
+/// dugite reproduces all 55 upstream ScriptHashes. Corrected under #1008.)
 pub fn blake2b_224_tagged(tag: u8, data: &[u8]) -> Hash28 {
     let mut buf = Vec::with_capacity(1 + data.len());
     buf.push(tag);
