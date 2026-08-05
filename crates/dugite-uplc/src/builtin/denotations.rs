@@ -710,7 +710,7 @@ pub fn denote(
             Ok(Value::Const(Constant::ByteString(bytes)))
         }
 
-        // ── CIP-0117 Integer ↔ ByteString conversions (V3) ────────────
+        // ── CIP-0121 Integer ↔ ByteString conversions (V3) ────────────
         IntegerToByteString => {
             // (endianness: Bool, big-endian if True) (width: Integer) (n: Integer) -> ByteString
             // If width = 0, output is the minimal big-endian
@@ -725,9 +725,15 @@ pub fn denote(
                 return Err(builtin_failure(id, "integerToByteString: negative input"));
             }
             let width_u = bigint_to_usize_or_failure(&width, id, "integerToByteString width")?;
-            // Reasonable cap to avoid runaway allocation.  Matches the
-            // Haskell reference's `integerToByteStringMaximumOutputLength`
-            // (= 8192 bytes = 65536 bits); CIP-0117 mandates the limit.
+            // Cap matches the Haskell reference's
+            // `integerToByteStringMaximumOutputLength` (= 8192 bytes =
+            // 65536 bits), which is also what bounds the allocation here.
+            //
+            // NOTE: CIP-0121 specifies that the length argument fails
+            // outside `(0, 2^29 - 1)` — a far larger bound. plutus ships
+            // the 8192 cap and that is what consensus actually enforces,
+            // so this follows the implementation, NOT the CIP text. Do
+            // not "align" this to 2^29.
             const MAX_INT_TO_BS_WIDTH: usize = 8192;
             if width_u > MAX_INT_TO_BS_WIDTH {
                 return Err(builtin_failure(
@@ -743,7 +749,7 @@ pub fn denote(
             }
             if width_u == 0 {
                 // Auto-width: the minimal representation must itself
-                // fit within the 8192-byte CIP-0117 cap; n >= 2^65536
+                // fit within the 8192-byte plutus cap; n >= 2^65536
                 // is rejected as evaluation failure (#603).
                 if be_bytes.len() > MAX_INT_TO_BS_WIDTH {
                     return Err(builtin_failure(

@@ -62,10 +62,12 @@ Normative (must match byte-for-byte):
 | `PlutusData` CBOR | `IntersectMBO/plutus:plutus-core/plutus-core/src/PlutusCore/Data.hs`. |
 | Default builtins | `IntersectMBO/plutus:plutus-core/plutus-core/src/PlutusCore/Default/Builtins.hs`. |
 | BLS12-381 | CIP-0381 (zkcrypto/IETF serialisation, BLS12381G[12]\_XMD:SHA-256\_SSWU\_RO\_, strict subgroup checks). |
-| Keccak-256 + Blake2b-224 | CIP-0127. |
-| RIPEMD-160 | CIP-0101. |
-| IntegerToByteString / ByteStringToInteger | CIP-0117. |
-| ByteString bitwise builtins | CIP-0123. |
+| Keccak-256 + Blake2b-224 | CIP-0101. |
+| RIPEMD-160 | CIP-0127. |
+| IntegerToByteString / ByteStringToInteger | CIP-0121. |
+| ByteString logical builtins (and/or/xor/complement, readBit, writeBits, replicateByte) | CIP-0122. |
+| ByteString bitwise builtins (shift/rotate, countSetBits, findFirstSetBit) | CIP-0123. |
+| Explicit script return values (V3 must evaluate to unit) | CIP-0117. |
 | ScriptContext V2 | CIP-0033. |
 | ScriptContext V3 + governance | CIP-0035 + CIP-1694. |
 | Cost-model parameter order | `IntersectMBO/plutus:plutus-core/cost-model/` + Conway-era `cardano-ledger-conway/cddl-files/conway.cddl`. |
@@ -422,7 +424,7 @@ diverges from cardano-node and must be tested explicitly:
 4. PR 3: CEK machine (no builtins yet — only `lam`/`app`/`var`/`force`/`delay`/`const`/`error`/`constr`/`case`).
 5. PR 4: Builtin suite (V1) + cost model loader.
 6. PR 5: Builtin suite (V2) + CIP-0033.
-7. PR 6: Builtin suite (V3) + CIP-0035 + CIP-0117 + CIP-0123 + CIP-0127 + CIP-0101 + CIP-0381.
+7. PR 6: Builtin suite (V3) + CIP-0035 + CIP-0117 + CIP-0121 + CIP-0122 + CIP-0123 + CIP-0127 + CIP-0101 + CIP-0381.
 8. PR 7: ScriptContext V1/V2/V3 builders.
 9. PR 8: phase-two façade + integration into `dugite-ledger/src/plutus.rs`.
 10. PR 9: drop `uplc = { git = ... aiken-lang/aiken.git ... }` from workspace and confirm `cargo tree | grep pallas` is empty.
