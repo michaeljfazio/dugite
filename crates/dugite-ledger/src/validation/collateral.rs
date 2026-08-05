@@ -916,8 +916,10 @@ fn collect_plutus_script_hashes(tx: &Transaction, utxo_set: &dyn UtxoLookup) -> 
                     | ScriptRef::PlutusV2(_)
                     | ScriptRef::PlutusV3(_)
                     | ScriptRef::PlutusV4(_) => {
-                        // V4 (Dijkstra) requires a redeemer like V1/V2/V3
-                        // (issue #475 Phase 5; full validator integration TBD).
+                        // V4 (Dijkstra) requires a redeemer like V1/V2/V3.
+                        // Evaluator integration landed in issue #1000 (dugite-uplc's
+                        // `ScriptLanguage::PlutusV4`); this witness-completeness check
+                        // needed no change since it already treated V4 like V1/V2/V3.
                         // Plutus refs only (native excluded above) — no native_original.
                         hashes.insert(compute_script_ref_hash(script_ref, None));
                     }
