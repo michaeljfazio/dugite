@@ -157,10 +157,12 @@ enum QuerySubcommand {
     TxMempool {
         #[arg(long, default_value = "node.sock")]
         socket_path: PathBuf,
-        /// Subcommand: info, next-tx, has-tx
+        /// Subcommand: info, next-tx, tx-exists (cardano-cli's canonical
+        /// spelling; `has-tx` is accepted as a deprecated alias for existing
+        /// dugite scripts — #1008)
         #[arg(default_value = "info")]
         subcmd: String,
-        /// Transaction ID (for has-tx)
+        /// Transaction ID (for tx-exists)
         #[arg(long)]
         tx_id: Option<String>,
         #[arg(long)]
@@ -2047,9 +2049,12 @@ impl QueryCmd {
 
                         let _ = client.monitor_done().await;
                     }
-                    "has-tx" => {
+                    // cardano-cli's canonical name is `tx-exists`; `has-tx` is
+                    // dugite's original (pre-#1008) name, kept working for
+                    // back-compat.
+                    "has-tx" | "tx-exists" => {
                         let id = tx_id.ok_or_else(|| {
-                            anyhow::anyhow!("--tx-id is required for has-tx subcommand")
+                            anyhow::anyhow!("--tx-id is required for tx-exists subcommand")
                         })?;
                         let hash_bytes = hex::decode(&id)
                             .map_err(|e| anyhow::anyhow!("Invalid tx ID hex: {e}"))?;
@@ -2105,7 +2110,7 @@ impl QueryCmd {
                         let _ = client.monitor_done().await;
                     }
                     _ => {
-                        println!("Available subcommands: info, has-tx, next-tx");
+                        println!("Available subcommands: info, next-tx, tx-exists (has-tx)");
                     }
                 }
                 Ok(())
