@@ -935,11 +935,18 @@ impl Gen<'_> {
             }
         };
 
-        let script_ref = (!is_legacy && self.chance(100)).then(|| match self.choice(4) {
+        let script_ref = (!is_legacy && self.chance(100)).then(|| match self.choice(5) {
             0 => ScriptRef::NativeScript(self.native_script(2)),
             1 => ScriptRef::PlutusV1(self.bytes(64)),
             2 => ScriptRef::PlutusV2(self.bytes(64)),
-            _ => ScriptRef::PlutusV3(self.bytes(64)),
+            3 => ScriptRef::PlutusV3(self.bytes(64)),
+            // PlutusV4 (Dijkstra, issue #1000) — wire tag 4. Structurally
+            // decodable under any era (the decoder doesn't era-gate this
+            // arm; PV-gating happens one layer up, at Phase-1/Phase-2
+            // validation via `ledger_language_introduced_in`), so it's
+            // safe to generate regardless of which era this output lands
+            // in — same as the pre-existing V1/V2/V3 arms above.
+            _ => ScriptRef::PlutusV4(self.bytes(64)),
         });
 
         TransactionOutput {
