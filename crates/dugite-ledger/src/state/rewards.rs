@@ -283,7 +283,7 @@ pub fn compute_reward_update(
         }
     };
 
-    // #898: `totalActiveStake` is the sum of the GO snapshot's ENTIRE
+    // `totalActiveStake` is the sum of the GO snapshot's ENTIRE
     // per-credential active-stake map — it is NOT restricted to pools that are
     // still registered.
     //
@@ -301,20 +301,43 @@ pub fn compute_reward_update(
     //       `nonZeroOr` knownNonZeroCoin @1
     //
     // Membership requires *registered + delegated + non-zero stake*; it does
-    // NOT require the delegated-to pool to still exist. Pool retirement
-    // (POOLREAP) removes the pool from `psStakePools` but leaves its
-    // delegators' delegations dangling, so their stake keeps contributing to
-    // `ssTotalActiveStake` while contributing to no pool's `spssStake`
-    // (`ssStakePoolsSnapShot` is rebuilt from `psStakePools` alone).
+    // NOT require the delegated-to pool to still exist OR to have ever
+    // existed — a `StakeDelegation`/`VoteDelegation` certificate is never
+    // required to name a currently-registered pool, so a credential can stay
+    // "active" against a `pool_id` that has retired, or one that was never
+    // registered at all.
     //
-    // Filtering by `pool_params` understated `totalActiveStake`. Since
-    // `appPerf = beta / sigmaA = beta * totalActiveStake / poolStake`, a low
-    // total scales every pool's `poolPot` — and therefore every leader and
-    // member reward — down proportionally. On preview epoch 1363 a retired
-    // pool held 1000 ADA, so dugite's total was 1_000_000_000 lovelace low;
-    // the member reward for account 8fab5f50… came out 4 lovelace short of
-    // the on-chain value and the PV≥10 exact-drain withdrawal check then
-    // halted chain advance permanently.
+    // A prior version of this comment additionally claimed POOLREAP "leaves
+    // [a retiring pool's] delegators' delegations dangling" as the mechanism.
+    // That is WRONG and was oracle-refuted against cardano-node 11.0.1's
+    // actual pinned cardano-ledger source (2026-08-05): POOLREAP clears a
+    // retiring pool's delegators' `stakePoolDelegationAccountStateL` in the
+    // SAME transition that removes the pool
+    // (`Cardano.Ledger.State.Account.removeStakePoolDelegations`,
+    // `Cardano.Ledger.Shelley.Rules.PoolReap.poolReapTransition`), which is
+    // exactly what `certs.delegations.retain(|_, p| p != pool_id)` does
+    // below in `state/epoch.rs`/`eras/conway.rs` at retirement. Since SNAP
+    // always runs BEFORE POOLREAP within one boundary, a given snapshot's
+    // `pool_stake` and `pool_params` are captured together, in sync, and
+    // stay mutually consistent for that snapshot's whole lifetime — the
+    // "orphan" case this function guards against is a delegation whose
+    // target pool_id was NEVER registered (always legal, per the paragraph
+    // above), not a delegation surviving its target pool's retirement.
+    //
+    // Filtering by `pool_params` understates `totalActiveStake` relative to
+    // the Haskell definition either way. Since `appPerf = beta / sigmaA =
+    // beta * totalActiveStake / poolStake`, a low total scales every pool's
+    // `poolPot` — and therefore every leader and member reward — down
+    // proportionally, so getting this exactly right matters even though (per
+    // commit 5c9d833b52, the fix that removed the `pool_params` filter) it
+    // is "a defensive alignment [with the Haskell definition], not a
+    // behaviour change on any reachable state" under dugite's own
+    // active-purge POOLREAP — unfiltered and pool_params-filtered sums
+    // coincide today. That commit's own byte-exact preview-epoch-1363
+    // regression test (Koios-cross-checked pool_fees/member_rewards/
+    // deleg_rewards) is what ruled this OUT as a cause of issue #898 (which
+    // was a separate Mithril-import governance-roots bug); do not re-attach
+    // #898 to this code path.
     //
     // `pool_stake` and `stake_distribution` are built from the same
     // `certs.delegations` walk in both `eras/shelley.rs` and `eras/conway.rs`
