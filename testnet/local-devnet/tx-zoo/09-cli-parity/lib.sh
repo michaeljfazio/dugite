@@ -389,6 +389,11 @@ parity_record() {
     local icon
     case "$status" in
         EQUAL)    icon="✓" ;;
+        # COMPARED is a real pass (a direct property assertion rather than a
+        # sha diff) and run.sh tallies it in its own bucket. It had no icon
+        # arm, so every such row printed "?" — the console said "unknown" for
+        # rows the gate counts as passing.
+        COMPARED) icon="✓" ;;
         DIVERGENT) icon="✗" ;;
         SKIP)     icon="-" ;;
         ERROR)    icon="!" ;;

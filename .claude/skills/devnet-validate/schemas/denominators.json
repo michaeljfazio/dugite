@@ -40,8 +40,8 @@
     }
   },
   "cli_parity": {
-    "expected_queries": 22,
-    "expected_rows": 25,
+    "expected_queries": 23,
+    "expected_rows": 26,
     "$comment": "expected_queries = tx-zoo/09-cli-parity/09*.sh on disk. expected_rows = terminal ROWS in cli-parity.csv, which is NOT the same number: three scripts emit a second row each \u2014 two from parity_assert_pool_filter, the direct (non-comparative) check added with #963 that a pool-scoped query answers for exactly the pool it was asked about, and 09h, which compares the EPOCH NONCE separately from the protocol version (#964). run.sh gates on expected_rows; test-denominators.sh derives BOTH from disk so adding either a script or an extra assertion without bumping the pin fails rather than silently widening the gate. EQUAL+DIVERGENT+COMPARED+SKIP+ERROR must sum to expected_rows. Env-skips are counted as their own class and never folded into EQUAL."
   },
   "n2n_adversarial": {
