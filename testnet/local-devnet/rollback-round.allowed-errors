@@ -1,0 +1,57 @@
+# rollback-round.allowed-errors — expected error-class lines during the
+# partition/heal cycles this round deliberately provokes.               (#1040)
+#
+# One extended-regex per line; blank lines and full-line '#' comments are
+# ignored (inline trailing comments are NOT supported by
+# lib/expect-log-errors.sh's parser — never put a comment after a pattern on
+# the same line, it becomes part of the regex). Consumed by
+# assert_no_other_errors, which only classifies lines matching the shared
+# LOG_ERROR_PATTERN in .claude/skills/devnet-validate/scripts/lib/
+# log-level-counts.sh — a literal ' ERROR ' token, a panic, or one of the
+# three invalid-block trace names. WARN/INFO lines (including both dugite
+# fork-too-deep lines below) are already outside that classifier and do not
+# strictly need an entry here; they are listed anyway as defense-in-depth
+# against a future severity bump, and because rollback-round.sh's own
+# comments point back to this file as the place that documents them.
+
+# --- TCP-level fallout while the pfctl/iptables port-pair rules are up ---
+# Both dugite (tokio) and cardano-node (network-mux) can surface a severed
+# cross-group connection as an OS-level I/O error before either side's
+# mini-protocol layer has classified it as a routine peer departure.
+[Cc]onnection reset by peer
+[Cc]onnection refused
+[Bb]roken pipe
+[Oo]s error 54
+[Oo]s error 61
+[Oo]s error 104
+[Oo]s error 111
+
+# --- ChainSync intersection / reconnect churn ---
+# Expected on every reconnect attempt across a partitioned edge while the
+# two sides' known-points lists no longer share a recent checkpoint — this
+# is the routine "which point do we still have in common" negotiation, not
+# a fault. Also covers the pre-existing #552/#908 stale-intersection class
+# this round's healing step can retrigger.
+MsgIntersectNotFound
+[Nn]o intersection found
+stale intersection
+
+# --- Case 2's own fault: the permanent-fork / max-rollback refusal class ---
+# This IS the condition rollback-round.sh Case 2 exists to provoke, and
+# step 14 (expect_log_errors) positively REQUIRES at least one of these two
+# lines to appear. Listed here too only so assert_no_other_errors never
+# double-counts it as unexpected noise if either line's severity is ever
+# bumped to ERROR. See rollback-round.sh step 14 for the full citation
+# (crates/dugite-node/src/node/sync.rs and
+# crates/dugite-storage/src/volatile_db.rs).
+ChainSync intersection only at genesis
+fork requires rollback beyond k
+
+# --- cardano-node (Haskell) side of the same two contract outcomes ---
+# ouroboros-network's tracer names for the analogous decisions on the
+# Haskell nodes (cardano-bp, cardano-arbiter). SwitchedToAFork is the
+# EXPECTED Case-1 reconvergence signal (rollback-round.sh step 7 asserts on
+# it positively); ForkTooDeep/IntersectNotFound are Case 2's equivalents.
+SwitchedToAFork
+ForkTooDeep
+IntersectNotFound
