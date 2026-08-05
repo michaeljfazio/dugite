@@ -16,7 +16,7 @@ mod certificate;
 mod governance;
 mod protocol_params;
 mod script;
-mod transaction;
+pub(crate) mod transaction;
 mod value;
 
 // Re-export all public items for backwards compatibility
