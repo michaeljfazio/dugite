@@ -327,7 +327,7 @@ fn categorize_validation_error(error: &dugite_ledger::ValidationError) -> String
         ValidationError::TxTooLarge { .. } => "TxTooLarge".to_string(),
         ValidationError::TtlExpired { .. } => "TtlExpired".to_string(),
         ValidationError::NotYetValid { .. } => "NotYetValid".to_string(),
-        ValidationError::InsufficientCollateral => "InsufficientCollateral".to_string(),
+        ValidationError::InsufficientCollateral { .. } => "InsufficientCollateral".to_string(),
         ValidationError::TooManyCollateralInputs { .. } => "TooManyCollateralInputs".to_string(),
         ValidationError::CollateralNotFound(_) => "CollateralNotFound".to_string(),
         ValidationError::CollateralHasTokens(_) => "CollateralHasTokens".to_string(),
