@@ -1,0 +1,102 @@
+# Known, tracked gaps between cardano-cli's subcommand surface and
+# dugite-cli's, checked by cli-surface-parity.sh (#1006).
+#
+# Format: <normalized command path><TAB><issue-number>
+# One entry per line. Blank lines and lines starting with # are ignored.
+#
+# The script fails on any MISSING command not listed here (a real gap the
+# gate hasn't tracked yet), and separately fails on any listed entry that is
+# no longer actually missing (a stale exemption — remove it). Mirrors the
+# `SKIP_LIST` discipline in
+# tests/conformance/src/upstream/ledger_rules_replay/mod.rs: "empty or every
+# entry has a tracking issue" (CLAUDE.md).
+#
+# The 82 entries below are the check's first real run against cardano-cli
+# 11.0.0.0 (97036a66bcf8c89f687ae57a048eecc0389977ef) — see #1008 for the
+# full backlog, grouped and with per-group caveats (several are
+# naming/structure differences rather than true absent capabilities; #1008
+# documents which). Not a commitment to implement all 82 — several are
+# Byron-era ceremony tooling or Peras BLS keys of uncertain present value.
+
+byron genesis genesis	1008
+byron genesis print-genesis-hash	1008
+byron governance create-proposal-vote	1008
+byron governance create-update-proposal	1008
+byron governance submit-proposal-vote	1008
+byron governance submit-update-proposal	1008
+byron key keygen	1008
+byron key to-verification	1008
+byron miscellaneous pretty-print-cbor	1008
+byron miscellaneous validate-cbor	1008
+byron transaction issue-genesis-utxo-expenditure	1008
+byron transaction issue-utxo-expenditure	1008
+byron transaction submit-tx	1008
+byron transaction txid	1008
+cip-format cip-129 committee-cold-key	1008
+cip-format cip-129 committee-hot-key	1008
+cip-format cip-129 drep	1008
+cip-format cip-129 governance-action-id	1008
+debug check-node-configuration	1008
+debug log-epoch-state	1008
+debug transaction view	1008
+genesis create-cardano	1008
+genesis create-testnet-data	1008
+genesis get-ver-key	1008
+genesis initial-addr	1008
+genesis initial-txin	1008
+genesis key-gen-delegate	1008
+genesis key-gen-genesis	1008
+genesis key-gen-utxo	1008
+governance action create-hardfork	1008
+governance action update-committee	1008
+governance action view	1008
+governance committee create-cold-key-resignation-certificate	1008
+governance committee create-hot-key-authorization-certificate	1008
+governance committee key-gen-cold	1008
+governance committee key-gen-hot	1008
+governance committee key-hash	1008
+governance create-genesis-key-delegation-certificate	1008
+governance create-mir-certificate stake-addresses	1008
+governance create-mir-certificate transfer-to-rewards	1008
+governance create-mir-certificate transfer-to-treasury	1008
+governance drep metadata-hash	1008
+governance vote view	1008
+hash anchor-data	1008
+hash genesis-file	1008
+hash script	1008
+key convert-byron-genesis-vkey	1008
+key convert-byron-key	1008
+key convert-cardano-address-key	1008
+key convert-itn-bip32-key	1008
+key convert-itn-extended-key	1008
+key convert-itn-key	1008
+key derive-from-mnemonic	1008
+key generate-mnemonic	1008
+key non-extended-key	1008
+key verification-key	1008
+node issue-pop-BLS	1008
+node key-gen-BLS	1008
+node key-hash-BLS	1008
+ping	1008
+query drep-stake-distribution	1008
+query era-history	1008
+query future-pparams	1008
+query ledger-peer-snapshot	1008
+query pool-state	1008
+query ref-script-size	1008
+query spo-stake-distribution	1008
+query stake-pool-default-vote	1008
+query tx-mempool info	1008
+query tx-mempool next-tx	1008
+query tx-mempool tx-exists	1008
+stake-address registration-and-delegation-certificate	1008
+stake-address registration-and-vote-delegation-certificate	1008
+stake-address registration-stake-and-vote-delegation-certificate	1008
+stake-address stake-and-vote-delegation-certificate	1008
+stake-address stake-delegation-certificate	1008
+stake-pool deregistration-certificate	1008
+transaction build-estimate	1008
+transaction calculate-plutus-script-cost offline	1008
+transaction calculate-plutus-script-cost online	1008
+transaction signed-transaction	1008
+version	1008
