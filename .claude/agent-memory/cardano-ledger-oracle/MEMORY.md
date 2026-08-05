@@ -3,8 +3,14 @@
 ## Meta
 - [KB table files in system prompt don't exist](kb-table-files-missing-use-live-github.md) — use live GitHub via `gh api`; confirmed missing 2026-07-07, `gh` authenticated for search/code/contents
 
+## cardano-cli / cardano-api hashing & sizing (script hash, ref-script-size, anchor/metadata hash)
+- [Plutus script hash retains ONE CBOR bstr wrapper](plutus-script-hash-retains-one-cbor-bstr-wrapper.md) — hashes `tag <> CBOR-bstr(flat_bytes)`, NOT bare flat bytes; the "double CBOR encoding" is real. Empirically verified vs a real mainnet PlutusV2 hash via Koios (live-verified 2026-08-05).
+- [getReferenceInputsSizeForTxIds / txNonDistinctRefScriptsSize](getreferenceinputssize-and-refscriptsize-nondistinct-sum.md) — cardano-cli `query ref-script-size` uses the SAME primitive as CIP-0112 tiered ref-script fees: sum of `originalBytesSize` per matching TxIn, non-deduplicated (live-verified 2026-08-05).
+- [anchor-data / drep metadata-hash / stake-pool metadata-hash](anchor-data-and-metadata-hash-raw-bytes-no-canonicalization.md) — all three = `blake2b_256(raw bytes)`, no JSON-LD canonicalization anywhere; stake-pool alone adds a 512-byte+schema validation GATE that doesn't touch the hash input (live-verified 2026-08-05).
+
 ## Dijkstra era (nested transactions) — UNRELEASED, master-only
 - [Dijkstra sub-tx wire format + SUB-rule chain (live-verified 2026-08-05 @ 4849c13d6f70e5ab46add9af6e0ec5c537b61f69 = master HEAD)](dijkstra-subtx-wire-and-sub-rule-chain.md) — ONE GADT `DijkstraTxBodyRaw l era`, full SubTx CBOR key table, DijkstraSubTx has own TxWits, SUBUTXOW/SUBCERTS-family/SUBGOV wiring + full pred-failure lists. cabal=0.4.0.0 unreleased, latest tag 0.3.0.0
+- [conwayDelegTransition/poolTransition/conwayGovCertTransition verbatim (live-verified 2026-08-05 @ 4849c13d)](deleg-pool-govcert-verbatim-transitions.md) — full fn bodies, exact PV hardfork gates, IncorrectDepositDELEG vs DepositIncorrectDELEG partitioned by PV11, VRF dedup registry scope, committee resigned/unknown share one code path. Plus the GENERAL STS fact: `?!` never short-circuits within a rule body (Extended.hs runClause Predicate case) — all applicable failures per-cert accumulate, wire-visible in MsgRejectTx.
 
 - [Dijkstra SUBLEDGERS/SUBLEDGER/SUB* rule pipeline](dijkstra-sub-transaction-pipeline.md) — verbatim source @ 4849c13d: fold structure, full witness/cert/gov surface per sub-tx, all predicate-failure ADTs, no TxIx on failures
 

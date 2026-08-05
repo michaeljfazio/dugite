@@ -1,5 +1,8 @@
 # Tech Lead Agent Memory
 
+## Dijkstra Sub-Transaction Rules (2026-08-05)
+- [#1011 SUBCERTS/SUBDELEG/SUBPOOL/SUBGOVCERT/SUBENTITIES landed](issue-1011-dijkstra-subcerts-subpool-subgovcert.md) — clone-then-mutate-or-discard pattern (imbl+Arc make CertSubState/GovSubState clones cheap) beats extracting the top-level validator; SUBGOV+mint stay guarded (too large for one issue)
+
 ## Ledger Review Batches (2026-07-06)
 - [#804 GenesisKeyDelegation + MIR quorum](issue-804-genesisdeleg-mir-quorum.md) — SNAPSHOT v27->28; new `future_gen_delegs` field; MIR quorum broke exhaustive ValidationError match
 - [#784 PPUP votedValue quorum](issue-784-ppup-voted-value-quorum.md) — 3 buggy distinct-proposer copies routed through unused `voted_future_pparams`; LATENT (no live-chain diff)
