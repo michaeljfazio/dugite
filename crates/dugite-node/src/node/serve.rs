@@ -610,11 +610,19 @@ fn enrich_validation_errors(
                     minimum,
                     output_index,
                     ..
-                } => tx
-                    .body
-                    .outputs
-                    .get(*output_index)
-                    .map(|o| (raw_output_hex(o), *minimum)),
+                } => {
+                    // The sentinel index points at `collateral_return`, which
+                    // Haskell folds into the SAME `BabbageOutputTooSmallUTxO`
+                    // via `allSizedOutputsTxBodyF`.
+                    let out = if *output_index
+                        == dugite_ledger::validation::COLLATERAL_RETURN_OUTPUT_INDEX
+                    {
+                        tx.body.collateral_return.as_ref()
+                    } else {
+                        tx.body.outputs.get(*output_index)
+                    };
+                    out.map(|o| (raw_output_hex(o), *minimum))
+                }
                 _ => unreachable!("filtered above"),
             })
             .collect();
@@ -2293,6 +2301,53 @@ mod tests {
                         (hex::encode([0x82, 0x05, 0x06]), 2_000_000),
                     ]
                 );
+            }
+            other => panic!("expected BabbageOutputTooSmallUTxO, got {other:?}"),
+        }
+    }
+
+    /// The sentinel index resolves to `body.collateral_return` — Haskell
+    /// folds the collateral-return output into the SAME
+    /// `BabbageOutputTooSmallUTxO` via `allSizedOutputsTxBodyF`, and 18d in
+    /// the tx-zoo pins this on the wire.
+    #[test]
+    fn enrich_output_too_small_resolves_collateral_return_sentinel() {
+        use dugite_primitives::address::{Address, EnterpriseAddress};
+        use dugite_primitives::credentials::Credential;
+        use dugite_primitives::hash::Hash28;
+        use dugite_primitives::network::NetworkId;
+        use dugite_primitives::transaction::{OutputDatum, TransactionOutput};
+        use dugite_primitives::value::Value;
+
+        let body = dugite_primitives::transaction::TransactionBody {
+            collateral_return: Some(TransactionOutput {
+                address: Address::Enterprise(EnterpriseAddress {
+                    network: NetworkId::Mainnet,
+                    payment: Credential::VerificationKey(Hash28::from_bytes([0x22; 28])),
+                }),
+                value: Value {
+                    coin: Lovelace(1),
+                    multi_asset: Default::default(),
+                },
+                datum: OutputDatum::None,
+                script_ref: None,
+                is_legacy: false,
+                raw_cbor: Some(vec![0x82, 0x0a, 0x0b]),
+            }),
+            ..Default::default()
+        };
+        let tx = minimal_tx(body);
+
+        let errors = vec![VE::OutputTooSmall {
+            minimum: 1_500_000,
+            actual: 1,
+            output_index: dugite_ledger::validation::COLLATERAL_RETURN_OUTPUT_INDEX,
+        }];
+        let mapped = enrich_validation_errors(errors, &tx, &EmptyUtxo, 10);
+        assert_eq!(mapped.len(), 1);
+        match &mapped[0] {
+            TxValidationError::BabbageOutputTooSmallUTxO { outputs } => {
+                assert_eq!(outputs, &vec![(hex::encode([0x82, 0x0a, 0x0b]), 1_500_000)]);
             }
             other => panic!("expected BabbageOutputTooSmallUTxO, got {other:?}"),
         }
