@@ -211,7 +211,13 @@ pub(crate) fn handle_drep_stake_distr(
 /// Handle GetCommitteeMembersState (tag 27).
 pub(crate) fn handle_committee_state(state: &NodeStateSnapshot) -> QueryResult {
     debug!("Query: GetCommitteeMembersState");
-    QueryResult::CommitteeState(state.committee.clone())
+    // The second element is what makes `NextEpochChange` computable at all:
+    // it is defined as a comparison of the live committee against the one this
+    // epoch's ratification pass will install (#1020). `ratify_enacted` is the
+    // frozen `rsEnacted` — the same source `GetRatifyState` answers from, so
+    // the two queries cannot disagree about the incoming committee.
+    let next = super::encoding::committee_after_enacted(&state.committee, &state.ratify_enacted);
+    QueryResult::CommitteeState(state.committee.clone(), next)
 }
 
 /// Handle GetFilteredVoteDelegatees (tag 28).
@@ -674,7 +680,7 @@ mod tests {
         };
         let result = handle_committee_state(&state);
         match result {
-            QueryResult::CommitteeState(committee) => {
+            QueryResult::CommitteeState(committee, _) => {
                 assert_eq!(committee.members.len(), 1);
                 assert_eq!(committee.threshold, Some((2, 3)));
                 assert_eq!(committee.current_epoch, 42);
@@ -727,7 +733,7 @@ mod tests {
 
         let result = handle_committee_state(&state);
         match result {
-            QueryResult::CommitteeState(committee) => {
+            QueryResult::CommitteeState(committee, _) => {
                 assert_eq!(committee.members.len(), 2);
 
                 // First member: script hot key — hot_credential_type must be 1
@@ -776,7 +782,7 @@ mod tests {
 
         let result = handle_committee_state(&state);
         match result {
-            QueryResult::CommitteeState(committee) => {
+            QueryResult::CommitteeState(committee, _) => {
                 let m = &committee.members[0];
                 assert_eq!(m.hot_status, 2, "resigned member must have hot_status = 2");
                 assert!(m.hot_credential.is_none());

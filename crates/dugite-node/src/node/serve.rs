@@ -626,6 +626,114 @@ fn enrich_validation_errors(
         }
     }
 
+    // ── MissingRedeemersUTXOW (UTXOW tag 10) ──
+    //
+    // Haskell raises ONE `MissingRedeemers (NonEmpty (PlutusPurpose AsItem era,
+    // ScriptHash))` carrying every missing purpose; dugite raises one
+    // `MissingRedeemer` per purpose, so they aggregate into a single frame.
+    //
+    // The ScriptHash now travels on the ValidationError itself (#1025) — every
+    // raise site already had it. The ITEM is re-derived here by (tag, index)
+    // using the SAME ordering the raise site indexed by, which is documented at
+    // each site in `dugite_ledger::validation::collateral`:
+    //
+    //   Mint    `body.mint.keys().enumerate()`                 (BTreeMap order)
+    //   Cert    raw positional index into `body.certificates`
+    //   Reward  `body.withdrawals.keys().enumerate()`          (BTreeMap order)
+    //   Vote    `body.voting_procedures.keys().enumerate()`    (BTreeMap order)
+    //   Propose raw positional index into `body.proposal_procedures`
+    //
+    // Every one of those is a deterministic order over a container this
+    // function has in hand, so the lookup cannot name a different item than
+    // the validator meant. If ANY entry fails to resolve, the whole aggregate
+    // is abandoned and every occurrence falls through to the generic arm —
+    // a frame naming the wrong input would be worse than a free-text reason.
+    {
+        let missing_redeemer_idx: Vec<usize> = errors
+            .iter()
+            .enumerate()
+            .filter_map(|(i, e)| matches!(e, VE::MissingRedeemer { .. }).then_some(i))
+            .collect();
+        if !missing_redeemer_idx.is_empty() {
+            let mut entries: Vec<(dugite_network::PlutusPurposeItem, String)> = Vec::new();
+            let mut all_resolved = true;
+            for &i in &missing_redeemer_idx {
+                let VE::MissingRedeemer {
+                    tag,
+                    index,
+                    script_hash,
+                } = &errors[i]
+                else {
+                    unreachable!("filtered above")
+                };
+                let ix = *index as usize;
+                let item =
+                    match tag.as_str() {
+                        "Mint" => tx.body.mint.keys().nth(ix).map(|p| {
+                            dugite_network::PlutusPurposeItem::Minting {
+                                policy_id: p.to_hex(),
+                            }
+                        }),
+                        "Cert" => tx.body.certificates.get(ix).map(|c| {
+                            dugite_network::PlutusPurposeItem::Certifying(Box::new(c.clone()))
+                        }),
+                        "Reward" => tx.body.withdrawals.keys().nth(ix).map(|a| {
+                            dugite_network::PlutusPurposeItem::Withdrawing {
+                                account: hex::encode(a),
+                            }
+                        }),
+                        "Vote" => tx.body.voting_procedures.keys().nth(ix).map(|v| {
+                            dugite_network::PlutusPurposeItem::Voting(Box::new(v.clone()))
+                        }),
+                        "Propose" => tx.body.proposal_procedures.get(ix).map(|p| {
+                            dugite_network::PlutusPurposeItem::Proposing(Box::new(p.clone()))
+                        }),
+                        // No `Spend` arm: the missing-redeemer check never raises
+                        // one. An unrecognised tag must NOT be guessed at.
+                        _ => None,
+                    };
+                match item {
+                    Some(item) => entries.push((item, script_hash.clone())),
+                    None => {
+                        all_resolved = false;
+                        break;
+                    }
+                }
+            }
+            if all_resolved && !entries.is_empty() {
+                mapped.push(TxValidationError::MissingRedeemersUTXOW { entries });
+                for &i in &missing_redeemer_idx {
+                    consumed[i] = true;
+                }
+            }
+        }
+    }
+
+    // ── MalformedProposalGOV (GOV tag 1) ──
+    //
+    // Haskell's payload is the WHOLE `GovAction`, one failure per offending
+    // proposal. `ValidationError::MalformedProposal` now carries the proposal's
+    // INDEX (#1025), so this is a direct positional lookup into
+    // `tx.body.proposal_procedures` — the same shape as the
+    // `OutputBootAddrAttrsTooBigUTXO` enrichment below.
+    //
+    // The index is what makes this well-defined for a multi-proposal tx. The
+    // alternative considered and rejected was re-deriving `ppuWellFormed` here,
+    // which would duplicate a ~30-field structural check in a second place and
+    // could disagree with the validator that actually made the decision.
+    for (i, e) in errors.iter().enumerate() {
+        if let VE::MalformedProposal { proposal_index, .. } = e {
+            if let Some(p) = tx.body.proposal_procedures.get(*proposal_index) {
+                mapped.push(TxValidationError::MalformedProposalGOV {
+                    action: Box::new(p.gov_action.clone()),
+                });
+                consumed[i] = true;
+            }
+            // Out-of-range index: fall through to the generic arm rather than
+            // ship a frame describing the wrong proposal.
+        }
+    }
+
     // ── ZeroTreasuryWithdrawalsGOV (GOV tag 15) ──
     //
     // Haskell raises ONE `ZeroTreasuryWithdrawals (GovAction era)` PER
@@ -951,8 +1059,12 @@ pub(crate) fn convert_validation_error(
         } => TxValidationError::ConwayCommitteeIsUnknown {
             credential: cold_credential_hash,
         },
-        VE::MissingRedeemer { tag, index } => TxValidationError::ScriptFailed {
-            reason: format!("Missing redeemer for {tag} at index {index}"),
+        VE::MissingRedeemer {
+            tag,
+            index,
+            script_hash,
+        } => TxValidationError::ScriptFailed {
+            reason: format!("Missing redeemer for {tag} at index {index} (script {script_hash})"),
         },
         VE::MissingDatumWitness(datum_hash) => TxValidationError::ScriptFailed {
             reason: format!("Missing datum witness for script-locked input: datum hash {datum_hash}"),
@@ -1163,8 +1275,14 @@ pub(crate) fn convert_validation_error(
                 key_hashes: vec![credential_hash],
             }
         }
-        VE::MalformedProposal { reason } => TxValidationError::ScriptFailed {
-            reason: format!("Governance proposal rejected: malformed PParamsUpdate ({reason})"),
+        VE::MalformedProposal {
+            reason,
+            proposal_index,
+        } => TxValidationError::ScriptFailed {
+            reason: format!(
+                "Governance proposal rejected: malformed PParamsUpdate at proposal \
+                 {proposal_index} ({reason})"
+            ),
         },
         VE::DisallowedVoters { violations } => TxValidationError::DisallowedVoters {
             violations: violations
@@ -1828,10 +1946,11 @@ mod tests {
             // ── Payload insufficient: counterpart exists, data does not ──
             (
                 "MalformedProposal",
-                "GOV 1 needs the whole GovAction; dugite carries a reason string only \
-                 (no proposal index/id to correlate back to `tx.body.proposal_procedures` \
-                 in a multi-proposal tx, and re-deriving `ppuWellFormed` independently \
-                 here would duplicate a ~30-field structural check — #1025)",
+                "GOV 1 FIXED by `enrich_validation_errors` (#1025): the ValidationError now \
+                 carries the offending proposal's INDEX, so the whole GovAction is a direct \
+                 positional lookup into `tx.body.proposal_procedures` — no need to re-derive \
+                 `ppuWellFormed` in a second place. This arm is the fallback for an \
+                 out-of-range index.",
             ),
             (
                 "ZeroTreasuryWithdrawals",
@@ -1860,9 +1979,12 @@ mod tests {
             ),
             (
                 "MissingRedeemer",
-                "UTXOW 10 needs the ScriptHash beside the purpose (Haskell uses \
-                 `AsItem`, not `AsIx` — the item itself, not an index) — genuinely \
-                 unavailable without a `dugite-ledger` raise-site change (#1025)",
+                "UTXOW 10 FIXED by `enrich_validation_errors` (#1025): the ValidationError \
+                 now carries the ScriptHash (every raise site already had it), and the \
+                 `AsItem` value is re-derived from `tx.body` using the same deterministic \
+                 ordering the raise site indexed by. This arm is the fallback for an \
+                 unresolvable (tag, index) pair — a frame naming the wrong item would be \
+                 worse than a free-text reason.",
             ),
             (
                 "OutputBootAddrAttrsTooBig",
