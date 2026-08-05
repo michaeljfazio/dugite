@@ -227,7 +227,7 @@ pub(crate) fn decode_alonzo_family_block(
     // -------------------------------------------------------------------------
     // 4. auxiliary_data_set
     // -------------------------------------------------------------------------
-    let aux_map = decode_alonzo_aux_data_map(&mut r)?;
+    let aux_map = decode_alonzo_aux_data_map(&mut r, era)?;
 
     // -------------------------------------------------------------------------
     // 5. invalid_transactions (Alonzo+ only)
@@ -1404,15 +1404,66 @@ fn read_tag_value(r: &mut Reader<'_>) -> Result<u64, SerializationError> {
 /// the next decoder, which then failed with "expected array, got u8".
 pub(crate) fn decode_alonzo_aux_data_map(
     r: &mut Reader<'_>,
+    era: Era,
 ) -> Result<BTreeMap<u32, AuxiliaryData>, SerializationError> {
     let mut result = BTreeMap::new();
     r.for_each_map_entry(|r| {
         let tx_idx = r.read_uint()? as u32;
-        let aux = decode_alonzo_auxiliary_data(r)?;
+        let aux = decode_alonzo_auxiliary_data(r, era)?;
         result.insert(tx_idx, aux);
         Ok(())
     })?;
     Ok(result)
+}
+
+/// Highest PostAlonzo (tag-259) auxiliary-data key valid for `era`.
+///
+/// Issue #1014. Oracle-verified against `IntersectMBO/cardano-ledger` at
+/// pinned commit `4849c13d6f70e5ab46add9af6e0ec5c537b61f69` (SHA confirmed
+/// resolving via `gh api repos/IntersectMBO/cardano-ledger/commits/<sha>`),
+/// `eras/alonzo/impl/src/Cardano/Ledger/Alonzo/TxAuxData.hs`.
+///
+/// `DecCBOR (AlonzoTxAuxData era)` is the SAME instance reused verbatim
+/// across Alonzo/Babbage/Conway/Dijkstra (`type TxAuxData BabbageEra =
+/// AlonzoTxAuxData BabbageEra`, etc — no era-keyed branch in Haskell at all).
+/// Both its decode paths (`decodeSparseKeyed` at PV>=12,
+/// `SparseKeyed`/`auxDataField` below it) hard-reject a key with no case arm:
+/// `decoderByKey _ -> Nothing` -> `decodeSparseKeyed`'s `Unknown field key`
+/// `failMsg`; `auxDataField n = invalidField n` -> `invalidKey`. Neither has
+/// an "ignore unknown key" fallback.
+///
+/// What makes the cap differ BY ERA despite the one shared instance is that
+/// each of keys 2-5 individually calls `guardPlutus <lang>` before decoding
+/// its script list (`libs/cardano-ledger-core/.../Plutus/Language.hs`): key 2
+/// (`plutus_v1_script`) needs decoder PV>=5, key 3 (`plutus_v2_script`)
+/// PV>=7, key 4 (`plutus_v3_script`) PV>=9, key 5 (`plutus_v4_script`,
+/// Dijkstra-only) PV>=12 — and each era's real chain only ever carries PVs
+/// inside its own fixed range, so the PV floor reproduces an effective
+/// per-era cap. Independently confirmed against each era's own CDDL, which
+/// caps `auxiliary_data_map` at exactly these keys: `alonzo.cddl` 0-2,
+/// `babbage.cddl` 0-3, `conway.cddl` 0-4, `dijkstra.cddl` 0-5. Keys 0
+/// (`metadata`) and 1 (`native_scripts`) carry no `guardPlutus` gate and are
+/// valid in every era that reaches this branch.
+///
+/// `AuxiliaryData` has no `plutus_v4_scripts` field — Dijkstra is unreleased
+/// and its param set is still moving, so key 5 stays a documented
+/// fail-closed gap here (capped at 4, matching Conway) rather than guessing
+/// at wire format for an unmodelled field. Byron/Shelley/Allegra/Mary never
+/// legitimately emit the tag-259 shape at all (their own `TxAuxData` types
+/// are structurally different — a bare map or `[metadata, scripts]` array,
+/// with no `Tag` constructor whatsoever, so a real peer's decoder would
+/// reject the shape outright, not just an out-of-range key within it); this
+/// decoder is shared across every era in dugite's implementation (#984), so
+/// they get the same conservative key cap as a defense in depth, not because
+/// upstream defines a wider set for them.
+fn max_aux_data_key(era: Era) -> u64 {
+    match era {
+        Era::Byron | Era::Shelley | Era::Allegra | Era::Mary => 1,
+        Era::Alonzo => 2,
+        Era::Babbage => 3,
+        Era::Conway => 4,
+        Era::Dijkstra => 4,
+    }
 }
 
 /// Decode an Alonzo auxiliary data value.
@@ -1436,8 +1487,17 @@ pub(crate) fn decode_alonzo_aux_data_map(
 ///
 /// `raw_cbor` is preserved in every branch, so the `auxiliary_data_hash` check
 /// and byte-exact relay never depended on any of this.
+///
+/// **Unknown/out-of-era tag-259 keys are HARD-REJECTED** (issue #1014), not
+/// silently skipped — see [`max_aux_data_key`] for the full oracle citation.
+/// This is the same defect class #1013 fixed for `ProtocolParamUpdate`: a
+/// tx whose aux-data carries an unrecognised key was silently accepted here
+/// while Haskell's `SparseKeyed`/`decodeSparseKeyed` machinery hard-rejects
+/// it via `invalidField`/`Unknown field key`, on every live era including
+/// Conway (accept-where-Haskell-rejects on a production era).
 pub(crate) fn decode_alonzo_auxiliary_data(
     r: &mut Reader<'_>,
+    era: Era,
 ) -> Result<AuxiliaryData, SerializationError> {
     let raw_start = r.position();
     r.skip()?;
@@ -1473,6 +1533,7 @@ pub(crate) fn decode_alonzo_auxiliary_data(
             // PostAlonzo: tag(259) { ... }
             // Consume the tag (any value accepted; cardano uses 259)
             let _ = aux_r.read_tag()?;
+            let max_key = max_aux_data_key(era);
             // Now we have a map — handle BOTH definite and indefinite
             // length (sibling of #673 — cn 11.0.1 emits indef-length on
             // preview for some Babbage blocks).
@@ -1487,30 +1548,44 @@ pub(crate) fn decode_alonzo_auxiliary_data(
                             Ok(())
                         })?;
                     }
-                    // Plutus script vectors, keys 2/3/4 = V1/V2/V3.
+                    // Plutus script vectors, keys 2/3/4 = V1/V2/V3, each
+                    // gated on `max_key` (issue #1014 — see
+                    // `max_aux_data_key` for the `guardPlutus`-derived
+                    // per-era floor: key 2 needs Alonzo+, key 3 Babbage+,
+                    // key 4 Conway+).
                     //
                     // `for_each_array_item` rather than a length-prefixed read
                     // so indefinite-length arrays do not silently truncate.
-                    2 => {
+                    2 if max_key >= 2 => {
                         r.for_each_array_item(|r| {
                             plutus_v1_scripts.push(r.read_bytes_owned()?);
                             Ok(())
                         })?;
                     }
-                    3 => {
+                    3 if max_key >= 3 => {
                         r.for_each_array_item(|r| {
                             plutus_v2_scripts.push(r.read_bytes_owned()?);
                             Ok(())
                         })?;
                     }
-                    4 => {
+                    4 if max_key >= 4 => {
                         r.for_each_array_item(|r| {
                             plutus_v3_scripts.push(r.read_bytes_owned()?);
                             Ok(())
                         })?;
                     }
+                    // Unknown/out-of-era key — HARD REJECT (issue #1014), per
+                    // upstream `decoderByKey`/`auxDataField`/`invalidField`
+                    // (see `max_aux_data_key`'s doc comment for the full
+                    // oracle citation). This also catches key 5
+                    // (`plutus_v4_script`, Dijkstra — `AuxiliaryData` has no
+                    // field for it yet, a documented fail-closed gap) and
+                    // keys 2/3/4 reached under an era whose guard above did
+                    // not match (e.g. key 4 under `Era::Alonzo`).
                     _ => {
-                        r.skip()?;
+                        return Err(SerializationError::CborDecode(format!(
+                            "{era:?} auxiliary_data (tag 259): unknown/invalid key {k}"
+                        )));
                     }
                 }
                 Ok(())
@@ -1596,7 +1671,7 @@ pub(crate) fn decode_alonzo_family_tx_standalone(
             r.read_null()?;
             None
         } else {
-            Some(decode_alonzo_auxiliary_data(&mut r)?)
+            Some(decode_alonzo_auxiliary_data(&mut r, era)?)
         }
     };
 
@@ -1805,7 +1880,7 @@ mod tests {
         data.extend(cbor_map0());
 
         let mut r = Reader::new(&data);
-        let result = decode_alonzo_auxiliary_data(&mut r);
+        let result = decode_alonzo_auxiliary_data(&mut r, Era::Alonzo);
         assert!(
             matches!(result, Err(SerializationError::CborDecode(_))),
             "duplicate tag-259 aux field key must be rejected, got {result:?}"
@@ -1825,8 +1900,217 @@ mod tests {
         data.extend(&metadata_map);
 
         let mut r = Reader::new(&data);
-        let aux = decode_alonzo_auxiliary_data(&mut r).expect("unique aux field keys decode");
+        let aux = decode_alonzo_auxiliary_data(&mut r, Era::Alonzo)
+            .expect("unique aux field keys decode");
         assert_eq!(aux.metadata.len(), 1);
+    }
+
+    // ── Issue #1014: PostAlonzo aux-data unknown/out-of-era keys ───────────
+
+    /// Build `tag(259) { <entries> }` from already-CBOR-encoded (key, value)
+    /// pairs — at most 23 entries (definite map header fits in one byte).
+    fn tag259_aux(entries: &[(u64, Vec<u8>)]) -> Vec<u8> {
+        assert!(entries.len() <= 23);
+        let mut data = vec![0xd9, 0x01, 0x03]; // tag 259
+        data.push(0xa0 | entries.len() as u8);
+        for (k, v) in entries {
+            data.extend(cbor_uint(*k));
+            data.extend(v.clone());
+        }
+        data
+    }
+
+    /// Issue #1014: the shared PostAlonzo (tag 259) aux-data decoder used to
+    /// silently SKIP any key it didn't recognise (`_ => { r.skip()?; }`),
+    /// including key 5+ under a LIVE CONWAY network today — the same defect
+    /// class #1013 fixed for `ProtocolParamUpdate`, but this one was
+    /// reachable on mainnet, not just an unreleased era. Oracle-verified
+    /// against `IntersectMBO/cardano-ledger@4849c13d6f70e5ab46add9af6e0ec5c537b61f69`:
+    /// `DecCBOR (AlonzoTxAuxData era)` hard-rejects any key with no case arm
+    /// in EITHER decode branch (`decoderByKey _ -> Nothing` /
+    /// `auxDataField n = invalidField n`) — see `max_aux_data_key`'s doc
+    /// comment for the full citation.
+    #[test]
+    fn conway_aux_data_key_5_unknown_hard_rejected() {
+        let data = tag259_aux(&[(5, cbor_arr(&[]))]);
+        let mut r = Reader::new(&data);
+        let result = decode_alonzo_auxiliary_data(&mut r, Era::Conway);
+        assert!(
+            matches!(result, Err(SerializationError::CborDecode(_))),
+            "key 5 (plutus_v4_script, Dijkstra-only) must be rejected under \
+             Era::Conway, got {result:?}"
+        );
+    }
+
+    /// Issue #1014: every key genuinely valid under Conway (0-4) must still
+    /// decode AND populate the right field — the guard against converting
+    /// the #1013-shaped silent-accept into a false reject (worse than the
+    /// original bug), and against a routing mistake that decodes but drops
+    /// the bytes into the wrong vec.
+    #[test]
+    fn conway_aux_data_keys_0_through_4_all_decode_and_populate() {
+        let metadata_entry = {
+            let mut m = vec![0xa1]; // map(1)
+            m.extend(cbor_uint(7));
+            m.extend(cbor_uint(42));
+            m
+        };
+        let data = tag259_aux(&[
+            (0, metadata_entry),
+            (1, cbor_arr(&[])), // native_scripts: empty (shape covered elsewhere)
+            (2, cbor_arr(&[&cbor_bytes(&[0xaa])])),
+            (3, cbor_arr(&[&cbor_bytes(&[0xbb])])),
+            (4, cbor_arr(&[&cbor_bytes(&[0xcc])])),
+        ]);
+        let mut r = Reader::new(&data);
+        let aux = decode_alonzo_auxiliary_data(&mut r, Era::Conway)
+            .expect("keys 0-4 must all decode under Era::Conway");
+        assert_eq!(aux.metadata.get(&7), Some(&TransactionMetadatum::Int(42)));
+        assert_eq!(aux.native_scripts.len(), 0);
+        assert_eq!(aux.plutus_v1_scripts, vec![vec![0xaa]]);
+        assert_eq!(aux.plutus_v2_scripts, vec![vec![0xbb]]);
+        assert_eq!(aux.plutus_v3_scripts, vec![vec![0xcc]]);
+    }
+
+    /// Issue #1014: keys 0 (`metadata`) and 1 (`native_scripts`) carry no
+    /// `guardPlutus` gate upstream and must decode in every era this shared
+    /// decoder is reachable from.
+    #[test]
+    fn aux_data_keys_0_and_1_always_valid_every_era() {
+        let data = tag259_aux(&[(0, cbor_map0()), (1, cbor_arr(&[]))]);
+        for era in [
+            Era::Shelley,
+            Era::Allegra,
+            Era::Mary,
+            Era::Alonzo,
+            Era::Babbage,
+            Era::Conway,
+            Era::Dijkstra,
+        ] {
+            let mut r = Reader::new(&data);
+            let result = decode_alonzo_auxiliary_data(&mut r, era);
+            assert!(
+                result.is_ok(),
+                "keys 0/1 must decode under {era:?}, got {result:?}"
+            );
+        }
+    }
+
+    /// Issue #1014: key 2 (`plutus_v1_script`) needs `guardPlutus PlutusV1`
+    /// (decoder PV>=5) upstream, satisfied starting Alonzo. Shelley/
+    /// Allegra/Mary (PV 2-4) never reach it.
+    #[test]
+    fn aux_data_key_2_rejected_pre_alonzo_accepted_alonzo_plus() {
+        let data = tag259_aux(&[(2, cbor_arr(&[]))]);
+
+        for era in [Era::Shelley, Era::Allegra, Era::Mary] {
+            let mut r = Reader::new(&data);
+            let result = decode_alonzo_auxiliary_data(&mut r, era);
+            assert!(
+                matches!(result, Err(SerializationError::CborDecode(_))),
+                "key 2 (plutus_v1_script) must be rejected under {era:?} \
+                 (pre-Alonzo), got {result:?}"
+            );
+        }
+        for era in [Era::Alonzo, Era::Babbage, Era::Conway, Era::Dijkstra] {
+            let mut r = Reader::new(&data);
+            let result = decode_alonzo_auxiliary_data(&mut r, era);
+            assert!(
+                result.is_ok(),
+                "key 2 must decode under {era:?} (Alonzo+), got {result:?}"
+            );
+        }
+    }
+
+    /// Issue #1014: key 3 (`plutus_v2_script`) needs `guardPlutus PlutusV2`
+    /// (decoder PV>=7) upstream, satisfied starting Babbage.
+    #[test]
+    fn aux_data_key_3_rejected_pre_babbage_accepted_babbage_plus() {
+        let data = tag259_aux(&[(3, cbor_arr(&[]))]);
+
+        for era in [Era::Shelley, Era::Allegra, Era::Mary, Era::Alonzo] {
+            let mut r = Reader::new(&data);
+            let result = decode_alonzo_auxiliary_data(&mut r, era);
+            assert!(
+                matches!(result, Err(SerializationError::CborDecode(_))),
+                "key 3 (plutus_v2_script) must be rejected under {era:?} \
+                 (pre-Babbage), got {result:?}"
+            );
+        }
+        for era in [Era::Babbage, Era::Conway, Era::Dijkstra] {
+            let mut r = Reader::new(&data);
+            let result = decode_alonzo_auxiliary_data(&mut r, era);
+            assert!(
+                result.is_ok(),
+                "key 3 must decode under {era:?} (Babbage+), got {result:?}"
+            );
+        }
+    }
+
+    /// Issue #1014: key 4 (`plutus_v3_script`) needs `guardPlutus PlutusV3`
+    /// (decoder PV>=9) upstream, satisfied starting Conway. This is the
+    /// headline live-network case: a Babbage-era tx (PV7-8) claiming a
+    /// PlutusV3 aux-data script list must be rejected, not silently skipped.
+    #[test]
+    fn aux_data_key_4_rejected_pre_conway_accepted_conway_plus() {
+        let data = tag259_aux(&[(4, cbor_arr(&[]))]);
+
+        for era in [
+            Era::Shelley,
+            Era::Allegra,
+            Era::Mary,
+            Era::Alonzo,
+            Era::Babbage,
+        ] {
+            let mut r = Reader::new(&data);
+            let result = decode_alonzo_auxiliary_data(&mut r, era);
+            assert!(
+                matches!(result, Err(SerializationError::CborDecode(_))),
+                "key 4 (plutus_v3_script) must be rejected under {era:?} \
+                 (pre-Conway), got {result:?}"
+            );
+        }
+        for era in [Era::Conway, Era::Dijkstra] {
+            let mut r = Reader::new(&data);
+            let result = decode_alonzo_auxiliary_data(&mut r, era);
+            assert!(
+                result.is_ok(),
+                "key 4 must decode under {era:?} (Conway+), got {result:?}"
+            );
+        }
+    }
+
+    /// Issue #1014: key 5 (`plutus_v4_script`) is genuinely valid upstream
+    /// from Dijkstra onward (`dijkstra.cddl` caps `auxiliary_data_map` at
+    /// 0-5, `guardPlutus PlutusV4` needs decoder PV>=12), but
+    /// `AuxiliaryData` has no `plutus_v4_scripts` field to decode it into.
+    /// Documented fail-closed gap, deliberately left as-is — Dijkstra is
+    /// unreleased and its param set is still moving, the same call made for
+    /// `ProtocolParamUpdate` keys 38/39
+    /// (`pparam_update_keys_38_39_rejected_under_dijkstra_known_gap`).
+    /// If this test starts failing because someone added the field, that is
+    /// the intended trigger to invert it — not a regression.
+    #[test]
+    fn aux_data_key_5_rejected_every_era_known_gap() {
+        let data = tag259_aux(&[(5, cbor_arr(&[]))]);
+        for era in [
+            Era::Shelley,
+            Era::Allegra,
+            Era::Mary,
+            Era::Alonzo,
+            Era::Babbage,
+            Era::Conway,
+            Era::Dijkstra,
+        ] {
+            let mut r = Reader::new(&data);
+            let result = decode_alonzo_auxiliary_data(&mut r, era);
+            assert!(
+                matches!(result, Err(SerializationError::CborDecode(_))),
+                "key 5 (plutus_v4_script) has no dugite field yet — must be \
+                 rejected under {era:?} today (known gap, see \
+                 max_aux_data_key), got {result:?}"
+            );
+        }
     }
 
     /// Metadata LABEL maps stay LENIENT (last-wins) — metadata is the canonical
