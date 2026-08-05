@@ -51,13 +51,11 @@ pub(crate) fn check_collateral(
         return;
     }
 
-    // Rule 11 – max collateral inputs count
-    if body.collateral.len() as u64 > params.max_collateral_inputs {
-        errors.push(ValidationError::TooManyCollateralInputs {
-            max: params.max_collateral_inputs,
-            actual: body.collateral.len() as u64,
-        });
-    }
+    // NOTE: `TooManyCollateralInputs` (max collateral inputs count) is
+    // deliberately NOT checked here — see [`check_max_collateral_inputs`],
+    // called unconditionally (not gated on `has_plutus_scripts`) from
+    // `validate_transaction_with_pools`. Checking it here too would
+    // double-report the same predicate failure for Plutus transactions.
 
     // Accumulate collateral value and multi-asset balances
     let mut collateral_value = 0u64;
@@ -185,6 +183,40 @@ pub(crate) fn check_collateral(
 
     // Rule 11b – redeemer index bounds
     check_redeemer_indices(tx, errors);
+}
+
+/// Rule 11 — max collateral inputs count (Haskell `TooManyCollateralInputs`).
+///
+/// Per Haskell `Alonzo.validateTooManyCollateralInputs`
+/// (`eras/alonzo/impl/src/Cardano/Ledger/Alonzo/Rules/Utxo.hs:470-481`),
+/// called UNCONDITIONALLY from `babbageUtxoValidation`
+/// (`eras/babbage/impl/src/Cardano/Ledger/Babbage/Rules/Utxo.hs:412`) — this
+/// is a plain `runTest`, NOT nested inside `feesOK`'s
+/// `unless (null redeemers)` gate that guards `InsufficientCollateral` /
+/// `ScriptsNotPaidUTxO` / `CollateralContainsNonADA` / `NoCollateralInputs` /
+/// `IncorrectTotalCollateralField`.
+///
+/// dugite previously checked this only inside [`check_collateral`], which is
+/// itself gated behind `has_plutus_scripts(tx)` in
+/// `validation::validate_transaction_with_pools` — so a transaction with NO
+/// Plutus scripts and NO redeemers, but a `collateral` field declaring more
+/// inputs than `max_collateral_inputs` (syntactically legal: the CDDL
+/// `collateral` field is not restricted to Plutus transactions), was
+/// silently ACCEPTED where cardano-node rejects it. This function is called
+/// unconditionally (not gated on `has_plutus_scripts`) to match Haskell's
+/// actual, unconditional call site. See dugite issue #1022.
+pub(crate) fn check_max_collateral_inputs(
+    tx: &Transaction,
+    params: &ProtocolParameters,
+    errors: &mut Vec<ValidationError>,
+) {
+    let actual = tx.body.collateral.len() as u64;
+    if actual > params.max_collateral_inputs {
+        errors.push(ValidationError::TooManyCollateralInputs {
+            max: params.max_collateral_inputs,
+            actual,
+        });
+    }
 }
 
 /// Check that total execution units in the transaction do not exceed the
@@ -1212,7 +1244,7 @@ mod tests {
     use crate::utxo::UtxoSet;
     use crate::validation::ValidationError;
 
-    use super::check_collateral;
+    use super::{check_collateral, check_max_collateral_inputs};
 
     // -----------------------------------------------------------------------
     // Helpers
@@ -1447,6 +1479,10 @@ mod tests {
     // -----------------------------------------------------------------------
 
     /// 4 collateral inputs when `max_collateral_inputs = 3`.
+    ///
+    /// `check_max_collateral_inputs` is now a standalone, unconditionally-run
+    /// function (see its doc comment) — no longer nested inside
+    /// `check_collateral`, so this test calls it directly.
     #[test]
     fn test_too_many_collateral_inputs() {
         let cols: Vec<TransactionInput> = (0u8..4).map(|i| input(0xC0 + i)).collect();
@@ -1464,7 +1500,7 @@ mod tests {
         params.max_collateral_inputs = 3;
 
         let mut errors: Vec<ValidationError> = Vec::new();
-        check_collateral(&tx, &utxo, &params, &mut errors);
+        check_max_collateral_inputs(&tx, &params, &mut errors);
 
         assert!(
             errors.iter().any(|e| matches!(
