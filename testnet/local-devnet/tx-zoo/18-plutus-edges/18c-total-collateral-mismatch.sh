@@ -33,7 +33,17 @@ COLLAT=${COLLAT_PAIR%% *}; COLLAT_AMT=${COLLAT_PAIR##* }
 
 REDEEMER="$ZOO_BUILT/$NAME.redeemer.json"
 echo '{"int": 0}' > "$REDEEMER"
-EXUNITS="(1000000,1000000)"
+# (steps, memory) — cardano-cli's --tx-in-execution-units tuple order,
+# confirmed live via dugite-relay's ScriptFailed budget-exhaustion log
+# ("cpu_remaining" tracked the FIRST tuple element). always-true-v2 needs
+# ~1,893,779 steps / ~5,894 mem in practice (CEK decode overhead, despite
+# "trivial" logic) — 1,000,000 steps was under-provisioned. This mattered
+# concretely here: with the declared/effective collateral EQUAL (no
+# mismatch), the tx reaches Phase-2 and a too-low step budget produces a
+# ScriptFailed rejection that is indistinguishable, at the wire, from this
+# category's #979-shape "degraded to ConwayMempoolFailure" signal — masking
+# whether IncorrectTotalCollateralField's own encoder is exercised at all.
+EXUNITS="(2000000,1000000)"
 FEE=2000000
 REG_OUT=$((SCRIPT_AMT - FEE))
 PPARAMS=$(zoo_pparams_file)

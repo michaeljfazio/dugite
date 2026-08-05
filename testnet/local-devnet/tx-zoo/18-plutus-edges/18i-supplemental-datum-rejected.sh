@@ -45,7 +45,11 @@ COLLAT=${COLLAT_PAIR%% *}
 
 REDEEMER="$ZOO_BUILT/$NAME.redeemer.json"
 echo '{"int": 0}' > "$REDEEMER"
-EXUNITS="(1000000,1000000)"
+# (steps, memory) — cardano-cli's --tx-in-execution-units tuple order,
+# confirmed live via dugite-relay's ScriptFailed budget-exhaustion log
+# ("cpu_remaining" tracked the FIRST tuple element). always-true-v2 needs
+# ~1,893,779 steps / ~5,894 mem in practice; 1,000,000 was under-provisioned.
+EXUNITS="(2000000,1000000)"
 FEE=2000000
 REG_OUT=$((SCRIPT_AMT - FEE))
 TIP=$(zoo_tip_slot)
