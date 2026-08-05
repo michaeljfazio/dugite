@@ -1249,11 +1249,13 @@ fn v3_rewarding_purpose_uses_bare_credential() {
 // reordering, a dropped field, a wrong wrapper) that a narrower field-level
 // assertion could miss.
 //
-// TODO(#845 follow-up): when a real `cardano-ledger`-produced ScriptContext
-// dump for an equivalent Alonzo/Babbage Spend tx becomes available (e.g. via
-// the `DUGITE_DUMP_APPLIED_DIR` / #772-harness technique against a synced
-// cardano-node), replace/augment this hand-verified golden with the
-// independently-captured bytes for true cross-implementation verification.
+// Standing caveat: a golden derived from our own encoder cannot catch a
+// misunderstanding shared by the encoder and this fixture — it pins
+// self-consistency, not cross-implementation truth. Upgrading it needs a real
+// `cardano-ledger`-produced ScriptContext dump for an equivalent
+// Alonzo/Babbage Spend tx (capturable via the `DUGITE_DUMP_APPLIED_DIR` /
+// #772-harness technique against a synced cardano-node); no such dump exists
+// in this repo today. Replace/augment the hex below when one does.
 #[test]
 fn script_context_v1_populated_fixture_exact_cbor_golden() {
     let tx_out_ref = TxOutRef {
@@ -1304,8 +1306,8 @@ fn script_context_v1_populated_fixture_exact_cbor_golden() {
         EXPECTED_HEX,
         "ScriptContextV1 exact-bytes golden changed — if this is an \
          intentional encoding fix, verify field-by-field against the \
-         Haskell reference before updating EXPECTED_HEX (see #845 TODO \
-         above for the real-dump follow-up)"
+         Haskell reference before updating EXPECTED_HEX (see the \
+         standing caveat above: this golden is self-derived)"
     );
 
     // Round-trip sanity: the pinned bytes must decode back to the same Data.

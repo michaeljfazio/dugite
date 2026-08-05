@@ -854,8 +854,6 @@ impl TxInfoV3 {
                 // 8 — signatories :: [PubKeyHash]
                 data_list(self.signatories.iter().map(data_bs28).collect()),
                 // 9 — redeemers :: Map ScriptPurpose Redeemer
-                // TODO(task-13f): redeemers map not yet populated — wired as
-                // 9 — redeemers :: Map ScriptPurpose Redeemer
                 // V3 map keys use `ScriptPurpose::to_data_v3()` so that the
                 // `Spending` variant encodes with the bare-txid `TxOutRef`
                 // form introduced in V3 (V1/V2 use `Constr 0 [B bytes]`
