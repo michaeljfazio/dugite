@@ -11,54 +11,66 @@
 //!   identity on state: the previous-era ledger is carried forward verbatim.
 //!
 //! Dijkstra **does** add new tx-level / block-level features layered on top
-//! of the unchanged state machine. Those are NOT implemented here yet
-//! because they require native Dijkstra wire-format support (issue
-//! #466) to decode in the first place. They are catalogued under the
-//! `dijkstra_unimplemented` test module below as `#[ignore]` placeholders
-//! and linked to follow-on issues so future work has a concrete checklist.
+//! of the unchanged state machine. Most of those landed under #462 / #475;
+//! the exceptions are listed below and each has an open tracking issue.
 //!
 //! ## What's implemented now
 //!
-//! Every method delegates to [`ConwayRules`] except `on_era_transition`,
-//! which implements `translateEraDijkstra` as an explicit identity for
-//! Conway → Dijkstra and guards against unexpected from-eras. This matches
-//! Haskell's `translateEraDijkstra` in
-//! `Cardano.Ledger.Dijkstra.Translation` (state unchanged, only era tag
-//! advances).
+//! `on_era_transition` implements `translateEraDijkstra` as an explicit
+//! identity for Conway → Dijkstra and guards against unexpected from-eras,
+//! matching Haskell's `Cardano.Ledger.Dijkstra.Translation` (state unchanged,
+//! only the era tag advances). Every other method either delegates to
+//! [`ConwayRules`] or layers a Dijkstra-only step on top of it.
 //!
-//! ## What's deferred (require #466 + spec stability)
+//! Landed and verified in-tree:
 //!
-//! - **Sub-transactions** (TxBody key 23): nested SUB-rule hierarchy
-//!   (`SUBLEDGERS`/`SUBLEDGER`/`SUBUTXO`/`SUBUTXOW`/`SUBCERT`/`SUBCERTS`/
-//!   `SUBDELEG`/`SUBGOV`/`SUBGOVCERT`/`SUBPOOL`). See issue #462 Phase 3.1.
-//! - **`isValid` removal** (CIP-0167): top-level `Tx` drops the IsValid flag;
-//!   collateral-on-invalid-tx flow is restructured. Issue #462 Phase 3.2.
-//! - **`account_balance_intervals`** (TxBody key 26): new UTXO predicate
-//!   gating tx on reward-account balance ranges. Issue #462 Phase 3.3.
-//! - **`direct_deposits`** (TxBody key 25): ADA flow directly into reward
-//!   accounts. Issue #462 Phase 3.4.
-//! - **`guards`** (TxBody key 14, semantic upgrade): credential-based guards;
-//!   new native-script tag-6 `RequireGuard`; new Plutus purpose `Guarding`.
-//!   Issue #462 Phase 3.5.
-//! - **PlutusV4**: new script-language tag 3, hash prefix `\x04`, cost-model
-//!   slot. Issues #462 Phase 5 + #464.
-//! - **New PParams 34-37**: `maxRefScriptSizePerBlock`,
-//!   `maxRefScriptSizePerTx`, `refScriptCostStride`,
-//!   `refScriptCostMultiplier` (re-parameterise Conway's hardcoded
-//!   1 MiB / 25 KiB / 1.2× tier). Issue #462 Phase 4.
+//! - **`direct_deposits`** (TxBody key 25) — ADA flowing directly into reward
+//!   accounts; applied by `apply_direct_deposits` before sub-transactions.
+//! - **Sub-transactions** (TxBody key 23) — wire surface plus the UTxO and
+//!   incremental `stake_map` / `ptr_stake` effects (`apply_sub_transactions`).
+//!   See the caveat below.
+//! - **`account_balance_intervals`** (TxBody key 26) — UTXO predicate gating a
+//!   tx on reward-account balance ranges.
+//! - **`guards`** (TxBody key 14, semantic upgrade) — credential-based guards,
+//!   native-script tag-6 `RequireGuard`, Plutus purpose `Guarding`.
+//! - **PParams 34-37** — `maxRefScriptSizePerBlock` / `…PerTx` /
+//!   `refScriptCostStride` / `refScriptCostMultiplier`, re-parameterising
+//!   Conway's hardcoded 1 MiB / 25 KiB / 1.2× tier
+//!   (`dugite_primitives::genesis::dijkstra`).
 //! - **`minFeeA` type change** (PParams key 0 → `CoinPerByte`, renamed
-//!   `txFeePerByte`): semantic-only soft break. Implemented in
-//!   #462 Phase 4.3 — wire/JSON shape is byte-identical to Conway, the
-//!   Haskell rename surfaces via the [`CoinPerByte`] newtype +
-//!   [`ProtocolParameters::tx_fee_per_byte`] accessor in
-//!   `dugite_primitives::protocol_params`. See the round-trip test at the
+//!   `txFeePerByte`) — semantic-only soft break. The wire/JSON shape is
+//!   byte-identical to Conway; the Haskell rename surfaces via the
+//!   [`CoinPerByte`] newtype + [`ProtocolParameters::tx_fee_per_byte`]
+//!   accessor in `dugite_primitives::protocol_params`. Round-trip test at the
 //!   end of this file (`min_fee_a_coin_per_byte_encoding`).
-//! - **`peras_certificate`** in block body (`array(3)` third element).
-//!   Issue #462 Phase 1.4.
-//! - **`prevNonce` header field**: consensus-level nonce chaining change.
-//!   Issue #462 Phase 7.3.
-//! - **`dijkstra-genesis.json`**: PParams seeding for keys 34-37. Issue #462
-//!   Phase 6.
+//! - **`dijkstra-genesis.json`** — PParams seeding for keys 34-37.
+//! - **`prevNonce` header field** — consensus-level nonce chaining.
+//! - **PlutusV4 parse + hash** — script-language tag 4, hash prefix `\x04`,
+//!   cost-model wire slot 3. See the caveat below.
+//!
+//! ## Known gaps (each has an open issue — do not assume these are done)
+//!
+//! - **Sub-transaction failure semantics diverge from Haskell** (#1001).
+//!   Upstream `Cardano.Ledger.Dijkstra.Rules.SubLedgers` folds the OMap via
+//!   `foldM`, so any sub-tx failure aborts the WHOLE top-level tx. Dugite
+//!   validates each sub-tx in isolation and drops only the failing one's
+//!   effects, so successful siblings still apply — accept-where-Haskell-
+//!   rejects. `SUBUTXOW` / `SUBCERTS` / `SUBGOV` pre-conditions are also
+//!   unmodelled. See the comment in `apply_tx` below.
+//! - **PlutusV4 cannot be evaluated** (#1000). Parse and hash landed; the
+//!   evaluator did not. `ScriptLanguage` has no V4 variant, `WitnessSet` has
+//!   no `plutus_v4_scripts` field, and V4 reference scripts surface a typed
+//!   `PhaseTwoError::Internal`. Every path fails closed, so there is no silent
+//!   divergence — but no V4 script can be validated.
+//! - **CIP-0167 `isValid` removal is decoder-only** (#1002). The restructured
+//!   collateral-on-invalid-tx flow is not implemented; `apply_invalid_tx`
+//!   still delegates to Conway.
+//! - **`peras_certificate`** in the block body (`array(3)` third element) —
+//!   blocked upstream, tracked in #607. The wire shape has settled but the
+//!   certificate CONTENT is an explicit upstream stub (`PerasCert ByteArray`,
+//!   `validatePerasCert _ _ _ = True`), so byte-exact validation is not yet
+//!   definable. Pinned as the one `#[ignore]` placeholder in the
+//!   `dijkstra_unimplemented` module below.
 
 use std::collections::HashSet;
 
@@ -1280,10 +1292,17 @@ mod tests {
 
     // -- unimplemented Dijkstra features (tracked) -------------------------
     //
-    // Each test below is an `#[ignore]` placeholder pinning a concrete
-    // Dijkstra-only behaviour to a follow-up issue. When (#466)
-    // lands native Dijkstra support and the relevant Phase work proceeds,
-    // strip the `#[ignore]` and fill in the body.
+    // One `#[ignore]` placeholder remains: `peras_certificate` (#607), which
+    // is blocked upstream — the block-body wire shape has settled but the
+    // certificate CONTENT is still an explicit stub in cardano-ledger, so
+    // there is nothing byte-exact to validate against. Strip the `#[ignore]`
+    // and fill in the body once upstream cuts a tagged release with real
+    // `cardano-crypto-peras` CBOR instances.
+    //
+    // The doc comments below that describe already-landed phases are retained
+    // deliberately: they record the Haskell contract each phase was built
+    // against. Where a phase landed only partially the gap is named in the
+    // module header above with its tracking issue.
     mod dijkstra_unimplemented {
         // Re-import `super::*` if you flesh these out; left unused here so
         // ignored tests don't drag in build dependencies.
@@ -3601,7 +3620,7 @@ mod tests {
         ///
         /// Issue: #462 Phase 1.4 (blocked on #466 + Peras spec stability).
         #[test]
-        #[ignore = "Dijkstra peras_certificate in block body — see #462 Phase 1.4"]
+        #[ignore = "Dijkstra peras_certificate — blocked on upstream Peras spec, see #607"]
         fn block_body_peras_certificate_arm() {
             unimplemented!();
         }
