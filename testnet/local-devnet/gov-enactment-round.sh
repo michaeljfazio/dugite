@@ -976,8 +976,12 @@ run_guardrail_cases() {
         expect=$(jq -r ".[$i].expect" "$GR_CASES")
         mapfile -t CLIARGS < <(jq -r ".[$i].cli_args[]" "$GR_CASES")
         local afile="$ZOO_TMP/gr-$id.action"
+        # create-protocol-parameters-update takes the bare --testnet flag
+        # (network id), NOT --testnet-magic (a query/build flag). 13h carries
+        # the same latent typo but never reaches this call — it env-skips on an
+        # unguarded constitution.
         if ! cardano-cli conway governance action create-protocol-parameters-update \
-                --testnet-magic "$LD_MAGIC" \
+                --testnet \
                 --governance-action-deposit "$GOV_DEPOSIT" \
                 --deposit-return-stake-verification-key-file "$WA/stake.vkey" \
                 --anchor-url "$ANCHOR_URL" --anchor-data-hash "$ANCHOR_HASH" \
