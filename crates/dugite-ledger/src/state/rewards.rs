@@ -1416,13 +1416,18 @@ mod tests {
     ///
     ///   earned_epoch=1268 spendable_epoch=1270 leader_reward = 352_901_742
     ///
-    /// Dugite at that boundary computed 352_905_247 (diff = +3505). This
-    /// scaffold pins the known leader reward; a follow-up patch must load a
-    /// real GO snapshot + bprev counts for epoch 1268 and feed them through
-    /// `compute_reward_update` to assert byte-equality. Marked `#[ignore]`
-    /// because the snapshot file is not yet checked into the repo.
+    /// Dugite at that boundary computed 352_905_247 (diff = +3505). The
+    /// arithmetic discrepancy itself was resolved (#438); what this scaffold
+    /// still cannot do is assert byte-equality end-to-end, because that needs
+    /// a real GO snapshot + `bprev` counts for epoch 1268 fed through
+    /// `compute_reward_update`, and that fixture is multi-GB and not checked
+    /// into the repo.
+    ///
+    /// Unblock condition: commit (or fetch on demand) a preview epoch-1268 GO
+    /// snapshot, then drop the `#[ignore]`. Until then this pins the oracle
+    /// values only.
     #[test]
-    #[ignore = "needs preview epoch 1268 GO snapshot fixture — see #438"]
+    #[ignore = "needs an uncommitted preview epoch-1268 GO snapshot fixture"]
     fn test_koios_preview_epoch_1268_leader_reward_issue_438() {
         // Canonical Koios oracle values for the regression target.
         let expected_leader_reward: u64 = 352_901_742;
