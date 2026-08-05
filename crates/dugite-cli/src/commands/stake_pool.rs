@@ -58,8 +58,18 @@ enum StakePoolSubcommand {
         #[arg(long)]
         out_file: PathBuf,
     },
-    /// Create stake pool retirement certificate
-    RetirementCertificate {
+    /// Create stake pool deregistration certificate
+    ///
+    /// cardano-cli 11's canonical name is `deregistration-certificate`.
+    /// dugite's original name, `retirement-certificate`, is kept as a
+    /// visible alias for existing scripts (#1008) — both build the exact
+    /// same `PoolRetireCert` (cert type 4). The name is made primary here
+    /// (rather than just adding an alias to the old variant) so the
+    /// cardano-cli surface-parity walker — which reads only the first
+    /// token of each `Commands:` line, not `[aliases: ...]` — discovers it;
+    /// see `scripts/validation/cli-surface-parity.sh`.
+    #[command(visible_alias = "retirement-certificate")]
+    DeregistrationCertificate {
         #[arg(long)]
         cold_verification_key_file: PathBuf,
         /// Epoch at which the pool retires
@@ -270,7 +280,7 @@ impl StakePoolCmd {
                 kes_period,
                 &out_file,
             ),
-            StakePoolSubcommand::RetirementCertificate {
+            StakePoolSubcommand::DeregistrationCertificate {
                 cold_verification_key_file,
                 epoch,
                 out_file,

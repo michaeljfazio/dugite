@@ -47,8 +47,18 @@ enum StakeAddressSubcommand {
         #[arg(long)]
         out_file: PathBuf,
     },
-    /// Create a stake delegation certificate
-    DelegationCertificate {
+    /// Create a stake address stake delegation certificate
+    ///
+    /// cardano-cli 11's canonical name is `stake-delegation-certificate`.
+    /// dugite's original name, `delegation-certificate`, is kept as a
+    /// visible alias for existing scripts (#1008) — both build the exact
+    /// same `StakeDelegation` certificate. The name is made primary here
+    /// (rather than just adding an alias to the old variant) so the
+    /// cardano-cli surface-parity walker — which reads only the first
+    /// token of each `Commands:` line, not `[aliases: ...]` — discovers it;
+    /// see `scripts/validation/cli-surface-parity.sh`.
+    #[command(visible_alias = "delegation-certificate")]
+    StakeDelegationCertificate {
         #[arg(long)]
         stake_verification_key_file: PathBuf,
         /// Pool ID to delegate to (bech32 or hex)
@@ -263,7 +273,7 @@ impl StakeAddressCmd {
                 );
                 Ok(())
             }
-            StakeAddressSubcommand::DelegationCertificate {
+            StakeAddressSubcommand::StakeDelegationCertificate {
                 stake_verification_key_file,
                 stake_pool_id,
                 out_file,
