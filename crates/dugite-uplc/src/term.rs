@@ -549,50 +549,60 @@ impl BuiltinId {
     /// from PV11 (`vanRossemPV`) a V1 script may reference every later
     /// batch (2 through 6) at once — Haskell's `builtinsIntroducedIn
     /// PlutusV1` has exactly two map entries (`alonzoPV`, `vanRossemPV`).
+    ///
+    /// ## PlutusV4 (Dijkstra)
+    ///
+    /// `IntersectMBO/plutus`'s `PlutusLedgerLanguage` sum type has no `V4`
+    /// constructor at all (still-open `plutus#7342`) — there is no
+    /// V4-specific `DefaultFun` availability table to diverge from V3's,
+    /// and cardano-ledger's `PlutusV4` wraps V3's evaluation context
+    /// verbatim. Every V4 arm below therefore mirrors its V3 sibling
+    /// exactly. See `ScriptLanguage`'s doc comment
+    /// (`dugite-uplc/src/redeemer_resolve.rs`) for the full citation.
     pub fn is_available_in(self, language: ScriptLanguage, major_pv: u32) -> bool {
         let earliest_pv: u32 = match self.as_u8() {
             // batch1: Alonzo-era arithmetic/bytestring/string/data/list/pair.
             0..=50 => match language {
                 ScriptLanguage::PlutusV1 => 5,
                 ScriptLanguage::PlutusV2 => 7,
-                ScriptLanguage::PlutusV3 => 9,
+                ScriptLanguage::PlutusV3 | ScriptLanguage::PlutusV4 => 9,
             },
             // batch2: SerialiseData.
             51 => match language {
                 ScriptLanguage::PlutusV1 => 11,
                 ScriptLanguage::PlutusV2 => 7,
-                ScriptLanguage::PlutusV3 => 9,
+                ScriptLanguage::PlutusV3 | ScriptLanguage::PlutusV4 => 9,
             },
             // batch3: VerifyEcdsaSecp256k1Signature, VerifySchnorrSecp256k1Signature.
             52..=53 => match language {
                 ScriptLanguage::PlutusV1 => 11,
                 ScriptLanguage::PlutusV2 => 8,
-                ScriptLanguage::PlutusV3 => 9,
+                ScriptLanguage::PlutusV3 | ScriptLanguage::PlutusV4 => 9,
             },
             // batch4a: BLS12-381 G1/G2/pairing ops, Keccak_256, Blake2b_224.
             54..=72 => match language {
                 ScriptLanguage::PlutusV1 => 11,
                 ScriptLanguage::PlutusV2 => 11,
-                ScriptLanguage::PlutusV3 => 9,
+                ScriptLanguage::PlutusV3 | ScriptLanguage::PlutusV4 => 9,
             },
             // batch4b: IntegerToByteString, ByteStringToInteger.
             73..=74 => match language {
                 ScriptLanguage::PlutusV1 => 11,
                 ScriptLanguage::PlutusV2 => 10,
-                ScriptLanguage::PlutusV3 => 9,
+                ScriptLanguage::PlutusV3 | ScriptLanguage::PlutusV4 => 9,
             },
             // batch5: bitwise ops, Ripemd_160.
             75..=86 => match language {
                 ScriptLanguage::PlutusV1 => 11,
                 ScriptLanguage::PlutusV2 => 11,
-                ScriptLanguage::PlutusV3 => 10,
+                ScriptLanguage::PlutusV3 | ScriptLanguage::PlutusV4 => 10,
             },
             // batch6 (87..=100, and any future addition defaults here too):
             // ExpModInteger, DropList, array ops, value ops.
             _ => match language {
                 ScriptLanguage::PlutusV1 => 11,
                 ScriptLanguage::PlutusV2 => 11,
-                ScriptLanguage::PlutusV3 => 11,
+                ScriptLanguage::PlutusV3 | ScriptLanguage::PlutusV4 => 11,
             },
         };
         major_pv >= earliest_pv
@@ -881,6 +891,29 @@ mod tests {
         ] {
             assert!(!id.is_available_in(ScriptLanguage::PlutusV1, 10));
             assert!(id.is_available_in(ScriptLanguage::PlutusV1, 11));
+        }
+    }
+
+    /// Issue #1000 (PlutusV4/Dijkstra): `is_available_in(PlutusV4, pv)` must
+    /// equal `is_available_in(PlutusV3, pv)` for EVERY builtin at EVERY pv —
+    /// oracle-verified that `IntersectMBO/plutus`'s own `PlutusLedgerLanguage`
+    /// has no `V4` constructor at all (`plutus#7342`, still open), so V4
+    /// cannot have a distinct availability table. This is a property test
+    /// over the full wire-ID range + a spread of PVs, not just spot checks —
+    /// exactly the kind of "same table, new tag" claim a single spot check
+    /// could miss a batch boundary on.
+    #[test]
+    fn is_available_in_v4_mirrors_v3_exactly_for_every_builtin_and_pv() {
+        for raw in 0u8..=100 {
+            let id = BuiltinId::from_u8(raw).expect("from_u8");
+            for pv in 0u32..=13 {
+                assert_eq!(
+                    id.is_available_in(ScriptLanguage::PlutusV3, pv),
+                    id.is_available_in(ScriptLanguage::PlutusV4, pv),
+                    "builtin {:?} (raw={raw}) diverges between V3 and V4 at pv={pv}",
+                    id.name()
+                );
+            }
         }
     }
 

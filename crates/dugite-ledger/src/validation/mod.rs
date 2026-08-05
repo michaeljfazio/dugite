@@ -4226,17 +4226,36 @@ pub fn validate_transaction_with_pools(
         // ------------------------------------------------------------------
         let has_redeemers = !tx.witness_set.redeemers.is_empty();
 
-        // Phase-2 V3 TxInfo translation check (Haskell PR #5011):
+        // Phase-2 V3/V4 TxInfo translation check (Haskell PR #5011, and
+        // issue #1000 for the V4 half):
         //
         // At PV >= 11, the phase-1 `BabbageNonDisjointRefInputs` check is
         // relaxed (see phase1.rs Rule 9).  An equivalent check is moved
         // into PlutusV3 `TxInfo` construction: if any redeemer executes a
-        // V3 script AND `inputs ∩ reference_inputs` is non-empty, the
-        // translation fails with
-        // `ConwayContextError::ReferenceInputsNotDisjointFromInputs`.
+        // V3 (or, from Dijkstra, V4 — see below) script AND
+        // `inputs ∩ reference_inputs` is non-empty, the translation fails
+        // with `ConwayContextError::ReferenceInputsNotDisjointFromInputs`.
         //
-        // V1/V2/native scripts (and txs with NO V3 redeemer) are accepted
-        // with overlap — this is the intended relaxation.
+        // V1/V2/native scripts (and txs with NO V3/V4 redeemer) are
+        // accepted with overlap — this is the intended relaxation.
+        //
+        // PlutusV4 inclusion is oracle-verified, not inferred from
+        // `ScriptLanguage`'s "V4 is V3 semantics" doc comment alone:
+        // `IntersectMBO/cardano-ledger` @
+        // `4849c13d6f70e5ab46add9af6e0ec5c537b61f69`,
+        // `eras/dijkstra/impl/src/Cardano/Ledger/Dijkstra/TxInfo.hs`, BOTH
+        // `instance EraPlutusTxInfo 'PlutusV3 DijkstraEra` (line 391) and
+        // `instance EraPlutusTxInfo 'PlutusV4 DijkstraEra` (line 519,
+        // `mkAnyLevelTxInfo`, line 566) call
+        // `Conway.checkReferenceInputsNotDisjointFromInputs txBody`
+        // unconditionally (no `when (pvMajor >= 11)` guard — Dijkstra is
+        // always PV >= 12, so the Conway-era guard is always true there and
+        // was simplified away). This holds even though
+        // `EraPlutusTxInfo 'PlutusV4 DijkstraEra`'s `toPlutusScriptPurpose`
+        // is still `error "stub: PlutusV4 not yet implemented"` upstream —
+        // the disjointness check runs inside `toPlutusTxInfo`, which builds
+        // `TxInfo` BEFORE any per-redeemer `toPlutusScriptPurpose` call, so
+        // it is reached (and would fire) independently of that stub.
         //
         // This check is independent of other phase-1 errors (it is a pure
         // structural property of `inputs` vs `reference_inputs`), so we run
@@ -4249,8 +4268,8 @@ pub fn validate_transaction_with_pools(
             let version_map = crate::validation::plutus_script_version_map(tx, utxo_set);
             let redeemer_versions =
                 crate::validation::redeemer_script_version_map(tx, utxo_set, &version_map);
-            let any_v3_executed = redeemer_versions.values().any(|&v| v == 3);
-            if any_v3_executed {
+            let any_v3_or_v4_executed = redeemer_versions.values().any(|&v| v == 3 || v == 4);
+            if any_v3_or_v4_executed {
                 let input_set: std::collections::HashSet<_> = tx.body.inputs.iter().collect();
                 let mut common: Vec<&dugite_primitives::transaction::TransactionInput> = tx
                     .body

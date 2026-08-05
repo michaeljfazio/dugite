@@ -32,11 +32,44 @@ use dugite_primitives::transaction::{
 };
 
 /// Plutus language version a script targets.
+///
+/// ## PlutusV4 (Dijkstra) — oracle-verified as of 2026-08-05
+///
+/// `IntersectMBO/cardano-ledger` @ `4849c13d6f70e5ab46add9af6e0ec5c537b61f69`,
+/// `libs/cardano-ledger-core/src/Cardano/Ledger/Plutus/Language.hs`:
+///
+/// ```haskell
+/// data Language = PlutusV1 | PlutusV2 | PlutusV3 | PlutusV4
+/// ```
+///
+/// and `eras/dijkstra/impl/src/Cardano/Ledger/Dijkstra/TxInfo.hs` /
+/// `libs/cardano-ledger-core/.../Language.hs`'s `PlutusV4` instance wires
+/// evaluation straight through `PV3.evaluateScriptRestricting` /
+/// `PV3.mkEvaluationContext` — i.e. **as wired upstream today, PlutusV4 IS
+/// PlutusV3 semantics under a distinct language tag, byte-for-byte**. The
+/// `IntersectMBO/plutus` repo's own `PlutusLedgerLanguage` sum type
+/// (`plutus-ledger-api/.../Versions.hs`) has NO `PlutusV4` constructor at
+/// all (tracked by the still-open `plutus#7342`), so there is no V4-specific
+/// builtin set, `BuiltinSemanticsVariant`, or cost-model `ParamName` list to
+/// diverge from V3's. dugite therefore threads `PlutusV4` through every
+/// V3-shaped code path unchanged (same `ScriptContext`/`TxInfo` builder,
+/// same builtin availability table, same `SemanticsVariant`, same cost-model
+/// parameter interpretation) and only varies the bookkeeping that IS
+/// version-specific on both sides today: the cost-model array is read from
+/// `CostModels.plutus_v4` (wire slot 3) instead of `.plutus_v3`, the script
+/// hash uses prefix `0x04` instead of `0x03`, and the ledger-language
+/// availability gate is PV12 (Dijkstra) instead of PV9 (Conway).
+///
+/// Full research trail:
+/// `.claude/agent-memory/cardano-haskell-oracle/plutus-v4-dijkstra-witness-set-and-scriptcontext-status.md`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ScriptLanguage {
     PlutusV1,
     PlutusV2,
     PlutusV3,
+    /// Dijkstra (PV12+) only. See the enum-level doc comment — evaluates
+    /// identically to [`ScriptLanguage::PlutusV3`] upstream today.
+    PlutusV4,
 }
 
 /// Everything a [`crate::phase_two::eval_phase_two_raw`] needs to know
@@ -152,12 +185,15 @@ fn resolve_spend(
         ))
     })?;
     let (script_bytes, language) = find_script_bytes(tx, resolved, &script_hash)?;
-    // Datum lookup for V1/V2 only.
+    // Datum lookup for V1/V2 only. V3/V4 inline the datum into
+    // `ScriptInfo::Spending` instead (resolved later by
+    // `resolve_spend_datum_v3` — V4 shares the V3 ScriptContext builder,
+    // see `ScriptLanguage`'s doc comment).
     let datum = match language {
         ScriptLanguage::PlutusV1 | ScriptLanguage::PlutusV2 => {
             Some(resolve_spend_datum(tx, resolved_out, &script_hash)?)
         }
-        ScriptLanguage::PlutusV3 => None,
+        ScriptLanguage::PlutusV3 | ScriptLanguage::PlutusV4 => None,
     };
     let purpose = ScriptPurpose::Spending(crate::script_context::TxOutRef {
         tx_id: input.transaction_id.0,
@@ -237,7 +273,11 @@ fn resolve_cert(
         ScriptLanguage::PlutusV1 | ScriptLanguage::PlutusV2 => {
             crate::populate_gov::certificate_to_plutus_v1v2(cert)?
         }
-        ScriptLanguage::PlutusV3 => crate::populate_gov::certificate_to_plutus(cert)?,
+        // V4 shares V3's Conway `TxCert` shape (see `ScriptLanguage`'s doc
+        // comment — V4 is V3 semantics under a distinct language tag).
+        ScriptLanguage::PlutusV3 | ScriptLanguage::PlutusV4 => {
+            crate::populate_gov::certificate_to_plutus(cert)?
+        }
     };
     let purpose = ScriptPurpose::Certifying(idx as u64, tx_cert);
     Ok(ResolvedRedeemer {
@@ -535,11 +575,41 @@ fn proposal_script_hash(p: &dugite_primitives::transaction::ProposalProcedure) -
 /// 1. `tx.witness_set.plutus_v1_scripts` (hash each, match)
 /// 2. `tx.witness_set.plutus_v2_scripts`
 /// 3. `tx.witness_set.plutus_v3_scripts`
-/// 4. Each `resolved` UTxO's `script_ref` (V1/V2/V3 Plutus scripts).
+/// 4. Each `resolved` UTxO's `script_ref` (V1/V2/V3/V4 Plutus scripts).
 ///
 /// Returns the raw script bytes + the language version. Native
 /// scripts surface a typed `Internal` error — phase-2 only runs
 /// Plutus.
+///
+/// ## No witness-set step for PlutusV4 — deliberate, oracle-verified
+///
+/// Unlike V1/V2/V3, there is no `tx.witness_set.plutus_v4_scripts` step
+/// here, and `TransactionWitnessSet` has no such field. This is NOT a gap:
+/// `IntersectMBO/cardano-ledger` @ `4849c13d6f70e5ab46add9af6e0ec5c537b61f69`
+/// has `type TxWits DijkstraEra = AlonzoTxWits DijkstraEra` — Dijkstra
+/// reuses Alonzo's witness-set type verbatim — and BOTH branches of its
+/// `DecCBOR` (the `natVersion @12`-gated `decoderByKey` and the legacy
+/// `txWitnessField`) enumerate only keys 0-7 (vkey/native/bootstrap/v1/
+/// data/redeemers/v2/v3); any other key hard-fails via `invalidField`/
+/// `Nothing`. The Dijkstra CDDL spec generator itself
+/// (`eras/dijkstra/impl/cddl/lib/.../HuddleSpec.hs`) has a literal
+/// `-- TODO: Add plutus_v4_script at index 8 once AlonzoTxWitsRaw
+/// encoder/decoder supports it`, and the era's own test fixtures document
+/// *"PlutusV4 scripts are NOT part of Dijkstra's transaction_witness_set
+/// CDDL (only V1/V2/V3 are). Including them here would cause a roundtrip
+/// failure as they get silently dropped during serialization."*
+///
+/// A real cardano-node peer therefore cannot produce a V4 witness-set
+/// script on the wire today, and dugite must not invent a key 8 slot that
+/// doesn't exist upstream — doing so would make dugite generate/accept a
+/// CBOR shape a genuine Haskell peer can neither emit nor decode, which is
+/// exactly the kind of divergence this project treats as a defect. V4
+/// scripts are only reachable on-chain today via a `TxOut` reference
+/// script (`script` CDDL sum, tag 4) or `auxiliary_data_map` key 5 — both
+/// already handled (step 4 below, and pre-existing aux-data decoding
+/// respectively). See `ScriptLanguage`'s doc comment for the full research
+/// trail; re-check `plutus#7342` / the Dijkstra `TxWits.hs` before ever
+/// adding a witness-set arm here.
 fn find_script_bytes(
     tx: &Transaction,
     resolved: &[(PrimTxIn, PrimTxOut, Vec<u8>)],
@@ -586,19 +656,11 @@ fn find_script_bytes(
                     PrimScriptRef::PlutusV1(b) => return Ok((b.clone(), ScriptLanguage::PlutusV1)),
                     PrimScriptRef::PlutusV2(b) => return Ok((b.clone(), ScriptLanguage::PlutusV2)),
                     PrimScriptRef::PlutusV3(b) => return Ok((b.clone(), ScriptLanguage::PlutusV3)),
-                    // PlutusV4 (Dijkstra) ref-script resolution is part of
-                    // issue #475 Phase 5; the `ScriptLanguage::PlutusV4`
-                    // variant + evaluator wiring don't exist yet. Until they
-                    // land, refuse to resolve V4 ref-scripts so phase-2
-                    // doesn't silently feed V4 bytes to the V3 machine.
-                    PrimScriptRef::PlutusV4(_) => {
-                        return Err(PhaseTwoError::Internal(format!(
-                            "find_script_bytes: script {h} resolves to a PlutusV4 \
-                             reference script — V4 evaluation is not yet implemented \
-                             (issue #475 Phase 5)",
-                            h = hex::encode(script_hash)
-                        )));
-                    }
+                    // PlutusV4 (Dijkstra) reference script — the one
+                    // currently-real on-chain V4 surface (see this
+                    // function's doc comment). Evaluated via the same
+                    // pipeline as V3 (see `ScriptLanguage`'s doc comment).
+                    PrimScriptRef::PlutusV4(b) => return Ok((b.clone(), ScriptLanguage::PlutusV4)),
                     PrimScriptRef::NativeScript(_) => {
                         return Err(PhaseTwoError::Internal(format!(
                             "find_script_bytes: script {h} resolves to a native script — \
@@ -1048,6 +1110,50 @@ mod tests {
         assert_eq!(r.len(), 1);
         assert_eq!(r[0].language, ScriptLanguage::PlutusV3);
         assert_eq!(r[0].script_bytes, script_bytes);
+    }
+
+    /// Issue #1000 (PlutusV4/Dijkstra), acceptance criterion 2: "A Dijkstra
+    /// tx with a V4 REFERENCE script resolves and evaluates." This test
+    /// covers the "resolves" half at the `resolve_redeemers` layer (the
+    /// full evaluate end-to-end path is
+    /// `eval_redeemer::tests::smoke_v4_ref_script_runs_and_returns_unit`).
+    /// V4 only resolves via `script_ref` — there is no witness-set slot
+    /// upstream, see this module's `find_script_bytes` doc comment.
+    #[test]
+    fn spend_resolves_v4_reference_script() {
+        let script_bytes = vec![0x11, 0x22, 0x33, 0x44];
+        // V4 hash prefix is 0x04 (not V3's 0x03).
+        let mut buf = vec![4u8];
+        buf.extend_from_slice(&script_bytes);
+        let script_hash = dugite_primitives::hash::blake2b_224(&buf).0;
+        let input = TransactionInput {
+            transaction_id: h32(0xe4),
+            index: 0,
+        };
+        let mut spent_out = enterprise_script_output(script_hash, 1_000_000);
+        spent_out.script_ref = Some(PrimScriptRef::PlutusV4(script_bytes.clone()));
+        let mut body = minimal_body();
+        body.inputs = vec![input.clone()];
+        let mut ws = empty_witness();
+        // Deliberately empty: no `plutus_v4_scripts` field exists on
+        // `TransactionWitnessSet` at all (oracle-verified — see
+        // `find_script_bytes`'s doc comment), so the script MUST resolve
+        // via `script_ref`.
+        ws.redeemers = vec![Redeemer {
+            tag: RedeemerTag::Spend,
+            index: 0,
+            data: PrimPlutusData::Integer(num_bigint::BigInt::from(0)),
+            ex_units: ExUnits { mem: 1, steps: 1 },
+        }];
+        let tx = build_tx(body, ws);
+        let resolved = vec![(input, spent_out, vec![])];
+        let r = resolve_redeemers(&tx, &resolved).unwrap();
+        assert_eq!(r.len(), 1);
+        assert_eq!(r[0].language, ScriptLanguage::PlutusV4);
+        assert_eq!(r[0].script_bytes, script_bytes);
+        // V4 shares V3's datum-deferred-to-ScriptContext-builder semantics.
+        assert!(r[0].datum.is_none());
+        assert!(matches!(r[0].purpose, ScriptPurpose::Spending(_)));
     }
 
     #[test]
