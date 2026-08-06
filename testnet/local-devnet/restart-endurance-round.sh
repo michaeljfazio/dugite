@@ -40,12 +40,27 @@
 #                       Proves the metric is READ from the endpoint and not
 #                       defaulted/ignored (the #987 shape: a verdict column that
 #                       was always 0).
-set +e
-unsetopt ERR_EXIT ERR_RETURN 2>/dev/null || true
-
 cd "$(dirname "${BASH_SOURCE[0]}")" || exit 2
 . ./lib/common.sh
 . ./lib/expect-log-errors.sh
+
+# ORDER IS LOAD-BEARING: `lib/common.sh` line 4 is `set -euo pipefail`, so
+# relaxing errexit BEFORE sourcing it does nothing — the lib turns it straight
+# back on. Every sibling round (kes-round.sh, rollback-round.sh) sources first
+# and relaxes after, for exactly this reason.
+#
+# Caught by this round's own `RE_RED_CASE=down` proof: with errexit live,
+# `TIP=$(wait_relay_recovered)` returning 1 KILLED the script at the first
+# unrecovered iteration — before the end-of-round leak assertions and the log
+# oracle ever ran — and exited 1, which is indistinguishable from an orderly
+# failure. A round that aborts instead of failing reports less than nothing.
+# The happy path never noticed, because there `wait_relay_recovered` returns 0.
+#
+# `set +u` too: this script reads optional env knobs and a `${VAR}` typo under
+# `-u` would abort rather than fall back to its default.
+set +e
+set +u
+unsetopt ERR_EXIT ERR_RETURN 2>/dev/null || true
 
 ITERATIONS="${RE_ITERATIONS:-30}"
 CATCHUP_TIMEOUT="${RE_CATCHUP_TIMEOUT:-120}"
