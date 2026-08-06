@@ -184,6 +184,53 @@ pub(crate) const GENESIS_PARKED_DYNAMO_MARGIN_SLOTS: u64 = 2_000;
 // silent one on ANY network.
 const _: () = assert!(GENESIS_PARKED_DYNAMO_MARGIN_SLOTS < 25_920);
 
+/// #735 gross-request invariant, lock-free half: does this fetch range
+/// connect WITHOUT consulting the ChainDB?
+///
+/// Two cases need no lock:
+/// * `already_fetched` — this worker fetched the parent itself and the apply
+///   pipeline simply has not stored it yet (channel lag). The contiguous chain
+///   is in flight, not missing.
+/// * the range is rooted at **genesis**. `Hash32::ZERO` is dugite's canonical
+///   Origin parent: the encoder maps it to CBOR `null`, i.e. Haskell's
+///   `PrevHash = GenesisHash` (pinned by
+///   `test_encode_block_header_body_prev_hash_null_at_genesis`).
+///
+/// **#1057** — the genesis case is why this function exists. Genesis is never a
+/// *stored* block, so a `has_block(&genesis)` test is always false; the old
+/// guard only exempted a completely EMPTY ChainDB. A node holding any block of
+/// its own therefore declined the canonical chain's block 0 on every decision
+/// tick, forever: nothing was fetched, the ledger never advanced, ChainSync's
+/// forecast-horizon park timed out, and every peer was dropped and re-dialled
+/// in an endless loop with no self-healing. It stranded a block producer that
+/// won a slot before its initial sync completed.
+///
+/// Adoptability is not this guard's job to re-litigate: `sync.rs` accepts an
+/// Origin intersection only after confirming the local chain is within `k` of
+/// genesis, and `VolatileDB::switch_chain` re-applies the `k` cap before
+/// actually switching. Upstream carries the same notion as a first-class
+/// constructor — `AnchorGenesis` in ouroboros-consensus's `Anchor blk`, matched
+/// by `Paths.hs::isReachable`.
+pub(crate) fn fetch_range_connects_fast(
+    prev: &dugite_primitives::hash::Hash32,
+    already_fetched: bool,
+) -> bool {
+    already_fetched || *prev == dugite_primitives::hash::Hash32::ZERO
+}
+
+/// #735 gross-request invariant, ChainDB half: consulted only when
+/// [`fetch_range_connects_fast`] returned `false`.
+///
+/// `chain_db_empty` keeps the original from-origin bootstrap exemption as
+/// defence-in-depth for any era whose header decode does not surface a genesis
+/// `prev_hash`; `chain_db_has_prev` is the ordinary frontier-extension case.
+pub(crate) fn fetch_range_connects_via_chain_db(
+    chain_db_empty: bool,
+    chain_db_has_prev: bool,
+) -> bool {
+    chain_db_empty || chain_db_has_prev
+}
+
 /// Should an unproductive dynamo that has starved ChainSel past the watchdog
 /// window be ROTATED?
 ///
@@ -3054,22 +3101,23 @@ impl ConnectionLifecycleManager {
                                     )
                                 {
                                     let prev = hdr.prev_hash;
-                                    // Accept a parent this worker already
-                                    // fetched even if the apply pipeline has
-                                    // not stored it yet (channel lag) — the
-                                    // contiguous chain is in flight, not
-                                    // missing.
-                                    let connects = fetched_hashes.contains(prev.as_bytes()) || {
+                                    // The decision itself lives in the pure
+                                    // `fetch_range_connects` (unit-tested);
+                                    // here we only supply its inputs, taking
+                                    // the ChainDB lock lazily so the common
+                                    // already-fetched / genesis cases stay
+                                    // lock-free.
+                                    let connects = if fetch_range_connects_fast(
+                                        &prev,
+                                        fetched_hashes.contains(prev.as_bytes()),
+                                    ) {
+                                        true
+                                    } else {
                                         let cdb = chain_db.read().await;
-                                        // From-origin bootstrap: an EMPTY
-                                        // ChainDB has no frontier to extend —
-                                        // the first block's prev_hash is the
-                                        // GENESIS HASH, which is never a
-                                        // stored block. The guard only arms
-                                        // once a frontier exists (caught live
-                                        // on the devnet: the relay wedged at
-                                        // origin, declining block 1 forever).
-                                        cdb.get_tip_info().is_none() || cdb.has_block(&prev)
+                                        fetch_range_connects_via_chain_db(
+                                            cdb.get_tip_info().is_none(),
+                                            cdb.has_block(&prev),
+                                        )
                                     };
                                     if !connects {
                                         debug!(
@@ -7415,5 +7463,60 @@ mod range_byte_abort_751_tests {
         ));
         // ~A full mainnet stability window ahead → clearly parked → keep it.
         assert!(!should_rotate_unproductive_dynamo(Some(tip + 129_600), tip));
+    }
+
+    // ── #1057: the #735 gross-request invariant must accept a genesis root ──
+    //
+    // The live wedge: a block producer forged blocks 0..8 on Origin before its
+    // initial sync completed. The network's chain also diverges at genesis, so
+    // its first block's `prev_hash` is the Origin parent (`Hash32::ZERO`). With
+    // a NON-empty ChainDB the old guard declined that range forever — genesis is
+    // never a stored block — so nothing was fetched, the ledger never advanced,
+    // and ChainSync's forecast-horizon park dropped every peer in an endless
+    // loop. The node never rejoined the canonical chain.
+
+    /// A range rooted at genesis connects even when the ChainDB is NON-empty
+    /// and does not contain the genesis hash. This is the #1057 regression.
+    #[test]
+    fn fetch_range_rooted_at_genesis_connects_with_non_empty_chain_db() {
+        let genesis = dugite_primitives::hash::Hash32::ZERO;
+
+        // The lock-free half decides it outright — no ChainDB read needed.
+        assert!(
+            fetch_range_connects_fast(&genesis, false),
+            "a genesis-rooted range must connect without consulting the ChainDB (#1057)"
+        );
+
+        // And the ChainDB half, which is what the old code relied on, would
+        // have REFUSED: non-empty DB, and genesis is not a stored block. This
+        // asserts the precise shape of the bug that was fixed.
+        assert!(
+            !fetch_range_connects_via_chain_db(false, false),
+            "the ChainDB half alone cannot recognise genesis — that WAS the bug"
+        );
+    }
+
+    /// The ordinary cases must be unchanged: a parent already fetched by this
+    /// worker connects; an unknown non-genesis parent against a non-empty
+    /// ChainDB still does NOT (the far-ahead range the guard exists to decline).
+    #[test]
+    fn fetch_range_ordinary_cases_unchanged() {
+        let other = dugite_primitives::hash::Hash32::from_bytes([7u8; 32]);
+
+        // Already fetched by this worker → in flight, not missing.
+        assert!(fetch_range_connects_fast(&other, true));
+        // Not fetched, not genesis → must fall through to the ChainDB.
+        assert!(!fetch_range_connects_fast(&other, false));
+
+        // Frontier extension: the parent is stored → connects.
+        assert!(fetch_range_connects_via_chain_db(false, true));
+        // From-origin bootstrap exemption retained.
+        assert!(fetch_range_connects_via_chain_db(true, false));
+        // The #735 far-ahead range: unknown parent, non-empty DB → decline.
+        assert!(
+            !fetch_range_connects_via_chain_db(false, false),
+            "an unknown non-genesis parent against a non-empty ChainDB must \
+             still be declined — the #735 invariant is preserved"
+        );
     }
 }
