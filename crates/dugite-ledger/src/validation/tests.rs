@@ -14085,7 +14085,7 @@ mod tests {
     fn test_constitution_policy_hash_match_accepted() {
         // When the constitution has a guardrail script and the proposal provides
         // a matching policy_hash, validation should NOT produce a
-        // ConstitutionPolicyMismatch error.
+        // InvalidGuardrailsScriptHash error.
         let script_hash = Hash28::from_bytes([0xAB; 28]);
         let (utxo_set, _input, tx, params) = make_guardrail_proposal_tx(Some(script_hash));
 
@@ -14106,15 +14106,15 @@ mod tests {
             None,
             None,
             None,
-            Some(script_hash), // constitution_script_hash matches policy_hash
-            None,              // vote_delegations
+            Some(Some(script_hash)), // constitution guardrail matches policy_hash
+            None,                    // vote_delegations
         );
-        // Should not have ConstitutionPolicyMismatch (may have other errors
+        // Should not have InvalidGuardrailsScriptHash (may have other errors
         // like MissingWitness — that's fine, we only care about the policy check).
         if let Err(errors) = result {
             assert!(
-                !errors.iter().any(|e| matches!(e, ValidationError::ConstitutionPolicyMismatch { .. })),
-                "Should not have ConstitutionPolicyMismatch when policy_hash matches, got: {errors:?}"
+                !errors.iter().any(|e| matches!(e, ValidationError::InvalidGuardrailsScriptHash { .. })),
+                "Should not have InvalidGuardrailsScriptHash when policy_hash matches, got: {errors:?}"
             );
         }
     }
@@ -14123,7 +14123,7 @@ mod tests {
     fn test_constitution_policy_hash_mismatch_rejected() {
         // When the constitution has a guardrail script and the proposal provides
         // a DIFFERENT policy_hash, validation must produce a
-        // ConstitutionPolicyMismatch error.
+        // InvalidGuardrailsScriptHash error.
         let constitution_hash = Hash28::from_bytes([0xAB; 28]);
         let wrong_hash = Hash28::from_bytes([0xCD; 28]);
         let (utxo_set, _input, tx, params) = make_guardrail_proposal_tx(Some(wrong_hash));
@@ -14145,15 +14145,15 @@ mod tests {
             None,
             None,
             None,
-            Some(constitution_hash), // constitution expects 0xAB, proposal has 0xCD
-            None,                    // vote_delegations
+            Some(Some(constitution_hash)), // constitution expects 0xAB, proposal has 0xCD
+            None,                          // vote_delegations
         );
         let errors = result.expect_err("should reject mismatched policy_hash");
         assert!(
             errors
                 .iter()
-                .any(|e| matches!(e, ValidationError::ConstitutionPolicyMismatch { .. })),
-            "Should have ConstitutionPolicyMismatch, got: {errors:?}"
+                .any(|e| matches!(e, ValidationError::InvalidGuardrailsScriptHash { .. })),
+            "Should have InvalidGuardrailsScriptHash, got: {errors:?}"
         );
     }
 
@@ -14161,7 +14161,7 @@ mod tests {
     fn test_constitution_policy_hash_missing_rejected() {
         // When the constitution has a guardrail script but the proposal has
         // no policy_hash (None), validation must produce a
-        // ConstitutionPolicyMismatch error.
+        // InvalidGuardrailsScriptHash error.
         let constitution_hash = Hash28::from_bytes([0xAB; 28]);
         let (utxo_set, _input, tx, params) = make_guardrail_proposal_tx(None);
 
@@ -14182,22 +14182,167 @@ mod tests {
             None,
             None,
             None,
-            Some(constitution_hash), // constitution requires guardrail, proposal has None
-            None,                    // vote_delegations
+            Some(Some(constitution_hash)), // constitution requires guardrail, proposal has None
+            None,                          // vote_delegations
         );
         let errors = result.expect_err("should reject missing policy_hash");
         assert!(
             errors
                 .iter()
-                .any(|e| matches!(e, ValidationError::ConstitutionPolicyMismatch { .. })),
-            "Should have ConstitutionPolicyMismatch for missing policy_hash, got: {errors:?}"
+                .any(|e| matches!(e, ValidationError::InvalidGuardrailsScriptHash { .. })),
+            "Should have InvalidGuardrailsScriptHash for missing policy_hash, got: {errors:?}"
+        );
+    }
+
+    // ── #1028: SNothing-vs-not-plumbed, the full StrictMaybe matrix ────────
+    //
+    // Haskell:
+    //   checkGuardrailsScriptHash expectedHash actualHash =
+    //     failureUnless (actualHash == expectedHash) $
+    //       InvalidGuardrailsScriptHash actualHash expectedHash
+    //
+    // `SNothing == SNothing` is required exactly as `SJust h == SJust h` is.
+    // dugite gated the WHOLE check on `if let Some(hash) = ...`, so a
+    // guardrail-less constitution accepted a proposal carrying any policy_hash
+    // at all — accept-where-Haskell-rejects.
+
+    /// **The #1028 regression.** Constitution enacted with NO guardrail
+    /// (`Some(None)`), proposal supplies `SJust h` ⇒ MUST reject.
+    #[test]
+    fn guardrail_snothing_constitution_rejects_proposal_with_policy_hash() {
+        let provided = Hash28::from_bytes([0xCD; 28]);
+        let (utxo_set, _input, tx, params) = make_guardrail_proposal_tx(Some(provided));
+
+        let result = validate_transaction_with_pools(
+            &tx,
+            &utxo_set,
+            &params,
+            100,
+            300,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(None), // constitution ENACTED, guardrail SNothing
+            None,       // vote_delegations
+        );
+
+        let errors =
+            result.expect_err("a policy_hash against a guardrail-less constitution must reject");
+        let found = errors
+            .iter()
+            .find_map(|e| match e {
+                ValidationError::InvalidGuardrailsScriptHash { got, expected } => {
+                    Some((*got, *expected))
+                }
+                _ => None,
+            })
+            .unwrap_or_else(|| {
+                panic!(
+                    "InvalidGuardrailsScriptHash MUST fire when the constitution has NO \
+                     guardrail but the proposal supplies one (#1028); got: {errors:?}"
+                )
+            });
+        assert_eq!(
+            found.0,
+            Some(provided),
+            "`got` is the proposal's policy_hash"
+        );
+        assert_eq!(
+            found.1, None,
+            "`expected` is the constitution's SNothing guardrail"
+        );
+    }
+
+    /// Constitution enacted with NO guardrail and proposal ALSO supplies none
+    /// ⇒ must be accepted. `SNothing == SNothing`. Without this, a fix that
+    /// rejected everything on a guardrail-less constitution would pass the test
+    /// above.
+    #[test]
+    fn guardrail_snothing_constitution_accepts_proposal_without_policy_hash() {
+        let (utxo_set, _input, tx, params) = make_guardrail_proposal_tx(None);
+
+        let result = validate_transaction_with_pools(
+            &tx,
+            &utxo_set,
+            &params,
+            100,
+            300,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(None), // constitution ENACTED, guardrail SNothing
+            None,
+        );
+
+        if let Err(errors) = result {
+            assert!(
+                !errors
+                    .iter()
+                    .any(|e| matches!(e, ValidationError::InvalidGuardrailsScriptHash { .. })),
+                "SNothing constitution + SNothing proposal must NOT raise \
+                 InvalidGuardrailsScriptHash; got: {errors:?}"
+            );
+        }
+    }
+
+    /// The two meanings of `None` must behave DIFFERENTLY on identical input.
+    /// If they ever coincide, the doubly-optional type is pointless and #1028
+    /// has regressed — this is the test that makes the distinction observable.
+    #[test]
+    fn guardrail_not_plumbed_and_snothing_are_distinguishable() {
+        let provided = Hash28::from_bytes([0xCD; 28]);
+
+        let fires = |guardrail: Option<Option<Hash28>>| -> bool {
+            let (utxo_set, _input, tx, params) = make_guardrail_proposal_tx(Some(provided));
+            let result = validate_transaction_with_pools(
+                &tx, &utxo_set, &params, 100, 300, None, None, None, None, None, None, None, None,
+                None, None, None, guardrail, None,
+            );
+            match result {
+                Err(errors) => errors
+                    .iter()
+                    .any(|e| matches!(e, ValidationError::InvalidGuardrailsScriptHash { .. })),
+                Ok(_) => false,
+            }
+        };
+
+        assert!(
+            !fires(None),
+            "outer None = context not plumbed in ⇒ check SKIPPED (lenient default)"
+        );
+        assert!(
+            fires(Some(None)),
+            "Some(None) = constitution known to have NO guardrail ⇒ check ENFORCED (#1028)"
         );
     }
 
     #[test]
     fn test_no_constitution_no_policy_required() {
-        // When the constitution has no guardrail script (None), proposals with
-        // or without policy_hash should NOT trigger ConstitutionPolicyMismatch.
+        // #1028: this covers the OUTER `None` — the caller never plumbed the
+        // guardrail context in, so the check is skipped under this module's
+        // lenient-default convention for un-supplied context.
+        //
+        // It does NOT cover "the constitution exists and has no guardrail"
+        // (`Some(None)`); the original comment here said it did, which is
+        // exactly the conflation #1028 was about. That case is a real,
+        // representable on-chain state where Haskell still enforces equality,
+        // and it has its own tests below.
         let (utxo_set, _input, tx, params) =
             make_guardrail_proposal_tx(Some(Hash28::from_bytes([0xAB; 28])));
 
@@ -14206,13 +14351,13 @@ mod tests {
             None, None, None, None, // no constitution script hash
             None, // vote_delegations
         );
-        // Should not have ConstitutionPolicyMismatch.
+        // Should not have InvalidGuardrailsScriptHash.
         if let Err(errors) = result {
             assert!(
                 !errors
                     .iter()
-                    .any(|e| matches!(e, ValidationError::ConstitutionPolicyMismatch { .. })),
-                "Should not have ConstitutionPolicyMismatch when no constitution, got: {errors:?}"
+                    .any(|e| matches!(e, ValidationError::InvalidGuardrailsScriptHash { .. })),
+                "Should not have InvalidGuardrailsScriptHash when no constitution, got: {errors:?}"
             );
         }
     }
@@ -14247,15 +14392,15 @@ mod tests {
             None,
             None,
             None,
-            Some(constitution_hash),
+            Some(Some(constitution_hash)),
             None, // vote_delegations
         );
         let errors = result.expect_err("should reject mismatched TreasuryWithdrawals policy_hash");
         assert!(
             errors
                 .iter()
-                .any(|e| matches!(e, ValidationError::ConstitutionPolicyMismatch { .. })),
-            "Should have ConstitutionPolicyMismatch for TreasuryWithdrawals, got: {errors:?}"
+                .any(|e| matches!(e, ValidationError::InvalidGuardrailsScriptHash { .. })),
+            "Should have InvalidGuardrailsScriptHash for TreasuryWithdrawals, got: {errors:?}"
         );
     }
 
@@ -14322,7 +14467,7 @@ mod tests {
             None,
             None,
             None,
-            Some(script_hash),
+            Some(Some(script_hash)),
             None, // vote_delegations
         );
         // The redeemer at index 2 should NOT trigger RedeemerIndexOutOfRange
@@ -15866,8 +16011,6 @@ mod tests {
         assert_eq!(conflicts[0], cred.to_typed_hash32().to_hex());
     }
 
-    /// At PV=9 (Conway bootstrap) the conflicting-update check is **still
-    /// enforced** — there is no bootstrap skip for this rule.
     // -------------------------------------------------------------------------
     // #1026: DisallowedProposalDuringBootstrap (ConwayGovPredFailure tag 12)
     //
@@ -16037,6 +16180,8 @@ mod tests {
         );
     }
 
+    /// At PV=9 (Conway bootstrap) the conflicting-update check is **still
+    /// enforced** — there is no bootstrap skip for this rule.
     #[test]
     fn test_validate_transaction_rejects_conflicting_committee_update_in_bootstrap() {
         use dugite_primitives::credentials::Credential;
