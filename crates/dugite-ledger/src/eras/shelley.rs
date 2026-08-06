@@ -845,16 +845,28 @@ impl EraRules for ShelleyRules {
             );
         }
 
-        // Compute new epoch nonce (TICKN rule):
+        // Compute the new epoch nonce.
+        //
+        // TPraos eras (Shelley/Allegra/Mary/Alonzo) run the TICKN rule
+        // (Haskell `Cardano.Protocol.TPraos.Rules.Tickn.tickTransition`):
         //   η0 = candidateNonce ⭒ prevHashNonce ⭒ extraEntropy
-        // (Haskell `Cardano.Protocol.TPraos.Rules.Tickn.tickTransition`).
         // extraEntropy is NeutralNonce on virtually every epoch, but mainnet
         // injected a non-neutral value effective epoch 259 — omitting it
         // desynchronises the epoch nonce (and thus every VRF check) from there.
+        //
+        // #1015: this function is ALSO the shared pre-Conway boundary for
+        // BABBAGE, which is a **Praos** era — `tickChainDepState` folds only
+        // TWO terms and `extraEntropy` does not exist for Praos at all. Folding
+        // the third term there was wrong. The mode is derived from `ctx.era`
+        // inside `compute_epoch_boundary_nonce`'s caller so there is one code
+        // path and no way to select the wrong formula; see `EpochNonceMode`.
         let candidate = consensus.candidate_nonce;
         let prev_hash_nonce = consensus.last_epoch_block_nonce;
-        consensus.epoch_nonce = super::common::combine_nonce(
-            super::common::combine_nonce(candidate, prev_hash_nonce),
+        let nonce_mode = super::common::EpochNonceMode::for_era(ctx.era);
+        consensus.epoch_nonce = super::common::compute_epoch_boundary_nonce(
+            nonce_mode,
+            candidate,
+            prev_hash_nonce,
             consensus.extra_entropy,
         );
 

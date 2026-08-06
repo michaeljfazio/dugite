@@ -727,13 +727,31 @@ impl LedgerState {
         );
 
         // Step 1: Compute new epoch nonce using OLD prevHashNonce (ηh).
-        //   epochNonce = candidate ⭒ prevHashNonce ⭒ extraEntropy
+        //
+        // TPraos (Shelley..Alonzo): candidate ⭒ prevHashNonce ⭒ extraEntropy
+        // Praos  (Babbage onward):  candidate ⭒ prevHashNonce
+        //
         // Nonce combine (⭒) treats NeutralNonce (ZERO) as the identity.
         // extraEntropy is NeutralNonce on virtually every epoch, but mainnet
-        // injected a non-neutral value effective epoch 259 — it MUST be folded
-        // in (see `ConsensusSubState::extra_entropy`).
-        self.consensus.epoch_nonce = crate::eras::common::combine_nonce(
-            crate::eras::common::combine_nonce(candidate, prev_hash_nonce),
+        // injected a non-neutral value effective epoch 259 — on a TPraos era it
+        // MUST be folded in (see `ConsensusSubState::extra_entropy`); on a Praos
+        // era the term does not exist at all (#1015).
+        //
+        // #1015/#977: this is the THIRD site that computed a boundary nonce, and
+        // it is the `#[doc(hidden)]` test-only path that every unit test in this
+        // crate drives — exactly the path #977's fix landed in while production
+        // did nothing. It now shares the ONE
+        // `common::compute_epoch_boundary_nonce` with the era-rules paths, so the
+        // formula cannot drift between them. Only the mode SELECTION differs, and
+        // it differs because this signature has no era in scope; see
+        // `EpochNonceMode::for_protocol_version_major` for why that is the
+        // narrower choice and why production must not copy it.
+        self.consensus.epoch_nonce = crate::eras::common::compute_epoch_boundary_nonce(
+            crate::eras::common::EpochNonceMode::for_protocol_version_major(
+                self.epochs.protocol_params.protocol_version_major,
+            ),
+            candidate,
+            prev_hash_nonce,
             self.consensus.extra_entropy,
         );
 

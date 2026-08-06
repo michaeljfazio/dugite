@@ -40,7 +40,7 @@ use std::sync::Arc;
 use dugite_primitives::block::{Block, BlockHeader};
 use dugite_primitives::credentials::Credential;
 use dugite_primitives::era::Era;
-use dugite_primitives::hash::{blake2b_256, Hash28, Hash32};
+use dugite_primitives::hash::{Hash28, Hash32};
 use dugite_primitives::time::EpochNo;
 use dugite_primitives::transaction::{Certificate, GovActionId, Transaction, Voter};
 use dugite_primitives::value::Lovelace;
@@ -937,23 +937,27 @@ impl EraRules for ConwayRules {
         // capture position is load-bearing for byte-exact RUPD math at
         // boundaries that enact a ParameterChange / HardForkInitiation.
 
-        // Compute new epoch nonce (TICKN rule).
+        // Compute the new epoch nonce.
+        //
+        // Conway is a **Praos** era, so `tickChainDepState` folds TWO terms and
+        // never `extraEntropy`:
+        //   praosStateEpochNonce = candidateNonce ⭒ lastEpochBlockNonce
+        //
+        // #1015: this was a hand-inlined re-implementation of
+        // `combine_nonce`'s body — correct, but a third copy of the concept.
+        // Now it shares the one `compute_epoch_boundary_nonce` with Shelley and
+        // Babbage, so the TPraos/Praos split lives in exactly one place. That
+        // duplication WAS the mechanism by which Babbage kept folding a third
+        // term: Conway had the right formula, and its sibling reused the wrong
+        // era's code wholesale instead.
         let candidate = consensus.candidate_nonce;
         let prev_hash_nonce = consensus.last_epoch_block_nonce;
-
-        let zero = Hash32::ZERO;
-        consensus.epoch_nonce = if candidate == zero && prev_hash_nonce == zero {
-            zero
-        } else if candidate == zero {
-            prev_hash_nonce
-        } else if prev_hash_nonce == zero {
-            candidate
-        } else {
-            let mut nonce_input = Vec::with_capacity(64);
-            nonce_input.extend_from_slice(candidate.as_bytes());
-            nonce_input.extend_from_slice(prev_hash_nonce.as_bytes());
-            blake2b_256(&nonce_input)
-        };
+        consensus.epoch_nonce = super::common::compute_epoch_boundary_nonce(
+            super::common::EpochNonceMode::for_era(ctx.era),
+            candidate,
+            prev_hash_nonce,
+            consensus.extra_entropy,
+        );
 
         // Update prevHashNonce to current labNonce for NEXT epoch.
         consensus.last_epoch_block_nonce = consensus.lab_nonce;
