@@ -1918,6 +1918,14 @@ impl VolatileDB {
                                 selected_last_block_no = ?self.selected_chain.last().and_then(|h| self.blocks.get(h)).map(|b| b.block_no),
                                 immutable_anchor_hash = ?immutable_anchor.map(|(h, _)| h.to_hex()),
                                 immutable_anchor_slot = ?immutable_anchor.map(|(_, s)| s),
+                                // #1057: the two facts that decide whether the
+                                // genesis arm above could have fired. Without them
+                                // this line cannot distinguish "the root is not
+                                // genesis" from "the root IS genesis but the ledger
+                                // could not roll back to it", and three live runs
+                                // were spent guessing between exactly those.
+                                root_is_genesis = new_root_prev == Some(Hash32::ZERO),
+                                allow_genesis_anchor,
                                 "VolatileDB: fork unreachable — no common anchor (Haskell: isReachable = Nothing)"
                             );
                             return None;

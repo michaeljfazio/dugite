@@ -573,11 +573,25 @@ async fn run_selection_pass(
         // no chain selection occurs.  We fall through so the caller does
         // NOT attempt a ledger rollback; the block will re-enter chain
         // selection later if its ancestry becomes complete.
+        // #1057: report the INPUTS to the decision, not just its outcome.
+        //
+        // "fork unreachable" is the same message whether the fork's root is genesis
+        // or an unknown mid-chain hash, and whether the genesis arm was closed
+        // because the ledger cannot reach Origin or because the root simply does not
+        // anchor anywhere. Three separate live runs were spent guessing between those
+        // cases from a log line that could not distinguish them.
+        //
+        // `ledger_can_reach_origin` is the one input a reader cannot recover from the
+        // ChainDB afterwards, so it is the important one to state.
         warn!(
             fork_hash = %fork_hash.to_hex(),
             fork_block_no = fork_bn.0,
             fork_slot = fork_slot.0,
             current_tip_block_no,
+            ledger_can_reach_origin =
+                ledger_can_reach_origin.load(std::sync::atomic::Ordering::Relaxed),
+            immutable_anchored = db.get_immutable_tip_point().is_some(),
+            volatile_selected_len = db.volatile_selected_chain_count(),
             "chain_sel: fork unreachable — StoreButDontChange"
         );
     }
