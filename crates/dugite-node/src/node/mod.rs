@@ -9842,6 +9842,39 @@ impl Node {
             return;
         }
 
+        // ── Step 5c: TraceNodeCannotForge (KES key expired) ───────────────────
+        // Upper-bound mirror of the 5b gate above (issue #1054). Haskell's
+        // `HotKey.evolveKey` classifies the target period against
+        // `[c0, c0 + maxKESEvolutions)`; once the wall clock moves past the
+        // end of that window it POISONS the key (`forgetSignKeyKES`) and
+        // every subsequent `checkShouldForge` call short-circuits
+        // `KESKeyAlreadyPoisoned` — zero further blocks, permanently, without
+        // even attempting VRF leader election. Checking here — before the VRF
+        // leader check and before calling `forge_block` — matches that: a
+        // wedged forger fails fast every slot instead of only when a VRF-won
+        // slot happens to reach `forge_block`'s own bounds check.
+        //
+        // `self.consensus.max_kes_evolutions` is the SAME genesis-sourced
+        // value threaded into `BlockProducerConfig::max_kes_evolutions` below
+        // and used by `dugite_consensus::praos::validate_kes_period` on the
+        // receiving side — same bound, same `>=` comparison, so a block
+        // dugite forges is exactly one dugite (and Haskell) would accept.
+        let kes_evolutions = current_slot_kes_period.saturating_sub(creds.opcert_kes_period);
+        if kes_evolutions >= self.consensus.max_kes_evolutions {
+            warn!(
+                target: "forge",
+                current_slot,
+                wall_clock_kes_period = current_slot_kes_period,
+                opcert_kes_period = creds.opcert_kes_period,
+                kes_evolutions,
+                max_kes_evolutions = self.consensus.max_kes_evolutions,
+                pool_id = %creds.pool_id,
+                "TraceNodeCannotForge: KES key expired — cannot forge until the KES key is \
+                 rotated and a new operational certificate is issued",
+            );
+            return;
+        }
+
         // ── Extract ledger values needed for the forge attempt ────────────────
         // Use epoch_nonce_for_slot to handle first slot of new epoch correctly.
         // At epoch boundaries, the TICKN transition hasn't been applied yet, so
@@ -10010,6 +10043,11 @@ impl Node {
             _max_txs_per_block: 500,
             era: current_era,
             slots_per_kes_period,
+            // Genesis-sourced policy bound (issue #1054) — must match the
+            // exact value `dugite_consensus::praos::validate_kes_period` uses
+            // on the receiving side, so forge-side rejects at the same
+            // boundary a peer (dugite or Haskell) would.
+            max_kes_evolutions: self.consensus.max_kes_evolutions,
         };
 
         // ── Step 9: Block.forgeBlock — TraceForgedBlock ───────────────────────
@@ -11493,6 +11531,54 @@ mod tests {
         assert!(
             wall_clock_kes_period >= opcert_kes_period,
             "TraceNodeCannotForge gate must NOT fire when wall-clock period > opcert start"
+        );
+    }
+
+    /// CannotForge upper-bound gate (issue #1054): forge must be skipped once
+    /// the KES key has evolved past the GENESIS-configured `max_kes_evolutions`
+    /// policy bound, not the Sum6Kes structural ceiling of 62. Mirrors
+    /// `forge_gate_cannot_forge_key_not_usable_yet` above but for the upper
+    /// edge of the `[opcert_kes_period, opcert_kes_period + max_kes_evolutions)`
+    /// window, and matches the SAME `>=` comparison as
+    /// `dugite_consensus::praos::validate_kes_period` on the receiving side.
+    #[test]
+    fn forge_gate_kes_expired_uses_configured_max_not_structural_ceiling() {
+        let slots_per_kes_period: u64 = 120; // short-KES devnet overlay value
+        let max_kes_evolutions: u64 = 10; // genesis-configured, NOT 62
+        let opcert_kes_period: u64 = 0;
+
+        // offset 9 (< max 10, well under the 62 structural ceiling too):
+        // gate must NOT fire.
+        let current_slot: u64 = 9 * slots_per_kes_period;
+        let wall_clock_kes_period = current_slot / slots_per_kes_period;
+        let kes_evolutions = wall_clock_kes_period.saturating_sub(opcert_kes_period);
+        assert!(
+            kes_evolutions < max_kes_evolutions,
+            "gate must NOT fire below the configured max"
+        );
+
+        // offset 10 (== configured max 10, but still well under the
+        // structural ceiling of 62 — the regression this issue fixes: the
+        // OLD hardcoded-62 bound would have let this slot through):
+        // gate MUST fire.
+        let current_slot: u64 = 10 * slots_per_kes_period;
+        let wall_clock_kes_period = current_slot / slots_per_kes_period;
+        let kes_evolutions = wall_clock_kes_period.saturating_sub(opcert_kes_period);
+        assert!(
+            kes_evolutions >= max_kes_evolutions,
+            "gate must fire at offset == configured max (10), not wait for 62"
+        );
+
+        // offset 15 (comfortably between the configured max and the
+        // structural ceiling): gate MUST fire. This is exactly the #1054
+        // symptom — dugite-bp forged 40 blocks in this window before the fix.
+        let current_slot: u64 = 15 * slots_per_kes_period;
+        let wall_clock_kes_period = current_slot / slots_per_kes_period;
+        let kes_evolutions = wall_clock_kes_period.saturating_sub(opcert_kes_period);
+        assert!(
+            kes_evolutions >= max_kes_evolutions && kes_evolutions < 62,
+            "gate must fire between the configured max and the structural \
+             ceiling — this is the exact window #1054 leaked blocks through"
         );
     }
 

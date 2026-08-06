@@ -230,6 +230,19 @@ pub struct BlockProducerConfig {
     pub era: Era,
     /// Slots per KES period (from genesis config)
     pub slots_per_kes_period: u64,
+    /// Maximum number of KES key evolutions permitted for one operational
+    /// certificate (genesis `maxKESEvolutions`), i.e. the policy bound
+    /// `[opcert_kes_period, opcert_kes_period + max_kes_evolutions)`.
+    ///
+    /// This is a GENESIS-SOURCED policy value, not the Sum6Kes structural
+    /// depth (`dugite_crypto::kes` supports exactly 62 evolutions regardless
+    /// of genesis — see `dugite-crypto/src/kes.rs`). Real networks can and do
+    /// configure a smaller policy bound than the structural ceiling (e.g. a
+    /// short-KES devnet overlay with `maxKESEvolutions=10`), and this field
+    /// must reflect whatever the chain's genesis actually declares so the
+    /// forge-side bound matches `dugite_consensus::praos::validate_kes_period`
+    /// exactly (issue #1054).
+    pub max_kes_evolutions: u64,
 }
 
 impl Default for BlockProducerConfig {
@@ -247,6 +260,12 @@ impl Default for BlockProducerConfig {
             _max_txs_per_block: 500,
             era: Era::Conway,
             slots_per_kes_period: 129600,
+            // Matches the checked-in devnet genesis default AND the Sum6Kes
+            // structural ceiling, so tests/defaults that don't care about a
+            // custom policy bound keep working unchanged. Production forging
+            // always overrides this from `self.consensus.max_kes_evolutions`
+            // (genesis-sourced) — see `node/mod.rs`.
+            max_kes_evolutions: 62,
         }
     }
 }
@@ -337,18 +356,21 @@ pub fn forge_block(
     let current_slot_kes_period = slot.0 / config.slots_per_kes_period;
     let kes_period_offset = current_slot_kes_period.saturating_sub(creds.opcert_kes_period);
 
-    // Validate KES period offset is within bounds (Sum6Kes supports 62 evolutions)
-    const MAX_KES_EVOLUTIONS: u64 = 62;
-    // Sum6Kes supports periods 0..=61 (62 evolutions). Period 62 is expired.
-    // Using >= to match consensus validation at praos.rs which also uses >=.
-    if kes_period_offset >= MAX_KES_EVOLUTIONS {
+    // Validate KES period offset is within the genesis-configured policy bound
+    // (`config.max_kes_evolutions`), NOT the Sum6Kes structural ceiling of 62.
+    // Using >= to match consensus validation at praos.rs
+    // (`validate_kes_period`), which also uses >= against the same
+    // genesis-sourced `max_kes_evolutions` — the forge side and the receive
+    // side must reject at the identical boundary or a block forged here could
+    // be one dugite (and Haskell) would reject (issue #1054).
+    if kes_period_offset >= config.max_kes_evolutions {
         anyhow::bail!(
             "KES key expired: current period {} - opcert period {} = offset {} > max {}. \
              Rotate your KES key and issue a new operational certificate.",
             current_slot_kes_period,
             creds.opcert_kes_period,
             kes_period_offset,
-            MAX_KES_EVOLUTIONS
+            config.max_kes_evolutions
         );
     }
 
@@ -1012,6 +1034,122 @@ mod tests {
             result.is_ok(),
             "forge_block must succeed with a 608-byte (cardano-cli) KES key file: {:?}",
             result.err()
+        );
+    }
+
+    // ─── Issue #1054: forge-side KES bound must be genesis-configured ────────
+    //
+    // forge_block() previously bounded the KES period offset against a
+    // hardcoded `MAX_KES_EVOLUTIONS: u64 = 62` (the Sum6Kes STRUCTURAL
+    // ceiling), instead of `config.max_kes_evolutions` (the GENESIS policy
+    // bound). Under any genesis with `maxKESEvolutions < 62` — e.g. a
+    // short-KES devnet overlay with `maxKESEvolutions=10` — the forge path
+    // would keep signing blocks for 52 periods past the point cardano-node
+    // poisons its KES key and stops forging entirely.
+
+    /// forge_block must reject once the offset reaches the CONFIGURED
+    /// `max_kes_evolutions` (10), even though that offset (15) is
+    /// comfortably below the old hardcoded structural ceiling of 62 — i.e.
+    /// it must no longer "wait for 62".
+    #[test]
+    fn test_forge_block_rejects_past_configured_max_not_structural_62() {
+        let creds = make_test_credentials(); // opcert_kes_period = 0
+        let config = BlockProducerConfig {
+            slots_per_kes_period: 100,
+            max_kes_evolutions: 10,
+            ..BlockProducerConfig::default()
+        };
+        let epoch_nonce = Hash32::from_bytes([0x07u8; 32]);
+
+        // current_slot_kes_period = 1500 / 100 = 15: >= configured max (10)
+        // and < the structural ceiling (62).
+        let result = forge_block(
+            &creds,
+            &config,
+            SlotNo(1500),
+            BlockNo(1),
+            Hash32::ZERO,
+            &epoch_nonce,
+            vec![],
+        );
+        assert!(
+            result.is_err(),
+            "forge_block must bail at offset 15 once max_kes_evolutions=10 is \
+             configured, even though 15 < the Sum6Kes structural ceiling of 62"
+        );
+        let err = result.err().unwrap().to_string();
+        assert!(
+            err.contains("KES key expired"),
+            "error must be the KES-expired diagnostic (got: {err})"
+        );
+        assert!(
+            err.contains("max 10"),
+            "error must report the ACTUAL configured limit (10), not the old \
+             hardcoded 62 (got: {err})"
+        );
+    }
+
+    /// Boundary: offset == max-1 must still be forgeable; offset == max must
+    /// bail. Same `>=` comparison as
+    /// `dugite_consensus::praos::validate_kes_period` — the forge side and
+    /// the receive side must reject at the identical boundary.
+    #[test]
+    fn test_forge_block_kes_evolution_boundary_at_configured_max() {
+        let creds = make_test_credentials(); // opcert_kes_period = 0
+        let config = BlockProducerConfig {
+            slots_per_kes_period: 100,
+            max_kes_evolutions: 10,
+            ..BlockProducerConfig::default()
+        };
+        let epoch_nonce = Hash32::from_bytes([0x09u8; 32]);
+
+        // offset = 9 (== max - 1) — must succeed.
+        let ok_result = forge_block(
+            &creds,
+            &config,
+            SlotNo(900),
+            BlockNo(1),
+            Hash32::ZERO,
+            &epoch_nonce,
+            vec![],
+        );
+        assert!(
+            ok_result.is_ok(),
+            "offset 9 (max_kes_evolutions - 1) must still be forgeable: {:?}",
+            ok_result.err()
+        );
+
+        // offset = 10 (== max) — must bail.
+        let bail_result = forge_block(
+            &creds,
+            &config,
+            SlotNo(1000),
+            BlockNo(2),
+            Hash32::ZERO,
+            &epoch_nonce,
+            vec![],
+        );
+        assert!(
+            bail_result.is_err(),
+            "offset 10 (== max_kes_evolutions) must be rejected as KES-expired"
+        );
+        let err = bail_result.err().unwrap().to_string();
+        assert!(
+            err.contains("KES key expired"),
+            "error must be the KES-expired diagnostic (got: {err})"
+        );
+    }
+
+    /// `BlockProducerConfig::default()` must keep `max_kes_evolutions = 62`
+    /// so callers that don't care about a custom genesis policy bound (most
+    /// existing tests) are unaffected by this field's addition.
+    #[test]
+    fn test_default_block_producer_config_max_kes_evolutions_is_62() {
+        let config = BlockProducerConfig::default();
+        assert_eq!(
+            config.max_kes_evolutions, 62,
+            "default max_kes_evolutions must match the checked-in devnet \
+             genesis default and the Sum6Kes structural ceiling"
         );
     }
 }
