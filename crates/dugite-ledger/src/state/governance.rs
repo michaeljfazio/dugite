@@ -1660,7 +1660,7 @@ pub(crate) fn ratify_at_boundary(
         enacted = gov.governance.last_ratified.len(),
         expired = gov.governance.last_expired.len(),
         delayed = gov.governance.last_ratify_delayed,
-        "Applied the frozen DRep pulser result at the epoch boundary (#988)"
+        "Applied the frozen DRep pulser result at the epoch boundary"
     );
 }
 
