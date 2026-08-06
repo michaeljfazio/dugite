@@ -9507,6 +9507,88 @@ mod tests {
     // `Cardano.Ledger.Conway.Rules.Ledger`.
     // ---------------------------------------------------------------------------
 
+    // ── #1061: treasury-value is gated on Phase2Valid ─────────────────────
+    //
+    // Haskell `conwayLedgerTransition` runs `validateTreasuryValue` ONLY inside
+    // the `isPhase2ValidTxL == Phase2Valid` branch, alongside
+    // `validateRefScriptSize`:
+    //
+    //     if tx ^. isPhase2ValidTxL == Phase2Valid
+    //       then do
+    //         runTest $ validateTreasuryValue txBody (chainAccountState ^. casTreasuryL)
+    //         runTest $ validateRefScriptSize pp (utxoState ^. utxoL) tx
+    //
+    // dugite ran both unconditionally, so a tx declaring `is_valid: false` was
+    // REJECTED where cardano-node ACCEPTS it. False reject — and at block level,
+    // refusing a block cardano-node accepts is the #985 symptom class.
+    //
+    // BOTH directions are asserted. Asserting only the skip would pass trivially
+    // if the check had simply been deleted.
+
+    /// The #1061 regression: identical tx to
+    /// `test_issue_186_treasury_value_mismatch_rejects` except `is_valid: false`
+    /// ⇒ `TreasuryValueMismatch` must NOT fire.
+    #[test]
+    fn treasury_value_mismatch_skipped_when_phase2_invalid() {
+        let mut utxo_set = UtxoSet::new();
+        let input = TransactionInput {
+            transaction_id: Hash32::from_bytes([0xD1u8; 32]),
+            index: 0,
+        };
+        utxo_set.insert(
+            input.clone(),
+            TransactionOutput {
+                address: Address::Byron(ByronAddress {
+                    payload: vec![0u8; 32],
+                }),
+                value: Value::lovelace(10_000_000),
+                datum: OutputDatum::None,
+                script_ref: None,
+                is_legacy: false,
+                raw_cbor: None,
+            },
+        );
+        let mut params = ProtocolParameters::mainnet_defaults();
+        params.protocol_version_major = 9;
+
+        let mut tx = make_simple_tx(input, 9_800_000, 200_000);
+        tx.body.treasury_value = Some(Lovelace(999));
+        // The ONLY difference from the sibling test above.
+        tx.is_valid = false;
+
+        let result = validate_transaction_with_pools(
+            &tx,
+            &utxo_set,
+            &params,
+            100,
+            300,
+            None,
+            None,
+            Some(500), // current_treasury — mismatches declared 999
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+
+        if let Err(errors) = result {
+            assert!(
+                !errors
+                    .iter()
+                    .any(|e| matches!(e, ValidationError::TreasuryValueMismatch { .. })),
+                "TreasuryValueMismatch must be SKIPPED when is_valid=false — Haskell runs \
+                 validateTreasuryValue only inside the Phase2Valid branch (#1061); \
+                 got: {errors:?}"
+            );
+        }
+    }
+
     #[test]
     fn test_issue_186_treasury_value_mismatch_rejects() {
         // A tx that declares treasury_value = 999 when the ledger holds 500 must
