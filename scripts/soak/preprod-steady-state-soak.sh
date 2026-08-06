@@ -43,6 +43,21 @@ REPO="$(pwd)"
 # $REPO, so the branch below is a no-op there.
 MAIN_CHECKOUT="$(dirname "$(git rev-parse --git-common-dir 2>/dev/null || echo "$REPO/.git")")"
 
+# --rescore <evidence-dir>: recompute the verdict from a PREVIOUS run's preserved
+# evidence, without touching the network.
+#
+# This exists because the first real run failed three predicates on a `grep -c`
+# arithmetic bug in this script while the node itself passed everything. Re-running an
+# hour of soak to correct a SCORING error would be wasteful and would also discard the
+# original measurements — the samples and the node log are the evidence, and they were
+# fine. Re-scoring preserved evidence is the honest fix, and it keeps one copy of the
+# verdict logic rather than a second script that could drift from it.
+RESCORE=""
+if [ "${1:-}" = "--rescore" ]; then
+    RESCORE="${2:?usage: $0 --rescore <evidence-dir>}"
+    shift 2
+fi
+
 MINUTES="${1:-60}"
 DB_ARG="${2:-}"
 
@@ -93,6 +108,26 @@ bad()  { printf '\033[0;31m[FAIL]\033[0m %s\n' "$*"; FAILURES=$((FAILURES + 1));
 note() { printf '\033[0;36m[NOTE]\033[0m %s\n' "$*"; }
 step() { echo; echo "########## $* ##########"; date -u +%H:%M:%SZ; }
 
+# COUNT LINES MATCHING A PATTERN, safely.
+#
+# `grep -c` already prints 0 when nothing matches — and ALSO exits 1. The obvious
+# `grep -c … || echo 0` therefore prints "0" twice, and the resulting "0\n0" makes
+# every `[ "$n" -eq 0 ]` blow up with "integer expected" and report FAIL. That is
+# exactly what happened on the first real run of this script: the node passed every
+# predicate and the SCRIPT failed three of them on its own arithmetic.
+#
+# The irony is the lesson: this file's header promises to record the compared VALUE,
+# and the value it recorded was unparseable. A malformed measurement is not a
+# failure of the thing measured.
+count_matches() { # <ere> <file>
+    local n
+    n=$(grep -cE "$1" "$2" 2>/dev/null) || true
+    # Strip anything that is not a digit, then default: robust against both the
+    # empty string (missing file) and any stray newline.
+    n=$(printf '%s' "${n:-0}" | tr -cd '0-9')
+    printf '%s' "${n:-0}"
+}
+
 koios_tip_slot() { curl -s --max-time 20 "$KOIOS/tip" 2>/dev/null | jq -r '.[0].abs_slot // empty' 2>/dev/null; }
 koios_epoch()    { curl -s --max-time 20 "$KOIOS/tip" 2>/dev/null | jq -r '.[0].epoch_no // empty' 2>/dev/null; }
 metric() { # <metric-name>
@@ -105,6 +140,40 @@ node_slot() { metric dugite_slot_number; }
 # metric name that does not exist reads as 0 forever, which would have made the
 # peer predicate silently vacuous.
 node_peers() { metric dugite_peers_connected; }
+
+# ── rescore: derive the aggregates from preserved evidence, then fall through to
+#            the SAME verdict block the live path uses ──────────────────────────
+if [ -n "$RESCORE" ]; then
+    OUT="$RESCORE"
+    LOG="$OUT/node.log"
+    SAMPLES="$OUT/samples.tsv"
+    REPORT="$OUT/report.md"
+    [ -f "$SAMPLES" ] || { echo "REFUSING TO RESCORE: no samples.tsv in $OUT"; exit 2; }
+    [ -f "$LOG" ]     || { echo "REFUSING TO RESCORE: no node.log in $OUT"; exit 2; }
+
+    step "re-scoring preserved evidence — no network activity"
+    note "evidence: $OUT"
+
+    # Columns: ts node_slot koios_slot delta peers rss_mb errors apply_fail
+    #
+    # ONLY lines beginning with a timestamp are records. Do not assume every line in
+    # the file is one: the very bug this mode exists to correct also wrote a literal
+    # "0\n0" into each row's `errors` field, so records in the first real run's file
+    # SPAN LINES. A naive `NR>1` counted 37 lines as 36 samples and read `peers` and
+    # `rss_mb` off continuation lines, producing min_peers=0 and rss_last=0 — i.e. the
+    # rescue path reproduced the original defect in a new place.
+    REC='^[0-9][0-9]:[0-9][0-9]:[0-9][0-9]Z'
+    MAX_DELTA=$(awk -v r="$REC" '$0 ~ r && $4+0>m {m=$4+0} END{print m+0}' "$SAMPLES")
+    MIN_PEERS=$(awk -v r="$REC" '$0 ~ r {if (n=="" || $5+0<n) n=$5+0} END{print (n==""?999:n)}' "$SAMPLES")
+    SAMPLE_COUNT=$(grep -cE "$REC" "$SAMPLES" 2>/dev/null || true)
+    SAMPLE_COUNT=$(printf '%s' "${SAMPLE_COUNT:-0}" | tr -cd '0-9')
+    FAILED_SAMPLES=0
+    RSS_FIRST=$(awk -v r="$REC" '$0 ~ r {print $6+0; exit}' "$SAMPLES")
+    RSS_LAST=$(awk -v r="$REC" '$0 ~ r {v=$6+0} END{print v+0}' "$SAMPLES")
+    MINUTES=$(( ${SAMPLE_COUNT:-0} * 5 ))
+    TIP_TOLERANCE_SLOTS="${SOAK_TIP_TOLERANCE:-120}"
+    note "derived: samples=$SAMPLE_COUNT max_delta=$MAX_DELTA min_peers=$MIN_PEERS rss ${RSS_FIRST}->${RSS_LAST}MB"
+else
 
 step "preprod steady-state soak — ${MINUTES} min"
 note "db      : $DB"
@@ -132,7 +201,8 @@ echo "$NODE_PID" > "$OUT/node.pid"
 note "node pid $NODE_PID"
 
 cleanup() {
-    if kill -0 "$NODE_PID" 2>/dev/null; then
+    [ -n "$RESCORE" ] && return 0
+    if kill -0 "${NODE_PID:-}" 2>/dev/null; then
         kill -TERM "$NODE_PID" 2>/dev/null || true
         for _ in $(seq 1 90); do
             kill -0 "$NODE_PID" 2>/dev/null || break
@@ -210,8 +280,8 @@ while [ "$(date +%s)" -lt "$END" ]; do
     ns=$(node_slot); ks=$(koios_tip_slot); pe=$(node_peers)
     rss=$(ps -o rss= -p "$NODE_PID" 2>/dev/null | tr -d ' ')
     rss_mb=$(( ${rss:-0} / 1024 ))
-    errs=$(grep -cE ' ERROR |panicked' "$LOG" 2>/dev/null || echo 0)
-    afail=$(grep -cE 'Failed to apply block|apply failed|block application failed' "$LOG" 2>/dev/null || echo 0)
+    errs=$(count_matches ' ERROR |panicked' "$LOG")
+    afail=$(count_matches 'Failed to apply block|apply failed|block application failed' "$LOG")
 
     if [ -n "${ns:-}" ] && [ -n "${ks:-}" ]; then
         ns_i=${ns%.*}; d=$(( ks - ns_i )); [ "$d" -lt 0 ] && d=$(( -d ))
@@ -230,6 +300,8 @@ while [ "$(date +%s)" -lt "$END" ]; do
     fi
     sleep "$SAMPLE_INTERVAL"
 done
+
+fi   # end of the live-run path; rescore joins here
 
 # ── verdict ────────────────────────────────────────────────────────────────
 step "verdict"
@@ -253,7 +325,7 @@ else
     bad "peer count fell to ${MIN_PEERS} — a node with no peers is not serving or following anything"
 fi
 
-ERRS=$(grep -cE ' ERROR |panicked' "$LOG" 2>/dev/null || echo 0)
+ERRS=$(count_matches ' ERROR |panicked' "$LOG")
 if [ "${ERRS:-0}" -eq 0 ]; then
     ok "0 ERROR/panic lines in the node log"
 else
@@ -263,7 +335,7 @@ fi
 
 # #985: a node applying blocks WITHOUT this line is positive evidence the startup
 # LedgerSeq re-anchor fired. Its presence means a chimera was reconstructed.
-INCOH=$(grep -c 'LedgerSeq was incoherent' "$LOG" 2>/dev/null || echo 0)
+INCOH=$(count_matches 'LedgerSeq was incoherent' "$LOG")
 if [ "${INCOH:-0}" -eq 0 ]; then
     ok "0 'LedgerSeq was incoherent' — positive evidence the startup re-anchor fired (#985)"
 else
@@ -271,7 +343,7 @@ else
 fi
 
 # #1057's own signatures must not appear on a healthy synced node.
-WEDGE=$(grep -c 'declining a range rooted at GENESIS' "$LOG" 2>/dev/null || echo 0)
+WEDGE=$(count_matches 'declining a range rooted at GENESIS' "$LOG")
 if [ "${WEDGE:-0}" -eq 0 ]; then
     ok "0 genesis-range declines (#1057 wedge absent, as expected on a synced node)"
 else
