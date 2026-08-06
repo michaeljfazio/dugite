@@ -1320,6 +1320,18 @@ pub(crate) fn convert_validation_error(
             prev_action_id: prev_action_id.as_ref().map(gov_action_id_to_string),
             proposal,
         },
+        // #1026: PV9 bootstrap proposal-submission restriction, GOV tag 12.
+        // Typed from the start — see the encoder arm's note on why a new
+        // predicate must not join the #979/#1050 generic-fallback backlog.
+        VE::DisallowedProposalDuringBootstrap {
+            action_index,
+            action_type,
+            proposal,
+        } => TxValidationError::DisallowedProposalDuringBootstrap {
+            action_index,
+            action_type: action_type.to_string(),
+            proposal,
+        },
         // No dedicated wire variant yet (dugite issue #1021, tracked
         // alongside #979's "generic rejections" backlog) — same
         // generic-reason fallback pattern as `MalformedProposal` above. The

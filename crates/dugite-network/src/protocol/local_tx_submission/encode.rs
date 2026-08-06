@@ -695,6 +695,30 @@ fn encode_conway_ledger_pred_failure(enc: &mut Encoder<&mut Vec<u8>>, err: &TxVa
             });
         }
 
+        // Tag 12: DisallowedProposalDuringBootstrap — [12, <the whole
+        // ProposalProcedure>].
+        //
+        // Haskell (`Cardano.Ledger.Conway.Rules.Gov`):
+        //   DisallowedProposalDuringBootstrap (ProposalProcedure era)
+        // — the identical one-field `Sum` shape as tag 8, so it re-uses the same
+        // `encode_proposal_procedure` (the function that also builds proposals
+        // into tx bodies for signing, keeping the two byte-identical).
+        //
+        // Fires only at PV9, where `checkBootstrapProposal` restricts proposal
+        // submission to ParameterChange / HardForkInitiation / InfoAction.
+        // Landing the typed arm together with the predicate deliberately: #979
+        // and #1050 are both cases where a correct ledger rejection shipped with
+        // no encoder arm and degraded to a generic `ConwayMempoolFailure`, and
+        // #1053 is still open for the whole phase-2 class. A new predicate
+        // should not add to that list (#1026).
+        TxValidationError::DisallowedProposalDuringBootstrap { proposal, .. } => {
+            let raw = dugite_serialization::encode_proposal_procedure(proposal);
+            encode_gov_failure(enc, 12, |enc| {
+                let writer = enc.writer_mut();
+                writer.extend_from_slice(&raw);
+            });
+        }
+
         // Decode-level rejection: the tx failed `decode_transaction` before
         // Phase-1 ever ran (e.g. a Conway duplicate input hard-fails the
         // strict-set decoder, mirroring Haskell `decodeSetEnforceNoDuplicates`).
@@ -4261,6 +4285,107 @@ mod tests {
             "the GOV tag-1 payload must be byte-identical to the body encoder's output"
         );
         assert_eq!(&buf[..4], &[0x82, 0x03, 0x82, 0x01]);
+    }
+
+    // ── #1026: `DisallowedProposalDuringBootstrap` (Ledger tag 3, GOV tag 12) ──
+
+    /// CBOR golden: `DisallowedProposalDuringBootstrap` carrying a
+    /// `TreasuryWithdrawals` proposal — a bootstrap-DISALLOWED action type.
+    ///
+    /// Haskell: `DisallowedProposalDuringBootstrap (ProposalProcedure era)`, the
+    /// identical one-field `Sum` shape as tag 8, so the payload is the whole
+    /// proposal and the only difference from `test_encode_invalid_prev_gov_
+    /// action_id_golden` is the constructor tag (12 vs 8) and the action.
+    #[test]
+    fn test_encode_disallowed_proposal_during_bootstrap_golden() {
+        use dugite_primitives::hash::Hash32;
+        use dugite_primitives::transaction::{Anchor, GovAction, ProposalProcedure};
+        use dugite_primitives::value::Lovelace;
+
+        let return_addr: Vec<u8> = std::iter::once(0xE1)
+            .chain(std::iter::repeat_n(0x11, 28))
+            .collect();
+        let proposal = ProposalProcedure {
+            deposit: Lovelace(1_000_000),
+            return_addr,
+            gov_action: GovAction::InfoAction,
+            anchor: Anchor {
+                url: "https://x".to_string(),
+                data_hash: Hash32::from_bytes([0xAA; 32]),
+            },
+        };
+        let err = TxValidationError::DisallowedProposalDuringBootstrap {
+            action_index: 0,
+            action_type: "TreasuryWithdrawals".to_string(),
+            proposal: Box::new(proposal),
+        };
+
+        let mut buf = Vec::new();
+        let mut enc = Encoder::new(&mut buf);
+        encode_conway_ledger_pred_failure(&mut enc, &err);
+
+        let mut expected = vec![
+            0x82, 0x03, // ConwayLedgerPredFailure: array(2)[3, ...]
+            0x82, 0x0c, // ConwayGovPredFailure: array(2)[12, ...]
+            0x84, // ProposalProcedure: array(4)
+            0x1a, 0x00, 0x0f, 0x42, 0x40, // deposit = 1_000_000
+            0x58, 0x1d, // return_addr: bstr(29)
+        ];
+        expected.push(0xe1);
+        expected.extend(std::iter::repeat_n(0x11u8, 28));
+        expected.extend([0x81, 0x06]); // gov_action payload
+        expected.push(0x82);
+        expected.push(0x69);
+        expected.extend(b"https://x");
+        expected.push(0x58);
+        expected.push(0x20);
+        expected.extend([0xAAu8; 32]);
+
+        assert_eq!(
+            buf, expected,
+            "DisallowedProposalDuringBootstrap must be a byte-exact GOV tag-12 frame"
+        );
+    }
+
+    /// The whole point of #1026's wire half: this must NOT degrade to the
+    /// generic `ConwayMempoolFailure` (Ledger tag 7) fallback that #979/#1050
+    /// were about. Asserts the Ledger and GOV tags directly rather than merely
+    /// "some bytes were produced".
+    #[test]
+    fn disallowed_proposal_during_bootstrap_is_not_a_generic_mempool_failure() {
+        use dugite_primitives::hash::Hash32;
+        use dugite_primitives::transaction::{Anchor, GovAction, ProposalProcedure};
+        use dugite_primitives::value::Lovelace;
+
+        let proposal = ProposalProcedure {
+            deposit: Lovelace(42),
+            return_addr: std::iter::once(0xE1)
+                .chain(std::iter::repeat_n(0x22, 28))
+                .collect(),
+            gov_action: GovAction::InfoAction,
+            anchor: Anchor {
+                url: "u".to_string(),
+                data_hash: Hash32::from_bytes([0x01; 32]),
+            },
+        };
+        let err = TxValidationError::DisallowedProposalDuringBootstrap {
+            action_index: 3,
+            action_type: "NoConfidence".to_string(),
+            proposal: Box::new(proposal),
+        };
+
+        let mut buf = Vec::new();
+        let mut enc = Encoder::new(&mut buf);
+        encode_conway_ledger_pred_failure(&mut enc, &err);
+
+        assert_eq!(buf[0], 0x82, "must be array(2)[LedgerTag, inner]");
+        assert_eq!(
+            buf[1], 0x03,
+            "Ledger tag must be 3 (ConwayGovFailure), NOT 7 (ConwayMempoolFailure) — \
+             a typed GOV frame is the entire point of #1026's wire half"
+        );
+        assert_eq!(buf[2], 0x82, "inner must be array(2)[GovTag, payload]");
+        assert_eq!(buf[3], 0x0c, "GOV tag must be 12");
     }
 
     // ── Issue #915: `InvalidPrevGovActionId` (Ledger tag 3, GOV tag 8) ──

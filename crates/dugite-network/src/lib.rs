@@ -834,6 +834,26 @@ pub enum TxValidationError {
         /// `(typed-hash32 hex, expiry epoch)` per offending member.
         members: Vec<(String, u64)>,
     },
+    /// `DisallowedProposalDuringBootstrap` (GOV tag 12) —
+    /// `DisallowedProposalDuringBootstrap (ProposalProcedure era)`.
+    ///
+    /// At PV9 only `ParameterChange` / `HardForkInitiation` / `InfoAction` may
+    /// be PROPOSED (Haskell `checkBootstrapProposal`, step 1 of
+    /// `processProposal`). dugite had only the symmetric VOTE-side restriction
+    /// below, so a bootstrap-disallowed proposal was accepted where
+    /// cardano-node rejects it (#1026).
+    ///
+    /// One-field payload carrying the ENTIRE proposal, exactly like
+    /// [`TxValidationError::InvalidPrevGovActionId`]'s tag 8 — so the encoder
+    /// re-encodes it with `dugite_serialization::encode_proposal_procedure`, the
+    /// same function that builds proposals into tx bodies for signing, keeping
+    /// both paths byte-identical by construction. Boxed for the same hot-path
+    /// enum-size reason.
+    DisallowedProposalDuringBootstrap {
+        action_index: u32,
+        action_type: String,
+        proposal: Box<dugite_primitives::transaction::ProposalProcedure>,
+    },
     /// `DisallowedVotesDuringBootstrap` (GOV tag 13) —
     /// `NonEmpty (Voter, GovActionId)`.
     DisallowedVotesDuringBootstrap {

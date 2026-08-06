@@ -15868,6 +15868,175 @@ mod tests {
 
     /// At PV=9 (Conway bootstrap) the conflicting-update check is **still
     /// enforced** — there is no bootstrap skip for this rule.
+    // -------------------------------------------------------------------------
+    // #1026: DisallowedProposalDuringBootstrap (ConwayGovPredFailure tag 12)
+    //
+    // These are the tests that prove the predicate is WIRED into the live
+    // `validate_transaction_with_context` path, not merely that a helper
+    // function returns the right boolean. #977's lesson: eight unit tests were
+    // green while the production path did nothing, because they all drove a
+    // `#[doc(hidden)]` helper instead of the real dispatch.
+    // -------------------------------------------------------------------------
+
+    /// Build a bootstrap-DISALLOWED proposal (TreasuryWithdrawals).
+    fn treasury_withdrawal_proposal_for_test() -> ProposalProcedure {
+        ProposalProcedure {
+            deposit: Lovelace(1_000_000),
+            return_addr: std::iter::once(0xE1)
+                .chain(std::iter::repeat_n(0x11, 28))
+                .collect(),
+            gov_action: dugite_primitives::transaction::GovAction::TreasuryWithdrawals {
+                withdrawals: BTreeMap::new(),
+                policy_hash: None,
+            },
+            anchor: dugite_primitives::transaction::Anchor {
+                url: "https://x".to_string(),
+                data_hash: Hash32::from_bytes([0xAA; 32]),
+            },
+        }
+    }
+
+    /// Build a bootstrap-ALLOWED proposal (InfoAction).
+    fn info_action_proposal_for_test() -> ProposalProcedure {
+        ProposalProcedure {
+            deposit: Lovelace(1_000_000),
+            return_addr: std::iter::once(0xE1)
+                .chain(std::iter::repeat_n(0x11, 28))
+                .collect(),
+            gov_action: dugite_primitives::transaction::GovAction::InfoAction,
+            anchor: dugite_primitives::transaction::Anchor {
+                url: "https://x".to_string(),
+                data_hash: Hash32::from_bytes([0xAA; 32]),
+            },
+        }
+    }
+
+    /// At PV9 a `TreasuryWithdrawals` proposal MUST be rejected with
+    /// `DisallowedProposalDuringBootstrap`. Before #1026 dugite accepted it —
+    /// accept-where-Haskell-rejects.
+    #[test]
+    fn treasury_withdrawal_proposal_rejected_during_bootstrap_pv9() {
+        let mut params = ProtocolParameters::mainnet_defaults();
+        params.protocol_version_major = 9;
+        let utxo_set = UtxoSet::new();
+
+        let tx = make_gov_tx(
+            vec![treasury_withdrawal_proposal_for_test()],
+            BTreeMap::new(),
+        );
+        let context =
+            ValidationContext::new().with_network(dugite_primitives::network::NetworkId::Mainnet);
+        let errors =
+            validate_transaction_with_context(&tx, &utxo_set, &params, 100, 500, None, context)
+                .expect_err("a TreasuryWithdrawals proposal must be rejected at PV9");
+
+        assert!(
+            errors
+                .iter()
+                .any(|e| matches!(e, ValidationError::DisallowedProposalDuringBootstrap { .. })),
+            "DisallowedProposalDuringBootstrap MUST fire at PV9 for TreasuryWithdrawals \
+             (#1026); got: {errors:?}"
+        );
+    }
+
+    /// The PV gate: at PV10 the same proposal must NOT raise this predicate.
+    /// `hardforkConwayBootstrapPhase pv = pvMajor pv == natVersion @9`, so an
+    /// over-broad fix that rejected TreasuryWithdrawals on live networks would
+    /// be a false-reject far worse than the gap it closed.
+    #[test]
+    fn treasury_withdrawal_proposal_allowed_post_bootstrap_pv10() {
+        let params = conway_pparams_pv10();
+        let utxo_set = UtxoSet::new();
+
+        let tx = make_gov_tx(
+            vec![treasury_withdrawal_proposal_for_test()],
+            BTreeMap::new(),
+        );
+        let context =
+            ValidationContext::new().with_network(dugite_primitives::network::NetworkId::Mainnet);
+        // The tx still fails (no inputs), so filter for THIS predicate only.
+        let errors =
+            validate_transaction_with_context(&tx, &utxo_set, &params, 100, 500, None, context)
+                .expect_err("tx has no inputs, so it fails for unrelated reasons");
+
+        assert!(
+            !errors
+                .iter()
+                .any(|e| matches!(e, ValidationError::DisallowedProposalDuringBootstrap { .. })),
+            "DisallowedProposalDuringBootstrap must NOT fire at PV10 — the bootstrap \
+             phase is PV9 only; got: {errors:?}"
+        );
+    }
+
+    /// An `InfoAction` proposal is bootstrap-ALLOWED and must not raise the
+    /// predicate even at PV9. Without this, a fix that rejected every proposal
+    /// during bootstrap would pass the test above.
+    #[test]
+    fn info_action_proposal_allowed_during_bootstrap_pv9() {
+        let mut params = ProtocolParameters::mainnet_defaults();
+        params.protocol_version_major = 9;
+        let utxo_set = UtxoSet::new();
+
+        let tx = make_gov_tx(vec![info_action_proposal_for_test()], BTreeMap::new());
+        let context =
+            ValidationContext::new().with_network(dugite_primitives::network::NetworkId::Mainnet);
+        let errors =
+            validate_transaction_with_context(&tx, &utxo_set, &params, 100, 500, None, context)
+                .expect_err("tx has no inputs, so it fails for unrelated reasons");
+
+        assert!(
+            !errors
+                .iter()
+                .any(|e| matches!(e, ValidationError::DisallowedProposalDuringBootstrap { .. })),
+            "InfoAction is a bootstrap action and must stay proposable at PV9; got: {errors:?}"
+        );
+    }
+
+    /// The payload must identify WHICH proposal failed, so a tx carrying several
+    /// proposals is diagnosable — and it must carry the whole
+    /// `ProposalProcedure`, which is what lets the N2C encoder emit a byte-exact
+    /// GOV tag-12 frame instead of a generic `ConwayMempoolFailure`.
+    #[test]
+    fn disallowed_proposal_during_bootstrap_payload_identifies_the_proposal() {
+        let mut params = ProtocolParameters::mainnet_defaults();
+        params.protocol_version_major = 9;
+        let utxo_set = UtxoSet::new();
+
+        // index 0 allowed, index 1 disallowed.
+        let tx = make_gov_tx(
+            vec![
+                info_action_proposal_for_test(),
+                treasury_withdrawal_proposal_for_test(),
+            ],
+            BTreeMap::new(),
+        );
+        let context =
+            ValidationContext::new().with_network(dugite_primitives::network::NetworkId::Mainnet);
+        let errors =
+            validate_transaction_with_context(&tx, &utxo_set, &params, 100, 500, None, context)
+                .expect_err("the disallowed proposal must reject the tx");
+
+        let found = errors
+            .iter()
+            .find_map(|e| match e {
+                ValidationError::DisallowedProposalDuringBootstrap {
+                    action_index,
+                    action_type,
+                    proposal,
+                } => Some((*action_index, *action_type, proposal.clone())),
+                _ => None,
+            })
+            .expect("DisallowedProposalDuringBootstrap must be present");
+
+        assert_eq!(found.0, 1, "must name the SECOND proposal, not the first");
+        assert_eq!(found.1, "TreasuryWithdrawals");
+        assert_eq!(
+            found.2.deposit,
+            Lovelace(1_000_000),
+            "payload must carry the whole ProposalProcedure for the tag-12 encoder"
+        );
+    }
+
     #[test]
     fn test_validate_transaction_rejects_conflicting_committee_update_in_bootstrap() {
         use dugite_primitives::credentials::Credential;
