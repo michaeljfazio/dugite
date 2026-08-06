@@ -834,6 +834,53 @@ pub enum TxValidationError {
         /// `(typed-hash32 hex, expiry epoch)` per offending member.
         members: Vec<(String, u64)>,
     },
+    /// `HardForkApplyTxErrWrongEra` — the submitted transaction's era does not
+    /// match the ledger's current era (#1047).
+    ///
+    /// This is NOT a ledger predicate failure and does NOT share their wire
+    /// shape. `ApplyTxErr` for the HFC is
+    /// `Either (MismatchEraInfo xs) (OneEraApplyTxErr xs)`, and
+    /// `encodeEitherMismatch` (ouroboros-consensus
+    /// `HardFork/Combinator/Serialisation/Common.hs`) branches on the `Either`:
+    ///
+    /// ```haskell
+    /// (HardForkNodeToClientEnabled{}, Right a) ->
+    ///   mconcat [ Enc.encodeListLen 1, enc a ]
+    /// (HardForkNodeToClientEnabled{}, Left (MismatchEraInfo err)) ->
+    ///   mconcat
+    ///     [ Enc.encodeListLen 2
+    ///     , encodeNS (hpure (fn encodeName)) era1
+    ///     , encodeNS (hpure (fn (encodeName . getLedgerEraInfo))) era2
+    ///     ]
+    ///   where (era1, era2) = Match.mismatchToNS err
+    /// ```
+    ///
+    /// So the normal case is `array(1)[…]` — which is what every other variant
+    /// in this enum produces — and the wrong-era case is a top-level
+    /// **`array(2)`** of two `encodeNS` values. `encodeNS` is
+    /// `array(2)[word8 index, value]`, and `encodeName` is
+    /// `Serialise.encode . singleEraName`, i.e. a CBOR **text** string.
+    ///
+    /// Field order is pinned by `mkEraMismatch`
+    /// (`HardFork/Combinator/AcrossEras.hs`), whose
+    /// `Mismatch SingleEraInfo LedgerEraInfo` gives `SingleEraInfo` = the
+    /// TRANSACTION's era and `LedgerEraInfo` = the LEDGER's era, and by
+    /// `encodeEitherMismatch` emitting `era1` (SingleEraInfo) first. Getting
+    /// this order backwards would mislabel the reply exactly as #1051's spurious
+    /// Set tag made one undecodable.
+    ///
+    /// `singleEraName = T.pack (L.eraName @era)` (`ShelleyHFC.hs`), i.e.
+    /// cardano-ledger's era name: "Byron", "Shelley", …, "Conway", "Dijkstra".
+    HardForkApplyTxErrWrongEra {
+        /// HFC index of the era the client declared for its transaction.
+        tx_era_index: u8,
+        /// Era name for the transaction's era (Haskell `SingleEraInfo`).
+        tx_era_name: String,
+        /// HFC index of the ledger's current era.
+        ledger_era_index: u8,
+        /// Era name for the ledger's era (Haskell `LedgerEraInfo`).
+        ledger_era_name: String,
+    },
     /// `DisallowedProposalDuringBootstrap` (GOV tag 12) —
     /// `DisallowedProposalDuringBootstrap (ProposalProcedure era)`.
     ///

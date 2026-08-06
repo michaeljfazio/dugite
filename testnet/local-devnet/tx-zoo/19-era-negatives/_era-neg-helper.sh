@@ -252,3 +252,70 @@ era_neg_assert_rejected_both() {
     zoo_record "$name" PASS "$txid" "$detail"
     return 0
 }
+
+# era_neg_assert_wrong_era_both <name> <signed-file> <txid> <submit-fn>
+#
+# Stricter form of `era_neg_assert_rejected_both` for the legacy-era cases
+# (19a-19d): both observers must reject AND **dugite's reason must name an era
+# mismatch**, not a CBOR decode failure.
+#
+# Why this exists (#1047): before dugite had a wire-era check, a legacy-era
+# submission was rejected only as an ACCIDENTAL decode error — the standalone
+# Shelley decoder expects a different array length than a real Shelley tx has.
+# The verdict was right for the wrong reason, and correcting any one of those
+# decoders without adding an era check would have turned these cases into
+# ACCEPTS on a Conway chain (MIR Phase-1 validation is a documented no-op at
+# PV>=9 and GenesisKeyDelegation has era-unconditional apply-time support, so the
+# ledger layer would not have caught them). dugite now answers
+# `HardForkApplyTxErrWrongEra` before decoding, so the reason is assertable and
+# the accident is no longer load-bearing.
+#
+# The reason is matched against a SET of renderings rather than one exact string,
+# because the text comes from cardano-cli's formatting of
+# `HardForkApplyTxErrWrongEra` and is not dugite's to pin. What IS pinned is the
+# negative: the reason must NOT be a decode failure, which is precisely the
+# pre-#1047 behaviour this asserts we have moved off.
+era_neg_assert_wrong_era_both() {
+    local name="$1" signed="$2" txid="${3:-}" submit_fn="${4:-era_neg_submit_cli}"
+    local dugite_line cbp_line dugite_rc cbp_rc
+
+    dugite_line=$("$submit_fn" "$signed" "$ZOO_SOCKET") && dugite_rc=0 || dugite_rc=$?
+    cbp_line=$("$submit_fn" "$signed" "$LD_CARDANO_BP_SOCK") && cbp_rc=0 || cbp_rc=$?
+
+    if [ "$dugite_rc" -eq 2 ] && [ "$cbp_rc" -eq 2 ]; then
+        zoo_record_env_skip "$name" "both-sockets-not-found"
+        return 0
+    fi
+
+    local detail="dugite(${ZOO_SOCKET})=${dugite_line}; cbp(${LD_CARDANO_BP_SOCK})=${cbp_line}"
+
+    if [ "$dugite_rc" -eq 1 ] || [ "$cbp_rc" -eq 1 ]; then
+        zoo_fail "$name: accepted where rejection was expected — $detail"
+        zoo_record "$name" FAIL "$txid" "$detail"
+        return 1
+    fi
+
+    # dugite was unreachable — cannot assert its reason; the rejection by the
+    # observer that WAS reachable still holds.
+    if [ "$dugite_rc" -eq 2 ]; then
+        zoo_ok "$name: rejected (dugite socket absent, reason not asserted) — $detail"
+        zoo_record "$name" PASS "$txid" "$detail"
+        return 0
+    fi
+
+    if printf '%s' "$dugite_line" | grep -qiE 'EraMismatch|otherEraName|WrongEra|era of the node'; then
+        zoo_ok "$name: rejected with an era mismatch — $detail"
+        zoo_record "$name" PASS "$txid" "$detail"
+        return 0
+    fi
+
+    if printf '%s' "$dugite_line" | grep -qiE 'decode failed|DeserialiseFailure'; then
+        zoo_fail "$name: dugite rejected via a CBOR DECODE error, not an era check — this is the pre-#1047 accident and means the wire-era check did not fire — $detail"
+        zoo_record "$name" FAIL "$txid" "decode-not-era-check: $detail"
+        return 1
+    fi
+
+    zoo_fail "$name: dugite rejected but the reason names neither an era mismatch nor a decode failure; #1047 expects HardForkApplyTxErrWrongEra — $detail"
+    zoo_record "$name" FAIL "$txid" "unexpected-reason: $detail"
+    return 1
+}

@@ -41,6 +41,33 @@ pub fn encode_apply_tx_err(error: &TxValidationError, era_id: u16) -> Vec<u8> {
     let mut buf = Vec::new();
     let mut enc = Encoder::new(&mut buf);
 
+    // #1047: a wrong-era rejection is the `Left` branch of
+    // `Either (MismatchEraInfo xs) (OneEraApplyTxErr xs)` and has a STRUCTURALLY
+    // DIFFERENT top level — `array(2)` of two `encodeNS` values — so it cannot go
+    // through the array(1) era-tagged path below. Handled first, before
+    // `flatten_errors`, because it is not a ledger predicate failure at all and
+    // must never be wrapped as one.
+    if let TxValidationError::HardForkApplyTxErrWrongEra {
+        tx_era_index,
+        tx_era_name,
+        ledger_era_index,
+        ledger_era_name,
+    } = error
+    {
+        enc.array(2).expect("infallible");
+        // era1 = SingleEraInfo = the TRANSACTION's era (Haskell `mkEraMismatch`
+        // binds `SingleEraInfo` to `otherEra`, and `encodeEitherMismatch` emits
+        // era1 first).
+        enc.array(2).expect("infallible");
+        enc.u8(*tx_era_index).expect("infallible");
+        enc.str(tx_era_name).expect("infallible");
+        // era2 = LedgerEraInfo = the LEDGER's era.
+        enc.array(2).expect("infallible");
+        enc.u8(*ledger_era_index).expect("infallible");
+        enc.str(ledger_era_name).expect("infallible");
+        return buf;
+    }
+
     // Collect all failures (flatten Multiple variant)
     let errors = flatten_errors(error);
 
@@ -4285,6 +4312,108 @@ mod tests {
             "the GOV tag-1 payload must be byte-identical to the body encoder's output"
         );
         assert_eq!(&buf[..4], &[0x82, 0x03, 0x82, 0x01]);
+    }
+
+    // ── #1047: HardForkApplyTxErrWrongEra ─────────────────────────────────
+    //
+    // `ApplyTxErr` for the HFC is
+    // `Either (MismatchEraInfo xs) (OneEraApplyTxErr xs)` and
+    // `encodeEitherMismatch` branches on it:
+    //
+    //   Right a -> [ encodeListLen 1, enc a ]
+    //   Left (MismatchEraInfo err) ->
+    //     [ encodeListLen 2
+    //     , encodeNS encodeName era1                      -- SingleEraInfo (tx)
+    //     , encodeNS (encodeName . getLedgerEraInfo) era2  -- LedgerEraInfo
+    //     ]
+    //
+    // with `encodeNS = [word8 index, value]` and
+    // `encodeName = Serialise.encode . singleEraName` (a CBOR text).
+
+    /// Golden: a Shelley (index 1) tx submitted to a Conway (index 6) ledger.
+    ///
+    /// `array(2)[ array(2)[1,"Shelley"], array(2)[6,"Conway"] ]`
+    #[test]
+    fn test_encode_wrong_era_golden() {
+        let err = TxValidationError::HardForkApplyTxErrWrongEra {
+            tx_era_index: 1,
+            tx_era_name: "Shelley".to_string(),
+            ledger_era_index: 6,
+            ledger_era_name: "Conway".to_string(),
+        };
+        let bytes = encode_apply_tx_err(&err, 1);
+
+        let mut want: Vec<u8> = vec![0x82]; // array(2) — the Left branch
+        want.extend([0x82, 0x01]); // era1: array(2)[1, ...]
+        want.push(0x67); // text(7)
+        want.extend(b"Shelley");
+        want.extend([0x82, 0x06]); // era2: array(2)[6, ...]
+        want.push(0x66); // text(6)
+        want.extend(b"Conway");
+
+        assert_eq!(
+            bytes, want,
+            "HardForkApplyTxErrWrongEra must be array(2) of two encodeNS values"
+        );
+    }
+
+    /// The wrong-era reply must NOT use the array(1) era-tagged shape that every
+    /// ledger predicate failure uses. Encoding it as a predicate failure would
+    /// make cardano-cli parse an era name where it expects a failure list.
+    #[test]
+    fn wrong_era_is_not_encoded_as_a_ledger_predicate_failure() {
+        let wrong_era = TxValidationError::HardForkApplyTxErrWrongEra {
+            tx_era_index: 1,
+            tx_era_name: "Shelley".to_string(),
+            ledger_era_index: 6,
+            ledger_era_name: "Conway".to_string(),
+        };
+        let ordinary = TxValidationError::InsufficientCollateral {
+            balance: 0,
+            required: 1,
+        };
+
+        assert_eq!(
+            encode_apply_tx_err(&wrong_era, 6)[0],
+            0x82,
+            "wrong-era is the Left branch: top level array(2)"
+        );
+        assert_eq!(
+            encode_apply_tx_err(&ordinary, 6)[0],
+            0x81,
+            "an ordinary predicate failure is the Right branch: top level array(1)"
+        );
+    }
+
+    /// Field ORDER is pinned by `mkEraMismatch`: `SingleEraInfo` is the
+    /// TRANSACTION's era and `LedgerEraInfo` the LEDGER's, and
+    /// `encodeEitherMismatch` emits era1 (SingleEraInfo) first. Swapping them
+    /// would mislabel which side is wrong — the reply would still decode, so only
+    /// an explicit assertion catches it.
+    #[test]
+    fn wrong_era_emits_transaction_era_before_ledger_era() {
+        let err = TxValidationError::HardForkApplyTxErrWrongEra {
+            tx_era_index: 4,
+            tx_era_name: "Alonzo".to_string(),
+            ledger_era_index: 6,
+            ledger_era_name: "Conway".to_string(),
+        };
+        let bytes = encode_apply_tx_err(&err, 4);
+
+        // bytes[0]=array(2); bytes[1..]=first encodeNS.
+        assert_eq!(bytes[1], 0x82, "first element is an encodeNS array(2)");
+        assert_eq!(
+            bytes[2], 0x04,
+            "the TRANSACTION's era index (Alonzo=4) must come FIRST"
+        );
+        let rest = &bytes[3..];
+        assert_eq!(rest[0], 0x66, "text(6)");
+        assert_eq!(&rest[1..7], b"Alonzo");
+        assert_eq!(rest[7], 0x82, "second element is an encodeNS array(2)");
+        assert_eq!(
+            rest[8], 0x06,
+            "the LEDGER's era index (Conway=6) must come SECOND"
+        );
     }
 
     // ── #1026: `DisallowedProposalDuringBootstrap` (Ledger tag 3, GOV tag 12) ──

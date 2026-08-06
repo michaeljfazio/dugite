@@ -65,4 +65,9 @@ cardano-cli compatible shelley transaction signed-transaction \
 
 TXID=$(cardano-cli conway transaction txid --tx-file "$SIGNED" --output-text 2>/dev/null || echo "")
 
-era_neg_assert_rejected_both "$NAME" "$SIGNED" "$TXID" era_neg_submit_cli
+# #1047: dugite now answers HardForkApplyTxErrWrongEra BEFORE decoding, so
+# the reject REASON is assertable. The strict form additionally FAILS if
+# dugite rejects via a CBOR decode error — that was the pre-#1047 accident,
+# and relying on it would have hidden an accept-where-Haskell-rejects the
+# moment any legacy standalone decoder was corrected.
+era_neg_assert_wrong_era_both "$NAME" "$SIGNED" "$TXID" era_neg_submit_cli
