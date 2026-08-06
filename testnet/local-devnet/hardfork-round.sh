@@ -605,13 +605,25 @@ step "5. re-run 16e post-HF — expect the PV11 constructor"
 run_16e "5-16e-post-hf" 11 "$EVID/16e-post-hf.csv"
 
 # ─────────────────────────────────────────────────────────────────────────
-step "6. post-HF zoo smoke (01-bookkeeping, 08-negative, 16-cert-negatives) — both sockets"
+step "6. post-HF zoo smoke (01-bookkeeping, 08-negative, 16-cert-negatives)"
 # ─────────────────────────────────────────────────────────────────────────
 # 18-plutus-edges is deliberately excluded: 18f's BabbageNonDisjointRefInputs
 # constructor arm INVERTS at PV11 (pre-flight finding 3) and would need its
 # own expectation flip before it belongs in a post-HF smoke.
-run_zoo_smoke "6-zoo-smoke-relay"   "$LD_RELAY_SOCK"      "$EVID/zoo-smoke-relay.csv"
-run_zoo_smoke "6-zoo-smoke-haskell" "$LD_CARDANO_BP_SOCK" "$EVID/zoo-smoke-haskell.csv"
+#
+# ONE run, against the relay (dugite) socket. An earlier revision ran the
+# same scripts a SECOND time against the cardano-bp socket for "both-socket
+# parity", but both runs draw from the same funder wallet — the first run's
+# positives (01i/01j fan-out, 08t's accept arm) consume it, so the second run
+# failed with fanout-not-included / submit / drained-wallet cascades (5 false
+# FAILs), NOT a PV11 divergence. Cross-node parity is already covered without
+# a second submit: every positive script calls zoo_wait_all_observers, which
+# fails unless the tx reaches BOTH dugite-bp AND cardano-bp with the same
+# verdict, and the bidirectional-parity round (1p) runs these exact
+# categories through both sockets with disjoint per-batch wallets. So the
+# post-HF smoke asserts dugite accepts/rejects correctly at PV11; it does not
+# re-submit the identical bytes to a second socket on a shared wallet.
+run_zoo_smoke "6-zoo-smoke" "$LD_RELAY_SOCK" "$EVID/zoo-smoke.csv"
 
 # ─────────────────────────────────────────────────────────────────────────
 step "SUMMARY"
