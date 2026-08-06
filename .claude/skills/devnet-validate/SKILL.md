@@ -506,6 +506,41 @@ RED case that *passes* is reported as the failure it is.
 
 Evidence: `restart-endurance.csv`; denominator `restart_endurance.expected_cases: 30`.
 
+### Round 12 — Genesis-fork reproduction (~15 min, its own devnet, TERMINAL) — #1057
+
+```bash
+./genesis-fork-round.sh
+GF_MIN_FORK_BLOCKS=3 ./genesis-fork-round.sh
+```
+
+**Currently reports INCONCLUSIVE — the scenario cannot yet be constructed.** Kept
+in the tree deliberately; see the script header for the two measured negatives.
+
+Splits the devnet into two islands sharing only genesis (the relay is the bridge:
+`relay -> {dugite-bp, cardano-bp}`), lets each build its own chain, then restores
+the bridge and requires dugite-bp's tip **hash** to match cardano-bp's — hash, not
+"advanced", because a node rebuilding its own fork also advances. dugite-bp is
+deliberately not restarted, so adoption must happen on the LIVE path where #1057
+bites.
+
+Why it does not yet work: a dugite BP **cannot mint the first block of a chain**.
+Fully isolated it forged 0 blocks; peered only with dugite-relay it forged 0 and
+logged ZERO `TraceStartLeadershipCheck`, because both start at Origin so nothing
+supplies the non-Origin `MsgIntersectFound` the peer-connectivity gate wants and
+the silent catch-up gate short-circuits every slot. That is Bug-A/Bug-G protection
+working as designed — and it leaves an open question on #1057, since in the
+original occurrence dugite-bp *did* forge `block_no=0`.
+
+Unmet preconditions report **INCONCLUSIVE and exit 3**, never PASS. Step 4
+classifies three states from log signatures so a future attempt can distinguish a
+*wrong* fix from *no* fix: unfixed (`declining far-ahead range` /
+`beyond forecast horizon`, switch never attempted) · **bad fix**
+(`Fork rollback failed` — switch attempted, ledger could not reach Origin) ·
+fixed (converged, neither). That distinction exists because #1057's first fix
+attempt produced the middle state while its unit tests were green.
+
+Not in any preset manifest. Read `genesis-fork-round.sh`'s output directly.
+
 ## Final report
 
 After all rounds complete, generate a machine-parseable + GitHub-release-ready report:
