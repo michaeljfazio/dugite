@@ -3226,27 +3226,46 @@ mod tests {
     #[test]
     fn test_switch_chain_reachable_via_immutable_anchor() {
         let mut db = VolatileDB::new();
-        // Anchor (immutable tip) is h(0) at slot 50 — NOT in VolatileDB.
-        // Selected chain: h(1) → h(2), both children of h(0).
-        db.add_block(h(1), 100, 10, h(0), b"s1".to_vec());
+        // Anchor (immutable tip) is h(200) at slot 50 — NOT in VolatileDB.
+        //
+        // This anchor MUST NOT be `h(0)`. `h(0)` is `[0u8; 32]` ==
+        // `Hash32::ZERO`, which is dugite's canonical GENESIS parent (the
+        // encoder maps it to CBOR `null` == Haskell `PrevHash = GenesisHash`),
+        // so the original version of this test was really exercising the
+        // genesis-rooted case while claiming to exercise the immutable-anchor
+        // case. Use a non-ZERO anchor so this test covers the immutable-tip path
+        // it is named for.
+        //
+        // Its `switch_chain(.., None, ..).is_none()` assertion also documents
+        // that a genesis-rooted fork is currently REFUSED when the ImmutableDB
+        // is empty — see #1057, which is that wedge and is NOT yet fixed: the
+        // storage layer can be taught to emit the plan, but the ledger cannot
+        // roll back to Origin, so the switch fails downstream instead.
+        // Selected chain: h(1) → h(2), both children of h(200).
+        db.add_block(h(1), 100, 10, h(200), b"s1".to_vec());
         db.add_block(h(2), 200, 20, h(1), b"s2".to_vec());
-        // Fork chain: h(10) → h(11), both also descendants of h(0) but on
+        // Fork chain: h(10) → h(11), both also descendants of h(200) but on
         // a different branch (share only the immutable anchor).
-        db.add_block(h(10), 150, 11, h(0), b"f1".to_vec());
+        db.add_block(h(10), 150, 11, h(200), b"f1".to_vec());
         db.add_block(h(11), 250, 21, h(10), b"f2".to_vec());
         db.add_block(h(12), 350, 22, h(11), b"f3".to_vec());
 
-        // Without immutable_anchor the fork is unreachable (current behaviour).
+        // Without immutable_anchor the fork is unreachable: its root's
+        // prev_hash is a real block hash we do not have, and it is not genesis.
         assert!(
             db.switch_chain(&h(12), None, u64::MAX).is_none(),
             "without knowing the immutable anchor, fork stays unreachable"
         );
 
-        // Passing the immutable anchor (h(0) at slot 50) allows the switch.
+        // Passing the immutable anchor (h(200) at slot 50) allows the switch.
         let plan = db
-            .switch_chain(&h(12), Some((h(0), 50)), u64::MAX)
+            .switch_chain(&h(12), Some((h(200), 50)), u64::MAX)
             .expect("fork is reachable via immutable-tip anchor");
-        assert_eq!(plan.intersection, h(0), "intersection is the immutable tip");
+        assert_eq!(
+            plan.intersection,
+            h(200),
+            "intersection is the immutable tip"
+        );
         assert_eq!(plan.intersection_slot, 50);
         assert_eq!(
             plan.rollback,

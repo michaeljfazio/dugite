@@ -834,6 +834,112 @@ pub enum TxValidationError {
         /// `(typed-hash32 hex, expiry epoch)` per offending member.
         members: Vec<(String, u64)>,
     },
+    /// `ScriptIntegrityHashMismatch` (UTXOW tag 18) — the **PV>=11** form of a
+    /// script-integrity-hash mismatch (#1058).
+    ///
+    /// `checkScriptIntegrityHash` (cardano-ledger
+    /// `eras/alonzo/impl/src/Cardano/Ledger/Alonzo/Rules/Utxow.hs`) picks the
+    /// constructor by protocol version:
+    ///
+    /// ```haskell
+    /// $ if pvMajor (pp ^. ppProtocolVersionL) < natVersion @11
+    ///   then PPViewHashesDontMatch mismatch
+    ///   else ScriptIntegrityHashMismatch mismatch expectedScriptIntegrity
+    /// ```
+    ///
+    /// The two differ in BOTH tag and payload shape
+    /// (`Conway/Rules/Utxow.hs`):
+    ///
+    /// ```haskell
+    /// PPViewHashesDontMatch       mm  -> Sum … 13 !> ToGroup mm
+    /// ScriptIntegrityHashMismatch x y -> Sum … 18 !> To x !> To y
+    /// ```
+    ///
+    /// so tag 13 FLATTENS the `Mismatch` into the constructor array while tag 18
+    /// carries it as a self-contained `array(2)` plus a SECOND field. dugite
+    /// emitted tag 13 at every PV, which is wrong on preview/PV11 — the #978
+    /// inversion (there, only the unreachable PV>=11 arms existed).
+    ///
+    /// `expected_bytes` is Haskell's `originalBytes <$> scriptIntegrity`: the
+    /// script-integrity **preimage**, not a hash. dugite's Phase-1 error carries
+    /// only hashes, so this is `None` (`SNothing`) — structurally valid and
+    /// decodable, omitting a diagnostic. Plumbing the preimage span out of
+    /// Phase-1 is a larger change and deliberately does not gate the tag fix.
+    ScriptIntegrityHashMismatchUTXOW {
+        /// Hex-encoded hash the transaction body declared, if any.
+        supplied: Option<String>,
+        /// Hex-encoded hash recomputed from the script context, if any.
+        expected: Option<String>,
+        /// Hex-encoded script-integrity preimage bytes, if known.
+        expected_bytes: Option<String>,
+    },
+    /// `HardForkApplyTxErrWrongEra` — the submitted transaction's era does not
+    /// match the ledger's current era (#1047).
+    ///
+    /// This is NOT a ledger predicate failure and does NOT share their wire
+    /// shape. `ApplyTxErr` for the HFC is
+    /// `Either (MismatchEraInfo xs) (OneEraApplyTxErr xs)`, and
+    /// `encodeEitherMismatch` (ouroboros-consensus
+    /// `HardFork/Combinator/Serialisation/Common.hs`) branches on the `Either`:
+    ///
+    /// ```haskell
+    /// (HardForkNodeToClientEnabled{}, Right a) ->
+    ///   mconcat [ Enc.encodeListLen 1, enc a ]
+    /// (HardForkNodeToClientEnabled{}, Left (MismatchEraInfo err)) ->
+    ///   mconcat
+    ///     [ Enc.encodeListLen 2
+    ///     , encodeNS (hpure (fn encodeName)) era1
+    ///     , encodeNS (hpure (fn (encodeName . getLedgerEraInfo))) era2
+    ///     ]
+    ///   where (era1, era2) = Match.mismatchToNS err
+    /// ```
+    ///
+    /// So the normal case is `array(1)[…]` — which is what every other variant
+    /// in this enum produces — and the wrong-era case is a top-level
+    /// **`array(2)`** of two `encodeNS` values. `encodeNS` is
+    /// `array(2)[word8 index, value]`, and `encodeName` is
+    /// `Serialise.encode . singleEraName`, i.e. a CBOR **text** string.
+    ///
+    /// Field order is pinned by `mkEraMismatch`
+    /// (`HardFork/Combinator/AcrossEras.hs`), whose
+    /// `Mismatch SingleEraInfo LedgerEraInfo` gives `SingleEraInfo` = the
+    /// TRANSACTION's era and `LedgerEraInfo` = the LEDGER's era, and by
+    /// `encodeEitherMismatch` emitting `era1` (SingleEraInfo) first. Getting
+    /// this order backwards would mislabel the reply exactly as #1051's spurious
+    /// Set tag made one undecodable.
+    ///
+    /// `singleEraName = T.pack (L.eraName @era)` (`ShelleyHFC.hs`), i.e.
+    /// cardano-ledger's era name: "Byron", "Shelley", …, "Conway", "Dijkstra".
+    HardForkApplyTxErrWrongEra {
+        /// HFC index of the era the client declared for its transaction.
+        tx_era_index: u8,
+        /// Era name for the transaction's era (Haskell `SingleEraInfo`).
+        tx_era_name: String,
+        /// HFC index of the ledger's current era.
+        ledger_era_index: u8,
+        /// Era name for the ledger's era (Haskell `LedgerEraInfo`).
+        ledger_era_name: String,
+    },
+    /// `DisallowedProposalDuringBootstrap` (GOV tag 12) —
+    /// `DisallowedProposalDuringBootstrap (ProposalProcedure era)`.
+    ///
+    /// At PV9 only `ParameterChange` / `HardForkInitiation` / `InfoAction` may
+    /// be PROPOSED (Haskell `checkBootstrapProposal`, step 1 of
+    /// `processProposal`). dugite had only the symmetric VOTE-side restriction
+    /// below, so a bootstrap-disallowed proposal was accepted where
+    /// cardano-node rejects it (#1026).
+    ///
+    /// One-field payload carrying the ENTIRE proposal, exactly like
+    /// [`TxValidationError::InvalidPrevGovActionId`]'s tag 8 — so the encoder
+    /// re-encodes it with `dugite_serialization::encode_proposal_procedure`, the
+    /// same function that builds proposals into tx bodies for signing, keeping
+    /// both paths byte-identical by construction. Boxed for the same hot-path
+    /// enum-size reason.
+    DisallowedProposalDuringBootstrap {
+        action_index: u32,
+        action_type: String,
+        proposal: Box<dugite_primitives::transaction::ProposalProcedure>,
+    },
     /// `DisallowedVotesDuringBootstrap` (GOV tag 13) —
     /// `NonEmpty (Voter, GovActionId)`.
     DisallowedVotesDuringBootstrap {

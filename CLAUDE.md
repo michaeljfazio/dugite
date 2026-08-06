@@ -101,7 +101,165 @@ dugite-lsm (LSM-tree on-disk storage for UTxO-HD)
 - 28-byte hash types (DRep keys, pool voter keys, required signers) must be padded to 32 bytes via `Hash28::to_hash32_padded()` — do not use `Hash<32>::from()` directly on 28-byte hashes
 
 ## Current Focus
-**v2.6.0 (2026-08-04) — the DRep pulser becomes one mechanism.**
+**v2.7.0 (2026-08-06) — eras are checked at the wire.**
+Drop-in from v2.6.0, **SNAPSHOT unchanged at 37**. Closes #1015, #1026, #1028,
+#1046, #1047, #1048, #1050, #1051, #1054, #1055, #1031, #1044, plus **#1058**
+found during the sweep. Open: **#1057** (P0, fully diagnosed below — the
+two-layer storage fix was attempted, verified WRONG live, and reverted), #1008
+(CLI surface backlog), #1053 (typed phase-2 wire class), #1030 items 4-6.
+
+### #1057 — a node with any block of its own never rejoins (P0, OPEN)
+
+**Diagnosed in detail, NOT fixed — do not re-diagnose from scratch.** A node whose
+local chain must be replaced from Origin never adopts the canonical chain:
+BlockFetch declines the peer's block 0 forever, the ledger never advances,
+ChainSync's forecast-horizon park times out, and **every** peer is disconnected in
+an endless reconnect loop with no self-healing. It strands a block producer.
+
+Live evidence: dugite-bp forged blocks 0..8 (slots 4-21) on Origin, then froze at
+its own tip while the Haskell chain reached block 240+, dying at the *same* header
+slot on every peer and every reconnect. Controlled comparison, same binary and
+devnet: **dugite-relay reached epoch 2, dugite-bp stayed at epoch 0** — the only
+difference being whether the ChainDB was non-empty when the Origin adoption was
+required.
+
+Two layers both refuse a genesis anchor, recognising only a stored block or the
+ImmutableDB tip:
+- `connection_lifecycle.rs` — the #735 gross-request invariant exempts only a
+  COMPLETELY EMPTY ChainDB. Genesis is never a stored block, so
+  `has_block(&genesis)` is always false. **This is the branch that fires.**
+- `volatile_db.rs::switch_chain` — accepts a non-intersecting fork only when its
+  root anchors at the ImmutableDB tip; with nothing flushed yet that anchor is
+  `None`.
+
+**Why the obvious two-line fix is WRONG, verified live.** Teaching both layers to
+accept `prev_hash == Hash32::ZERO` was attempted and REVERTED: storage then emits a
+genesis-rooted `SwitchPlan` (`intersection = ZERO, slot 0`), chain selection asks
+the ledger to roll back to Origin, and `sync.rs` aborts —
+
+```
+Chain selection: fork switch at live tip — rolling back ledger to intersection
+  intersection=00000000000000000000000000000000
+ERROR Rollback target outside LedgerSeq volatile window AND no canonical
+  snapshot available. Aborting rollback
+WARN  Fork rollback failed; skipping fork replay
+```
+
+— leaving dugite-bp at block 4 while the network was at 84. The wedge MOVES from
+BlockFetch to the ledger rollback; it does not go away. Unit tests on
+`switch_chain` in isolation all passed, because nothing drove the storage plan
+through the ledger.
+
+The complete fix needs the ledger to **re-initialise from genesis** on a
+rollback-to-Origin (a full `init_fresh_ledger`, not an in-place rewind — #989
+deleted `reset_to_origin` precisely because a partial reset cannot be correct),
+plus a LedgerSeq re-anchor (#985) and a query-state reset. That touches the code
+path that produced #985's chimera, so it needs its own focused pass with
+byte-exact validation.
+
+`Hash32::ZERO` IS dugite's canonical Origin parent (encoder → CBOR `null` ==
+Haskell `PrevHash = GenesisHash`), and upstream needs no guard at all because
+`AnchorGenesis` is a first-class constructor of `Anchor blk`, matched by
+`Paths.hs::isReachable`. Those facts are settled; the blocker is the ledger.
+
+**An existing test PINNED the storage half**:
+`test_switch_chain_reachable_via_immutable_anchor` used `h(0)` as its "immutable
+tip", and `h(0)` is `[0u8; 32]` — the genesis sentinel. Re-pointed at a non-ZERO
+anchor so it covers the path it is named for; its `is_none()` assertion now
+documents the open wedge explicitly.
+
+### #1015 — Babbage folded extraEntropy; Praos has 2 terms, not 3
+
+`babbage.rs` delegated wholesale to `ShelleyRules::process_epoch_transition`,
+which folds the TPraos TICKN 3-term nonce. Babbage is **Praos**:
+`tickChainDepState` folds two terms and `extraEntropy` does not exist for Praos
+at all (`Praos.hs` has zero occurrences; `hkdExtraEntropyL =
+notSupportedInThisEraL` for Babbage/Conway/Dijkstra). Dormant — extra_entropy is
+`ZERO` by the time Babbage runs on every known network — but nonce evolution has
+no self-correcting mechanism, so a chain carrying a non-neutral value across
+Alonzo→Babbage would split via the VRF leader schedule forever.
+
+THREE implementations existed and the duplication WAS the mechanism: Conway had
+the right formula, Babbage reused the wrong era's code. Now one
+`compute_epoch_boundary_nonce` + an `EpochNonceMode` derived from `ctx.era` via
+`Era::uses_tpraos()` (#985's predicate), so no caller can select the wrong one.
+
+**The third copy was in `state/epoch.rs`** — the `#[doc(hidden)]` test-only
+`LedgerState::process_epoch_transition`, i.e. *exactly the path #977's fix landed
+in while production did nothing*, and the path every unit test drives. Fixing
+only the era-rules path would have left the tests exercising the old formula.
+
+### #1046 — the invented default PlutusV2 cost model
+
+dugite injected a hardcoded `defaultV2CostModel` whenever genesis supplied no
+V2, so `curPParams.costModels` reported `[V1,V2,V3]` where cardano-node reports
+`[V1,V3]` on mainnet/preview/preprod. Latent accept-where-Haskell-rejects: a V2
+script executes on dugite and fails upstream with
+`CollectErrors [NoCostModel PlutusV2]`.
+
+The issue supposed the devnet/preview disagreement came from different *paths
+into Conway*. It does not — it is the **genesis file**:
+
+| genesis | `costModels` | `extraConfig.costModels` |
+|---|---|---|
+| devnet (`create-testnet-data`) | V1 | V1, **V2** |
+| preview/preprod/mainnet | V1 | *absent* |
+
+`alonzoInjectCostModels` (`Alonzo/Transition.hs`) applies
+`agExtraConfig.aecCostModels` via `curPParamsEpochStateL` — **cur-only**, and
+`updateCostModels` is a **per-language** update. cardano-ledger has no default
+V2 anywhere; `defaultV2CostModel` lives in **cardano-api** as a value written
+INTO a generated genesis file. dugite's constant was copied from that same
+source, so it matched on the devnet by coincidence while being wrong everywhere
+real. Reading only the top-level `costModels` key is what produced #994's wrong
+conclusion — and #994's claim that real alonzo-genesis files "DO define
+PlutusV2" is false; none ever has.
+
+### #1058 — script-integrity mismatch used tag 13 at every PV (#1030 item 3)
+
+`checkScriptIntegrityHash` picks by PV: `< 11` ⇒ `PPViewHashesDontMatch` (UTXOW
+**13**, `ToGroup` = Mismatch FLATTENED); `>= 11` ⇒ `ScriptIntegrityHashMismatch`
+(UTXOW **18**, Mismatch NESTED + a `StrictMaybe ByteString` preimage field).
+dugite emitted 13 unconditionally — wrong at PV11, **which preview runs**, so
+the reachable case was the wrong one. #978's inversion. Found only because
+#1030 item 3 said the split had "not been independently re-verified against
+dugite's encoder" — it was worth re-verifying.
+
+### #1047 / #1026 / #1028 — three accept-where-Haskell-rejects gaps
+
+- **#1047**: no wire-era check on N2C submission. A legacy-era tx was rejected
+  only as an ACCIDENTAL CBOR array-length error, and that accident was
+  load-bearing: correct any legacy standalone decoder without adding an era
+  check and MIR / GenesisKeyDelegation become ACCEPTABLE on a Conway chain (MIR
+  Phase-1 is a no-op at PV>=9; GenesisKeyDelegation has era-unconditional
+  apply-time support, so the ledger would not catch it). Now
+  `HardForkApplyTxErrWrongEra` before decoding, era from
+  `EraHistory::current_era()` — **not** ledger pparams (#985).
+- **#1026**: PV9 restricts proposal SUBMISSION to
+  ParameterChange/HardForkInitiation/InfoAction. dugite had the symmetric VOTE
+  restriction but not the proposal side. `isBootstrapAction` is now SHARED by
+  both, as upstream gates both on the one predicate.
+- **#1028**: `SNothing` guardrail was treated as "anything goes". Haskell
+  compares the WHOLE `StrictMaybe`, so a guardrail-less constitution requires the
+  proposal to supply `SNothing` too. Root cause was a type that could not express
+  the distinction — `Option<Hash28>` conflated "not plumbed" with "genuinely
+  absent"; now `Option<Option<Hash28>>`.
+
+### Testing discipline this wave
+
+Every fix landed with a test **proven RED by disarming the fix**, not merely
+written — and the one case where that was NOT enough is the lesson of this wave:
+#1057's unit tests all passed while the fix was wrong, because they exercised
+`switch_chain` in isolation and nothing drove its output through the ledger. A
+RED-proven unit test bounds the function, not the system.
+
+Where it did work, it worked well. The two cases that matter most: #1026's behavioural
+tests were RED against the *wiring* (not the predicate), which is #977's exact
+failure mode; and #1028's not-plumbed-vs-SNothing test drives the same input
+through both and asserts they behave DIFFERENTLY, so the doubly-optional type
+cannot silently collapse again.
+
+### Superseded: v2.6.0 (2026-08-04) — the DRep pulser becomes one mechanism.
 **RE-SYNC RELEASE: SNAPSHOT_VERSION 32 -> 37**, so existing DBs replay chunks
 on first restart. Closes #977, #980, #969, #970 (the earlier backlog) plus
 #988, #989, #990, #991, #992, #993, #995, #996, #997. Open: #994 (devnet-only,

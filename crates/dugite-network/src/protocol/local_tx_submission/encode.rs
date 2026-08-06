@@ -41,6 +41,33 @@ pub fn encode_apply_tx_err(error: &TxValidationError, era_id: u16) -> Vec<u8> {
     let mut buf = Vec::new();
     let mut enc = Encoder::new(&mut buf);
 
+    // #1047: a wrong-era rejection is the `Left` branch of
+    // `Either (MismatchEraInfo xs) (OneEraApplyTxErr xs)` and has a STRUCTURALLY
+    // DIFFERENT top level — `array(2)` of two `encodeNS` values — so it cannot go
+    // through the array(1) era-tagged path below. Handled first, before
+    // `flatten_errors`, because it is not a ledger predicate failure at all and
+    // must never be wrapped as one.
+    if let TxValidationError::HardForkApplyTxErrWrongEra {
+        tx_era_index,
+        tx_era_name,
+        ledger_era_index,
+        ledger_era_name,
+    } = error
+    {
+        enc.array(2).expect("infallible");
+        // era1 = SingleEraInfo = the TRANSACTION's era (Haskell `mkEraMismatch`
+        // binds `SingleEraInfo` to `otherEra`, and `encodeEitherMismatch` emits
+        // era1 first).
+        enc.array(2).expect("infallible");
+        enc.u8(*tx_era_index).expect("infallible");
+        enc.str(tx_era_name).expect("infallible");
+        // era2 = LedgerEraInfo = the LEDGER's era.
+        enc.array(2).expect("infallible");
+        enc.u8(*ledger_era_index).expect("infallible");
+        enc.str(ledger_era_name).expect("infallible");
+        return buf;
+    }
+
     // Collect all failures (flatten Multiple variant)
     let errors = flatten_errors(error);
 
@@ -387,23 +414,47 @@ fn encode_conway_ledger_pred_failure(enc: &mut Encoder<&mut Vec<u8>>, err: &TxVa
             );
         }
 
-        // Utxow tag 13: ScriptIntegrityHashMismatch (formerly PPViewHashesDontMatch pre-PV11) — [supplied_hash_or_null, expected_hash_or_null]
+        // Utxow tag 13: PPViewHashesDontMatch — the PV<=10 form (#1058).
+        //
+        //   PPViewHashesDontMatch mm -> Sum … 13 !> ToGroup mm
+        //
+        // `ToGroup` FLATTENS the Mismatch into the constructor array, so the two
+        // StrictMaybe values sit directly in it. The PV>=11 form is a different
+        // constructor with a different tag AND a third field — see
+        // `ScriptIntegrityHashMismatchUTXOW` above. `convert_validation_error_at_pv`
+        // chooses between them.
         TxValidationError::ScriptDataHashMismatch { expected, actual } => {
             encode_utxow_failure(enc, 13, |enc| {
-                // supplied (actual from tx) — StrictMaybe encoding
-                if let Some(hash_bytes) = parse_hex_bytes(actual) {
-                    enc.array(1).expect("infallible");
-                    enc.bytes(&hash_bytes).expect("infallible");
-                } else {
-                    enc.array(0).expect("infallible");
-                }
-                // expected (computed from script context) — StrictMaybe encoding
-                if let Some(hash_bytes) = parse_hex_bytes(expected) {
-                    enc.array(1).expect("infallible");
-                    enc.bytes(&hash_bytes).expect("infallible");
-                } else {
-                    enc.array(0).expect("infallible");
-                }
+                // supplied (declared in the tx body), then expected (recomputed).
+                encode_strict_maybe_bytes(enc, Some(actual.as_str()));
+                encode_strict_maybe_bytes(enc, Some(expected.as_str()));
+            });
+        }
+
+        // Utxow tag 18: ScriptIntegrityHashMismatch — the PV>=11 form (#1058).
+        //
+        //   ScriptIntegrityHashMismatch x y -> Sum … 18 !> To x !> To y
+        //
+        // `To x` puts the `Mismatch` in a NON-group position, so it uses its own
+        // `EncCBOR` and is a self-contained array(2) — the opposite of tag 13's
+        // `ToGroup mm`, which flattens the same Mismatch into the constructor
+        // array. Getting that distinction backwards is #1050's
+        // ProposalDepositIncorrect trap (a nested Mismatch where a flattened one
+        // was wanted produced `DeserialiseFailure … "expected word"`).
+        //
+        // `y :: StrictMaybe ByteString` is the script-integrity PREIMAGE.
+        TxValidationError::ScriptIntegrityHashMismatchUTXOW {
+            supplied,
+            expected,
+            expected_bytes,
+        } => {
+            encode_utxow_failure(enc, 18, |enc| {
+                // x: the Mismatch as a self-contained array(2).
+                enc.array(2).expect("infallible");
+                encode_strict_maybe_bytes(enc, supplied.as_deref());
+                encode_strict_maybe_bytes(enc, expected.as_deref());
+                // y: StrictMaybe ByteString.
+                encode_strict_maybe_bytes(enc, expected_bytes.as_deref());
             });
         }
 
@@ -690,6 +741,30 @@ fn encode_conway_ledger_pred_failure(enc: &mut Encoder<&mut Vec<u8>>, err: &TxVa
         TxValidationError::InvalidPrevGovActionId { proposal, .. } => {
             let raw = dugite_serialization::encode_proposal_procedure(proposal);
             encode_gov_failure(enc, 8, |enc| {
+                let writer = enc.writer_mut();
+                writer.extend_from_slice(&raw);
+            });
+        }
+
+        // Tag 12: DisallowedProposalDuringBootstrap — [12, <the whole
+        // ProposalProcedure>].
+        //
+        // Haskell (`Cardano.Ledger.Conway.Rules.Gov`):
+        //   DisallowedProposalDuringBootstrap (ProposalProcedure era)
+        // — the identical one-field `Sum` shape as tag 8, so it re-uses the same
+        // `encode_proposal_procedure` (the function that also builds proposals
+        // into tx bodies for signing, keeping the two byte-identical).
+        //
+        // Fires only at PV9, where `checkBootstrapProposal` restricts proposal
+        // submission to ParameterChange / HardForkInitiation / InfoAction.
+        // Landing the typed arm together with the predicate deliberately: #979
+        // and #1050 are both cases where a correct ledger rejection shipped with
+        // no encoder arm and degraded to a generic `ConwayMempoolFailure`, and
+        // #1053 is still open for the whole phase-2 class. A new predicate
+        // should not add to that list (#1026).
+        TxValidationError::DisallowedProposalDuringBootstrap { proposal, .. } => {
+            let raw = dugite_serialization::encode_proposal_procedure(proposal);
+            encode_gov_failure(enc, 12, |enc| {
                 let writer = enc.writer_mut();
                 writer.extend_from_slice(&raw);
             });
@@ -1763,6 +1838,25 @@ fn parse_hex_bytes(s: &str) -> Option<Vec<u8>> {
         .step_by(2)
         .map(|i| u8::from_str_radix(&s[i..i + 2], 16).ok())
         .collect()
+}
+
+/// Encode a `StrictMaybe ByteString` from an optional hex string.
+///
+/// Haskell's `StrictMaybe` encodes as `array(0)` for `SNothing` and
+/// `array(1)[value]` for `SJust` — the shape used by every script-integrity and
+/// metadata-hash field. Unparseable hex is treated as `SNothing` rather than
+/// silently emitting a truncated byte string, so a malformed input cannot
+/// produce a frame that decodes to the wrong value (#1058).
+fn encode_strict_maybe_bytes(enc: &mut Encoder<&mut Vec<u8>>, hex: Option<&str>) {
+    match hex.and_then(parse_hex_bytes) {
+        Some(bytes) => {
+            enc.array(1).expect("infallible");
+            enc.bytes(&bytes).expect("infallible");
+        }
+        None => {
+            enc.array(0).expect("infallible");
+        }
+    }
 }
 
 /// Parse a hex string into exactly 28 raw bytes.
@@ -4261,6 +4355,310 @@ mod tests {
             "the GOV tag-1 payload must be byte-identical to the body encoder's output"
         );
         assert_eq!(&buf[..4], &[0x82, 0x03, 0x82, 0x01]);
+    }
+
+    // ── #1058: script-integrity-hash mismatch splits at PV 11 ──────────────
+    //
+    //   pv < 11  -> PPViewHashesDontMatch mismatch                 (UTXOW 13)
+    //   pv >= 11 -> ScriptIntegrityHashMismatch mismatch preimage   (UTXOW 18)
+    //
+    // and the encodings differ in shape, not just tag:
+    //   PPViewHashesDontMatch       mm  -> Sum … 13 !> ToGroup mm   (FLATTENED)
+    //   ScriptIntegrityHashMismatch x y -> Sum … 18 !> To x !> To y (NESTED + 3rd)
+    //
+    // dugite emitted 13 at every PV. preview runs PV11, so the reachable case was
+    // the wrong one — the #978 inversion.
+
+    /// PV<=10 form: tag 13 with the Mismatch FLATTENED into the constructor.
+    #[test]
+    fn script_integrity_pv10_is_tag_13_flattened() {
+        let err = TxValidationError::ScriptDataHashMismatch {
+            expected: "aa".repeat(32),
+            actual: "bb".repeat(32),
+        };
+        let mut buf = Vec::new();
+        let mut enc = Encoder::new(&mut buf);
+        encode_conway_ledger_pred_failure(&mut enc, &err);
+
+        // ConwayLedgerPredFailure array(2)[1, ConwayUtxowPredFailure]
+        assert_eq!(buf[0], 0x82);
+        assert_eq!(buf[1], 0x01, "Ledger tag 1 = ConwayUtxowFailure");
+        // UTXOW array(3)[13, supplied, expected] — flattened, so THREE elements.
+        assert_eq!(buf[2], 0x83, "ToGroup flattens the Mismatch: array(3)");
+        assert_eq!(buf[3], 0x0d, "UTXOW tag 13 (PPViewHashesDontMatch)");
+        // supplied = SJust bstr(32)
+        assert_eq!(buf[4], 0x81, "StrictMaybe SJust = array(1)");
+        assert_eq!(buf[5], 0x58);
+        assert_eq!(buf[6], 0x20, "bstr(32)");
+        assert_eq!(&buf[7..39], [0xbbu8; 32], "supplied comes FIRST");
+    }
+
+    /// PV>=11 form: tag 18, Mismatch NESTED as array(2), plus a third field.
+    #[test]
+    fn script_integrity_pv11_is_tag_18_nested_with_preimage_field() {
+        let err = TxValidationError::ScriptIntegrityHashMismatchUTXOW {
+            supplied: Some("bb".repeat(32)),
+            expected: Some("aa".repeat(32)),
+            expected_bytes: None,
+        };
+        let mut buf = Vec::new();
+        let mut enc = Encoder::new(&mut buf);
+        encode_conway_ledger_pred_failure(&mut enc, &err);
+
+        assert_eq!(buf[0], 0x82);
+        assert_eq!(buf[1], 0x01, "Ledger tag 1 = ConwayUtxowFailure");
+        assert_eq!(buf[2], 0x83, "UTXOW array(3)[18, mismatch, preimage]");
+        assert_eq!(buf[3], 0x12, "UTXOW tag 18 (ScriptIntegrityHashMismatch)");
+        assert_eq!(
+            buf[4], 0x82,
+            "`To x` NESTS the Mismatch as a self-contained array(2) — the opposite \
+             of tag 13's ToGroup flattening"
+        );
+        // supplied then expected inside the nested Mismatch.
+        assert_eq!(buf[5], 0x81);
+        assert_eq!(buf[6], 0x58);
+        assert_eq!(buf[7], 0x20);
+        assert_eq!(
+            &buf[8..40],
+            [0xbbu8; 32],
+            "supplied first inside the Mismatch"
+        );
+        // ... expected ...
+        assert_eq!(buf[40], 0x81);
+        assert_eq!(&buf[43..75], [0xaau8; 32], "expected second");
+        // third field: SNothing, since dugite has no preimage.
+        assert_eq!(buf[75], 0x80, "StrictMaybe ByteString SNothing = array(0)");
+    }
+
+    /// The two forms must be DISTINGUISHABLE on the wire. If they ever encode
+    /// identically the PV gate is pointless and #1058 has regressed.
+    #[test]
+    fn script_integrity_pv10_and_pv11_forms_differ() {
+        let pv10 = TxValidationError::ScriptDataHashMismatch {
+            expected: "aa".repeat(32),
+            actual: "bb".repeat(32),
+        };
+        let pv11 = TxValidationError::ScriptIntegrityHashMismatchUTXOW {
+            supplied: Some("bb".repeat(32)),
+            expected: Some("aa".repeat(32)),
+            expected_bytes: None,
+        };
+
+        let enc_one = |e: &TxValidationError| {
+            let mut b = Vec::new();
+            let mut x = Encoder::new(&mut b);
+            encode_conway_ledger_pred_failure(&mut x, e);
+            b
+        };
+
+        assert_ne!(
+            enc_one(&pv10),
+            enc_one(&pv11),
+            "the PV<=10 and PV>=11 script-integrity forms must differ on the wire"
+        );
+    }
+
+    // ── #1047: HardForkApplyTxErrWrongEra ─────────────────────────────────
+    //
+    // `ApplyTxErr` for the HFC is
+    // `Either (MismatchEraInfo xs) (OneEraApplyTxErr xs)` and
+    // `encodeEitherMismatch` branches on it:
+    //
+    //   Right a -> [ encodeListLen 1, enc a ]
+    //   Left (MismatchEraInfo err) ->
+    //     [ encodeListLen 2
+    //     , encodeNS encodeName era1                      -- SingleEraInfo (tx)
+    //     , encodeNS (encodeName . getLedgerEraInfo) era2  -- LedgerEraInfo
+    //     ]
+    //
+    // with `encodeNS = [word8 index, value]` and
+    // `encodeName = Serialise.encode . singleEraName` (a CBOR text).
+
+    /// Golden: a Shelley (index 1) tx submitted to a Conway (index 6) ledger.
+    ///
+    /// `array(2)[ array(2)[1,"Shelley"], array(2)[6,"Conway"] ]`
+    #[test]
+    fn test_encode_wrong_era_golden() {
+        let err = TxValidationError::HardForkApplyTxErrWrongEra {
+            tx_era_index: 1,
+            tx_era_name: "Shelley".to_string(),
+            ledger_era_index: 6,
+            ledger_era_name: "Conway".to_string(),
+        };
+        let bytes = encode_apply_tx_err(&err, 1);
+
+        let mut want: Vec<u8> = vec![0x82]; // array(2) — the Left branch
+        want.extend([0x82, 0x01]); // era1: array(2)[1, ...]
+        want.push(0x67); // text(7)
+        want.extend(b"Shelley");
+        want.extend([0x82, 0x06]); // era2: array(2)[6, ...]
+        want.push(0x66); // text(6)
+        want.extend(b"Conway");
+
+        assert_eq!(
+            bytes, want,
+            "HardForkApplyTxErrWrongEra must be array(2) of two encodeNS values"
+        );
+    }
+
+    /// The wrong-era reply must NOT use the array(1) era-tagged shape that every
+    /// ledger predicate failure uses. Encoding it as a predicate failure would
+    /// make cardano-cli parse an era name where it expects a failure list.
+    #[test]
+    fn wrong_era_is_not_encoded_as_a_ledger_predicate_failure() {
+        let wrong_era = TxValidationError::HardForkApplyTxErrWrongEra {
+            tx_era_index: 1,
+            tx_era_name: "Shelley".to_string(),
+            ledger_era_index: 6,
+            ledger_era_name: "Conway".to_string(),
+        };
+        let ordinary = TxValidationError::InsufficientCollateral {
+            balance: 0,
+            required: 1,
+        };
+
+        assert_eq!(
+            encode_apply_tx_err(&wrong_era, 6)[0],
+            0x82,
+            "wrong-era is the Left branch: top level array(2)"
+        );
+        assert_eq!(
+            encode_apply_tx_err(&ordinary, 6)[0],
+            0x81,
+            "an ordinary predicate failure is the Right branch: top level array(1)"
+        );
+    }
+
+    /// Field ORDER is pinned by `mkEraMismatch`: `SingleEraInfo` is the
+    /// TRANSACTION's era and `LedgerEraInfo` the LEDGER's, and
+    /// `encodeEitherMismatch` emits era1 (SingleEraInfo) first. Swapping them
+    /// would mislabel which side is wrong — the reply would still decode, so only
+    /// an explicit assertion catches it.
+    #[test]
+    fn wrong_era_emits_transaction_era_before_ledger_era() {
+        let err = TxValidationError::HardForkApplyTxErrWrongEra {
+            tx_era_index: 4,
+            tx_era_name: "Alonzo".to_string(),
+            ledger_era_index: 6,
+            ledger_era_name: "Conway".to_string(),
+        };
+        let bytes = encode_apply_tx_err(&err, 4);
+
+        // bytes[0]=array(2); bytes[1..]=first encodeNS.
+        assert_eq!(bytes[1], 0x82, "first element is an encodeNS array(2)");
+        assert_eq!(
+            bytes[2], 0x04,
+            "the TRANSACTION's era index (Alonzo=4) must come FIRST"
+        );
+        let rest = &bytes[3..];
+        assert_eq!(rest[0], 0x66, "text(6)");
+        assert_eq!(&rest[1..7], b"Alonzo");
+        assert_eq!(rest[7], 0x82, "second element is an encodeNS array(2)");
+        assert_eq!(
+            rest[8], 0x06,
+            "the LEDGER's era index (Conway=6) must come SECOND"
+        );
+    }
+
+    // ── #1026: `DisallowedProposalDuringBootstrap` (Ledger tag 3, GOV tag 12) ──
+
+    /// CBOR golden: `DisallowedProposalDuringBootstrap` carrying a
+    /// `TreasuryWithdrawals` proposal — a bootstrap-DISALLOWED action type.
+    ///
+    /// Haskell: `DisallowedProposalDuringBootstrap (ProposalProcedure era)`, the
+    /// identical one-field `Sum` shape as tag 8, so the payload is the whole
+    /// proposal and the only difference from `test_encode_invalid_prev_gov_
+    /// action_id_golden` is the constructor tag (12 vs 8) and the action.
+    #[test]
+    fn test_encode_disallowed_proposal_during_bootstrap_golden() {
+        use dugite_primitives::hash::Hash32;
+        use dugite_primitives::transaction::{Anchor, GovAction, ProposalProcedure};
+        use dugite_primitives::value::Lovelace;
+
+        let return_addr: Vec<u8> = std::iter::once(0xE1)
+            .chain(std::iter::repeat_n(0x11, 28))
+            .collect();
+        let proposal = ProposalProcedure {
+            deposit: Lovelace(1_000_000),
+            return_addr,
+            gov_action: GovAction::InfoAction,
+            anchor: Anchor {
+                url: "https://x".to_string(),
+                data_hash: Hash32::from_bytes([0xAA; 32]),
+            },
+        };
+        let err = TxValidationError::DisallowedProposalDuringBootstrap {
+            action_index: 0,
+            action_type: "TreasuryWithdrawals".to_string(),
+            proposal: Box::new(proposal),
+        };
+
+        let mut buf = Vec::new();
+        let mut enc = Encoder::new(&mut buf);
+        encode_conway_ledger_pred_failure(&mut enc, &err);
+
+        let mut expected = vec![
+            0x82, 0x03, // ConwayLedgerPredFailure: array(2)[3, ...]
+            0x82, 0x0c, // ConwayGovPredFailure: array(2)[12, ...]
+            0x84, // ProposalProcedure: array(4)
+            0x1a, 0x00, 0x0f, 0x42, 0x40, // deposit = 1_000_000
+            0x58, 0x1d, // return_addr: bstr(29)
+        ];
+        expected.push(0xe1);
+        expected.extend(std::iter::repeat_n(0x11u8, 28));
+        expected.extend([0x81, 0x06]); // gov_action payload
+        expected.push(0x82);
+        expected.push(0x69);
+        expected.extend(b"https://x");
+        expected.push(0x58);
+        expected.push(0x20);
+        expected.extend([0xAAu8; 32]);
+
+        assert_eq!(
+            buf, expected,
+            "DisallowedProposalDuringBootstrap must be a byte-exact GOV tag-12 frame"
+        );
+    }
+
+    /// The whole point of #1026's wire half: this must NOT degrade to the
+    /// generic `ConwayMempoolFailure` (Ledger tag 7) fallback that #979/#1050
+    /// were about. Asserts the Ledger and GOV tags directly rather than merely
+    /// "some bytes were produced".
+    #[test]
+    fn disallowed_proposal_during_bootstrap_is_not_a_generic_mempool_failure() {
+        use dugite_primitives::hash::Hash32;
+        use dugite_primitives::transaction::{Anchor, GovAction, ProposalProcedure};
+        use dugite_primitives::value::Lovelace;
+
+        let proposal = ProposalProcedure {
+            deposit: Lovelace(42),
+            return_addr: std::iter::once(0xE1)
+                .chain(std::iter::repeat_n(0x22, 28))
+                .collect(),
+            gov_action: GovAction::InfoAction,
+            anchor: Anchor {
+                url: "u".to_string(),
+                data_hash: Hash32::from_bytes([0x01; 32]),
+            },
+        };
+        let err = TxValidationError::DisallowedProposalDuringBootstrap {
+            action_index: 3,
+            action_type: "NoConfidence".to_string(),
+            proposal: Box::new(proposal),
+        };
+
+        let mut buf = Vec::new();
+        let mut enc = Encoder::new(&mut buf);
+        encode_conway_ledger_pred_failure(&mut enc, &err);
+
+        assert_eq!(buf[0], 0x82, "must be array(2)[LedgerTag, inner]");
+        assert_eq!(
+            buf[1], 0x03,
+            "Ledger tag must be 3 (ConwayGovFailure), NOT 7 (ConwayMempoolFailure) — \
+             a typed GOV frame is the entire point of #1026's wire half"
+        );
+        assert_eq!(buf[2], 0x82, "inner must be array(2)[GovTag, payload]");
+        assert_eq!(buf[3], 0x0c, "GOV tag must be 12");
     }
 
     // ── Issue #915: `InvalidPrevGovActionId` (Ledger tag 3, GOV tag 8) ──

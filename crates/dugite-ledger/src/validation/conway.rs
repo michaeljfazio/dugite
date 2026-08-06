@@ -396,13 +396,12 @@ pub(super) fn check_pparam_update_well_formed(
 ///
 /// `hardforkConwayBootstrapPhase pv = pvMajor pv < 10` — fires at PV9 only.
 /// Callers gate on `protocol_version_major == 9` before invoking.
+///
+/// The action-type classification is shared with the proposal-side restriction
+/// via [`is_bootstrap_action`] — Haskell gates both on the identical
+/// `isBootstrapAction` predicate, so they must not be able to drift.
 pub(super) fn is_bootstrap_vote_disallowed(voter: &Voter, action: &GovAction) -> bool {
-    let is_bootstrap_action = matches!(
-        action,
-        GovAction::ParameterChange { .. }
-            | GovAction::HardForkInitiation { .. }
-            | GovAction::InfoAction
-    );
+    let is_bootstrap_action = is_bootstrap_action(action);
     match voter {
         // DRepVoter: only InfoAction is allowed during bootstrap.
         Voter::DRep(_) => !matches!(action, GovAction::InfoAction),
@@ -410,6 +409,63 @@ pub(super) fn is_bootstrap_vote_disallowed(voter: &Voter, action: &GovAction) ->
         // (ParameterChange / HardForkInitiation / InfoAction).
         Voter::ConstitutionalCommittee(_) | Voter::StakePool(_) => !is_bootstrap_action,
     }
+}
+
+/// Haskell `isBootstrapAction` — the governance-action types permitted during
+/// the Conway bootstrap phase (PV9).
+///
+/// ```haskell
+/// isBootstrapAction =
+///   \case
+///     ParameterChange {} -> True
+///     HardForkInitiation {} -> True
+///     InfoAction -> True
+///     _ -> False
+/// ```
+///
+/// Source: `eras/conway/impl/src/Cardano/Ledger/Conway/Rules/Gov.hs`
+/// (lines 633-639), pinned at `4849c13d6f70e5ab46add9af6e0ec5c537b61f69`.
+///
+/// Haskell gates BOTH bootstrap restrictions on this one predicate — votes via
+/// `checkBootstrapVotes` and proposal submission via `checkBootstrapProposal` —
+/// so dugite shares it rather than keeping two matching `matches!` arms that
+/// could drift (#1026).
+pub(super) fn is_bootstrap_action(action: &GovAction) -> bool {
+    matches!(
+        action,
+        GovAction::ParameterChange { .. }
+            | GovAction::HardForkInitiation { .. }
+            | GovAction::InfoAction
+    )
+}
+
+/// Returns `true` when a proposal may NOT be SUBMITTED during the Conway
+/// bootstrap phase.
+///
+/// Per Haskell `checkBootstrapProposal`, step 1 of the per-proposal fold in
+/// `conwayGovTransition`'s `processProposal`:
+///
+/// ```haskell
+/// checkBootstrapProposal pp proposal
+///   | hardforkConwayBootstrapPhase (pp ^. ppProtocolVersionL) =
+///       failureUnless (isBootstrapAction (pProcGovAction proposal)) $
+///         DisallowedProposalDuringBootstrap proposal
+///   | otherwise = pure ()
+/// ```
+///
+/// So at PV9 only `ParameterChange` / `HardForkInitiation` / `InfoAction` may be
+/// proposed; `NoConfidence`, `UpdateCommittee`, `NewConstitution` and
+/// `TreasuryWithdrawals` are rejected with `ConwayGovPredFailure` tag 12.
+///
+/// **Ordering is load-bearing**: `runTest $ checkBootstrapProposal pp proposal`
+/// is the FIRST test in `processProposal`, ahead of the `ProposalCantFollow`
+/// hard-fork check and `actionWellFormed`. Callers must run it before those, so
+/// a bootstrap-disallowed proposal reports tag 12 and not some later failure.
+///
+/// Callers gate on `protocol_version_major == 9` before invoking
+/// (`hardforkConwayBootstrapPhase pv = pvMajor pv == natVersion @9`).
+pub(super) fn is_bootstrap_proposal_disallowed(action: &GovAction) -> bool {
+    !is_bootstrap_action(action)
 }
 
 pub(super) fn is_voter_disallowed(voter: &Voter, action: &GovAction) -> bool {
@@ -3095,5 +3151,85 @@ mod tests {
             committee_update_invalid_expiries(&proposal, &ctx).is_empty(),
             "Predicate must skip (empty vec) when current_epoch is None"
         );
+    }
+
+    // ── #1026: PV9 bootstrap proposal-SUBMISSION restriction ──────────────
+    //
+    // Haskell `checkBootstrapProposal` (step 1 of `processProposal`) restricts
+    // PROPOSAL submission at PV9 to the same action set the VOTE side already
+    // restricted, via the identical `isBootstrapAction` predicate. dugite had
+    // only the vote side, i.e. accept-where-Haskell-rejects.
+
+    /// `isBootstrapAction` — allowed set is exactly ParameterChange /
+    /// HardForkInitiation / InfoAction.
+    #[test]
+    fn is_bootstrap_action_matches_haskell_allowed_set() {
+        assert!(is_bootstrap_action(&GovAction::InfoAction));
+        assert!(is_bootstrap_action(&GovAction::HardForkInitiation {
+            prev_action_id: None,
+            protocol_version: (10, 0),
+        }));
+
+        // Everything else is disallowed during bootstrap.
+        assert!(!is_bootstrap_action(&GovAction::NoConfidence {
+            prev_action_id: None
+        }));
+        assert!(!is_bootstrap_action(&GovAction::TreasuryWithdrawals {
+            withdrawals: std::collections::BTreeMap::new(),
+            policy_hash: None,
+        }));
+        assert!(!is_bootstrap_action(&GovAction::NewConstitution {
+            prev_action_id: None,
+            constitution: dugite_primitives::transaction::Constitution {
+                anchor: dugite_primitives::transaction::Anchor {
+                    url: "https://c".to_string(),
+                    data_hash: dugite_primitives::hash::Hash32::from_bytes([0x05; 32]),
+                },
+                script_hash: None,
+            },
+        }));
+    }
+
+    /// The proposal-side predicate is the exact negation, and — critically —
+    /// shares its classification with the vote side, so the two cannot drift.
+    /// Haskell gates both on one `isBootstrapAction`.
+    #[test]
+    fn bootstrap_proposal_and_vote_restrictions_share_one_classification() {
+        let disallowed = GovAction::TreasuryWithdrawals {
+            withdrawals: std::collections::BTreeMap::new(),
+            policy_hash: None,
+        };
+        let allowed = GovAction::InfoAction;
+
+        assert!(is_bootstrap_proposal_disallowed(&disallowed));
+        assert!(!is_bootstrap_proposal_disallowed(&allowed));
+
+        // Same action set drives the SPO/CC vote restriction: a non-bootstrap
+        // action is vote-disallowed for those voters too. If a future edit
+        // changed one side's set, this pairing fails.
+        let spo = Voter::StakePool(dugite_primitives::hash::Hash32::from_bytes([7u8; 32]));
+        assert_eq!(
+            is_bootstrap_proposal_disallowed(&disallowed),
+            is_bootstrap_vote_disallowed(&spo, &disallowed),
+            "proposal and SPO-vote restrictions must agree on a non-bootstrap action"
+        );
+        assert_eq!(
+            is_bootstrap_proposal_disallowed(&allowed),
+            is_bootstrap_vote_disallowed(&spo, &allowed),
+            "proposal and SPO-vote restrictions must agree on a bootstrap action"
+        );
+    }
+
+    /// A HardForkInitiation proposal must stay PROPOSABLE at PV9 — that is the
+    /// whole point of the bootstrap phase, and rejecting it would break the
+    /// PV9→PV10 hard fork itself. Guards against an over-broad fix.
+    #[test]
+    fn hardfork_initiation_stays_proposable_during_bootstrap() {
+        assert!(!is_bootstrap_proposal_disallowed(
+            &GovAction::HardForkInitiation {
+                prev_action_id: None,
+                protocol_version: (10, 0),
+            }
+        ));
     }
 }

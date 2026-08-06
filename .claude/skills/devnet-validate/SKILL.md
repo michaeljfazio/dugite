@@ -461,6 +461,51 @@ Two-forger + arbiter devnet. Case 1: ~30s firewall partition (port-pair pfctl/ip
 
 Actually enacts a HardForkInitiation PV 11.0 (DRep + SPO + CC votes; `ExperimentalHardForksEnabled` injected into the RENDERED cardano configs only). Runs 16e pre-HF (PV10 constructor `IncorrectDepositDELEG`) and post-HF (PV11 `DepositIncorrectDELEG` Mismatch form) — both inversion arms in one round; the futurePParams and ratify-state samplers run across the ratification + enactment boundaries (their first exercise over a REAL hard fork); both sockets must flip to PV11 in the SAME epoch; then a 01/08/16 zoo smoke at PV11 (18-plutus-edges deliberately excluded — 18f's constructor inverts at PV11). **Terminal**, and deliberately absent from the preset manifests: when it runs, read `hardfork-round.csv` directly.
 
+### Round 11 — Restart endurance (~20 min, needs a RUNNING devnet) — #1044
+
+```bash
+./restart-endurance-round.sh                       # 30 iterations
+RE_ITERATIONS=3 ./restart-endurance-round.sh       # shakedown
+```
+
+30 SIGTERM/restart cycles of **dugite-relay**, with per-iteration recovery
+assertions. Adapted from upstream `test_reconnect.py::test_metrics_reconnect`
+(200 upstream, adopted at 30 — at devnet scale the metric assertions saturate
+long before 200, which adds wall-time, not signal).
+
+The subject under test is **dugite-bp — the PEER of the restarted node.** Leak
+classes need repetition to surface and are invisible in the gate's single Round-3
+restart: fd-per-reconnect (#924 — dropping a tokio `JoinHandle` DETACHES, leaking
+the socket for the process lifetime), task-per-reconnect (#980's responder re-arm),
+and peer-registry growth. One cycle cannot distinguish "recovered" from
+"recovered while leaking a socket each time".
+
+Per iteration: SIGTERM (**never SIGKILL** — kill -9 corrupts the ImmutableDB;
+the chaos suite owns that scenario separately), confirm exit by POLLING rather
+than trusting `kill`'s exit status, restart with run.sh's flags, then require the
+relay's tip to be **advancing** (a socket that accepts a connection is not a node
+that rejoined the chain) and `dugite_peers_connected` to be readable and ≥ 1. A
+missing metric FAILS rather than defaulting — the #987 shape was a verdict column
+that was always 0.
+
+End of round: all 30 recovered; dugite-bp fd and thread counts flat within budget;
+no unexpected error-class lines in either log via `lib/expect-log-errors.sh` +
+the checked-in `restart-endurance-round.allowed-errors` (kept deliberately narrow
+— an allowlist matching `WARN` would swallow the very regressions this round
+exists to catch). **Not terminal**: it leaves the devnet running.
+
+RED cases, runnable rather than claimed:
+
+```bash
+RE_RED_CASE=down  ./restart-endurance-round.sh   # assert recovery, never restart
+RE_RED_CASE=peers ./restart-endurance-round.sh   # require peers_connected > 999
+```
+
+Both must FAIL the round; in RED mode the script inverts its exit status, so a
+RED case that *passes* is reported as the failure it is.
+
+Evidence: `restart-endurance.csv`; denominator `restart_endurance.expected_cases: 30`.
+
 ## Final report
 
 After all rounds complete, generate a machine-parseable + GitHub-release-ready report:

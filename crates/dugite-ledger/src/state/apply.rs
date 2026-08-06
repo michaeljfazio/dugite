@@ -903,7 +903,9 @@ impl LedgerState {
             std::sync::Arc<std::collections::HashSet<dugite_primitives::hash::Hash32>>,
             std::sync::Arc<std::collections::HashSet<dugite_primitives::hash::Hash32>>,
             imbl::HashMap<dugite_primitives::hash::Hash32, u64>,
-            Option<dugite_primitives::hash::Hash28>,
+            // #1028: doubly-optional guardrail — outer None = no constitution
+            // enacted; Some(None) = enacted with NO guardrail (SNothing).
+            Option<Option<dugite_primitives::hash::Hash28>>,
         ) = if mode == BlockValidationMode::ValidateAll {
             use std::collections::{HashMap, HashSet};
             use std::sync::Arc;
@@ -1041,12 +1043,18 @@ impl LedgerState {
                     .map(|(_, hot)| *hot)
                     .collect(),
             );
-            let constitution_script_hash = self
+            // #1028: doubly-optional. `None` = no constitution enacted (context
+            // unknown, check skipped); `Some(None)` = constitution enacted with
+            // NO guardrail script (Haskell `SNothing`), against which a proposal
+            // must also supply `SNothing`; `Some(Some(h))` = guardrail `h`.
+            // Flattening these two `None`s is what let a guardrail-less
+            // constitution accept any `policy_hash` at all.
+            let constitution_script_hash: Option<Option<dugite_primitives::hash::Hash28>> = self
                 .gov
                 .governance
                 .constitution
                 .as_ref()
-                .and_then(|c| c.script_hash);
+                .map(|c| c.script_hash);
 
             // Refresh the cache with the (possibly rebuilt) large registries and
             // their current source keys.  RHS reads only `&self` immutably and
@@ -1333,8 +1341,11 @@ impl LedgerState {
                     if let Some(net) = self.node_network {
                         ctx = ctx.with_network(net);
                     }
-                    if let Some(h) = block_constitution_script_hash {
-                        ctx = ctx.with_constitution_script_hash(h);
+                    // #1028: `Some(guardrail)` — where `guardrail` may itself be
+                    // `None` — means a constitution IS enacted and its guardrail
+                    // (present or absent) must be matched exactly.
+                    if let Some(guardrail) = block_constitution_script_hash {
+                        ctx = ctx.with_constitution_guardrail(guardrail);
                     }
                     if let Some(start) = ctx_start {
                         t_ctx_build += start.elapsed();

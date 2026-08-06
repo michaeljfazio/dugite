@@ -317,12 +317,34 @@ pub struct ValidationContext {
     ///
     /// Uses `imbl::HashMap` for the same O(1) clone reason as `reward_accounts`.
     pub stake_key_deposits: Option<ImblMap<Hash32, u64>>,
-    /// The constitution's guardrail script hash, if any.
+    /// The enacted constitution's guardrail script, as a **doubly**-optional
+    /// value. The nesting is load-bearing (#1028):
     ///
-    /// When `Some`, governance proposals of type `ParameterChange` or
-    /// `TreasuryWithdrawals` must carry a matching `policy_hash`.  When `None`,
-    /// the constitution policy-hash check is skipped.
-    pub constitution_script_hash: Option<Hash28>,
+    /// * `None` — the caller has not plumbed this context in. The guardrail
+    ///   check is SKIPPED, following the lenient-default convention the other
+    ///   GOV predicates in this module use for un-supplied context.
+    /// * `Some(None)` — the constitution is known and genuinely has **no**
+    ///   guardrail script (Haskell `SNothing`). A `ParameterChange` /
+    ///   `TreasuryWithdrawals` proposal must then supply `SNothing` too; any
+    ///   `SJust h` is REJECTED.
+    /// * `Some(Some(h))` — the guardrail is `h`; a proposal must supply exactly
+    ///   `SJust h`.
+    ///
+    /// A single `Option<Hash28>` conflated the first two, and dugite skipped the
+    /// whole check on `None` — so with a guardrail-less constitution a proposal
+    /// carrying ANY `policy_hash`, including garbage, was silently accepted
+    /// (accept-where-Haskell-rejects). Haskell compares the entire
+    /// `StrictMaybe ScriptHash`:
+    ///
+    /// ```haskell
+    /// checkGuardrailsScriptHash expectedHash actualHash =
+    ///   failureUnless (actualHash == expectedHash) $
+    ///     InvalidGuardrailsScriptHash actualHash expectedHash
+    /// ```
+    ///
+    /// `SNothing == SNothing` is required exactly as `SJust h == SJust h` is —
+    /// "the constitution has no guardrail" does NOT mean "anything goes".
+    pub constitution_script_hash: Option<Option<Hash28>>,
     /// DRep vote delegations — keys are stake credential hashes of accounts
     /// that have delegated to any DRep (including AlwaysAbstain / AlwaysNoConfidence).
     pub vote_delegations: Option<Arc<HashSet<Hash32>>>,
@@ -590,8 +612,26 @@ impl ValidationContext {
         self
     }
 
+    /// Declare the enacted constitution's guardrail, INCLUDING the case where it
+    /// has none.
+    ///
+    /// Call this whenever a constitution is enacted, passing its
+    /// `script_hash` verbatim — `None` here means "known to have no guardrail"
+    /// (`SNothing`), not "unknown". Leaving the context unset (never calling
+    /// this) is what means "unknown", and only that skips the check (#1028).
+    pub fn with_constitution_guardrail(mut self, guardrail: Option<Hash28>) -> Self {
+        self.constitution_script_hash = Some(guardrail);
+        self
+    }
+
+    /// Convenience for the common case of a constitution WITH a guardrail.
+    ///
+    /// Equivalent to `with_constitution_guardrail(Some(hash))`. Prefer
+    /// [`Self::with_constitution_guardrail`] at any site that derives the value
+    /// from a real constitution, so a guardrail-less one stays distinguishable
+    /// from missing context.
     pub fn with_constitution_script_hash(mut self, hash: Hash28) -> Self {
-        self.constitution_script_hash = Some(hash);
+        self.constitution_script_hash = Some(Some(hash));
         self
     }
 
@@ -1177,6 +1217,50 @@ pub enum ValidationError {
     #[error("DisallowedVotesDuringBootstrap: {violations:?}")]
     DisallowedVotesDuringBootstrap {
         violations: Vec<(Voter, GovActionId)>,
+    },
+    /// Conway bootstrap-phase (PV9) proposal-SUBMISSION restriction —
+    /// `ConwayGovPredFailure` tag 12.
+    ///
+    /// Per Haskell `checkBootstrapProposal`, step 1 of the per-proposal fold in
+    /// `conwayGovTransition`'s `processProposal`
+    /// (`eras/conway/impl/src/Cardano/Ledger/Conway/Rules/Gov.hs`, pinned at
+    /// `4849c13d6f70e5ab46add9af6e0ec5c537b61f69`):
+    ///
+    /// ```haskell
+    /// checkBootstrapProposal pp proposal
+    ///   | hardforkConwayBootstrapPhase (pp ^. ppProtocolVersionL) =
+    ///       failureUnless (isBootstrapAction (pProcGovAction proposal)) $
+    ///         DisallowedProposalDuringBootstrap proposal
+    ///   | otherwise = pure ()
+    /// ```
+    ///
+    /// Only `ParameterChange` / `HardForkInitiation` / `InfoAction` may be
+    /// proposed at PV9; `NoConfidence`, `UpdateCommittee`, `NewConstitution` and
+    /// `TreasuryWithdrawals` are rejected. dugite had the symmetric VOTE-side
+    /// restriction ([`Self::DisallowedVotesDuringBootstrap`]) but no
+    /// proposal-side one, i.e. accept-where-Haskell-rejects (#1026).
+    ///
+    /// Fires only when `pvMajor == 9`. Not reachable on mainnet/preprod/preview,
+    /// which are all past PV9 — but a fresh devnet or testnet bootstrapped at
+    /// PV9 reaches it, and historical replay through the PV9 window would too.
+    ///
+    /// Haskell's payload is the whole `ProposalProcedure`
+    /// (`DisallowedProposalDuringBootstrap (ProposalProcedure era)`), the same
+    /// one-field shape as [`Self::InvalidPrevGovActionId`]'s tag 8. `proposal`
+    /// carries it so the N2C encoder can emit a byte-exact tag-12 frame rather
+    /// than degrading to a generic `ConwayMempoolFailure` — the #979/#1050 class
+    /// this project keeps having to un-degrade. Boxed for the same reason tag 8
+    /// boxes it: `ProposalProcedure` boxes `ProtocolParamUpdate`, and an unboxed
+    /// copy would make this the largest `ValidationError` variant and bloat every
+    /// `Vec<ValidationError>` on the hot rejection path.
+    #[error(
+        "DisallowedProposalDuringBootstrap: proposal index {action_index} ({action_type}) may \
+         not be proposed during the Conway bootstrap phase (PV9)"
+    )]
+    DisallowedProposalDuringBootstrap {
+        action_index: u32,
+        action_type: &'static str,
+        proposal: Box<ProposalProcedure>,
     },
     /// Conway GOV rule: every TreasuryWithdrawals destination address
     /// must be a registered staking credential.
@@ -2112,25 +2196,52 @@ pub enum ValidationError {
         /// reports the whole set (#979).
         accounts: Vec<String>,
     },
-    /// Conway GOV rule: a `ParameterChange` or `TreasuryWithdrawals` proposal's
-    /// `policy_hash` does not match the constitution's guardrail script hash.
+    /// Conway GOV rule `InvalidGuardrailsScriptHash` (`ConwayGovPredFailure`
+    /// tag 11): a `ParameterChange` or `TreasuryWithdrawals` proposal's
+    /// `policy_hash` does not equal the enacted constitution's guardrail script.
     ///
-    /// When the constitution carries a guardrail script, every governed proposal
-    /// must include a `policy_hash` that equals the constitution's script hash.
-    /// A mismatch or omission prevents the guardrail from being executed during
-    /// Phase-2, bypassing the constitutionality check.
+    /// Haskell compares the WHOLE `StrictMaybe ScriptHash`:
     ///
-    /// Reference: Haskell `ConwayGovFailure` predicate —
-    /// `GovActionsDoNotExist` / policy-hash mismatch in the GOV rule.
+    /// ```haskell
+    /// checkGuardrailsScriptHash expectedHash actualHash =
+    ///   failureUnless (actualHash == expectedHash) $
+    ///     InvalidGuardrailsScriptHash actualHash expectedHash
+    /// ```
+    ///
+    /// called as `checkGuardrailsScriptHash constitutionPolicy proposalPolicy`.
+    /// All four combinations matter, and there is no escape hatch:
+    ///
+    /// | constitution | proposal   | verdict |
+    /// |---|---|---|
+    /// | `SJust h`  | `SJust h`  | ok |
+    /// | `SJust a`  | `SJust b`  | reject (mismatch) |
+    /// | `SJust e`  | `SNothing` | reject (omitted — bypasses the guardrail) |
+    /// | `SNothing` | `SJust a`  | reject (#1028 — dugite used to skip) |
+    ///
+    /// The last row is the point of #1028: "the constitution has no guardrail"
+    /// does NOT mean "anything goes". dugite gated the whole check on
+    /// `if let Some(hash) = constitution_script_hash`, so a guardrail-less
+    /// constitution accepted a proposal carrying any `policy_hash` at all.
+    /// See [`ValidationContext::constitution_script_hash`] for how the two
+    /// meanings of `None` are now kept apart.
+    ///
+    /// Renamed from `ConstitutionPolicyMismatch` to match Haskell's own
+    /// constructor name, and the payload is now typed `Option<Hash28>` on both
+    /// sides rather than hex strings with an empty-string sentinel for absence —
+    /// the wire variant in `dugite-network` was already
+    /// `InvalidGuardrailsScriptHash { got, expected }` with `StrictMaybe`
+    /// semantics, so this removes a stringly-typed conversion in between.
+    ///
+    /// Field order follows Haskell's constructor: ACTUAL (`got`) first.
     #[error(
-        "Governance proposal policy_hash mismatch: constitution requires {expected}, \
-         proposal has {actual} (ConstitutionPolicyMismatch)"
+        "InvalidGuardrailsScriptHash: constitution guardrail is {expected:?}, \
+         proposal policy_hash is {got:?}"
     )]
-    ConstitutionPolicyMismatch {
-        /// Hex-encoded expected constitution script hash.
-        expected: String,
-        /// Hex-encoded provided policy hash, or "None" if absent.
-        actual: String,
+    InvalidGuardrailsScriptHash {
+        /// The proposal's `policy_hash` (Haskell `actualHash`).
+        got: Option<Hash28>,
+        /// The enacted constitution's guardrail script (Haskell `expectedHash`).
+        expected: Option<Hash28>,
     },
     /// Pool metadata hash exceeds the 32-byte (Blake2b-256) cap.
     ///
@@ -3008,6 +3119,37 @@ pub fn validate_transaction_with_context(
     // -------------------------------------------------------------------
     if params.protocol_version_major >= 9 && !tx.body.proposal_procedures.is_empty() {
         // -------------------------------------------------------------------
+        // DisallowedProposalDuringBootstrap (ConwayGovPredFailure tag 12),
+        // PV9 only.
+        //
+        // MUST be first. Haskell's `processProposal` opens with
+        //
+        //     runTest $ checkBootstrapProposal pp proposal
+        //
+        // ahead of the `ProposalCantFollow` hard-fork check and
+        // `actionWellFormed`, so a bootstrap-disallowed proposal reports tag 12
+        // rather than some later predicate's failure. Placing it after
+        // ProposalCantFollow would still reject the tx but with the wrong reason
+        // for a `HardForkInitiation`-shaped payload.
+        //
+        // dugite already had the symmetric VOTE-side restriction
+        // (`DisallowedVotesDuringBootstrap`) and shares the identical
+        // `isBootstrapAction` classification with it via
+        // `conway::is_bootstrap_action` (#1026).
+        // -------------------------------------------------------------------
+        if params.protocol_version_major == 9 {
+            for (idx, proposal) in tx.body.proposal_procedures.iter().enumerate() {
+                if conway::is_bootstrap_proposal_disallowed(&proposal.gov_action) {
+                    extra_errors.push(ValidationError::DisallowedProposalDuringBootstrap {
+                        action_index: idx as u32,
+                        action_type: gov_action_type_name(&proposal.gov_action),
+                        proposal: Box::new(proposal.clone()),
+                    });
+                }
+            }
+        }
+
+        // -------------------------------------------------------------------
         // ProposalCantFollow: a HardForkInitiation proposal's target protocol
         // version must legally follow its resolved base version (Haskell
         // `badHardFork` / `pvCanFollow`, checked BEFORE `InvalidPrevGovActionId`
@@ -3468,7 +3610,7 @@ pub fn validate_transaction_with_pools(
     committee_members: Option<&HashSet<Hash32>>,
     committee_resigned: Option<&HashSet<Hash32>>,
     stake_key_deposits: Option<&ImblMap<Hash32, u64>>,
-    constitution_script_hash: Option<Hash28>,
+    constitution_script_hash: Option<Option<Hash28>>,
     vote_delegations: Option<&HashSet<Hash32>>,
 ) -> Result<(), Vec<ValidationError>> {
     trace!(
@@ -4317,29 +4459,33 @@ pub fn validate_transaction_with_pools(
     // script hash for governed governance actions.
     // ------------------------------------------------------------------
     if params.protocol_version_major >= 9 {
-        if let Some(required_hash) = constitution_script_hash {
-            for (idx, proposal) in tx.body.proposal_procedures.iter().enumerate() {
+        // #1028: the OUTER `Option` is "did the caller plumb this in?". Only
+        // that skips the check. `Some(None)` is a real, representable on-chain
+        // state — a constitution with no guardrail script — and Haskell still
+        // enforces equality there.
+        if let Some(expected_guardrail) = constitution_script_hash {
+            for proposal in tx.body.proposal_procedures.iter() {
                 let policy_hash = match &proposal.gov_action {
                     GovAction::ParameterChange { policy_hash, .. }
-                    | GovAction::TreasuryWithdrawals { policy_hash, .. } => policy_hash.as_ref(),
+                    | GovAction::TreasuryWithdrawals { policy_hash, .. } => *policy_hash,
                     _ => continue,
                 };
-                match policy_hash {
-                    Some(provided) if *provided == required_hash => {
-                        // Valid — policy hash matches constitution guardrail
-                    }
-                    Some(provided) => {
-                        errors.push(ValidationError::ConstitutionPolicyMismatch {
-                            expected: required_hash.to_hex(),
-                            actual: provided.to_hex(),
-                        });
-                    }
-                    None => {
-                        errors.push(ValidationError::ConstitutionPolicyMismatch {
-                            expected: required_hash.to_hex(),
-                            actual: format!("None (proposal index {idx})"),
-                        });
-                    }
+                // Whole-`StrictMaybe` comparison, matching
+                //   checkGuardrailsScriptHash expectedHash actualHash =
+                //     failureUnless (actualHash == expectedHash) $
+                //       InvalidGuardrailsScriptHash actualHash expectedHash
+                //
+                // so all four combinations are handled by one `!=`:
+                //   SJust h  vs SJust h  -> ok
+                //   SJust a  vs SJust b  -> reject (mismatch)
+                //   SNothing vs SJust e  -> reject (missing)
+                //   SJust a  vs SNothing -> reject  <-- the #1028 gap: dugite
+                //                                      used to skip entirely
+                if policy_hash != expected_guardrail {
+                    errors.push(ValidationError::InvalidGuardrailsScriptHash {
+                        got: policy_hash,
+                        expected: expected_guardrail,
+                    });
                 }
             }
         }

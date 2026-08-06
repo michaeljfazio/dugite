@@ -135,6 +135,116 @@ pub(crate) fn combine_nonce(a: Hash32, b: Hash32) -> Hash32 {
     }
 }
 
+/// Which epoch-boundary nonce formula an era uses.
+///
+/// **These are two different, independently hand-written Haskell functions, not
+/// a parameterised variant of one** (#1015):
+///
+/// * [`EpochNonceMode::TPraos`] — Shelley/Allegra/Mary/Alonzo. The TICKN rule
+///   (`Cardano.Protocol.TPraos.Rules.Tickn.tickTransition`) folds **three**
+///   terms:
+///   ```text
+///   ticknStateEpochNonce = ηc ⭒ ηh ⭒ extraEntropy
+///   ```
+/// * [`EpochNonceMode::Praos`] — Babbage/Conway/Dijkstra. `tickChainDepState`
+///   (`Ouroboros.Consensus.Protocol.Praos`) folds **two**, and `extraEntropy`
+///   does not exist for Praos at all:
+///   ```text
+///   praosStateEpochNonce = praosStateCandidateNonce st ⭒ praosStateLastEpochBlockNonce st
+///   ```
+///   Grepping `Praos.hs` for `extraEntropy` is zero hits; `PraosState` has no
+///   such field, and `tickChainDepState` takes no `TicknEnv`. Confirmed
+///   structurally in cardano-ledger: `hkdExtraEntropyL =
+///   notSupportedInThisEraL` for Babbage, Conway and Dijkstra — only
+///   `Alonzo/PParams.hs` carries the real field.
+///
+/// `HFEras.hs` binds the era set: `TPraos` for Shelley-Alonzo, `Praos` for
+/// Babbage+.
+///
+/// Why this matters even though it is dormant today: `extra_entropy` is only
+/// ever set from a legacy pre-Conway `ProtocolParamUpdate.extra_entropy`, and
+/// the one historical mainnet occurrence (epoch 259) was entirely inside the
+/// TPraos window, so on mainnet/preview/preprod the third term is
+/// `Hash32::ZERO` — the identity of `⭒` — by the time Babbage runs. But nonce
+/// evolution has **no self-correcting mechanism**: any chain that carried a
+/// non-neutral `extra_entropy` across the Alonzo→Babbage boundary without an
+/// intervening reset PPU would diverge from cardano-node forever, as a
+/// consensus split via the VRF leader schedule.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum EpochNonceMode {
+    /// Shelley through Alonzo: `candidate ⭒ prevHashNonce ⭒ extraEntropy`.
+    TPraos,
+    /// Babbage onward: `candidate ⭒ prevHashNonce` — no `extraEntropy` term.
+    Praos,
+}
+
+impl EpochNonceMode {
+    /// Select the formula from the era whose rules are executing.
+    ///
+    /// Derived from [`Era::uses_tpraos`] rather than plumbed through a
+    /// parameter, deliberately: the shared pre-Conway boundary function then has
+    /// exactly ONE code path and no caller can pass the wrong mode. This reuses
+    /// the same canonical era predicate #985 introduced to collapse the two
+    /// hand-written copies of the overlay-slot condition, and it mirrors
+    /// `HFEras.hs`, which binds `TPraos` to Shelley-Alonzo and `Praos` to
+    /// Babbage+ at the type level.
+    pub(crate) fn for_era(era: dugite_primitives::era::Era) -> Self {
+        if era.uses_tpraos() {
+            Self::TPraos
+        } else {
+            Self::Praos
+        }
+    }
+
+    /// Protocol-version fallback for the ONE call site that has no era in
+    /// scope: `LedgerState::process_epoch_transition`, the `#[doc(hidden)]`
+    /// test-only boundary helper whose own rustdoc says *"Production code MUST
+    /// go through `Self::apply_block`"*. That signature takes only an
+    /// `EpochNo`, so `ctx.era` does not exist there.
+    ///
+    /// PV → era: Shelley 2, Allegra 3, Mary 4, Alonzo 5-6, Babbage 7-8,
+    /// Conway 9+. So TPraos ⟺ `pv <= 6`.
+    ///
+    /// **Prefer [`Self::for_era`] everywhere it is available.** #985's lesson is
+    /// that an era decision keyed off ledger pparams can be fed a stale or
+    /// corrupt protocol version — that is precisely how a PV-6 chimera ran the
+    /// overlay classifier on a PV-11 Conway header. This variant is acceptable
+    /// only because the path is test-only and no block era is reachable from it;
+    /// it exists so the boundary FORMULA has a single implementation rather than
+    /// a third hand-written copy, which is the drift mechanism #977 and #985
+    /// both got caught by.
+    pub(crate) fn for_protocol_version_major(pv_major: u64) -> Self {
+        if pv_major <= 6 {
+            Self::TPraos
+        } else {
+            Self::Praos
+        }
+    }
+}
+
+/// Compute the epoch-boundary nonce for `mode`.
+///
+/// The single implementation of both formulas. Before #1015 there were three
+/// call sites with two behaviours and no shared code: `shelley.rs` folded three
+/// terms (correct for TPraos), `babbage.rs` reused that function wholesale and
+/// so folded three terms too (**wrong** — Babbage is Praos), and `conway.rs`
+/// hand-inlined a two-term fold that duplicated [`combine_nonce`]'s body. That
+/// is the recurring N-copies trap: one era's implementation had the right
+/// formula, a sibling sharing the same STS concept did not, because it reused
+/// the *other* era's code.
+pub(crate) fn compute_epoch_boundary_nonce(
+    mode: EpochNonceMode,
+    candidate_nonce: Hash32,
+    last_epoch_block_nonce: Hash32,
+    extra_entropy: Hash32,
+) -> Hash32 {
+    let two_term = combine_nonce(candidate_nonce, last_epoch_block_nonce);
+    match mode {
+        EpochNonceMode::TPraos => combine_nonce(two_term, extra_entropy),
+        EpochNonceMode::Praos => two_term,
+    }
+}
+
 // ============================================================================
 // 1. apply_utxo_changes
 // ============================================================================
@@ -2574,6 +2684,161 @@ mod tests {
             result.is_err(),
             "block ExUnits budget must count is_valid=false tx redeemers \
              (Haskell has no IsValid filter in Bbody.hs)"
+        );
+    }
+
+    // ── #1015: TPraos folds extraEntropy, Praos does NOT ──────────────────
+    //
+    // These are two independently hand-written Haskell functions:
+    //   TPraos  Tickn.tickTransition:   ηc ⭒ ηh ⭒ extraEntropy      (3 terms)
+    //   Praos   tickChainDepState:      candidate ⭒ lastEpochBlock  (2 terms)
+    // `Praos.hs` has zero occurrences of extraEntropy and `PraosState` has no
+    // such field; cardano-ledger sets `hkdExtraEntropyL = notSupportedInThisEraL`
+    // for Babbage, Conway and Dijkstra.
+    //
+    // Babbage was folding the third term because it reused Shelley's boundary
+    // function wholesale. With a non-neutral extra_entropy the two formulas give
+    // DIFFERENT nonces, and nonce evolution never self-corrects — so this was a
+    // latent consensus split via the VRF leader schedule.
+
+    /// The two modes must actually disagree when extra_entropy is non-neutral.
+    /// If they ever agree here, every other assertion in this area is vacuous.
+    #[test]
+    fn epoch_nonce_modes_differ_when_extra_entropy_is_non_neutral() {
+        let candidate = Hash32::from_bytes([1u8; 32]);
+        let prev_hash = Hash32::from_bytes([2u8; 32]);
+        let extra = Hash32::from_bytes([3u8; 32]);
+
+        let tpraos =
+            compute_epoch_boundary_nonce(EpochNonceMode::TPraos, candidate, prev_hash, extra);
+        let praos =
+            compute_epoch_boundary_nonce(EpochNonceMode::Praos, candidate, prev_hash, extra);
+
+        assert_ne!(
+            tpraos, praos,
+            "with a non-neutral extraEntropy the 3-term TPraos fold and the \
+             2-term Praos fold MUST differ — otherwise #1015 is untestable"
+        );
+        // Praos is exactly the two-term fold, extra_entropy ignored entirely.
+        assert_eq!(praos, combine_nonce(candidate, prev_hash));
+        // TPraos is that, then folded with extraEntropy.
+        assert_eq!(
+            tpraos,
+            combine_nonce(combine_nonce(candidate, prev_hash), extra)
+        );
+    }
+
+    /// Praos must ignore extra_entropy no matter what it holds.
+    #[test]
+    fn praos_epoch_nonce_ignores_extra_entropy() {
+        let candidate = Hash32::from_bytes([9u8; 32]);
+        let prev_hash = Hash32::from_bytes([8u8; 32]);
+        let expected = combine_nonce(candidate, prev_hash);
+
+        for byte in [0u8, 1, 42, 255] {
+            let extra = Hash32::from_bytes([byte; 32]);
+            assert_eq!(
+                compute_epoch_boundary_nonce(EpochNonceMode::Praos, candidate, prev_hash, extra),
+                expected,
+                "Praos must ignore extra_entropy (byte {byte})"
+            );
+        }
+    }
+
+    /// The era → mode mapping is the whole fix: Babbage must select Praos.
+    /// `HFEras.hs` binds TPraos to Shelley-Alonzo and Praos to Babbage+.
+    #[test]
+    fn epoch_nonce_mode_for_era_matches_hferas_binding() {
+        use dugite_primitives::era::Era;
+        for era in [Era::Shelley, Era::Allegra, Era::Mary, Era::Alonzo] {
+            assert_eq!(
+                EpochNonceMode::for_era(era),
+                EpochNonceMode::TPraos,
+                "{era:?} is a TPraos era and folds extraEntropy"
+            );
+        }
+        for era in [Era::Babbage, Era::Conway, Era::Dijkstra] {
+            assert_eq!(
+                EpochNonceMode::for_era(era),
+                EpochNonceMode::Praos,
+                "{era:?} is a Praos era and must NOT fold extraEntropy (#1015)"
+            );
+        }
+    }
+
+    /// Regression, stated as the bug: on a chain carrying a non-neutral
+    /// extra_entropy, the BABBAGE boundary nonce must equal the Praos 2-term
+    /// value — i.e. it must NOT equal what Shelley would produce from the same
+    /// inputs. This is the assertion that was false before #1015.
+    #[test]
+    fn babbage_epoch_nonce_is_praos_not_tpraos() {
+        use dugite_primitives::era::Era;
+        let candidate = Hash32::from_bytes([0xaau8; 32]);
+        let prev_hash = Hash32::from_bytes([0xbbu8; 32]);
+        let extra = Hash32::from_bytes([0xccu8; 32]);
+
+        let babbage = compute_epoch_boundary_nonce(
+            EpochNonceMode::for_era(Era::Babbage),
+            candidate,
+            prev_hash,
+            extra,
+        );
+        let shelley = compute_epoch_boundary_nonce(
+            EpochNonceMode::for_era(Era::Shelley),
+            candidate,
+            prev_hash,
+            extra,
+        );
+
+        assert_eq!(
+            babbage,
+            combine_nonce(candidate, prev_hash),
+            "Babbage boundary nonce must be the 2-term Praos fold"
+        );
+        assert_ne!(
+            babbage, shelley,
+            "Babbage must NOT reuse Shelley's 3-term TPraos fold (#1015)"
+        );
+    }
+
+    /// The PV fallback used by the test-only boundary path must agree with the
+    /// era mapping: Shelley 2, Allegra 3, Mary 4, Alonzo 5-6 are TPraos;
+    /// Babbage 7-8, Conway 9+ are Praos. PV 6/7 is the load-bearing boundary.
+    #[test]
+    fn epoch_nonce_mode_for_protocol_version_major_matches_era_mapping() {
+        for pv in [2u64, 3, 4, 5, 6] {
+            assert_eq!(
+                EpochNonceMode::for_protocol_version_major(pv),
+                EpochNonceMode::TPraos,
+                "PV {pv} is a TPraos era"
+            );
+        }
+        for pv in [7u64, 8, 9, 10, 11, 12] {
+            assert_eq!(
+                EpochNonceMode::for_protocol_version_major(pv),
+                EpochNonceMode::Praos,
+                "PV {pv} is a Praos era and must NOT fold extraEntropy (#1015)"
+            );
+        }
+    }
+
+    /// Neutral extra_entropy is the identity of ⭒, which is why this defect was
+    /// dormant on mainnet/preview/preprod: the two formulas coincide there.
+    /// Pinned so the dormancy argument is checked, not assumed.
+    #[test]
+    fn epoch_nonce_modes_coincide_when_extra_entropy_is_neutral() {
+        let candidate = Hash32::from_bytes([4u8; 32]);
+        let prev_hash = Hash32::from_bytes([5u8; 32]);
+        assert_eq!(
+            compute_epoch_boundary_nonce(
+                EpochNonceMode::TPraos,
+                candidate,
+                prev_hash,
+                Hash32::ZERO
+            ),
+            compute_epoch_boundary_nonce(EpochNonceMode::Praos, candidate, prev_hash, Hash32::ZERO),
+            "with NeutralNonce extraEntropy the formulas must agree — this is \
+             exactly why the Babbage bug was invisible on every live network"
         );
     }
 }

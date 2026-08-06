@@ -80,6 +80,25 @@ step() { echo; echo "########## $* ##########"; date -u +%H:%M:%SZ; }
 ok()   { printf '\033[0;32m[PASS]\033[0m %s\n' "$*"; }
 bad()  { printf '\033[0;31m[FAIL]\033[0m %s\n' "$*"; FAILURES=$((FAILURES + 1)); }
 note() { printf '\033[0;36m[NOTE]\033[0m %s\n' "$*"; }
+# INCONCLUSIVE = the predicate could not be evaluated, so its PASS would have
+# been vacuous. Counted as a failure on purpose (#953: a gate must hard-fail on
+# evidence that was never produced) but labelled distinctly so an operator can
+# tell "dugite-bp did the wrong thing" from "dugite-bp was never measured".
+inconc() { printf '\033[0;33m[INCONCLUSIVE]\033[0m %s\n' "$*"; FAILURES=$((FAILURES + 1)); }
+
+# Count dugite-bp leadership checks recorded after a log mark.
+#
+# #1055/#1057: "dugite-bp forged 0 blocks in the post-expiry window" is
+# trivially true for a forger that is not even RUNNING leadership checks — and
+# that is exactly what #1057 produced (the BP wedged on its own fork, its
+# catch-up gate silently skipping every slot before the KES gate could be
+# reached). Without this discriminator the KES round reported a clean PASS for a
+# node that had been dead for 20 minutes for an unrelated reason.
+dbp_leader_checks_since() {
+    local mark="$1"
+    awk -v m="$mark" 'NR > m && /TraceStartLeadershipCheck/ {c++} END{print c+0}' \
+        "$LD_LOGS/dugite-bp.log" 2>/dev/null
+}
 
 if [ "$SKIP_SETUP" -eq 0 ]; then
     step "setup + run (two-forger mode + short-KES genesis overlay)"
@@ -348,8 +367,29 @@ DBP_DELTA=$((DBP_AFTER - DBP_BEFORE))
 CBP_DELTA=$((CBP_AFTER - CBP_BEFORE))
 note "window deltas: dugite-bp=+$DBP_DELTA cardano-bp=+$CBP_DELTA"
 
+# LIVENESS GATE (#1055/#1057) — evaluate BEFORE reading the zero-forge result.
+#
+# A forger that never ran a leadership check in the window cannot tell us
+# anything about KES expiry. dugite's per-slot KES upper-bound gate lives at
+# step 5c of `try_forge_block_at`, i.e. AFTER the silent catch-up gate at the
+# top of that function — so a BP wedged behind its peers skips every slot
+# without reaching (or logging) the KES check at all. #1057 produced exactly
+# that, and this round's "forged 0 blocks" read as a KES pass for 20 minutes of
+# a completely dead node.
+DBP_CHECKS=$(dbp_leader_checks_since "$MARK_DBP")
+note "dugite-bp leadership checks in window: $DBP_CHECKS"
+if [ "$DBP_CHECKS" -eq 0 ]; then
+    inconc "dugite-bp ran 0 leadership checks in the ${OBS_WINDOW}s window — it was not forging for some reason OTHER than KES expiry (wedged, not caught up, or not a block producer). The zero-forge predicate below is vacuous; investigate dugite-bp.log before trusting this step (#1055/#1057)"
+else
+    ok "dugite-bp ran $DBP_CHECKS leadership check(s) in the window — it was live and attempting to forge, so the zero-forge predicate is meaningful"
+fi
+
 if [ "$DBP_DELTA" -eq 0 ]; then
-    ok "dugite-bp forged 0 new blocks in the ${OBS_WINDOW}s post-expiry window"
+    if [ "$DBP_CHECKS" -gt 0 ]; then
+        ok "dugite-bp forged 0 new blocks in the ${OBS_WINDOW}s post-expiry window (while actively running $DBP_CHECKS leadership checks)"
+    else
+        note "dugite-bp forged 0 new blocks — NOT counted as a pass, see the INCONCLUSIVE above"
+    fi
 else
     bad "dugite-bp forged $DBP_DELTA block(s) after its KES key should have expired at slot $KES_DEATH_SLOT"
 fi

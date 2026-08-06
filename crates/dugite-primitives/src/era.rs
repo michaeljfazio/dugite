@@ -116,6 +116,25 @@ impl Era {
         }
     }
 
+    /// Inverse of [`Era::to_era_index`]: resolve an HFC / N2C era index.
+    ///
+    /// Returns `None` for an index outside the known era set, so a client that
+    /// declares a nonexistent era can be reported as such instead of being
+    /// silently coerced to a real era (#1047).
+    pub fn from_era_index(index: u16) -> Option<Era> {
+        Some(match index {
+            0 => Era::Byron,
+            1 => Era::Shelley,
+            2 => Era::Allegra,
+            3 => Era::Mary,
+            4 => Era::Alonzo,
+            5 => Era::Babbage,
+            6 => Era::Conway,
+            7 => Era::Dijkstra,
+            _ => return None,
+        })
+    }
+
     /// Era index for the N2C protocol (hard-fork combinator era index)
     pub fn to_era_index(self) -> u32 {
         match self {
@@ -149,6 +168,32 @@ impl std::fmt::Display for Era {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #1047: the HFC era-index mapping must round-trip, and an unknown index
+    /// must be reported as unknown rather than coerced to a real era — a client
+    /// declaring era 99 should not be silently treated as Byron.
+    #[test]
+    fn era_index_round_trips_and_rejects_unknown() {
+        for era in [
+            Era::Byron,
+            Era::Shelley,
+            Era::Allegra,
+            Era::Mary,
+            Era::Alonzo,
+            Era::Babbage,
+            Era::Conway,
+            Era::Dijkstra,
+        ] {
+            let idx = era.to_era_index();
+            assert_eq!(
+                Era::from_era_index(idx as u16),
+                Some(era),
+                "{era:?} must round-trip through its HFC index {idx}"
+            );
+        }
+        assert_eq!(Era::from_era_index(8), None, "index 8 is not an era");
+        assert_eq!(Era::from_era_index(99), None, "index 99 is not an era");
+    }
 
     #[test]
     fn test_is_shelley_based() {

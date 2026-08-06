@@ -699,7 +699,10 @@ impl Node {
         // coincide mid-chain (pparams change only at boundaries, and
         // `setFreshDRepPulsingState` seals them there), so this matters only
         // before the first boundary — where upstream reports the
-        // genesis-translated params, without the injected defaultV2CostModel.
+        // genesis-translated params, i.e. WITHOUT the cost models
+        // `alonzoInjectCostModels` writes into `curPParams` from
+        // `agExtraConfig.aecCostModels` (#1046; formerly mis-described here as an
+        // injected `defaultV2CostModel`, a thing cardano-ledger does not have).
         let ratify_cur_protocol_params =
             match ls.gov.governance.ratify_plan().map(|r| &r.cur_pparams) {
                 Some(pp) => protocol_params_snapshot(pp),

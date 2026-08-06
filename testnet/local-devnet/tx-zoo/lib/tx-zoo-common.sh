@@ -168,6 +168,40 @@ zoo_largest_utxo() {
     echo "$line"
 }
 
+# Print the largest ADA-ONLY UTxO at $addr as "<txin> <lovelace>".
+#
+# #1048: `zoo_largest_utxo` ranks by lovelace alone, so on a wallet that has
+# accumulated multi-asset debris (any earlier mint script's output) it can return
+# a UTxO carrying tokens. A bare-ADA `build-raw --tx-out` then SILENTLY DROPS the
+# asset, and the tx is rejected with `ValueNotConservedUTxO` — a failure that
+# looks like a ledger bug and is really funder-wallet hygiene.
+#
+# `value` in the cardano-cli utxo JSON is a map whose only guaranteed key is
+# `lovelace`; any additional key is a policy id. So "ada-only" is exactly
+# `(.value.value | keys) == ["lovelace"]`.
+zoo_largest_ada_only_utxo() {
+    local addr="$1" sock="${2:-$ZOO_SOCKET}"
+    local tmp
+    tmp="$(mktemp)"
+    cardano-cli conway query utxo \
+        --testnet-magic "$LD_MAGIC" \
+        --socket-path   "$sock" \
+        --address       "$addr" \
+        --out-file      "$tmp"
+    local line
+    line=$(jq -r '
+        to_entries
+        | map(select((.value.value | keys) == ["lovelace"]))
+        | sort_by(-.value.value.lovelace)
+        | .[0] // empty
+        | "\(.key) \(.value.value.lovelace)"' "$tmp")
+    rm -f "$tmp"
+    if [ -z "$line" ] || [ "$line" = "null null" ]; then
+        return 1
+    fi
+    echo "$line"
+}
+
 # Print the Nth-largest UTxO (0-indexed) — useful when scripts share a wallet
 # and need disjoint inputs.
 zoo_utxo_at() {

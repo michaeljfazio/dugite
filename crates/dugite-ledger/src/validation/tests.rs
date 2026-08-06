@@ -13386,6 +13386,55 @@ mod tests {
         tx
     }
 
+    /// #1030 item 1: Phase-1 failures must ACCUMULATE, not short-circuit.
+    ///
+    /// Haskell's STS `?!` never short-circuits within a rule body, so every
+    /// applicable predicate failure reaches `MsgRejectTx`. dugite gated Rule 3
+    /// (ADA conservation) on `errors.is_empty()`, so an unrelated
+    /// `ProposalDepositIncorrect` raised immediately above it SUPPRESSED the
+    /// conservation failure — a client saw one cause where cardano-node reports
+    /// two. The verdict never diverged; the reported reason list was short.
+    ///
+    /// This drives a tx that violates BOTH at once and requires both to surface.
+    #[test]
+    fn phase1_failures_accumulate_proposal_deposit_and_value_conservation() {
+        let mut params = ProtocolParameters::mainnet_defaults();
+        params.protocol_version_major = 9;
+        let wrong_deposit = params.gov_action_deposit.0 - 1;
+
+        let mut utxo_set = UtxoSet::new();
+        // Correctly-balanced proposal tx with a WRONG proposal deposit...
+        let mut tx = make_proposal_tx(&mut utxo_set, wrong_deposit, &params);
+        // ...then break ADA conservation too, by inflating the output.
+        if let Some(out) = tx.body.outputs.first_mut() {
+            out.value.coin = Lovelace(out.value.coin.0 + 1_000_000);
+        }
+
+        let errors = validate_transaction_with_pools(
+            &tx, &utxo_set, &params, 100, 300, None, None, None, None, None, None, None, None,
+            None, None, None, None, None,
+        )
+        .expect_err("both predicates are violated, so the tx must be rejected");
+
+        let has_deposit = errors
+            .iter()
+            .any(|e| matches!(e, ValidationError::ProposalDepositIncorrect { .. }));
+        let has_conservation = errors
+            .iter()
+            .any(|e| matches!(e, ValidationError::ValueNotConserved { .. }));
+
+        assert!(
+            has_deposit,
+            "ProposalDepositIncorrect must be reported; got: {errors:?}"
+        );
+        assert!(
+            has_conservation,
+            "ValueNotConserved must ALSO be reported — an `errors.is_empty()` gate \
+             on Rule 3 suppressed it, shortening the failure list vs cardano-node \
+             (#1030 item 1); got: {errors:?}"
+        );
+    }
+
     #[test]
     fn test_proposal_incorrect_deposit_rejected() {
         // A proposal with a deposit that doesn't match gov_action_deposit must
@@ -14085,7 +14134,7 @@ mod tests {
     fn test_constitution_policy_hash_match_accepted() {
         // When the constitution has a guardrail script and the proposal provides
         // a matching policy_hash, validation should NOT produce a
-        // ConstitutionPolicyMismatch error.
+        // InvalidGuardrailsScriptHash error.
         let script_hash = Hash28::from_bytes([0xAB; 28]);
         let (utxo_set, _input, tx, params) = make_guardrail_proposal_tx(Some(script_hash));
 
@@ -14106,15 +14155,15 @@ mod tests {
             None,
             None,
             None,
-            Some(script_hash), // constitution_script_hash matches policy_hash
-            None,              // vote_delegations
+            Some(Some(script_hash)), // constitution guardrail matches policy_hash
+            None,                    // vote_delegations
         );
-        // Should not have ConstitutionPolicyMismatch (may have other errors
+        // Should not have InvalidGuardrailsScriptHash (may have other errors
         // like MissingWitness — that's fine, we only care about the policy check).
         if let Err(errors) = result {
             assert!(
-                !errors.iter().any(|e| matches!(e, ValidationError::ConstitutionPolicyMismatch { .. })),
-                "Should not have ConstitutionPolicyMismatch when policy_hash matches, got: {errors:?}"
+                !errors.iter().any(|e| matches!(e, ValidationError::InvalidGuardrailsScriptHash { .. })),
+                "Should not have InvalidGuardrailsScriptHash when policy_hash matches, got: {errors:?}"
             );
         }
     }
@@ -14123,7 +14172,7 @@ mod tests {
     fn test_constitution_policy_hash_mismatch_rejected() {
         // When the constitution has a guardrail script and the proposal provides
         // a DIFFERENT policy_hash, validation must produce a
-        // ConstitutionPolicyMismatch error.
+        // InvalidGuardrailsScriptHash error.
         let constitution_hash = Hash28::from_bytes([0xAB; 28]);
         let wrong_hash = Hash28::from_bytes([0xCD; 28]);
         let (utxo_set, _input, tx, params) = make_guardrail_proposal_tx(Some(wrong_hash));
@@ -14145,15 +14194,15 @@ mod tests {
             None,
             None,
             None,
-            Some(constitution_hash), // constitution expects 0xAB, proposal has 0xCD
-            None,                    // vote_delegations
+            Some(Some(constitution_hash)), // constitution expects 0xAB, proposal has 0xCD
+            None,                          // vote_delegations
         );
         let errors = result.expect_err("should reject mismatched policy_hash");
         assert!(
             errors
                 .iter()
-                .any(|e| matches!(e, ValidationError::ConstitutionPolicyMismatch { .. })),
-            "Should have ConstitutionPolicyMismatch, got: {errors:?}"
+                .any(|e| matches!(e, ValidationError::InvalidGuardrailsScriptHash { .. })),
+            "Should have InvalidGuardrailsScriptHash, got: {errors:?}"
         );
     }
 
@@ -14161,7 +14210,7 @@ mod tests {
     fn test_constitution_policy_hash_missing_rejected() {
         // When the constitution has a guardrail script but the proposal has
         // no policy_hash (None), validation must produce a
-        // ConstitutionPolicyMismatch error.
+        // InvalidGuardrailsScriptHash error.
         let constitution_hash = Hash28::from_bytes([0xAB; 28]);
         let (utxo_set, _input, tx, params) = make_guardrail_proposal_tx(None);
 
@@ -14182,22 +14231,167 @@ mod tests {
             None,
             None,
             None,
-            Some(constitution_hash), // constitution requires guardrail, proposal has None
-            None,                    // vote_delegations
+            Some(Some(constitution_hash)), // constitution requires guardrail, proposal has None
+            None,                          // vote_delegations
         );
         let errors = result.expect_err("should reject missing policy_hash");
         assert!(
             errors
                 .iter()
-                .any(|e| matches!(e, ValidationError::ConstitutionPolicyMismatch { .. })),
-            "Should have ConstitutionPolicyMismatch for missing policy_hash, got: {errors:?}"
+                .any(|e| matches!(e, ValidationError::InvalidGuardrailsScriptHash { .. })),
+            "Should have InvalidGuardrailsScriptHash for missing policy_hash, got: {errors:?}"
+        );
+    }
+
+    // ── #1028: SNothing-vs-not-plumbed, the full StrictMaybe matrix ────────
+    //
+    // Haskell:
+    //   checkGuardrailsScriptHash expectedHash actualHash =
+    //     failureUnless (actualHash == expectedHash) $
+    //       InvalidGuardrailsScriptHash actualHash expectedHash
+    //
+    // `SNothing == SNothing` is required exactly as `SJust h == SJust h` is.
+    // dugite gated the WHOLE check on `if let Some(hash) = ...`, so a
+    // guardrail-less constitution accepted a proposal carrying any policy_hash
+    // at all — accept-where-Haskell-rejects.
+
+    /// **The #1028 regression.** Constitution enacted with NO guardrail
+    /// (`Some(None)`), proposal supplies `SJust h` ⇒ MUST reject.
+    #[test]
+    fn guardrail_snothing_constitution_rejects_proposal_with_policy_hash() {
+        let provided = Hash28::from_bytes([0xCD; 28]);
+        let (utxo_set, _input, tx, params) = make_guardrail_proposal_tx(Some(provided));
+
+        let result = validate_transaction_with_pools(
+            &tx,
+            &utxo_set,
+            &params,
+            100,
+            300,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(None), // constitution ENACTED, guardrail SNothing
+            None,       // vote_delegations
+        );
+
+        let errors =
+            result.expect_err("a policy_hash against a guardrail-less constitution must reject");
+        let found = errors
+            .iter()
+            .find_map(|e| match e {
+                ValidationError::InvalidGuardrailsScriptHash { got, expected } => {
+                    Some((*got, *expected))
+                }
+                _ => None,
+            })
+            .unwrap_or_else(|| {
+                panic!(
+                    "InvalidGuardrailsScriptHash MUST fire when the constitution has NO \
+                     guardrail but the proposal supplies one (#1028); got: {errors:?}"
+                )
+            });
+        assert_eq!(
+            found.0,
+            Some(provided),
+            "`got` is the proposal's policy_hash"
+        );
+        assert_eq!(
+            found.1, None,
+            "`expected` is the constitution's SNothing guardrail"
+        );
+    }
+
+    /// Constitution enacted with NO guardrail and proposal ALSO supplies none
+    /// ⇒ must be accepted. `SNothing == SNothing`. Without this, a fix that
+    /// rejected everything on a guardrail-less constitution would pass the test
+    /// above.
+    #[test]
+    fn guardrail_snothing_constitution_accepts_proposal_without_policy_hash() {
+        let (utxo_set, _input, tx, params) = make_guardrail_proposal_tx(None);
+
+        let result = validate_transaction_with_pools(
+            &tx,
+            &utxo_set,
+            &params,
+            100,
+            300,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(None), // constitution ENACTED, guardrail SNothing
+            None,
+        );
+
+        if let Err(errors) = result {
+            assert!(
+                !errors
+                    .iter()
+                    .any(|e| matches!(e, ValidationError::InvalidGuardrailsScriptHash { .. })),
+                "SNothing constitution + SNothing proposal must NOT raise \
+                 InvalidGuardrailsScriptHash; got: {errors:?}"
+            );
+        }
+    }
+
+    /// The two meanings of `None` must behave DIFFERENTLY on identical input.
+    /// If they ever coincide, the doubly-optional type is pointless and #1028
+    /// has regressed — this is the test that makes the distinction observable.
+    #[test]
+    fn guardrail_not_plumbed_and_snothing_are_distinguishable() {
+        let provided = Hash28::from_bytes([0xCD; 28]);
+
+        let fires = |guardrail: Option<Option<Hash28>>| -> bool {
+            let (utxo_set, _input, tx, params) = make_guardrail_proposal_tx(Some(provided));
+            let result = validate_transaction_with_pools(
+                &tx, &utxo_set, &params, 100, 300, None, None, None, None, None, None, None, None,
+                None, None, None, guardrail, None,
+            );
+            match result {
+                Err(errors) => errors
+                    .iter()
+                    .any(|e| matches!(e, ValidationError::InvalidGuardrailsScriptHash { .. })),
+                Ok(_) => false,
+            }
+        };
+
+        assert!(
+            !fires(None),
+            "outer None = context not plumbed in ⇒ check SKIPPED (lenient default)"
+        );
+        assert!(
+            fires(Some(None)),
+            "Some(None) = constitution known to have NO guardrail ⇒ check ENFORCED (#1028)"
         );
     }
 
     #[test]
     fn test_no_constitution_no_policy_required() {
-        // When the constitution has no guardrail script (None), proposals with
-        // or without policy_hash should NOT trigger ConstitutionPolicyMismatch.
+        // #1028: this covers the OUTER `None` — the caller never plumbed the
+        // guardrail context in, so the check is skipped under this module's
+        // lenient-default convention for un-supplied context.
+        //
+        // It does NOT cover "the constitution exists and has no guardrail"
+        // (`Some(None)`); the original comment here said it did, which is
+        // exactly the conflation #1028 was about. That case is a real,
+        // representable on-chain state where Haskell still enforces equality,
+        // and it has its own tests below.
         let (utxo_set, _input, tx, params) =
             make_guardrail_proposal_tx(Some(Hash28::from_bytes([0xAB; 28])));
 
@@ -14206,13 +14400,13 @@ mod tests {
             None, None, None, None, // no constitution script hash
             None, // vote_delegations
         );
-        // Should not have ConstitutionPolicyMismatch.
+        // Should not have InvalidGuardrailsScriptHash.
         if let Err(errors) = result {
             assert!(
                 !errors
                     .iter()
-                    .any(|e| matches!(e, ValidationError::ConstitutionPolicyMismatch { .. })),
-                "Should not have ConstitutionPolicyMismatch when no constitution, got: {errors:?}"
+                    .any(|e| matches!(e, ValidationError::InvalidGuardrailsScriptHash { .. })),
+                "Should not have InvalidGuardrailsScriptHash when no constitution, got: {errors:?}"
             );
         }
     }
@@ -14247,15 +14441,15 @@ mod tests {
             None,
             None,
             None,
-            Some(constitution_hash),
+            Some(Some(constitution_hash)),
             None, // vote_delegations
         );
         let errors = result.expect_err("should reject mismatched TreasuryWithdrawals policy_hash");
         assert!(
             errors
                 .iter()
-                .any(|e| matches!(e, ValidationError::ConstitutionPolicyMismatch { .. })),
-            "Should have ConstitutionPolicyMismatch for TreasuryWithdrawals, got: {errors:?}"
+                .any(|e| matches!(e, ValidationError::InvalidGuardrailsScriptHash { .. })),
+            "Should have InvalidGuardrailsScriptHash for TreasuryWithdrawals, got: {errors:?}"
         );
     }
 
@@ -14322,7 +14516,7 @@ mod tests {
             None,
             None,
             None,
-            Some(script_hash),
+            Some(Some(script_hash)),
             None, // vote_delegations
         );
         // The redeemer at index 2 should NOT trigger RedeemerIndexOutOfRange
@@ -15864,6 +16058,175 @@ mod tests {
             .unwrap_or_else(|| panic!("ConflictingCommitteeUpdate not in error set: {errors:?}"));
         assert_eq!(conflicts.len(), 1);
         assert_eq!(conflicts[0], cred.to_typed_hash32().to_hex());
+    }
+
+    // -------------------------------------------------------------------------
+    // #1026: DisallowedProposalDuringBootstrap (ConwayGovPredFailure tag 12)
+    //
+    // These are the tests that prove the predicate is WIRED into the live
+    // `validate_transaction_with_context` path, not merely that a helper
+    // function returns the right boolean. #977's lesson: eight unit tests were
+    // green while the production path did nothing, because they all drove a
+    // `#[doc(hidden)]` helper instead of the real dispatch.
+    // -------------------------------------------------------------------------
+
+    /// Build a bootstrap-DISALLOWED proposal (TreasuryWithdrawals).
+    fn treasury_withdrawal_proposal_for_test() -> ProposalProcedure {
+        ProposalProcedure {
+            deposit: Lovelace(1_000_000),
+            return_addr: std::iter::once(0xE1)
+                .chain(std::iter::repeat_n(0x11, 28))
+                .collect(),
+            gov_action: dugite_primitives::transaction::GovAction::TreasuryWithdrawals {
+                withdrawals: BTreeMap::new(),
+                policy_hash: None,
+            },
+            anchor: dugite_primitives::transaction::Anchor {
+                url: "https://x".to_string(),
+                data_hash: Hash32::from_bytes([0xAA; 32]),
+            },
+        }
+    }
+
+    /// Build a bootstrap-ALLOWED proposal (InfoAction).
+    fn info_action_proposal_for_test() -> ProposalProcedure {
+        ProposalProcedure {
+            deposit: Lovelace(1_000_000),
+            return_addr: std::iter::once(0xE1)
+                .chain(std::iter::repeat_n(0x11, 28))
+                .collect(),
+            gov_action: dugite_primitives::transaction::GovAction::InfoAction,
+            anchor: dugite_primitives::transaction::Anchor {
+                url: "https://x".to_string(),
+                data_hash: Hash32::from_bytes([0xAA; 32]),
+            },
+        }
+    }
+
+    /// At PV9 a `TreasuryWithdrawals` proposal MUST be rejected with
+    /// `DisallowedProposalDuringBootstrap`. Before #1026 dugite accepted it —
+    /// accept-where-Haskell-rejects.
+    #[test]
+    fn treasury_withdrawal_proposal_rejected_during_bootstrap_pv9() {
+        let mut params = ProtocolParameters::mainnet_defaults();
+        params.protocol_version_major = 9;
+        let utxo_set = UtxoSet::new();
+
+        let tx = make_gov_tx(
+            vec![treasury_withdrawal_proposal_for_test()],
+            BTreeMap::new(),
+        );
+        let context =
+            ValidationContext::new().with_network(dugite_primitives::network::NetworkId::Mainnet);
+        let errors =
+            validate_transaction_with_context(&tx, &utxo_set, &params, 100, 500, None, context)
+                .expect_err("a TreasuryWithdrawals proposal must be rejected at PV9");
+
+        assert!(
+            errors
+                .iter()
+                .any(|e| matches!(e, ValidationError::DisallowedProposalDuringBootstrap { .. })),
+            "DisallowedProposalDuringBootstrap MUST fire at PV9 for TreasuryWithdrawals \
+             (#1026); got: {errors:?}"
+        );
+    }
+
+    /// The PV gate: at PV10 the same proposal must NOT raise this predicate.
+    /// `hardforkConwayBootstrapPhase pv = pvMajor pv == natVersion @9`, so an
+    /// over-broad fix that rejected TreasuryWithdrawals on live networks would
+    /// be a false-reject far worse than the gap it closed.
+    #[test]
+    fn treasury_withdrawal_proposal_allowed_post_bootstrap_pv10() {
+        let params = conway_pparams_pv10();
+        let utxo_set = UtxoSet::new();
+
+        let tx = make_gov_tx(
+            vec![treasury_withdrawal_proposal_for_test()],
+            BTreeMap::new(),
+        );
+        let context =
+            ValidationContext::new().with_network(dugite_primitives::network::NetworkId::Mainnet);
+        // The tx still fails (no inputs), so filter for THIS predicate only.
+        let errors =
+            validate_transaction_with_context(&tx, &utxo_set, &params, 100, 500, None, context)
+                .expect_err("tx has no inputs, so it fails for unrelated reasons");
+
+        assert!(
+            !errors
+                .iter()
+                .any(|e| matches!(e, ValidationError::DisallowedProposalDuringBootstrap { .. })),
+            "DisallowedProposalDuringBootstrap must NOT fire at PV10 — the bootstrap \
+             phase is PV9 only; got: {errors:?}"
+        );
+    }
+
+    /// An `InfoAction` proposal is bootstrap-ALLOWED and must not raise the
+    /// predicate even at PV9. Without this, a fix that rejected every proposal
+    /// during bootstrap would pass the test above.
+    #[test]
+    fn info_action_proposal_allowed_during_bootstrap_pv9() {
+        let mut params = ProtocolParameters::mainnet_defaults();
+        params.protocol_version_major = 9;
+        let utxo_set = UtxoSet::new();
+
+        let tx = make_gov_tx(vec![info_action_proposal_for_test()], BTreeMap::new());
+        let context =
+            ValidationContext::new().with_network(dugite_primitives::network::NetworkId::Mainnet);
+        let errors =
+            validate_transaction_with_context(&tx, &utxo_set, &params, 100, 500, None, context)
+                .expect_err("tx has no inputs, so it fails for unrelated reasons");
+
+        assert!(
+            !errors
+                .iter()
+                .any(|e| matches!(e, ValidationError::DisallowedProposalDuringBootstrap { .. })),
+            "InfoAction is a bootstrap action and must stay proposable at PV9; got: {errors:?}"
+        );
+    }
+
+    /// The payload must identify WHICH proposal failed, so a tx carrying several
+    /// proposals is diagnosable — and it must carry the whole
+    /// `ProposalProcedure`, which is what lets the N2C encoder emit a byte-exact
+    /// GOV tag-12 frame instead of a generic `ConwayMempoolFailure`.
+    #[test]
+    fn disallowed_proposal_during_bootstrap_payload_identifies_the_proposal() {
+        let mut params = ProtocolParameters::mainnet_defaults();
+        params.protocol_version_major = 9;
+        let utxo_set = UtxoSet::new();
+
+        // index 0 allowed, index 1 disallowed.
+        let tx = make_gov_tx(
+            vec![
+                info_action_proposal_for_test(),
+                treasury_withdrawal_proposal_for_test(),
+            ],
+            BTreeMap::new(),
+        );
+        let context =
+            ValidationContext::new().with_network(dugite_primitives::network::NetworkId::Mainnet);
+        let errors =
+            validate_transaction_with_context(&tx, &utxo_set, &params, 100, 500, None, context)
+                .expect_err("the disallowed proposal must reject the tx");
+
+        let found = errors
+            .iter()
+            .find_map(|e| match e {
+                ValidationError::DisallowedProposalDuringBootstrap {
+                    action_index,
+                    action_type,
+                    proposal,
+                } => Some((*action_index, *action_type, proposal.clone())),
+                _ => None,
+            })
+            .expect("DisallowedProposalDuringBootstrap must be present");
+
+        assert_eq!(found.0, 1, "must name the SECOND proposal, not the first");
+        assert_eq!(found.1, "TreasuryWithdrawals");
+        assert_eq!(
+            found.2.deposit,
+            Lovelace(1_000_000),
+            "payload must carry the whole ProposalProcedure for the tag-12 encoder"
+        );
     }
 
     /// At PV=9 (Conway bootstrap) the conflicting-update check is **still
