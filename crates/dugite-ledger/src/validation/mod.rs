@@ -1178,6 +1178,50 @@ pub enum ValidationError {
     DisallowedVotesDuringBootstrap {
         violations: Vec<(Voter, GovActionId)>,
     },
+    /// Conway bootstrap-phase (PV9) proposal-SUBMISSION restriction —
+    /// `ConwayGovPredFailure` tag 12.
+    ///
+    /// Per Haskell `checkBootstrapProposal`, step 1 of the per-proposal fold in
+    /// `conwayGovTransition`'s `processProposal`
+    /// (`eras/conway/impl/src/Cardano/Ledger/Conway/Rules/Gov.hs`, pinned at
+    /// `4849c13d6f70e5ab46add9af6e0ec5c537b61f69`):
+    ///
+    /// ```haskell
+    /// checkBootstrapProposal pp proposal
+    ///   | hardforkConwayBootstrapPhase (pp ^. ppProtocolVersionL) =
+    ///       failureUnless (isBootstrapAction (pProcGovAction proposal)) $
+    ///         DisallowedProposalDuringBootstrap proposal
+    ///   | otherwise = pure ()
+    /// ```
+    ///
+    /// Only `ParameterChange` / `HardForkInitiation` / `InfoAction` may be
+    /// proposed at PV9; `NoConfidence`, `UpdateCommittee`, `NewConstitution` and
+    /// `TreasuryWithdrawals` are rejected. dugite had the symmetric VOTE-side
+    /// restriction ([`Self::DisallowedVotesDuringBootstrap`]) but no
+    /// proposal-side one, i.e. accept-where-Haskell-rejects (#1026).
+    ///
+    /// Fires only when `pvMajor == 9`. Not reachable on mainnet/preprod/preview,
+    /// which are all past PV9 — but a fresh devnet or testnet bootstrapped at
+    /// PV9 reaches it, and historical replay through the PV9 window would too.
+    ///
+    /// Haskell's payload is the whole `ProposalProcedure`
+    /// (`DisallowedProposalDuringBootstrap (ProposalProcedure era)`), the same
+    /// one-field shape as [`Self::InvalidPrevGovActionId`]'s tag 8. `proposal`
+    /// carries it so the N2C encoder can emit a byte-exact tag-12 frame rather
+    /// than degrading to a generic `ConwayMempoolFailure` — the #979/#1050 class
+    /// this project keeps having to un-degrade. Boxed for the same reason tag 8
+    /// boxes it: `ProposalProcedure` boxes `ProtocolParamUpdate`, and an unboxed
+    /// copy would make this the largest `ValidationError` variant and bloat every
+    /// `Vec<ValidationError>` on the hot rejection path.
+    #[error(
+        "DisallowedProposalDuringBootstrap: proposal index {action_index} ({action_type}) may \
+         not be proposed during the Conway bootstrap phase (PV9)"
+    )]
+    DisallowedProposalDuringBootstrap {
+        action_index: u32,
+        action_type: &'static str,
+        proposal: Box<ProposalProcedure>,
+    },
     /// Conway GOV rule: every TreasuryWithdrawals destination address
     /// must be a registered staking credential.
     ///
@@ -3007,6 +3051,37 @@ pub fn validate_transaction_with_context(
     // a tx with no proposals).
     // -------------------------------------------------------------------
     if params.protocol_version_major >= 9 && !tx.body.proposal_procedures.is_empty() {
+        // -------------------------------------------------------------------
+        // DisallowedProposalDuringBootstrap (ConwayGovPredFailure tag 12),
+        // PV9 only.
+        //
+        // MUST be first. Haskell's `processProposal` opens with
+        //
+        //     runTest $ checkBootstrapProposal pp proposal
+        //
+        // ahead of the `ProposalCantFollow` hard-fork check and
+        // `actionWellFormed`, so a bootstrap-disallowed proposal reports tag 12
+        // rather than some later predicate's failure. Placing it after
+        // ProposalCantFollow would still reject the tx but with the wrong reason
+        // for a `HardForkInitiation`-shaped payload.
+        //
+        // dugite already had the symmetric VOTE-side restriction
+        // (`DisallowedVotesDuringBootstrap`) and shares the identical
+        // `isBootstrapAction` classification with it via
+        // `conway::is_bootstrap_action` (#1026).
+        // -------------------------------------------------------------------
+        if params.protocol_version_major == 9 {
+            for (idx, proposal) in tx.body.proposal_procedures.iter().enumerate() {
+                if conway::is_bootstrap_proposal_disallowed(&proposal.gov_action) {
+                    extra_errors.push(ValidationError::DisallowedProposalDuringBootstrap {
+                        action_index: idx as u32,
+                        action_type: gov_action_type_name(&proposal.gov_action),
+                        proposal: Box::new(proposal.clone()),
+                    });
+                }
+            }
+        }
+
         // -------------------------------------------------------------------
         // ProposalCantFollow: a HardForkInitiation proposal's target protocol
         // version must legally follow its resolved base version (Haskell
