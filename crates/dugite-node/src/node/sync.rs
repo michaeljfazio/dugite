@@ -2404,7 +2404,12 @@ impl Node {
     ///    files are laid out sequentially on disk.
     /// 2. **LSM replay** (fallback): Reads blocks by block number from the LSM tree.
     ///    Slower due to random I/O but works when chunk files aren't available.
-    pub async fn replay_ledger_from_storage(&mut self, shutdown_rx: watch::Receiver<bool>) {
+    ///
+    /// Returns `true` when replay pushed LedgerSeq deltas, meaning the caller must
+    /// NOT re-anchor afterwards — `reset_anchor` clears the volatile window, which
+    /// would throw away the rollback capability the delta replay exists to build
+    /// (#1057).
+    pub async fn replay_ledger_from_storage(&mut self, shutdown_rx: watch::Receiver<bool>) -> bool {
         // Migrate legacy immutable-replay/ to immutable/ (backwards compat)
         let legacy_dir = self.database_path.join("immutable-replay");
         let immutable_dir = self.database_path.join("immutable");
@@ -2475,7 +2480,7 @@ impl Node {
                      the database is stranded; re-import via `dugite-node mithril-import` (#768)."
                 );
             }
-            return; // Ledger is already caught up (or ahead — see warning above)
+            return false; // Ledger is already caught up (or ahead — see warning above)
         }
 
         let blocks_behind = db_tip.block_number.0.saturating_sub({
@@ -2498,7 +2503,7 @@ impl Node {
                 "Skipping ledger replay: gap exceeds DUGITE_REPLAY_LIMIT. \
                  Set DUGITE_REPLAY_LIMIT to a higher value or remove it to replay all blocks."
             );
-            return;
+            return false;
         }
 
         if blocks_behind > 100_000 {
@@ -2509,7 +2514,7 @@ impl Node {
             ledger_slot,
             db_tip_slot, blocks_behind, "Replaying ledger from ChainDB (LSM mode)",
         );
-        self.replay_from_lsm(db_tip, shutdown_rx).await;
+        self.replay_from_lsm(db_tip, shutdown_rx).await
     }
 
     /// Fast replay: read blocks sequentially from chunk files.
@@ -2762,11 +2767,13 @@ impl Node {
     /// flushed to ImmutableDB were invisible to the replay — resulting in
     /// "Block not found in ChainDB during replay block_no=NNNN" and 0 blocks
     /// applied, leaving the ledger stuck at the fork snapshot tip.
+    /// Returns `true` when it pushed LedgerSeq deltas — see
+    /// [`Self::replay_ledger_from_storage`].
     async fn replay_from_lsm(
         &mut self,
         db_tip: dugite_primitives::block::Tip,
         shutdown_rx: watch::Receiver<bool>,
-    ) {
+    ) -> bool {
         let start = std::time::Instant::now();
         let mut replayed = 0u64;
         let mut last_log = std::time::Instant::now();
@@ -2996,6 +3003,43 @@ impl Node {
             );
         }
 
+        // #1057 — REPLAY THE VOLATILE CHAIN AS DELTAS, NOT IN BULK.
+        //
+        // cardano-node's LedgerDB comes up anchored at the immutable tip with the
+        // volatile chain re-pushed as individually rollback-able states (V2.hs snapshots
+        // `anchorHandle`, then init `pruneToImmTipOnly`s and chain selection re-pushes).
+        // dugite's bulk replay moves `ledger_state` with no deltas at all, and the
+        // `reanchor_ledger_seq` that follows sets the anchor to the replayed TIP — so a
+        // restart came up unable to roll back anywhere, and a chain diverging at genesis
+        // stayed unreachable however long the peer's chain was.
+        //
+        // Scoped to "nothing has been flushed to the ImmutableDB", which is precisely
+        // the regime where the entire chain is inside k of genesis. Two consequences
+        // make this the whole fix rather than a special case of one:
+        //   * the block count is bounded by k, so pushing every delta is cheap and
+        //     needs no tail arithmetic or mid-loop mode switch;
+        //   * `Node::new` has already rejected any tip-snapshot in this regime (see
+        //     `snapshot_is_a_valid_anchor`), so the ledger starts AT GENESIS and the
+        //     anchor is already Origin — nothing needs re-anchoring first.
+        // Above k, the immutable tip exists, bulk replay is correct, and the anchor it
+        // lands on is the same one upstream would have.
+        let delta_replay = self
+            .chain_db
+            .read()
+            .await
+            .get_immutable_tip_point()
+            .is_none();
+        let mut pushed_deltas = false;
+        if delta_replay && start_slot < end_slot {
+            info!(
+                start_slot,
+                end_slot,
+                "ImmutableDB is empty, so the whole chain is within k of genesis: \
+                 replaying it through the LedgerSeq delta path to keep the anchor at \
+                 Origin and every block rollback-able, as cardano-node does."
+            );
+        }
+
         let mut current_slot = start_slot;
         // Point cursor: steps through same-slot Byron EBB/main pairs that a
         // slot-only walk skips.  Origin/unknown hashes fall back to the
@@ -3050,7 +3094,24 @@ impl Node {
                         Ok(block) => {
                             let mut ls = self.ledger_state.write().await;
                             let block_no = ls.tip.block_number.0 + 1;
-                            if let Err(e) = ls.apply_block(&block, BlockValidationMode::ApplyOnly) {
+                            // #1057: in the delta regime every replayed block must also
+                            // land in the LedgerSeq, so the anchor stays where it is
+                            // (Origin) and the chain remains rollback-able. Identical
+                            // validation mode either way — ApplyOnly — so this changes
+                            // what is RECORDED about the replay, never its result.
+                            let mut delta_opt = None;
+                            if delta_replay {
+                                match ls
+                                    .apply_block_with_delta(&block, BlockValidationMode::ApplyOnly)
+                                {
+                                    Ok(delta) => delta_opt = Some(delta),
+                                    Err(e) => {
+                                        warn!(slot = next_slot.0, "Replay ledger apply failed: {e}")
+                                    }
+                                }
+                            } else if let Err(e) =
+                                ls.apply_block(&block, BlockValidationMode::ApplyOnly)
+                            {
                                 warn!(slot = next_slot.0, "Replay ledger apply failed: {e}");
                             }
                             replayed += 1;
@@ -3089,6 +3150,15 @@ impl Node {
                             // during replay. The existing post-loop
                             // save (below) produces a single snapshot
                             // once replay completes.
+
+                            // Lock order per `Node`'s own docs: ledger_state is
+                            // released BEFORE ledger_seq is taken.
+                            drop(ls);
+                            if let Some(delta) = delta_opt {
+                                let mut seq = self.ledger_seq.write().await;
+                                seq.push(delta);
+                                pushed_deltas = true;
+                            }
                         }
                         Err(e) => {
                             warn!(
@@ -3179,6 +3249,8 @@ impl Node {
             // called from a future code path that doesn't do the handover step.
             self.publish_ledger_view(&ls);
         }
+
+        pushed_deltas
     }
 }
 

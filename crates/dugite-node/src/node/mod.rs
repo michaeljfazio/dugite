@@ -21,7 +21,6 @@
 pub(crate) mod connection_lifecycle;
 pub(crate) mod epoch;
 // #1057: the on-disk marker that makes a restart recover a genesis-divergent node.
-pub(crate) mod genesis_divergence;
 pub(crate) mod ledger_view;
 pub(crate) mod n2c_query;
 pub(crate) mod networking;
@@ -1070,6 +1069,27 @@ impl Node {
     /// loading an empty or structurally-incompatible UTxO set. A missing
     /// sidecar (pre-meta snapshots, e.g. an existing `db-mainnet`) is handled
     /// by backend inference and loads normally.
+    /// Whether an on-disk ledger snapshot can serve as the startup LedgerSeq anchor.
+    ///
+    /// dugite writes `ledger-snapshot.bin` from the LIVE ledger tip, whereas
+    /// cardano-node snapshots the LedgerDB *anchor* and re-pushes the volatile chain
+    /// on init. The two coincide whenever the snapshot sits at or below the immutable
+    /// tip, and diverge exactly when it describes a still-volatile block.
+    ///
+    /// With an EMPTY ImmutableDB every block is volatile, so any non-genesis snapshot
+    /// is a tip snapshot. Anchoring there strands the node: `find_rollback_n` can
+    /// reach nothing below the anchor, so a chain that diverges at genesis is
+    /// unreachable however long the peer's chain is. Genesis is the only anchor that
+    /// is correct in that regime, and it is what upstream would have (#1057).
+    ///
+    /// Kept as a free-standing predicate so both bounds are unit-testable without a
+    /// ChainDB, a snapshot file, or a running node.
+    fn snapshot_is_a_valid_anchor(immutable_db_is_empty: bool, snapshot_slot: u64) -> bool {
+        // A genesis-slot snapshot IS the genesis anchor, so it is always fine; the
+        // non-empty case keeps dugite's existing behaviour untouched.
+        !immutable_db_is_empty || snapshot_slot == 0
+    }
+
     fn load_snapshot_with_backend_guard(
         snapshot_path: &std::path::Path,
         database_path: &std::path::Path,
@@ -1165,66 +1185,20 @@ impl Node {
         // Uses default epoch parameters (epoch 0, length 432000) since era_history
         // isn't built yet. The active chunk gets correctly named at the first
         // finalize_chunk() call during epoch transitions, which passes real epoch info.
-        let mut opened_chain_db = ChainDB::open_with_config(
+        let opened_chain_db = ChainDB::open_with_config(
             &args.database_path,
             &args.storage_config.immutable,
             security_param_k,
         )?;
 
-        // #1057: act on the genesis-divergence marker HERE, while the ChainDB is
-        // still unshared.
+        // Captured before the `Arc<RwLock<_>>` wrap below, because the ledger-snapshot
+        // decision further down needs it and cannot `blocking_read()` a tokio lock
+        // from inside the runtime.
         //
-        // The marker means a previous run established that this node cannot rejoin
-        // the network because its chain diverges at GENESIS: BlockFetch declines
-        // every range rooted at genesis, so the ledger never advances and peers
-        // churn forever. Restarting alone does NOT recover — measured on a
-        // two-forger devnet, `run()`'s replay re-applies the node's own fork within
-        // twelve seconds and it still did not adopt the peer's chain. The dead-end
-        // chain has to go, not just the ledger derived from it.
-        //
-        // Doing it at startup means the whole reset rides the ALREADY-VALIDATED
-        // from-genesis path: a fresh `init_fresh_ledger` plus the LSM
-        // `wipe_utxo_store_before_replay` whose own comment records that a stale
-        // store roughly doubles `sumCoinUTxO` at the Byron→Shelley boundary and
-        // underflows the first MIR debit. No live in-place ledger re-initialisation
-        // — that is what #989 deleted `reset_to_origin` over.
-        //
-        // Placed before the `Arc<RwLock<_>>` wrap deliberately: `Node::new` is not
-        // async, and `blocking_read()` on a tokio lock from inside a runtime panics.
-        // Owning the value outright is simpler than making the constructor async and
-        // is safe precisely because nothing else can hold it yet.
-        //
-        // Both bounds live in `genesis_divergence::decide` and are unit-tested: a
-        // node with anything flushed to the ImmutableDB is REFUSED (a rollback past
-        // the immutable tip is protocol-impossible under k-finality), and repeated
-        // resets are refused as the configuration error they almost certainly are.
-        let genesis_reset = {
-            let decision = genesis_divergence::decide(
-                genesis_divergence::read_attempts(&args.database_path),
-                opened_chain_db.get_immutable_tip_point().is_none(),
-            );
-            genesis_divergence::log_decision(decision, &args.database_path);
-            match decision {
-                genesis_divergence::ResetDecision::Reset { .. } => true,
-                genesis_divergence::ResetDecision::None => false,
-                genesis_divergence::ResetDecision::Refused(_) => {
-                    // Cleared so a stale marker does not make every future start
-                    // suspicious. If the wedge is still real the node re-detects it
-                    // and writes a fresh marker, which is the honest outcome.
-                    genesis_divergence::clear(&args.database_path);
-                    false
-                }
-            }
-        };
-        if genesis_reset {
-            // Discard the dead-end chain. `clear_volatile` truncates the WAL too, so
-            // the fork does not come back on the next start, and startup replay then
-            // has nothing to re-apply — which is what leaves the ledger at Origin.
-            let cleared = opened_chain_db.volatile_block_count();
-            opened_chain_db.clear_volatile();
-            genesis_divergence::log_reset_performed(cleared);
-            genesis_divergence::clear(&args.database_path);
-        }
+        // "Nothing has been flushed to the ImmutableDB" is the regime in which the
+        // WHOLE chain is still within k of genesis, so genesis is the only correct
+        // LedgerSeq anchor. See `snapshot_is_a_valid_anchor`.
+        let immutable_db_is_empty = opened_chain_db.get_immutable_tip_point().is_none();
 
         let chain_db = Arc::new(RwLock::new(opened_chain_db));
 
@@ -1498,15 +1472,45 @@ impl Node {
         // is honoured in the LSM block further down.
         let mut wipe_utxo_store_before_replay = false;
 
-        // #1057: the reset itself already happened at ChainDB open (above). Here it
-        // only has to force the ledger side: any snapshot describes the chain that
-        // was just discarded, and the on-disk UTxO store must be rebuilt.
-        if genesis_reset {
+        let snapshot_usable = if snapshot_path.exists()
+            && !Self::snapshot_is_a_valid_anchor(
+                immutable_db_is_empty,
+                Self::peek_snapshot_slot(&snapshot_path).unwrap_or(0),
+            ) {
+            // #1057 — THE RESTART HALF, and it is a snapshot-policy bug.
+            //
+            // cardano-node snapshots the LedgerDB's ANCHOR, not its tip
+            // (`LedgerDB/V2.hs`):
+            //
+            //     let pruneStrat = LedgerDbPruneBeforeSlot (slot + 1)
+            //     (slot,) <$> (duplicateStateRef $ anchorHandle $ snd $ prune pruneStrat lseq)
+            //
+            // and on init it `pruneToImmTipOnly`s, so the LedgerDB comes up anchored
+            // at the immutable tip with the volatile chain re-pushed as individually
+            // rollback-able states. With nothing flushed, that anchor IS genesis —
+            // which is exactly why upstream can still adopt a genesis-rooted chain
+            // after a restart, and why `Paths.hs::isReachable`'s `anchorIsGenesis`
+            // case is reachable there at all.
+            //
+            // dugite snapshots the LIVE TIP. Loading such a snapshot re-anchors the
+            // LedgerSeq at the tip with zero deltas, so the node comes up unable to
+            // roll back ANYWHERE — the wedge survives the restart, which is the
+            // observation that produced the marker mechanism.
+            //
+            // Rejecting it is cheap and always correct in this regime: with nothing
+            // immutable the chain is under k blocks, so replay from genesis costs
+            // under k applies. The blocks themselves are NOT discarded — they stay in
+            // the VolatileDB and are re-pushed as deltas, so chain selection decides
+            // on the merits instead of an operator deleting a chain by hand.
             wipe_utxo_store_before_replay = true;
-        }
-
-        let snapshot_usable = if genesis_reset {
-            // Any snapshot describes the chain we just discarded.
+            info!(
+                snapshot_slot = Self::peek_snapshot_slot(&snapshot_path).unwrap_or(0),
+                "Ledger snapshot describes a volatile tip while the ImmutableDB is empty, \
+                 so it is not a valid LedgerSeq anchor — replaying from genesis instead. \
+                 cardano-node snapshots the anchor, not the tip; keeping the anchor at \
+                 genesis is what lets a node under k blocks deep still adopt a \
+                 genesis-rooted chain."
+            );
             false
         } else if snapshot_path.exists()
             && matches!(
@@ -3202,7 +3206,7 @@ impl Node {
         // This happens after a Mithril snapshot import — blocks are in storage
         // but the ledger hasn't processed them yet.
         let replay_start = std::time::Instant::now();
-        self.replay_ledger_from_storage(shutdown_rx.clone()).await;
+        let replay_pushed_deltas = self.replay_ledger_from_storage(shutdown_rx.clone()).await;
         self.metrics
             .set_replay_duration_secs(replay_start.elapsed().as_secs());
 
@@ -3221,10 +3225,34 @@ impl Node {
         // TPraos overlay classifier over a canonical Conway block, rejected
         // it, and poisoned chain selection permanently.
         //
-        // Unconditional rather than gated on "did replay do anything": the
-        // no-op case is a cheap `clone_without_utxos` of a state we already
-        // hold, and a gate is one more thing that can be wrong.
-        self.reanchor_ledger_seq("startup replay complete").await;
+        // Gated on ONE thing only (#1057): whether replay itself already built the
+        // volatile window. `reset_anchor` CLEARS that window, so re-anchoring after a
+        // delta replay would discard exactly the rollback capability the delta replay
+        // exists to create — the anchor would land back on the replayed tip and the
+        // node would come up unable to roll back anywhere, which is the restart half of
+        // #1057. In every other case this stays unconditional, for the reason above:
+        // the no-op is a cheap `clone_without_utxos` of a state we already hold.
+        if replay_pushed_deltas {
+            let (anchor, depth) = {
+                let seq = self.ledger_seq.read().await;
+                (format!("{:?}", seq.anchor_point()), seq.len())
+            };
+            info!(
+                anchor,
+                volatile_depth = depth,
+                "Startup replay populated the LedgerSeq directly; keeping its anchor \
+                 rather than re-anchoring on the replayed tip."
+            );
+            // PUBLISH EXPLICITLY. `set_ledger_can_reach_origin` is otherwise only ever
+            // called from `reanchor_ledger_seq`, which this branch deliberately skips —
+            // so without this the flag keeps its initial `false` and BlockFetch declines
+            // every genesis-rooted range even though the ledger CAN now roll back to
+            // Origin. The whole restart path would be dead while looking implemented,
+            // which is the shape of a gate reading a value nobody sets.
+            self.publish_ledger_can_reach_origin().await;
+        } else {
+            self.reanchor_ledger_seq("startup replay complete").await;
+        }
 
         if *shutdown_rx.borrow() {
             info!("Shutdown requested during replay, exiting");
@@ -10781,6 +10809,48 @@ mod tests {
     use dugite_primitives::era::Era;
     use dugite_primitives::hash::Hash32;
     use dugite_primitives::time::{BlockNo, SlotNo};
+
+    /// #1057 — a tip-snapshot is not a valid LedgerSeq anchor when nothing has been
+    /// flushed to the ImmutableDB.
+    ///
+    /// The case that matters is the THIRD one. Accepting a volatile-tip snapshot
+    /// anchors the LedgerSeq at that tip with an empty volatile window, so
+    /// `find_rollback_n` can reach nothing below it and a chain diverging at genesis
+    /// stays unreachable no matter how much longer it is — the node comes up wedged
+    /// and stays wedged. cardano-node cannot land in that state because it snapshots
+    /// the LedgerDB *anchor*, so with nothing immutable its snapshot IS genesis.
+    #[test]
+    fn tip_snapshot_is_not_a_valid_anchor_when_immutable_db_is_empty() {
+        use super::Node;
+
+        // Anything flushed ⇒ dugite's existing behaviour is untouched, at any slot.
+        assert!(
+            Node::snapshot_is_a_valid_anchor(false, 0),
+            "a non-empty ImmutableDB must keep accepting snapshots"
+        );
+        assert!(
+            Node::snapshot_is_a_valid_anchor(false, 119_084_816),
+            "a non-empty ImmutableDB must keep accepting a deep snapshot"
+        );
+
+        // Nothing flushed + a genesis-slot snapshot: that snapshot IS the genesis
+        // anchor, so it is accepted and no replay is forced.
+        assert!(
+            Node::snapshot_is_a_valid_anchor(true, 0),
+            "a genesis snapshot is the genesis anchor and must be accepted"
+        );
+
+        // Nothing flushed + a non-genesis snapshot: it describes a still-volatile
+        // block, i.e. a tip snapshot. REJECT.
+        assert!(
+            !Node::snapshot_is_a_valid_anchor(true, 1),
+            "with an empty ImmutableDB even a slot-1 snapshot is a volatile tip"
+        );
+        assert!(
+            !Node::snapshot_is_a_valid_anchor(true, 80),
+            "the devnet reproduction: 6 blocks, nothing flushed, snapshot at slot 80"
+        );
+    }
 
     /// #768 apply-stall predicate matrix.
     #[test]
