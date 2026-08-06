@@ -2936,19 +2936,54 @@ impl Node {
         // `send` returns Err only when there are zero receivers — that's
         // fine, we don't care if no one is listening yet.
         let _ = self.ledger_tip_slot_tx.send(new_tip_slot);
-        // #1057 half A: chain selection lives in `dugite-storage`, which sits below
-        // the ledger and cannot read it, but `switch_chain`'s genesis-anchor arm
-        // must only fire when the ledger can execute the plan. Published from the
-        // ONE place that already fans out every ledger-tip change, so a new call
+        // #1057: chain selection lives in `dugite-storage`, which sits below the
+        // ledger and cannot read it, but `switch_chain`'s genesis-anchor arm must
+        // only fire when the ledger can EXECUTE the resulting plan. Published from
+        // the ONE place that already fans out every ledger-tip change, so a new call
         // site cannot forget it.
         //
-        // The comparison is against `Point::Origin` and NOT `slot == 0`: genesis is
-        // slot-less, a real block can sit at slot 0, and an Origin test that is
-        // merely "slot is zero" is how a genesis sentinel gets confused with a
-        // block (see the `h(0) == Hash32::ZERO` test that pinned this very bug).
-        if let Some(ref cs) = self.chain_sel_handle {
-            cs.set_ledger_at_origin(ls.tip.point == Point::Origin);
-        }
+        // NOTE the genesis-anchor gate is NOT published here. It depends on the
+        // LedgerSeq ANCHOR, not on the ledger tip, and the anchor changes in exactly
+        // two places — `reanchor_ledger_seq` and `advance_anchor`. Publishing where
+        // the value actually changes is both cheaper and harder to get wrong than
+        // recomputing it on every tip change (and this fn is sync, so it could not
+        // take the seq lock anyway). See `publish_ledger_can_reach_origin`.
+    }
+
+    /// #1057: publish whether a rollback to Origin is currently EXECUTABLE.
+    ///
+    /// This is the gate on `VolatileDB::switch_chain`'s genesis-anchor arm and on
+    /// BlockFetch's genesis clause. It is deliberately NOT "the ledger tip is
+    /// Origin" — that version was implemented and measured too narrow, because
+    /// holding ANY chain disqualifies a longer genesis-divergent one. On the devnet
+    /// a node that had just recovered re-adopted a stale 10-block chain from its
+    /// sibling and was wedged again against the canonical 155-block chain thirty
+    /// seconds later.
+    ///
+    /// The executable condition is that `LedgerSeq::find_rollback_n(Origin)` will
+    /// succeed, which is its `target == anchor` full-rewind case:
+    ///
+    /// * the seq's anchor point IS Origin — true for any node that started from
+    ///   genesis and has not yet advanced its anchor past it; false for a
+    ///   snapshot-restored ledger, which is exactly why the earlier attempt hit
+    ///   "Rollback target outside LedgerSeq volatile window AND no canonical
+    ///   snapshot available";
+    /// * the window is coherent (#985) — an incoherent window makes
+    ///   `find_rollback_n` decline for every target, and reconstructing from it
+    ///   would produce a chimera.
+    ///
+    /// Nothing is inferred about the ledger TIP here: a node 10 blocks in with an
+    /// Origin anchor can roll all 10 back, which is precisely the case that has to
+    /// work.
+    pub(crate) async fn publish_ledger_can_reach_origin(&self) {
+        let Some(ref cs) = self.chain_sel_handle else {
+            return;
+        };
+        // Lock order: ledger_state before ledger_seq (per Node docs). The caller
+        // may already hold the ledger_state read guard, so only the seq is taken.
+        let seq = self.ledger_seq.read().await;
+        let can = *seq.anchor_point() == Point::Origin && !seq.is_incoherent();
+        cs.set_ledger_can_reach_origin(can);
     }
 
     /// Convenience: re-publish the view by taking the read lock and
@@ -2978,20 +3013,6 @@ impl Node {
                 mempool_txs = self.mempool.len(),
                 "Chain tip",
             );
-
-            // #1057 half A: seed the ledger-at-Origin flag HERE, not only from
-            // `publish_ledger_view`.
-            //
-            // That helper runs only on the LIVE apply path (see the #742 note
-            // below), so a node that comes up with a genesis ledger — the exact
-            // case this fix repairs — would never publish before its first applied
-            // block, and the genesis-anchor arm would stay disabled through the
-            // whole window in which it is needed. Same trap as #985's dead
-            // `recover_ledger_seq`: a mechanism wired to a path the scenario does
-            // not take is not wired at all.
-            if let Some(ref cs) = self.chain_sel_handle {
-                cs.set_ledger_at_origin(ls.tip.point == Point::Origin);
-            }
 
             // Initialize Prometheus metrics from loaded ledger state so they
             // are accurate immediately on startup (before any blocks arrive).

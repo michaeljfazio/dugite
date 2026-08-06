@@ -1754,11 +1754,11 @@ impl VolatileDB {
     /// (10 000) back, which the `k`-deep `LedgerSeq` then cannot roll back to,
     /// forcing a catastrophic snapshot+genesis-replay (observed: a 10 629-block
     /// rollback → ledger reset to genesis → unrecoverable stall).
-    /// `allow_genesis_anchor` (#1057 half A) — may a fork rooted at GENESIS be
-    /// treated as reachable? The caller passes "the ledger is at Origin", because
-    /// this function's output is executed by the ledger and a genesis-rooted plan
-    /// is only executable from there. See the arm inside for why it is a hard
-    /// precondition rather than a preference.
+    /// `allow_genesis_anchor` (#1057) — may a fork rooted at GENESIS be treated as
+    /// reachable? The caller passes "the ledger CAN BE ROLLED BACK to Origin",
+    /// because this function's output is executed by the ledger and a genesis-rooted
+    /// plan is only executable when that rollback is legal. See the arm inside for
+    /// why it is a hard precondition rather than a preference.
     pub fn switch_chain(
         &mut self,
         new_tip_hash: &Hash32,

@@ -314,7 +314,7 @@ pub async fn add_block_runner(
     chain_db: Arc<RwLock<ChainDB>>,
     invalid_cache: Arc<RwLock<InvalidBlockCache>>,
     // #1057 half A: published by the node; gates `switch_chain`'s genesis arm.
-    ledger_at_origin: Arc<std::sync::atomic::AtomicBool>,
+    ledger_can_reach_origin: Arc<std::sync::atomic::AtomicBool>,
 ) {
     debug!("add_block_runner: started");
 
@@ -340,7 +340,7 @@ pub async fn add_block_runner(
                     self_forged,
                     &chain_db,
                     &invalid_cache,
-                    &ledger_at_origin,
+                    &ledger_can_reach_origin,
                 )
                 .await;
 
@@ -367,10 +367,14 @@ pub async fn add_block_runner(
                         Some(cache.hash_set())
                     }
                 };
-                let result =
-                    run_selection_pass(&chain_db, &invalid_snapshot, true, &ledger_at_origin)
-                        .await
-                        .unwrap_or(AddBlockResult::StoredAsFork);
+                let result = run_selection_pass(
+                    &chain_db,
+                    &invalid_snapshot,
+                    true,
+                    &ledger_can_reach_origin,
+                )
+                .await
+                .unwrap_or(AddBlockResult::StoredAsFork);
                 if result_tx.send(result).is_err() {
                     trace!("add_block_runner: ReprocessLoE receiver dropped");
                 }
@@ -398,7 +402,7 @@ async fn run_selection_pass(
     chain_db: &Arc<RwLock<ChainDB>>,
     invalid_snapshot: &Option<std::collections::HashSet<Hash32>>,
     prefer_praos: bool,
-    ledger_at_origin: &Arc<std::sync::atomic::AtomicBool>,
+    ledger_can_reach_origin: &Arc<std::sync::atomic::AtomicBool>,
 ) -> Option<AddBlockResult> {
     let mut db = chain_db.write().await;
 
@@ -553,7 +557,7 @@ async fn run_selection_pass(
 
         if let Some(plan) = db.switch_to_fork(
             &fork_hash,
-            ledger_at_origin.load(std::sync::atomic::Ordering::Relaxed),
+            ledger_can_reach_origin.load(std::sync::atomic::Ordering::Relaxed),
         ) {
             return Some(AddBlockResult::TriggeredFork {
                 intersection_hash: plan.intersection,
@@ -596,7 +600,7 @@ async fn process_add_block(
     chain_db: &Arc<RwLock<ChainDB>>,
     invalid_cache: &Arc<RwLock<InvalidBlockCache>>,
     // #1057 half A: gates `switch_chain`'s genesis-anchor arm.
-    ledger_at_origin: &Arc<std::sync::atomic::AtomicBool>,
+    ledger_can_reach_origin: &Arc<std::sync::atomic::AtomicBool>,
 ) -> AddBlockResult {
     // --- Step 1: Duplicate check (VolatileDB + ImmutableDB) ----------------
     {
@@ -706,7 +710,7 @@ async fn process_add_block(
         chain_db,
         &invalid_snapshot,
         header.is_some(),
-        ledger_at_origin,
+        ledger_can_reach_origin,
     )
     .await
     {
@@ -755,17 +759,31 @@ pub struct ChainSelHandle {
     /// Shared invalid-block cache.  Exposed so callers can pre-seed the cache
     /// (e.g. from a persisted blacklist) or inspect it for monitoring.
     pub invalid_cache: Arc<RwLock<InvalidBlockCache>>,
-    /// #1057 half A: is the LEDGER at Origin?
+    /// #1057: can the LEDGER be rolled back to Origin?
     ///
-    /// `dugite-storage` sits below `dugite-ledger` in the dependency flow and
-    /// cannot read ledger state, but `switch_chain`'s genesis-anchor arm must not
-    /// fire unless the ledger can execute the plan it produces. The node publishes
-    /// the answer here via [`ChainSelHandle::set_ledger_at_origin`].
+    /// NOT "is the ledger at Origin" — that gate was implemented, measured, and
+    /// found too narrow: holding ANY chain disqualified the longer one, including a
+    /// chain adopted seconds earlier from a peer that was itself broken. On the
+    /// devnet a node that had just reset re-adopted a stale 10-block chain from its
+    /// sibling and was wedged again 30 seconds later against the canonical
+    /// 155-block chain.
     ///
-    /// Defaults to `false`, which is the conservative direction: the genesis arm
-    /// stays off, i.e. exactly the pre-#1057 behaviour. A caller that forgets to
-    /// publish loses the fix, never correctness.
-    ledger_at_origin: Arc<std::sync::atomic::AtomicBool>,
+    /// The real predicate is that a rollback to Origin is EXECUTABLE, which holds
+    /// when the LedgerSeq's anchor IS Origin and the window is coherent:
+    /// `find_rollback_n(Origin)` then returns `Some(deltas.len())` — the
+    /// full-rewind-to-anchor case — so no snapshot and no re-initialisation is
+    /// needed. A snapshot-restored ledger has a non-Origin anchor, which is exactly
+    /// why the earlier attempt hit "Rollback target outside LedgerSeq volatile
+    /// window AND no canonical snapshot available".
+    ///
+    /// `dugite-storage` sits below `dugite-ledger` and cannot read either, so the
+    /// node publishes the answer via
+    /// [`ChainSelHandle::set_ledger_can_reach_origin`].
+    ///
+    /// Defaults to `false`, the conservative direction: the genesis arm stays off,
+    /// i.e. exactly the pre-#1057 behaviour. A caller that forgets to publish loses
+    /// the fix, never correctness.
+    ledger_can_reach_origin: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl ChainSelHandle {
@@ -797,33 +815,33 @@ impl ChainSelHandle {
     ) -> (Self, impl std::future::Future<Output = ()>) {
         let invalid_cache = Arc::new(RwLock::new(InvalidBlockCache::new()));
         let (tx, rx) = mpsc::channel(capacity);
-        let ledger_at_origin = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let ledger_can_reach_origin = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
         let runner = add_block_runner(
             rx,
             chain_db,
             Arc::clone(&invalid_cache),
-            Arc::clone(&ledger_at_origin),
+            Arc::clone(&ledger_can_reach_origin),
         );
 
         let handle = ChainSelHandle {
             tx,
             invalid_cache,
-            ledger_at_origin,
+            ledger_can_reach_origin,
         };
 
         (handle, runner)
     }
 
-    /// Publish whether the ledger is at Origin (#1057 half A).
+    /// Publish whether the ledger can be rolled back to Origin (#1057).
     ///
     /// The node calls this whenever the ledger tip changes. It gates
     /// `VolatileDB::switch_chain`'s genesis-anchor arm, which must not emit a
     /// genesis-rooted `SwitchPlan` the ledger cannot execute — doing so relocates
     /// the #1057 wedge from BlockFetch to the ledger rollback, which was measured
     /// live and reverted.
-    pub fn set_ledger_at_origin(&self, at_origin: bool) {
-        self.ledger_at_origin
+    pub fn set_ledger_can_reach_origin(&self, at_origin: bool) {
+        self.ledger_can_reach_origin
             .store(at_origin, std::sync::atomic::Ordering::Relaxed);
     }
 

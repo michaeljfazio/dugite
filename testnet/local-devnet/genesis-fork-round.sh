@@ -168,6 +168,28 @@ tip_field() {
     cardano-cli query tip --testnet-magic "$LD_MAGIC" --socket-path "$1" 2>/dev/null \
         | jq -r "$2 // empty" 2>/dev/null
 }
+
+# Why `tip_field` returned nothing.
+#
+# Three runs in a row reported `relay=?` from an EMPTY `tip_field`, and I read that
+# as "the relay did not converge" when it actually meant "the measurement failed" —
+# the node was alive with peers and its N2C socket was listening. An assertion built
+# on an unreadable value is the reports-nothing-while-looking-definite class
+# (#916/#945): it cannot distinguish a wedged node from an unqueryable one.
+#
+# So when a tip read comes back empty, say WHY: whether the socket file exists, and
+# what cardano-cli actually wrote to stderr.
+explain_tip_failure() { # <label> <sock>
+    local label="$1" sock="$2" err
+    [ -S "$sock" ] || { note "  $label: no socket at $sock (node not listening)"; return; }
+    err=$(cardano-cli query tip --testnet-magic "$LD_MAGIC" --socket-path "$sock" 2>&1 >/dev/null \
+          | tr '\n' ' ' | cut -c1-220)
+    if [ -n "$err" ]; then
+        note "  $label: socket present but 'query tip' failed: $err"
+    else
+        note "  $label: socket present and 'query tip' succeeded — the jq field selector found nothing (unexpected shape)"
+    fi
+}
 forge_count() { awk '/TraceForgedBlock/ {c++} END{print c+0}' "$1" 2>/dev/null; }
 
 # start_dugite <name> <port> <metrics> <sock> [forge-pool]
@@ -646,8 +668,12 @@ if [ "$CONVERGED" -ne 1 ] && [ "${GF_SKIP_RESTART_PROBE:-0}" -ne 1 ]; then
     R_CBP=$(tip_field "$LD_CARDANO_BP_SOCK" .block)
     if [ "$R_RELAY_CONVERGED" -eq 1 ]; then
         ok "hop 1: dugite-relay re-synced from genesis and now matches cardano-bp at block ${R_RELAY_BLK:-?}"
+    elif [ -z "$R_RELAY_BLK" ]; then
+        # UNMEASURED is not the same as FAILED, and conflating them cost three runs.
+        inconc "hop 1: dugite-relay's tip is UNREADABLE, so whether it recovered is unknown — not a failure, an unmeasured result"
+        explain_tip_failure "dugite-relay" "$LD_RELAY_SOCK"
     else
-        bad "hop 1: dugite-relay did NOT converge with cardano-bp within ${CONVERGE_TIMEOUT}s after the marker restart (relay=${R_RELAY_BLK:-?} cardano-bp=${R_CBP:-?}) — #1057 half B did not recover it"
+        bad "hop 1: dugite-relay did NOT converge with cardano-bp within ${CONVERGE_TIMEOUT}s after the marker restart (relay=${R_RELAY_BLK} cardano-bp=${R_CBP:-?}) — #1057 half B did not recover it"
     fi
 
     # ── hop 2: dugite-bp, now facing a relay on the canonical chain ──
@@ -688,8 +714,12 @@ if [ "$CONVERGED" -ne 1 ] && [ "${GF_SKIP_RESTART_PROBE:-0}" -ne 1 ]; then
     R_CBP=$(tip_field "$LD_CARDANO_BP_SOCK" .block)
     if [ "$R_CONVERGED" -eq 1 ]; then
         ok "hop 2: dugite-bp recovered too — tip hash matches cardano-bp at block ${R_DBP:-?}. #1057 is RECOVERABLE BY RESTART."
+    elif [ -z "$R_DBP" ]; then
+        inconc "hop 2: dugite-bp's tip is UNREADABLE, so whether it recovered is unknown — not a failure, an unmeasured result"
+        explain_tip_failure "dugite-bp" "$LD_DUGITE_BP_SOCK"
     else
-        bad "hop 2: dugite-bp did NOT converge within ${CONVERGE_TIMEOUT}s after its own marker restart (dugite-bp=${R_DBP:-?} cardano-bp=${R_CBP:-?}) — #1057"
+        bad "hop 2: dugite-bp did NOT converge within ${CONVERGE_TIMEOUT}s after its own marker restart (dugite-bp=${R_DBP} cardano-bp=${R_CBP:-?}) — #1057"
+        explain_tip_failure "dugite-bp" "$LD_DUGITE_BP_SOCK"
     fi
 fi
 
