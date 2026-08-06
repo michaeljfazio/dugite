@@ -359,13 +359,17 @@ else
     bad "cardano-bp forged 0 blocks in the same window — cannot distinguish KES-expiry from a stalled devnet"
 fi
 
-# Pinned diagnostic: crates/dugite-node/src/forge.rs:344-351 bails with this
-# exact text once kes_period_offset >= MAX_KES_EVOLUTIONS; the Err(e) is
-# logged at ERROR by crates/dugite-node/src/node/mod.rs (the
-# "TraceForgeStateUpdateError: block forging failed: {e}" wrapper around the
-# forge_block() match, ~line 10560). Only reachable when dugite-bp is VRF-
-# elected leader for a slot after expiry — see the risk note in the header.
-KES_EXPIRED_PATTERN='TraceForgeStateUpdateError: block forging failed: KES key expired'
+# Pinned diagnostic. After the #1054 fix, the per-slot upper-bound gate in
+# try_forge_block_at fires BEFORE the VRF leader check and skips forging once
+# expired (matching Haskell's HotKey poison-once-then-short-circuit), logging
+# `TraceNodeCannotForge: KES key expired` at WARN. That gate short-circuits
+# before forge_block is ever called, so the OLDER
+# `TraceForgeStateUpdateError: block forging failed: KES key expired` wrapper
+# (forge.rs bail -> node/mod.rs Err(e), only reachable when dugite-bp was
+# VRF-elected leader at/after expiry) no longer fires. Match EITHER form so
+# the assertion holds both before and after the fix: the anchored phrase
+# `KES key expired` appears in both.
+KES_EXPIRED_PATTERN='KES key expired'
 if expect_log_errors "$LD_LOGS/dugite-bp.log" "$MARK_DBP" "$KES_EXPIRED_PATTERN"; then
     ok "dugite-bp.log carries the KES-expiry diagnostic"
 else
@@ -521,13 +525,20 @@ else
 fi
 
 note "kes-period-info parity across both sockets (cardano-cli against both, per the 09-cli-parity convention — this measures the NODE, not the CLI)"
+# `query kes-period-info` prints a HUMAN-READABLE report to stdout; JSON is
+# only emitted via --out-file. Piping stdout to jq yielded empty on BOTH
+# sockets (including the unmodified Haskell arbiter) — a harness bug, not a
+# dugite gap. Write to a file and read that.
 KPI_FILTER='del(.qKesRemainingSlotsInKesPeriod)'
-KPI_DBP=$(cardano-cli conway query kes-period-info --testnet-magic "$LD_MAGIC" \
-    --socket-path "$LD_RELAY_SOCK" --op-cert-file "$LD_KEYS/pool1/opcert.cert" 2>/dev/null \
-    | jq -S "$KPI_FILTER" 2>/dev/null)
-KPI_ARB=$(cardano-cli conway query kes-period-info --testnet-magic "$LD_MAGIC" \
-    --socket-path "$LD_CARDANO_ARBITER_SOCK" --op-cert-file "$LD_KEYS/pool1/opcert.cert" 2>/dev/null \
-    | jq -S "$KPI_FILTER" 2>/dev/null)
+_kpi() { # _kpi <socket>
+    local out; out="$WORK/kpi-$(basename "$1").json"
+    cardano-cli conway query kes-period-info --testnet-magic "$LD_MAGIC" \
+        --socket-path "$1" --op-cert-file "$LD_KEYS/pool1/opcert.cert" \
+        --out-file "$out" >/dev/null 2>&1
+    [ -s "$out" ] && jq -S "$KPI_FILTER" "$out" 2>/dev/null
+}
+KPI_DBP=$(_kpi "$LD_RELAY_SOCK")
+KPI_ARB=$(_kpi "$LD_CARDANO_ARBITER_SOCK")
 if [ -n "$KPI_DBP" ] && [ -n "$KPI_ARB" ] && [ "$KPI_DBP" = "$KPI_ARB" ]; then
     ok "kes-period-info parity: dugite (via relay) matches the Haskell arbiter"
 elif [ -z "$KPI_DBP" ] || [ -z "$KPI_ARB" ]; then
