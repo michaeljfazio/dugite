@@ -4434,8 +4434,16 @@ pub fn validate_transaction_with_pools(
     // Conway LEDGER rule: currentTreasuryValue must match ledger treasury.
     // This prevents mempool admission of transactions with stale/wrong
     // treasury assertions, which would cause forged blocks to be rejected.
+    //
+    // #1061: SKIPPED ENTIRELY when the tx declares `is_valid: false`.
+    // `conwayLedgerTransition` runs `validateTreasuryValue` only inside the
+    // `isPhase2ValidTxL == Phase2Valid` branch, alongside
+    // `validateRefScriptSize` (see the matching note in `phase1.rs`). Running it
+    // unconditionally was a FALSE REJECT — cardano-node accepts a
+    // phase-2-failing tx carrying a stale treasury assertion, and at block level
+    // dugite refusing such a block is the #985 symptom class.
     // ------------------------------------------------------------------
-    if params.protocol_version_major >= 9 {
+    if params.protocol_version_major >= 9 && tx.is_valid {
         if let (Some(declared), Some(actual)) = (tx.body.treasury_value.as_ref(), current_treasury)
         {
             if declared.0 != actual {
