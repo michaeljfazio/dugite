@@ -1195,6 +1195,11 @@ impl Node {
 
         // Load Alonzo genesis if configured (with hash validation)
         let mut alonzo_genesis_file_hash: Option<dugite_primitives::hash::Hash32> = None;
+        // #1046: `extraConfig.costModels` is applied to `curPParams` ONLY, and it
+        // must land AFTER the Conway genesis has contributed its V3 field, so the
+        // prev/cur snapshot below can be taken between the two. Hold the loaded
+        // genesis until then rather than applying the override here.
+        let mut alonzo_genesis_loaded: Option<AlonzoGenesis> = None;
         if let Some(ref genesis_path) = args.config.alonzo_genesis_file {
             let genesis_path = config_dir.join(genesis_path);
             match AlonzoGenesis::load_with_hash(&genesis_path) {
@@ -1202,10 +1207,12 @@ impl Node {
                     info!(
                         max_val_size = genesis.max_value_size,
                         collateral_pct = genesis.collateral_percentage,
+                        has_extra_config = genesis.extra_config.is_some(),
                         "Alonzo genesis loaded",
                     );
                     alonzo_genesis_file_hash = Some(hash);
                     genesis.apply_to_protocol_params(&mut protocol_params);
+                    alonzo_genesis_loaded = Some(genesis);
                 }
                 Err(e) => {
                     warn!("Failed to load Alonzo genesis: {e}");
@@ -1236,11 +1243,6 @@ impl Node {
         let mut conway_initial_dreps: Vec<(dugite_primitives::hash::Hash28, u64)> = Vec::new();
         let mut conway_genesis_file_hash: Option<dugite_primitives::hash::Hash32> = None;
         let mut conway_v3_cost_model: Option<Vec<i64>> = None;
-        // #994: did a genesis FILE supply the PlutusV2 cost model, or is the one
-        // we end up with the built-in default? `ConwayGenesis::apply_to_protocol_params`
-        // injects `defaultV2CostModel` when none is present, so this has to be
-        // sampled before that call. See `genesis_prev_protocol_params` below.
-        let v2_cost_model_from_genesis = protocol_params.cost_models.plutus_v2.is_some();
         if let Some(ref genesis_path) = args.config.conway_genesis_file {
             let genesis_path = config_dir.join(genesis_path);
             match ConwayGenesis::load_with_hash(&genesis_path) {
@@ -1281,36 +1283,33 @@ impl Node {
             }
         }
 
-        // #994: `cgsPrevPParams` at genesis carries only the cost models the
-        // genesis FILES supplied — never the built-in `defaultV2CostModel`.
+        // #994/#1046: `cgsPrevPParams` at genesis carries only what the genesis
+        // FIELDS supplied. The `extraConfig.costModels` override is applied to
+        // `curPParams` alone, so this snapshot must be taken BEFORE it.
         //
-        // On a chain whose FIRST era is Conway (`create-testnet-data`, i.e. the
-        // local devnet) cardano-node reports
+        // #994 observed the resulting shape on a `create-testnet-data` devnet —
         //     cur  = [PlutusV1, PlutusV2, PlutusV3]
         //     prev = [PlutusV1,           PlutusV3]
-        // with `prev` otherwise byte-identical to `cur` — V1 and V3 match
-        // exactly, and every non-costModels field matches. The devnet's
-        // alonzo-genesis defines only `PlutusV1` and its conway-genesis only
-        // `plutusV3CostModel`, so neither file supplies V2: the V2 in `cur` is
-        // the default both implementations inject so V2 scripts are runnable.
-        // It never reaches `prev`.
+        // with prev otherwise byte-identical to cur — and attributed the V2 to
+        // "the default both implementations inject". There is no such default.
+        // #1046 found the real mechanism: Haskell's `alonzoInjectCostModels`
+        // applies `agExtraConfig.aecCostModels` via
+        //     nesEsL . curPParamsEpochStateL . ppCostModelsL %~ ...
+        // i.e. cur-only, and `create-testnet-data` writes PlutusV1+PlutusV2 into
+        // that field. mainnet/preview/preprod alonzo-genesis files have no
+        // `extraConfig` whatsoever, which is why cardano-node has NO PlutusV2
+        // there and dugite's unconditional injection diverged.
         //
-        // dugite seeded `prev` by cloning `cur` wholesale, so the defaulted V2
-        // leaked in and `gov-state` diverged three times over (the same value is
-        // embedded in `nextRatifyState.nextEnactState.{curPParams,prevPParams}`).
-        //
-        // Inert on mainnet/preview/preprod: those alonzo-genesis files DO define
-        // PlutusV2, so `v2_cost_model_from_genesis` is true and `prev` is an
-        // exact clone as before. Those chains also start in Byron, where
-        // `prev` is overwritten by the first epoch boundary regardless — which
-        // is precisely why this is reachable only on a Conway-genesis chain.
-        let genesis_prev_protocol_params = {
-            let mut prev = protocol_params.clone();
-            if !v2_cost_model_from_genesis {
-                prev.cost_models.plutus_v2 = None;
-            }
-            prev
-        };
+        // Deriving prev as "cur minus the extraConfig override" replaces #994's
+        // `v2_cost_model_from_genesis` special case and generalises it: it holds
+        // for EVERY language extraConfig can name, not just V2.
+        let genesis_prev_protocol_params = protocol_params.clone();
+
+        // Now apply the cur-only override (no-op when the genesis has no
+        // `extraConfig`, i.e. on every real network).
+        if let Some(ref alonzo) = alonzo_genesis_loaded {
+            alonzo.apply_extra_config_cost_models(&mut protocol_params);
+        }
 
         // Load Dijkstra genesis if configured (issue #462 Phase 6 — parse only).
         //
