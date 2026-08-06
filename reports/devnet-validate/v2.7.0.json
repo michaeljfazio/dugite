@@ -1,0 +1,123 @@
+{
+  "schema_version": 1,
+  "release_tag": "v2.7.0",
+  "git_rev": "006166f38533564b7e53011f2dcea48e77764f33",
+  "timestamp": "2026-08-06T07:35:00Z",
+  "preset": "targeted",
+  "cardano_node_version": "cardano-node 11.0.1 - darwin-aarch64 - ghc-9.6",
+  "cardano_cli_version": "cardano-cli 11.0.0.0 - darwin-aarch64 - ghc-9.6",
+  "gate_integrity": {
+    "strict": false,
+    "admissible": false,
+    "missing": [
+      "round-1 full tx-zoo (154 scripts)",
+      "bidirectional parity matrix (99 scripts, both sockets)",
+      "09-cli-parity",
+      "adversarial N2N",
+      "UTxO RPC suite",
+      "chaos suite",
+      "gov-enactment / rewards / kes / rollback / hardfork rounds",
+      "tip-parity sampling across 4 rounds"
+    ],
+    "note": "TARGETED validation, NOT the devnet-validate standard preset. Scoped to the surfaces this release changes plus the P0 investigation. Must NOT be read as a 4-round gate result; gate_integrity.admissible is false accordingly."
+  },
+  "rounds": [
+    {
+      "name": "two-forger-round",
+      "result": "PASS",
+      "assertions_failed": 0,
+      "detail": {
+        "nodes": 4,
+        "dugite_bp_forged": 61,
+        "cardano_bp_forged": 53,
+        "final_convergence_block": 133,
+        "final_hash_all_four": "148a2ab82d78f583",
+        "invalid_block_events": 0,
+        "pots_byte_exact_vs_arbiter": true,
+        "treasury": 0,
+        "reserves": 5999994000000000,
+        "restart_under_contention": "rejoined 95 -> 117, hash matches arbiter; arbiter advanced to 115 while down",
+        "stale_intersection_warnings": 0,
+        "step_3b_1057_guard": "PASS (tip block 91 > 61 self-forged, arbiter 92)"
+      }
+    },
+    {
+      "name": "restart-endurance-round",
+      "result": "PASS",
+      "iterations_run": 3,
+      "iterations_pinned_for_gate": 30,
+      "detail": {
+        "recovered": "3/3",
+        "bp_fd_growth": -1,
+        "bp_thread_growth": -2,
+        "unexpected_error_lines": 0,
+        "red_case_down": "correctly detected",
+        "red_case_peers": "correctly detected",
+        "note": "Shakedown at 3 iterations, not the pinned 30. Its own RED case found an errexit bug in the round on first execution (lib/common.sh re-enables set -e); fixed in 3f9e63d750."
+      }
+    },
+    {
+      "name": "tx-zoo (targeted categories)",
+      "result": "FAIL",
+      "detail": {
+        "categories": [
+          "01-bookkeeping",
+          "08-negative",
+          "15-asset-lattice",
+          "16-cert-negatives",
+          "18-plutus-edges",
+          "19-era-negatives"
+        ],
+        "total": 68,
+        "pass": 66,
+        "fail": 2,
+        "env_skip": 0,
+        "state_skip": 0,
+        "18_plutus_edges": "12/12 PASS \u2014 validates #1050 (18a,18b) and #1051 (18f) on the wire",
+        "19_era_negatives": "6/6 PASS \u2014 validates #1047; 19a-19d use the STRICT era-mismatch assertion",
+        "failures": [
+          {
+            "script": "16d-drep-already-registered",
+            "cause": "ordering precondition \u2014 passes when 05-governance-certs runs first (documented in run-all.sh ALL_CATEGORIES)",
+            "defect": false
+          },
+          {
+            "script": "16a-stake-key-already-registered",
+            "cause": "reports MissingVKeyWitnessesUTXOW instead of StakeKeyRegisteredDELEG",
+            "defect": true,
+            "issue": 1060,
+            "pre_existing": true,
+            "verified": "fails identically with #1030 item 1 disarmed and release rebuilt"
+          }
+        ]
+      }
+    }
+  ],
+  "summary": {
+    "pass": false,
+    "rounds_pass": 2,
+    "rounds_fail": 1,
+    "total_tx_zoo_pass": 66,
+    "total_tx_zoo_fail": 2,
+    "invalid_forges_detected": 0,
+    "critical_anomalies": 0,
+    "new_issues_filed": [
+      1057,
+      1058,
+      1060
+    ],
+    "reverted_in_this_release": [
+      1057
+    ]
+  },
+  "workspace_tests": {
+    "run": 8068,
+    "passed": 8068,
+    "skipped": 13
+  },
+  "ci": {
+    "checks": 10,
+    "passed": 10,
+    "pr": 1059
+  }
+}
