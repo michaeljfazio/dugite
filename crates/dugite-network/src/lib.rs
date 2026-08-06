@@ -249,7 +249,21 @@ pub enum TxValidationError {
     ScriptFailed {
         reason: String,
     },
-    InsufficientCollateral,
+    /// `InsufficientCollateral DeltaCoin Coin` (Conway `ConwayUtxoPredFailure`
+    /// tag 12) — `balance` is the collateral balance actually present (may be
+    /// NEGATIVE if `collateral_return` over-declares), `required` is
+    /// `ceil(fee * collateralPercentage / 100)`.
+    ///
+    /// `DeltaCoin` is `newtype DeltaCoin = DeltaCoin Integer` with a
+    /// newtype-derived `EncCBOR` — a bare SIGNED CBOR integer, no array or
+    /// group wrapper (oracle-verified, #1050). Field order in the Sum
+    /// encoding is `DeltaCoin` (balance) then `Coin` (required), matching
+    /// dugite's own N2C decoder (`n2c_client.rs` tag 12) which already reads
+    /// `[balance_delta, required]` in that order.
+    InsufficientCollateral {
+        balance: i128,
+        required: u64,
+    },
     TooManyCollateralInputs {
         max: u64,
         actual: u64,
@@ -257,8 +271,16 @@ pub enum TxValidationError {
     CollateralNotFound {
         input: String,
     },
+    /// `CollateralContainsNonADA (Value era)` (Conway `ConwayUtxoPredFailure`
+    /// tag 15) — the FULL multi-asset `Value` Haskell reports (oracle-
+    /// verified against `Cardano.Ledger.Babbage.Rules.Utxo`, #1050): either
+    /// the raw sum of collateral-input `Value`s, or — only when the
+    /// collateral inputs are ada-only but `collateral_return` itself carries
+    /// tokens — the return output's own `Value`. NEVER the netted (inputs
+    /// minus return) balance in the general case, so a bare `input: String`
+    /// could never carry this payload.
     CollateralHasTokens {
-        input: String,
+        value: dugite_primitives::value::Value,
     },
     CollateralMismatch {
         declared: u64,
@@ -620,6 +642,18 @@ pub enum TxValidationError {
     // `ShelleyPoolPredFailure`'s `EncCBOR` is HAND-ROLLED rather than built
     // from the `Sum` combinators, so each arm states its own `encodeListLen`
     // and splices `Mismatch` fields in individually. There is no tag 2.
+    /// `StakePoolNotRegisteredOnKeyPOOL` — `array(2)[0, pool_id]`.
+    ///
+    /// Raised by a `PoolRetirement` certificate naming a pool ID that is
+    /// not currently registered. `ShelleyPoolPredFailure` is reused
+    /// UNMODIFIED in the Conway POOL rule, so this is the ONE field, a bare
+    /// `KeyHash StakePool` — no `Credential` wrapper, same shape as
+    /// [`Self::DelegateeStakePoolNotRegisteredDELEG`] but nested under
+    /// `PoolFailure` (CERT tag 2) rather than `DelegFailure` (CERT tag 1).
+    StakePoolNotRegisteredOnKeyPOOL {
+        /// Hex-encoded 28-byte pool key hash.
+        pool_id: String,
+    },
     /// `StakePoolCostTooLowPOOL` — `array(3)[3, supplied, expected]`.
     StakePoolCostTooLowPOOL {
         /// Cost the pool registration declared.
@@ -736,6 +770,22 @@ pub enum TxValidationError {
     ScriptsNotPaidUTxOUTXO {
         /// `("<txhash>#<index>", raw_hex_cbor_of_txout)` pairs.
         inputs_outputs: Vec<(String, String)>,
+    },
+    /// `BabbageOutputTooSmallUTxO` (Conway `ConwayUtxoPredFailure` tag 21) —
+    /// `NonEmpty (TxOut era, Coin)`: every output below the era's minimum
+    /// UTxO value, paired with the minimum it was required to meet. The old
+    /// pre-Babbage `OutputTooSmallUTxO` (tag 9, bare `NonEmpty (TxOut era)`)
+    /// is structurally unreachable on a Conway tx — this is the ONLY
+    /// reachable form, so no tag-9 arm is implemented.
+    ///
+    /// Haskell's `EncCBOR (BabbageTxOut era)` is NOT `MemoBytes` — it
+    /// re-encodes the typed `TxOut` on every failure — so dugite's own raw
+    /// (or freshly re-encoded, if raw bytes were never captured) `TxOut`
+    /// CBOR is byte-correct here.
+    BabbageOutputTooSmallUTxO {
+        /// `(raw_hex_cbor_of_txout, required_minimum_coin)` pairs, in
+        /// tx-body output order.
+        outputs: Vec<(String, u64)>,
     },
     /// `ZeroTreasuryWithdrawals` (GOV tag 15) — `GovAction era` (the WHOLE
     /// offending `TreasuryWithdrawals` action, not an identifier). Haskell's

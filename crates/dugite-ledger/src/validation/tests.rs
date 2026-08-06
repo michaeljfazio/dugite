@@ -871,7 +871,7 @@ mod tests {
             assert!(
                 !errors.iter().any(|e| matches!(
                     e,
-                    ValidationError::InsufficientCollateral
+                    ValidationError::InsufficientCollateral { .. }
                         | ValidationError::TooManyCollateralInputs { .. }
                         | ValidationError::CollateralNotFound(_)
                         | ValidationError::CollateralHasTokens(_)
@@ -1361,7 +1361,7 @@ mod tests {
             assert!(
                 !errors.iter().any(|e| matches!(
                     e,
-                    ValidationError::InsufficientCollateral
+                    ValidationError::InsufficientCollateral { .. }
                         | ValidationError::TooManyCollateralInputs { .. }
                         | ValidationError::CollateralNotFound(_)
                         | ValidationError::CollateralHasTokens(_)
@@ -4223,9 +4223,13 @@ mod tests {
         let mut errors_low: Vec<ValidationError> = Vec::new();
         check_collateral(&tx_low, &utxo_set, &params, &mut errors_low);
         assert!(
-            errors_low
-                .iter()
-                .any(|e| matches!(e, ValidationError::InsufficientCollateral)),
+            errors_low.iter().any(|e| matches!(
+                e,
+                ValidationError::InsufficientCollateral {
+                    balance: 151,
+                    required: 152,
+                }
+            )),
             "Collateral of 151 should fail with ceiling(101*150/100)=152: {errors_low:?}"
         );
 
@@ -4235,7 +4239,7 @@ mod tests {
         check_collateral(&tx_ok, &utxo_set, &params, &mut errors_ok);
         let collateral_errors: Vec<_> = errors_ok
             .iter()
-            .filter(|e| matches!(e, ValidationError::InsufficientCollateral))
+            .filter(|e| matches!(e, ValidationError::InsufficientCollateral { .. }))
             .collect();
         assert!(
             collateral_errors.is_empty(),
@@ -4279,7 +4283,7 @@ mod tests {
         check_collateral(&tx, &utxo_set, &params, &mut errors);
         let insuff: Vec<_> = errors
             .iter()
-            .filter(|e| matches!(e, ValidationError::InsufficientCollateral))
+            .filter(|e| matches!(e, ValidationError::InsufficientCollateral { .. }))
             .collect();
         assert!(
             insuff.is_empty(),
@@ -4345,7 +4349,7 @@ mod tests {
         assert!(
             !errors_pass
                 .iter()
-                .any(|e| matches!(e, ValidationError::InsufficientCollateral)),
+                .any(|e| matches!(e, ValidationError::InsufficientCollateral { .. })),
             "effective=152 should pass ceiling check: {errors_pass:?}"
         );
 
@@ -4365,9 +4369,13 @@ mod tests {
         let mut errors_fail: Vec<ValidationError> = Vec::new();
         check_collateral(&tx_fail, &utxo_set, &params, &mut errors_fail);
         assert!(
-            errors_fail
-                .iter()
-                .any(|e| matches!(e, ValidationError::InsufficientCollateral)),
+            errors_fail.iter().any(|e| matches!(
+                e,
+                ValidationError::InsufficientCollateral {
+                    balance: 151,
+                    required: 152,
+                }
+            )),
             "effective=151 should fail ceiling check: {errors_fail:?}"
         );
     }
