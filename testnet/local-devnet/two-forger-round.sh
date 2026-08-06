@@ -179,6 +179,29 @@ else
     bad "two-forger round did not achieve two forgers (dugite-bp=$DBP_FORGED cardano-bp=$CBP_FORGED); every assertion below would be vacuous"
 fi
 
+step "3b. dugite-bp is NOT stranded on its own self-forged fork (#1057 regression)"
+# #1057: a BP that won a slot before its initial sync completed forged blocks
+# 0..8 on Origin and then NEVER adopted a peer block again. BlockFetch declined
+# the canonical chain's block 0 (genesis is not a "stored block"), the ledger
+# froze at the BP's own last forged block, ChainSync's forecast-horizon park
+# dropped every peer on a loop, and the node stayed wedged for the process
+# lifetime.
+#
+# Step 5's convergence check does fail on this, but it reports "tips differ",
+# which reads as ordinary propagation lag. This asserts the SIGNATURE directly:
+# dugite-bp's tip block number must exceed the number of blocks it forged
+# itself, i.e. it has adopted at least one block from somebody else.
+DBP_TIP_BLK=$(tip_field "$LD_DUGITE_BP_SOCK" .block)
+ARB_TIP_BLK=$(tip_field "$LD_CARDANO_ARBITER_SOCK" .block)
+note "dugite-bp tip block=$DBP_TIP_BLK, arbiter tip block=$ARB_TIP_BLK, dugite-bp self-forged=$DBP_FORGED"
+if [ -z "$DBP_TIP_BLK" ] || [ -z "$ARB_TIP_BLK" ]; then
+    bad "could not read dugite-bp / arbiter tip — cannot evaluate the #1057 guard"
+elif [ "$DBP_TIP_BLK" -le "${DBP_FORGED:-0}" ] && [ "$ARB_TIP_BLK" -gt "$DBP_TIP_BLK" ]; then
+    bad "dugite-bp appears STRANDED ON ITS OWN FORK (#1057): tip block=$DBP_TIP_BLK is no higher than the $DBP_FORGED blocks it forged itself, while the arbiter is at block=$ARB_TIP_BLK. Check dugite-bp.log for repeated 'beyond forecast horizon ... disconnecting' against every peer with a frozen ledger tip"
+else
+    ok "dugite-bp has adopted blocks from the network (tip block=$DBP_TIP_BLK > self-forged=$DBP_FORGED, arbiter=$ARB_TIP_BLK)"
+fi
+
 step "4. slot battles / lost blocks observed"
 # Haskell's own signal that it forged a valid block and lost the race.
 # ouroboros-consensus documents this as rare-but-expected, at Error severity:
