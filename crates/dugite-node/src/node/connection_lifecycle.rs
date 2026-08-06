@@ -187,35 +187,33 @@ const _: () = assert!(GENESIS_PARKED_DYNAMO_MARGIN_SLOTS < 25_920);
 /// #735 gross-request invariant, lock-free half: does this fetch range
 /// connect WITHOUT consulting the ChainDB?
 ///
-/// Two cases need no lock:
-/// * `already_fetched` — this worker fetched the parent itself and the apply
-///   pipeline simply has not stored it yet (channel lag). The contiguous chain
-///   is in flight, not missing.
-/// * the range is rooted at **genesis**. `Hash32::ZERO` is dugite's canonical
-///   Origin parent: the encoder maps it to CBOR `null`, i.e. Haskell's
-///   `PrevHash = GenesisHash` (pinned by
-///   `test_encode_block_header_body_prev_hash_null_at_genesis`).
+/// Only one case needs no lock: `already_fetched` — this worker fetched the
+/// parent itself and the apply pipeline has not stored it yet (channel lag). The
+/// contiguous chain is in flight, not missing.
 ///
-/// **#1057** — the genesis case is why this function exists. Genesis is never a
-/// *stored* block, so a `has_block(&genesis)` test is always false; the old
-/// guard only exempted a completely EMPTY ChainDB. A node holding any block of
-/// its own therefore declined the canonical chain's block 0 on every decision
-/// tick, forever: nothing was fetched, the ledger never advanced, ChainSync's
-/// forecast-horizon park timed out, and every peer was dropped and re-dialled
-/// in an endless loop with no self-healing. It stranded a block producer that
-/// won a slot before its initial sync completed.
+/// **#1057 (OPEN)**: a range rooted at GENESIS is currently NOT accepted here
+/// unless the ChainDB is completely empty (see
+/// [`fetch_range_connects_via_chain_db`]). Genesis is never a *stored* block, so
+/// a node holding any block of its own declines the canonical chain's block 0
+/// forever and never rejoins a chain that diverges at Origin.
 ///
-/// Adoptability is not this guard's job to re-litigate: `sync.rs` accepts an
-/// Origin intersection only after confirming the local chain is within `k` of
-/// genesis, and `VolatileDB::switch_chain` re-applies the `k` cap before
-/// actually switching. Upstream carries the same notion as a first-class
-/// constructor — `AnchorGenesis` in ouroboros-consensus's `Anchor blk`, matched
-/// by `Paths.hs::isReachable`.
+/// Accepting `prev == Hash32::ZERO` here is necessary but NOT sufficient to fix
+/// that, and must not be done alone: the storage layer would then emit a
+/// genesis-rooted `SwitchPlan`, and the ledger cannot roll back to Origin
+/// (`sync.rs` aborts with "Rollback target outside LedgerSeq volatile window AND
+/// no canonical snapshot available"), so the wedge moves from BlockFetch to the
+/// ledger rollback instead of going away. Verified live on a two-forger devnet.
+/// The complete fix needs the ledger to re-initialise from genesis on a
+/// rollback-to-Origin — tracked in #1057.
+///
+/// `prev` is retained in the signature for that fix and is deliberately unused
+/// today.
 pub(crate) fn fetch_range_connects_fast(
     prev: &dugite_primitives::hash::Hash32,
     already_fetched: bool,
 ) -> bool {
-    already_fetched || *prev == dugite_primitives::hash::Hash32::ZERO
+    let _ = prev;
+    already_fetched
 }
 
 /// #735 gross-request invariant, ChainDB half: consulted only when
@@ -7475,24 +7473,25 @@ mod range_byte_abort_751_tests {
     // and ChainSync's forecast-horizon park dropped every peer in an endless
     // loop. The node never rejoined the canonical chain.
 
-    /// A range rooted at genesis connects even when the ChainDB is NON-empty
-    /// and does not contain the genesis hash. This is the #1057 regression.
+    /// #1057 (OPEN) — pins the CURRENT behaviour, not the desired one: a
+    /// genesis-rooted range is declined when the ChainDB is non-empty, which is
+    /// why a node holding any block of its own never rejoins a chain diverging
+    /// at Origin.
+    ///
+    /// Deliberately asserts the bug rather than hiding it, so the day #1057 is
+    /// fixed this test fails and forces the update. Accepting genesis here alone
+    /// is NOT the fix — it relocates the wedge to the ledger rollback path; see
+    /// `fetch_range_connects_fast`'s doc comment.
     #[test]
-    fn fetch_range_rooted_at_genesis_connects_with_non_empty_chain_db() {
+    fn fetch_range_rooted_at_genesis_is_declined_with_non_empty_chain_db() {
         let genesis = dugite_primitives::hash::Hash32::ZERO;
-
-        // The lock-free half decides it outright — no ChainDB read needed.
         assert!(
-            fetch_range_connects_fast(&genesis, false),
-            "a genesis-rooted range must connect without consulting the ChainDB (#1057)"
+            !fetch_range_connects_fast(&genesis, false),
+            "current behaviour: the lock-free half does not recognise genesis"
         );
-
-        // And the ChainDB half, which is what the old code relied on, would
-        // have REFUSED: non-empty DB, and genesis is not a stored block. This
-        // asserts the precise shape of the bug that was fixed.
         assert!(
             !fetch_range_connects_via_chain_db(false, false),
-            "the ChainDB half alone cannot recognise genesis — that WAS the bug"
+            "and the ChainDB half cannot either — genesis is never a stored block (#1057)"
         );
     }
 
