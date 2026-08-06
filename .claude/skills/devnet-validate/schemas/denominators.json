@@ -4,7 +4,7 @@
     "",
     "WHY THIS FILE EXISTS (#953, same class as #945/#923): every suite in this",
     "harness reports N/N by counting the rows it produced. A stimulus that never",
-    "fires produces no row, so N/N is tautological — '26/26 adversarial' said",
+    "fires produces no row, so N/N is tautological \u2014 '26/26 adversarial' said",
     "nothing about whether 26 cases ran. A denominator is only meaningful when it",
     "comes from OUTSIDE the run that produces the numerator.",
     "",
@@ -49,12 +49,12 @@
   "n2n_adversarial": {
     "expected_scripts": 7,
     "expected_cases": 26,
-    "$comment": "Rows in n2n-trace.csv. NOT the same as the count of adv_record call sites (28) — two sites are mutually-exclusive branches. Confirmed live: see the closing evidence on #953."
+    "$comment": "Rows in n2n-trace.csv. NOT the same as the count of adv_record call sites (28) \u2014 two sites are mutually-exclusive branches. Confirmed live: see the closing evidence on #953."
   },
   "chaos": {
     "expected_cases_standard": 5,
     "expected_cases_extended": 6,
-    "_comment": "expected_scripts = scenario .sh files on disk (excluding lib.sh/run.sh). expected_cases_* = terminal ROWS a given preset produces, which is preset-dependent: the STANDARD set runs 4 scenarios for 5 rows; EXTENDED adds network-partition + disk-full for 6. Pinning a single `expected_cases: 6` from the extended set made every standard run fail gate integrity with 'chaos recorded 5 rows, below the pinned 6' — a denominator no standard run could ever satisfy. ENV-SKIP is a counted class, never silence (#959).",
+    "_comment": "expected_scripts = scenario .sh files on disk (excluding lib.sh/run.sh). expected_cases_* = terminal ROWS a given preset produces, which is preset-dependent: the STANDARD set runs 4 scenarios for 5 rows; EXTENDED adds network-partition + disk-full for 6. Pinning a single `expected_cases: 6` from the extended set made every standard run fail gate integrity with 'chaos recorded 5 rows, below the pinned 6' \u2014 a denominator no standard run could ever satisfy. ENV-SKIP is a counted class, never silence (#959).",
     "expected_scripts": 6
   },
   "parity_matrix": {
@@ -75,12 +75,12 @@
     "excluded_categories": {
       "10-gov-lifecycle": "Chain-global governance lifecycle: propose -> 3-role vote -> assert enactment. Two batches would create two proposals in the same lane and both vote; ratification is a property of the whole chain, not of a batch, so the second batch's enactment assertion is not independent. Covered on path B only.",
       "12-post-enactment": "Only meaningful once a governance action has actually ENACTED, so it depends on 10 having run and on global chain state. Same reason as 10.",
-      "13-script-purposes": "The guarding scripts are fixed (always-true/false V3, one native), so their hashes are deterministic and BOTH parity batches would share one stake credential and one DRep credential. Batch 1 registers and then deregisters it, so batch 2 acts on state batch 1 already mutated — the same class as 05g/05h. These scripts instead demand Haskell confirmation directly: they use wait_all_strict, which requires all three observers and never soft-passes on 'cbp lagging'.",
-      "14-gov-negatives": "Governance negatives assert rejection CLASSES against chain-global gov state (live actions, registered DReps). Both batches would target the same actions, so batch 2's result depends on what batch 1 did — same class as 10/12. The rejection class is already compared against cardano-node directly by each script.",
+      "13-script-purposes": "The guarding scripts are fixed (always-true/false V3, one native), so their hashes are deterministic and BOTH parity batches would share one stake credential and one DRep credential. Batch 1 registers and then deregisters it, so batch 2 acts on state batch 1 already mutated \u2014 the same class as 05g/05h. These scripts instead demand Haskell confirmation directly: they use wait_all_strict, which requires all three observers and never soft-passes on 'cbp lagging'.",
+      "14-gov-negatives": "Governance negatives assert rejection CLASSES against chain-global gov state (live actions, registered DReps). Both batches would target the same actions, so batch 2's result depends on what batch 1 did \u2014 same class as 10/12. The rejection class is already compared against cardano-node directly by each script.",
       "15-asset-lattice": "Mint policies are derived from the batch's own payment key, so the two parity batches mint under DIFFERENT policy ids and the resulting values are not comparable cell-for-cell. The properties under test (encodeMap definite/indefinite boundaries at 23/24/256, multi-policy values, mint+burn, the maxTxSize lattice, the `after` timelock and nested native combinators) are wire-shape properties already checked against cardano-node by zoo_wait_all_observers on every script.",
       "16-cert-negatives": "Reject-REASON negatives asserted directly against the constructor name by expect_cert_rejection, which is a stronger check than the parity oracle's accept/reject cell. They also mutate shared credential state (16a/16d depend on wallet-a's stake key and drep-1 already being registered), so a second parity batch would act on state the first batch already changed - the same class as 05g/05h.",
       "17-context-inspecting": "Context-inspecting validators (#969). Each script locks its own UTxO at a script address and spends it, so a second batch is independent and the category WOULD be runnable through both sockets. It is excluded for cost, not correctness: 17f alone submits three transactions and does two cardano-cli builds, and the oracle already re-executes its set twice. Revisit if the parity round gets its own budget.",
-      "19-era-negatives": "Decode/era-level negatives asserted against BOTH sockets in-script (each script submits to relay AND cardano-bp itself). Haskell may drop the bearer on a decode failure (#925 class), which makes the oracle reject-REASON cell structurally CLASSDIFF — noise, not signal. The both-socket agreement the oracle would measure is already asserted, stronger, inside every script."
+      "19-era-negatives": "Decode/era-level negatives asserted against BOTH sockets in-script (each script submits to relay AND cardano-bp itself). Haskell may drop the bearer on a decode failure (#925 class), which makes the oracle reject-REASON cell structurally CLASSDIFF \u2014 noise, not signal. The both-socket agreement the oracle would measure is already asserted, stronger, inside every script."
     },
     "excluded_scripts": {
       "05g-cc-hot-key-authorization": "Constitutional committee is seated at genesis and is devnet-global. Batch 1 resigns cc-1, so batch 2 correctly receives ConwayCommitteeHasPreviouslyResigned. Giving batch 2 its own committee requires an UpdateCommittee governance action (2+ epoch boundaries). Verified live 2026-08-02, not a dugite defect.",
@@ -93,5 +93,9 @@
   "rpc": {
     "expected_checks": 27,
     "_comment": "Rows written by rpc/run.sh: 1 service-discovery + 8 service-present + 1 relay-reachable + 2 read-params + 2 cost-models + 2 read-tip + 2 read-utxos + 2 submit-tx + 2 malformed-cbor + 1 oversized + 1 empty-tx + 1 garbage-txoref + 1 duplicate-concurrent-submit + 1 mempool-hygiene = 27. Pinned from OUTSIDE the run so 27/27 is not tautological; a suite that silently stops emitting rows fails the gate instead of reporting a smaller clean sweep."
+  },
+  "restart_endurance": {
+    "expected_cases": 30,
+    "_comment": "Rows in restart-endurance.csv: one terminal row per SIGTERM/restart iteration of dugite-relay (#1044, #1031 P2-3). EXTENDED preset only. Adopted at 30, not upstream's 200 (test_reconnect.py::test_metrics_reconnect) \u2014 at devnet scale the metric assertions saturate long before 200, which adds wall-time, not signal. Overridable via RE_ITERATIONS for a shakedown, but the GATE pins 30: a run that quietly lowers the iteration count would weaken exactly the repetition this round exists for, since the leak classes it targets (#924 fd-per-reconnect, #980 task-per-reconnect) are invisible in a single cycle. The round's own RED cases are RE_RED_CASE=down (assert recovery without restarting) and RE_RED_CASE=peers (require peers_connected > 999); both must FAIL the round."
   }
 }
