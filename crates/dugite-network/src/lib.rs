@@ -246,8 +246,48 @@ pub enum TxValidationError {
         current_slot: u64,
         valid_from: u64,
     },
+    /// **CATCH-ALL — do NOT give this variant a typed encoder arm.**
+    ///
+    /// `serve.rs` routes roughly twenty unrelated `ValidationError`s onto this
+    /// one carrier (`RefScriptsSizeTooBig`, `Phase2EvalPanic`,
+    /// `GovernancePreConway`, `MissingDatumWitness`, `ZeroWithdrawal`,
+    /// `ScriptLockedCollateral`, …). Its only invariant is "some rejection whose
+    /// reason survives as free text", so any typed wire class attached here
+    /// would MISLABEL most of what flows through it — an arm that is worse than
+    /// the generic fallback (#979).
+    ///
+    /// The genuine phase-2 script failure now has its own carrier,
+    /// [`TxValidationError::Phase2ScriptsFailedUnexpectedly`].
     ScriptFailed {
         reason: String,
+    },
+    /// Conway `UtxosFailure (ValidationTagMismatch Phase2Valid
+    /// (FailedUnexpectedly …))` — the transaction declared `is_valid = true`
+    /// and its Plutus scripts then failed evaluation (#1053).
+    ///
+    /// This is the ONLY ledger error that means "phase-2 evaluation ran and
+    /// disagreed with a `Phase2Valid` tag", so it gets a dedicated carrier
+    /// rather than riding the [`TxValidationError::ScriptFailed`] catch-all —
+    /// otherwise the typed wire class would also be stamped on every unrelated
+    /// rejection that happens to share that variant.
+    ///
+    /// Haskell (`Cardano.Ledger.Alonzo.Rules.Utxos`
+    /// `scriptsValidateTransition`):
+    ///
+    /// ```haskell
+    /// Fails _ps fs ->
+    ///   failBecause $
+    ///     ValidationTagMismatch
+    ///       (tx ^. isValidTxL)
+    ///       (FailedUnexpectedly (scriptFailureToFailureDescription <$> fs))
+    /// ```
+    Phase2ScriptsFailedUnexpectedly {
+        /// One entry per failed script — the `Text` half of each Haskell
+        /// `PlutusFailure Text ByteString`. dugite raises a single aggregated
+        /// message today; the field is a `Vec` because Haskell's payload is a
+        /// `NonEmpty FailureDescription` and the shape must stay correct if a
+        /// future evaluator reports per-script failures.
+        messages: Vec<String>,
     },
     /// `InsufficientCollateral DeltaCoin Coin` (Conway `ConwayUtxoPredFailure`
     /// tag 12) — `balance` is the collateral balance actually present (may be

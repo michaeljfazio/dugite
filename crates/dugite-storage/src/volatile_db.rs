@@ -1754,11 +1754,17 @@ impl VolatileDB {
     /// (10 000) back, which the `k`-deep `LedgerSeq` then cannot roll back to,
     /// forcing a catastrophic snapshot+genesis-replay (observed: a 10 629-block
     /// rollback → ledger reset to genesis → unrecoverable stall).
+    /// `allow_genesis_anchor` (#1057) — may a fork rooted at GENESIS be treated as
+    /// reachable? The caller passes "the ledger CAN BE ROLLED BACK to Origin",
+    /// because this function's output is executed by the ledger and a genesis-rooted
+    /// plan is only executable when that rollback is legal. See the arm inside for
+    /// why it is a hard precondition rather than a preference.
     pub fn switch_chain(
         &mut self,
         new_tip_hash: &Hash32,
         immutable_anchor: Option<(Hash32, u64)>,
         max_rollback: u64,
+        allow_genesis_anchor: bool,
     ) -> Option<SwitchPlan> {
         let new_chain = self.walk_chain_back(new_tip_hash);
         if new_chain.is_empty() {
@@ -1815,59 +1821,115 @@ impl VolatileDB {
                     .first()
                     .and_then(|h| self.blocks.get(h))
                     .map(|b| b.prev_hash);
-                match (immutable_anchor, new_root_prev) {
-                    (Some((anchor_hash, anchor_slot)), Some(prev)) if anchor_hash == prev => {
-                        let rollback: Vec<Hash32> =
-                            self.selected_chain.iter().rev().copied().collect();
-                        let apply: Vec<Hash32> = new_chain.clone();
-                        debug!(
-                            new_tip = %new_tip_hash,
-                            anchor = %anchor_hash,
-                            anchor_slot,
-                            rollback_count = rollback.len(),
-                            apply_count = apply.len(),
-                            "VolatileDB: fork anchors at immutable tip — \
-                             switching via full-volatile rollback"
-                        );
-                        (anchor_hash, anchor_slot, rollback, apply)
-                    }
-                    _ => {
-                        // Truly unreachable: the fork's ancestry does not connect
-                        // to our current volatile chain or its anchor.  Leave
-                        // `selected_chain` untouched; the block stays in
-                        // VolatileDB inert.
-                        //
-                        // Diagnostic instrumentation (Bug J, 2026-05-16): log the
-                        // full shape of both chains and the anchor.  This lets us
-                        // distinguish the three plausible failure modes:
-                        //   1. walk_chain_back stopped at a too-shallow block
-                        //      (its first prev_hash is some peer block already
-                        //      flushed to immutable, not the immutable tip).
-                        //   2. selected_chain is shorter than expected because
-                        //      our own forges drifted past the volatile window.
-                        //   3. immutable_anchor is None when it shouldn't be
-                        //      (e.g., we never flushed but should have).
-                        warn!(
-                            new_tip = %new_tip_hash,
-                            new_tip_slot = self.blocks.get(new_tip_hash).map(|b| b.slot).unwrap_or(0),
-                            new_tip_block_no = self.blocks.get(new_tip_hash).map(|b| b.block_no).unwrap_or(0),
-                            new_chain_len = new_chain.len(),
-                            new_chain_first = ?new_chain.first().map(|h| h.to_hex()),
-                            new_chain_first_slot = ?new_chain.first().and_then(|h| self.blocks.get(h)).map(|b| b.slot),
-                            new_chain_first_block_no = ?new_chain.first().and_then(|h| self.blocks.get(h)).map(|b| b.block_no),
-                            new_root_prev = ?new_root_prev.map(|h| h.to_hex()),
-                            selected_len = self.selected_chain.len(),
-                            selected_first = ?self.selected_chain.first().map(|h| h.to_hex()),
-                            selected_first_slot = ?self.selected_chain.first().and_then(|h| self.blocks.get(h)).map(|b| b.slot),
-                            selected_first_block_no = ?self.selected_chain.first().and_then(|h| self.blocks.get(h)).map(|b| b.block_no),
-                            selected_last = ?self.selected_chain.last().map(|h| h.to_hex()),
-                            selected_last_slot = ?self.selected_chain.last().and_then(|h| self.blocks.get(h)).map(|b| b.slot),
-                            selected_last_block_no = ?self.selected_chain.last().and_then(|h| self.blocks.get(h)).map(|b| b.block_no),
-                            immutable_anchor_hash = ?immutable_anchor.map(|(h, _)| h.to_hex()),
-                            immutable_anchor_slot = ?immutable_anchor.map(|(_, s)| s),
-                            "VolatileDB: fork unreachable — no common anchor (Haskell: isReachable = Nothing)"
-                        );
-                        return None;
+                // #1057 half A: a fork rooted at GENESIS is reachable when the
+                // ledger is at Origin.
+                //
+                // `Hash32::ZERO` is dugite's canonical Origin parent (the encoder
+                // maps it to CBOR `null` == Haskell `PrevHash = GenesisHash`).
+                // Upstream needs no arm here at all: `AnchorGenesis` is a
+                // first-class constructor of `Anchor blk` and `Paths.hs::isReachable`
+                // matches it directly. dugite models the anchor as
+                // `Option<(Hash32, u64)>`, so with nothing flushed the anchor is
+                // `None` and a genesis-rooted fork looked unreachable — which is
+                // half of why a node with any block of its own never rejoined a
+                // chain diverging at genesis.
+                //
+                // `allow_genesis_anchor` is NOT optional politeness. Emitting this
+                // plan when the ledger is NOT at Origin asks chain selection to roll
+                // the ledger back to Origin, and that aborts ("Rollback target
+                // outside LedgerSeq volatile window AND no canonical snapshot
+                // available"), moving the wedge from BlockFetch to the ledger. That
+                // was implemented, measured live at block 4 against a network at 84,
+                // and REVERTED. Unit tests on this function all passed while it was
+                // wrong, because nothing drove the plan through the ledger.
+                // This arm yields the (intersection, slot, rollback, apply) TUPLE
+                // rather than returning a `SwitchPlan` directly. Returning early
+                // here skipped everything after the match — the Ouroboros
+                // k-finality `max_rollback` cap, the `gc_schedule` updates and the
+                // `selected_chain` rewrite — so the plan was handed out while the
+                // VolatileDB still pointed at the old tip, and a rollback deeper
+                // than k would have bypassed its own guard. Caught by
+                // `test_switch_chain_genesis_anchor_requires_ledger_at_origin`
+                // asserting the resulting tip, not just the returned plan.
+                //
+                // The k cap applying here is correct, not incidental: a rollback
+                // deeper than k is protocol-impossible, and it matches ChainSync's
+                // own "local chain is within k blocks of genesis" condition for
+                // accepting the Origin intersection in the first place.
+                if allow_genesis_anchor && new_root_prev == Some(Hash32::ZERO) {
+                    let rollback: Vec<Hash32> = self.selected_chain.iter().rev().copied().collect();
+                    let apply: Vec<Hash32> = new_chain.clone();
+                    debug!(
+                        new_tip = %new_tip_hash,
+                        rollback_count = rollback.len(),
+                        apply_count = apply.len(),
+                        "VolatileDB: fork anchors at GENESIS and the ledger is at \
+                         Origin — switching via full-volatile rollback (#1057)"
+                    );
+                    (Hash32::ZERO, 0, rollback, apply)
+                } else {
+                    match (immutable_anchor, new_root_prev) {
+                        (Some((anchor_hash, anchor_slot)), Some(prev)) if anchor_hash == prev => {
+                            let rollback: Vec<Hash32> =
+                                self.selected_chain.iter().rev().copied().collect();
+                            let apply: Vec<Hash32> = new_chain.clone();
+                            debug!(
+                                new_tip = %new_tip_hash,
+                                anchor = %anchor_hash,
+                                anchor_slot,
+                                rollback_count = rollback.len(),
+                                apply_count = apply.len(),
+                                "VolatileDB: fork anchors at immutable tip — \
+                                 switching via full-volatile rollback"
+                            );
+                            (anchor_hash, anchor_slot, rollback, apply)
+                        }
+                        _ => {
+                            // Truly unreachable: the fork's ancestry does not connect
+                            // to our current volatile chain or its anchor.  Leave
+                            // `selected_chain` untouched; the block stays in
+                            // VolatileDB inert.
+                            //
+                            // Diagnostic instrumentation (Bug J, 2026-05-16): log the
+                            // full shape of both chains and the anchor.  This lets us
+                            // distinguish the three plausible failure modes:
+                            //   1. walk_chain_back stopped at a too-shallow block
+                            //      (its first prev_hash is some peer block already
+                            //      flushed to immutable, not the immutable tip).
+                            //   2. selected_chain is shorter than expected because
+                            //      our own forges drifted past the volatile window.
+                            //   3. immutable_anchor is None when it shouldn't be
+                            //      (e.g., we never flushed but should have).
+                            warn!(
+                                new_tip = %new_tip_hash,
+                                new_tip_slot = self.blocks.get(new_tip_hash).map(|b| b.slot).unwrap_or(0),
+                                new_tip_block_no = self.blocks.get(new_tip_hash).map(|b| b.block_no).unwrap_or(0),
+                                new_chain_len = new_chain.len(),
+                                new_chain_first = ?new_chain.first().map(|h| h.to_hex()),
+                                new_chain_first_slot = ?new_chain.first().and_then(|h| self.blocks.get(h)).map(|b| b.slot),
+                                new_chain_first_block_no = ?new_chain.first().and_then(|h| self.blocks.get(h)).map(|b| b.block_no),
+                                new_root_prev = ?new_root_prev.map(|h| h.to_hex()),
+                                selected_len = self.selected_chain.len(),
+                                selected_first = ?self.selected_chain.first().map(|h| h.to_hex()),
+                                selected_first_slot = ?self.selected_chain.first().and_then(|h| self.blocks.get(h)).map(|b| b.slot),
+                                selected_first_block_no = ?self.selected_chain.first().and_then(|h| self.blocks.get(h)).map(|b| b.block_no),
+                                selected_last = ?self.selected_chain.last().map(|h| h.to_hex()),
+                                selected_last_slot = ?self.selected_chain.last().and_then(|h| self.blocks.get(h)).map(|b| b.slot),
+                                selected_last_block_no = ?self.selected_chain.last().and_then(|h| self.blocks.get(h)).map(|b| b.block_no),
+                                immutable_anchor_hash = ?immutable_anchor.map(|(h, _)| h.to_hex()),
+                                immutable_anchor_slot = ?immutable_anchor.map(|(_, s)| s),
+                                // #1057: the two facts that decide whether the
+                                // genesis arm above could have fired. Without them
+                                // this line cannot distinguish "the root is not
+                                // genesis" from "the root IS genesis but the ledger
+                                // could not roll back to it", and three live runs
+                                // were spent guessing between exactly those.
+                                root_is_genesis = new_root_prev == Some(Hash32::ZERO),
+                                allow_genesis_anchor,
+                                "VolatileDB: fork unreachable — no common anchor (Haskell: isReachable = Nothing)"
+                            );
+                            return None;
+                        }
                     }
                 }
             }
@@ -3119,7 +3181,7 @@ mod tests {
         db.add_block(h(6), 400, 40, h(5), b"b6".to_vec());
 
         // Switch to the longer fork.
-        db.switch_chain(&h(6), None, u64::MAX);
+        db.switch_chain(&h(6), None, u64::MAX, false);
 
         // After the switch, selected_chain = [h1, h4, h5, h6].
         // h3 has no successors and is NOT on selected_chain → fork tip.
@@ -3157,7 +3219,7 @@ mod tests {
         db.add_block(h(6), 400, 40, h(5), b"b6".to_vec());
 
         assert_eq!(db.get_tip(), Some((300, h(3), 30)));
-        let plan = db.switch_chain(&h(6), None, u64::MAX).unwrap();
+        let plan = db.switch_chain(&h(6), None, u64::MAX, false).unwrap();
         assert_eq!(plan.intersection, h(1));
         assert_eq!(plan.rollback, vec![h(3), h(2)]);
         assert_eq!(plan.apply, vec![h(4), h(5), h(6)]);
@@ -3190,7 +3252,7 @@ mod tests {
         db.add_block(h(99), 400, 40, h(98), b"detached1".to_vec());
         db.add_block(h(100), 500, 50, h(99), b"detached2".to_vec());
 
-        let plan = db.switch_chain(&h(100), None, u64::MAX);
+        let plan = db.switch_chain(&h(100), None, u64::MAX, false);
         assert!(
             plan.is_none(),
             "switch_chain must return None when the fork is unreachable \
@@ -3236,11 +3298,8 @@ mod tests {
         // case. Use a non-ZERO anchor so this test covers the immutable-tip path
         // it is named for.
         //
-        // Its `switch_chain(.., None, ..).is_none()` assertion also documents
-        // that a genesis-rooted fork is currently REFUSED when the ImmutableDB
-        // is empty — see #1057, which is that wedge and is NOT yet fixed: the
-        // storage layer can be taught to emit the plan, but the ledger cannot
-        // roll back to Origin, so the switch fails downstream instead.
+        // The genesis-rooted case is covered separately by
+        // `test_switch_chain_genesis_anchor_requires_ledger_at_origin` (#1057).
         // Selected chain: h(1) → h(2), both children of h(200).
         db.add_block(h(1), 100, 10, h(200), b"s1".to_vec());
         db.add_block(h(2), 200, 20, h(1), b"s2".to_vec());
@@ -3253,13 +3312,13 @@ mod tests {
         // Without immutable_anchor the fork is unreachable: its root's
         // prev_hash is a real block hash we do not have, and it is not genesis.
         assert!(
-            db.switch_chain(&h(12), None, u64::MAX).is_none(),
+            db.switch_chain(&h(12), None, u64::MAX, false).is_none(),
             "without knowing the immutable anchor, fork stays unreachable"
         );
 
         // Passing the immutable anchor (h(200) at slot 50) allows the switch.
         let plan = db
-            .switch_chain(&h(12), Some((h(200), 50)), u64::MAX)
+            .switch_chain(&h(12), Some((h(200), 50)), u64::MAX, false)
             .expect("fork is reachable via immutable-tip anchor");
         assert_eq!(
             plan.intersection,
@@ -3280,6 +3339,84 @@ mod tests {
         assert_eq!(db.get_tip(), Some((350, h(12), 22)));
     }
 
+    /// #1057 half A: a fork rooted at GENESIS is reachable with an EMPTY
+    /// ImmutableDB — but only when the caller says the ledger is at Origin.
+    ///
+    /// This is the storage half of the wedge. `Hash32::ZERO` is dugite's canonical
+    /// Origin parent, and with nothing flushed the immutable anchor is `None`, so
+    /// the previous code found no reachable ancestor and returned
+    /// `StoreButDontChange` forever.
+    ///
+    /// BOTH polarities are asserted, and the `false` one is the important one: the
+    /// version of this fix WITHOUT the ledger condition was implemented and
+    /// reverted, because storage then handed chain selection a plan the ledger
+    /// could not execute ("Rollback target outside LedgerSeq volatile window AND
+    /// no canonical snapshot available"), leaving the node at block 4 while the
+    /// network was at 84 — worse than unfixed.
+    ///
+    /// Note what a unit test can and cannot do here: this bounds `switch_chain`.
+    /// It does NOT establish that the resulting plan is executable — nothing here
+    /// drives it through the ledger, which is exactly how the reverted attempt
+    /// passed four RED-proven unit tests. The system-level check is
+    /// `testnet/local-devnet/genesis-fork-round.sh`.
+    #[test]
+    fn test_switch_chain_genesis_anchor_requires_ledger_at_origin() {
+        let mut db = VolatileDB::new();
+        // Selected chain: our own two blocks, rooted at GENESIS.
+        db.add_block(h(1), 100, 10, Hash32::ZERO, b"mine1".to_vec());
+        db.add_block(h(2), 200, 20, h(1), b"mine2".to_vec());
+        // A competing chain, also rooted at GENESIS, sharing NO block with ours.
+        db.add_block(h(10), 150, 11, Hash32::ZERO, b"theirs1".to_vec());
+        db.add_block(h(11), 250, 21, h(10), b"theirs2".to_vec());
+        db.add_block(h(12), 350, 22, h(11), b"theirs3".to_vec());
+
+        // Ledger NOT at Origin → must refuse, even though the fork is longer.
+        assert!(
+            db.switch_chain(&h(12), None, u64::MAX, false).is_none(),
+            "a genesis-rooted plan the ledger cannot execute must NOT be emitted \
+             — that is the reverted fix"
+        );
+
+        // Ledger at Origin → reachable, anchored at genesis.
+        let plan = db
+            .switch_chain(&h(12), None, u64::MAX, true)
+            .expect("a genesis-rooted fork is reachable when the ledger is at Origin");
+        assert_eq!(
+            plan.intersection,
+            Hash32::ZERO,
+            "the intersection IS genesis"
+        );
+        assert_eq!(plan.intersection_slot, 0);
+        assert_eq!(
+            plan.rollback,
+            vec![h(2), h(1)],
+            "roll back our entire own chain, newest first"
+        );
+        assert_eq!(
+            plan.apply,
+            vec![h(10), h(11), h(12)],
+            "apply the peer's entire chain, oldest first"
+        );
+        assert_eq!(db.get_tip(), Some((350, h(12), 22)));
+    }
+
+    /// The genesis clause must not become a general escape hatch: a fork whose
+    /// root's `prev_hash` is an unknown NON-genesis hash stays unreachable even
+    /// with `allow_genesis_anchor = true`.
+    #[test]
+    fn test_genesis_anchor_does_not_excuse_unknown_non_genesis_root() {
+        let mut db = VolatileDB::new();
+        db.add_block(h(1), 100, 10, Hash32::ZERO, b"mine1".to_vec());
+        // Fork root's parent h(200) is neither in the DB nor genesis.
+        db.add_block(h(10), 150, 11, h(200), b"theirs1".to_vec());
+        db.add_block(h(11), 250, 21, h(10), b"theirs2".to_vec());
+        assert!(
+            db.switch_chain(&h(11), None, u64::MAX, true).is_none(),
+            "an unknown non-genesis root must stay unreachable regardless of the \
+             ledger — otherwise the clause weakens Haskell's isReachable"
+        );
+    }
+
     /// A `SwitchPlan` returned by `switch_chain` must carry the intersection
     /// slot — not just the hash — so callers can build a `Point::Specific(slot,
     /// hash)` for ledger rollback without a second lookup that could miss the
@@ -3296,7 +3433,7 @@ mod tests {
         db.add_block(h(6), 444, 40, h(5), b"b-chain-tip".to_vec());
 
         let plan = db
-            .switch_chain(&h(6), None, u64::MAX)
+            .switch_chain(&h(6), None, u64::MAX, false)
             .expect("reachable fork");
         assert_eq!(plan.intersection, h(1));
         assert_eq!(
@@ -3371,7 +3508,7 @@ mod tests {
 
         // k = 3 < rollback depth 4 → refuse, leaving the selected chain intact.
         assert!(
-            db.switch_chain(&h(24), None, 3).is_none(),
+            db.switch_chain(&h(24), None, 3, false).is_none(),
             "fork requiring a 4-block rollback must be refused when k = 3"
         );
         assert_eq!(
@@ -3382,7 +3519,7 @@ mod tests {
 
         // k = 4 == rollback depth 4 → permitted (Haskell allows rollback ≤ k).
         let plan = db
-            .switch_chain(&h(24), None, 4)
+            .switch_chain(&h(24), None, 4, false)
             .expect("rollback of exactly k must be permitted");
         assert_eq!(plan.intersection, h(1));
         assert_eq!(plan.rollback, vec![h(5), h(4), h(3), h(2)]);
@@ -3408,7 +3545,8 @@ mod tests {
 
         // Full-volatile rollback depth = 3 (entire selected chain). k = 2 → refuse.
         assert!(
-            db.switch_chain(&h(13), Some((h(0), 50)), 2).is_none(),
+            db.switch_chain(&h(13), Some((h(0), 50)), 2, false)
+                .is_none(),
             "full-volatile rollback of 3 blocks must be refused when k = 2"
         );
         assert_eq!(
@@ -3429,7 +3567,7 @@ mod tests {
         assert!(db.has_block(&h(2)));
         assert!(db.has_block(&h(3)));
 
-        let plan = db.switch_chain(&h(3), None, u64::MAX).unwrap();
+        let plan = db.switch_chain(&h(3), None, u64::MAX, false).unwrap();
         assert_eq!(plan.apply, vec![h(3)]);
         assert_eq!(db.get_tip(), Some((100, h(3), 10)));
         assert_eq!(db.len(), 3);
@@ -3740,7 +3878,7 @@ mod tests {
         );
 
         // Attempt switch — must return None (unreachable fork).
-        let plan = db.switch_chain(&fork_tip, None, u64::MAX);
+        let plan = db.switch_chain(&fork_tip, None, u64::MAX, false);
         assert!(
             plan.is_none(),
             "switch_chain must return None for a deep detached fork \

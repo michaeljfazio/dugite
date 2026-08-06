@@ -1004,7 +1004,18 @@ pub(crate) fn convert_validation_error(
             current_slot,
             valid_from,
         },
-        VE::ScriptFailed(reason) => TxValidationError::ScriptFailed { reason },
+        // `ValidationError::ScriptFailed` has exactly ONE producer —
+        // `phase2_admission_error`, for `is_valid = true` + a genuine evaluation
+        // failure — so it maps to the dedicated phase-2 carrier and gets the
+        // typed `ValidationTagMismatch … FailedUnexpectedly` wire class (#1053).
+        //
+        // It deliberately does NOT ride `TxValidationError::ScriptFailed`: that
+        // network variant is the free-text catch-all for ~20 unrelated
+        // rejections below, and a typed phase-2 class stamped on all of them
+        // would be worse than the generic fallback (#979).
+        VE::ScriptFailed(reason) => TxValidationError::Phase2ScriptsFailedUnexpectedly {
+            messages: vec![reason],
+        },
         VE::InsufficientCollateral { balance, required } => {
             TxValidationError::InsufficientCollateral { balance, required }
         }
@@ -1817,6 +1828,49 @@ mod tests {
     // failures (etc.) — exactly the class of bug that bites operators in
     // production.
 
+    /// #1053 WIRING test. The typed `ValidationTagMismatch` encoder arm is
+    /// worthless if this mapping still points `VE::ScriptFailed` at the free-text
+    /// catch-all — #977's exact failure mode, where the fix landed in a path
+    /// nothing reached.
+    ///
+    /// The assertion is deliberately two-sided: the phase-2 failure must become
+    /// the dedicated carrier, AND a rejection that merely BORROWS the catch-all
+    /// (`RefScriptsSizeTooBig`) must NOT, because a typed phase-2 class stamped
+    /// on it would be a confident lie (#979).
+    #[test]
+    fn convert_validation_error_routes_phase2_failure_to_its_own_carrier() {
+        use dugite_ledger::validation::ValidationError as VE;
+
+        let e = convert_validation_error(VE::ScriptFailed(
+            "Plutus evaluation failed: script returned Error term".to_string(),
+        ));
+        match e {
+            TxValidationError::Phase2ScriptsFailedUnexpectedly { messages } => {
+                assert_eq!(messages.len(), 1, "one message per failed script");
+                assert!(
+                    messages[0].contains("script returned Error term"),
+                    "the evaluator's diagnostic must survive: {:?}",
+                    messages[0]
+                );
+            }
+            other => panic!(
+                "VE::ScriptFailed must map to the dedicated phase-2 carrier so it \
+                 reaches the client as a typed ValidationTagMismatch; got {other:?}"
+            ),
+        }
+
+        // The catch-all must keep its other tenants.
+        let e = convert_validation_error(VE::RefScriptsSizeTooBig {
+            maximum: 204_800,
+            actual: 300_000,
+        });
+        assert!(
+            matches!(e, TxValidationError::ScriptFailed { .. }),
+            "RefScriptsSizeTooBig is NOT a phase-2 script failure and must not \
+             acquire the phase-2 wire class; got {e:?}"
+        );
+    }
+
     #[test]
     fn convert_validation_error_preserves_known_variants() {
         use dugite_ledger::validation::ValidationError as VE;
@@ -2064,7 +2118,12 @@ mod tests {
                 "dugite parse guard; no Conway constructor",
             ),
             ("ZeroWithdrawal", "no Conway constructor"),
-            ("ScriptFailed", "the generic failure itself"),
+            // `ScriptFailed` was here as "the generic failure itself" until
+            // #1053. It is now the ONLY ledger error meaning "phase-2 evaluation
+            // ran and disagreed with a Phase2Valid tag", and it maps to
+            // `Phase2ScriptsFailedUnexpectedly` → the typed
+            // `ValidationTagMismatch … FailedUnexpectedly`. Re-adding it here
+            // would mean the typed arm had been unwired.
             // ── Payload insufficient: counterpart exists, data does not ──
             (
                 "MalformedProposal",
@@ -2157,6 +2216,18 @@ mod tests {
         let body = &src[start..];
         let end = body.find("\n/// ").unwrap_or(body.len());
         let body = &body[..end];
+
+        // Comments are STRIPPED before scanning. A comment that merely NAMES
+        // `TxValidationError::ScriptFailed` — for instance to explain why a
+        // neighbouring arm deliberately does NOT use it (#1053) — would
+        // otherwise be attributed to the arm it sits after and reported as an
+        // unjustified degradation. The guard must measure code, not prose.
+        let body: String = body
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .map(|l| format!("{l}\n"))
+            .collect();
+        let body = body.as_str();
 
         let mut found: Vec<&str> = Vec::new();
         let arms: Vec<(usize, &str)> = body

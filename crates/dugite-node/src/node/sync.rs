@@ -352,6 +352,12 @@ impl Node {
             dropped_deltas = dropped,
             "LedgerSeq re-anchored on the live ledger state"
         );
+        drop(seq);
+        drop(ls);
+        // #1057: the anchor just moved, so the "can this ledger roll back to Origin"
+        // answer may have flipped in either direction. Published HERE — one of only
+        // two places the anchor changes — rather than recomputed on every tip change.
+        self.publish_ledger_can_reach_origin().await;
     }
 
     async fn handle_rollback_inner(&self, rollback_point: &Point) -> bool {
@@ -1792,6 +1798,11 @@ impl Node {
                     // Advance LedgerSeq anchor — the oldest volatile delta
                     // is now immutable and can be absorbed into the anchor.
                     self.ledger_seq.write().await.advance_anchor();
+                    // #1057: advancing the anchor is how it stops being Origin, which
+                    // correctly DISABLES the genesis-anchor arm once the chain is
+                    // more than k blocks in (a rollback to Origin is then illegal
+                    // under Ouroboros k-finality anyway).
+                    self.publish_ledger_can_reach_origin().await;
 
                     // Flush DiffSeq entries for the now-immutable block.
                     // These diffs can never be rolled back, so keeping them

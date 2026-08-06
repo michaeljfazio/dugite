@@ -495,27 +495,49 @@ pub(crate) fn handle_debug_chain_dep_state(state: &NodeStateSnapshot) -> QueryRe
     }
 }
 
-/// Handle GetRewardProvenance (tag 14) — reward calculation provenance.
+/// Handle GetRewardProvenance (tag 14) — answered with an explicit error.
 ///
-/// Returns aggregate reward provenance data: total rewards pot, treasury tax,
-/// and total active stake for the current epoch.
-pub(crate) fn handle_reward_provenance(state: &NodeStateSnapshot) -> QueryResult {
-    debug!("Query: GetRewardProvenance");
-    let total_active_stake: u64 = state.stake_pools.iter().map(|p| p.stake).sum();
-    // Reward pot = reserves * rho (monetary expansion)
-    let rho_num = state.protocol_params.rho_num;
-    let rho_den = state.protocol_params.rho_den.max(1);
-    let total_rewards_pot = (state.reserves as u128 * rho_num as u128 / rho_den as u128) as u64;
-    // Treasury tax = reward_pot * tau
-    let tau_num = state.protocol_params.tau_num;
-    let tau_den = state.protocol_params.tau_den.max(1);
-    let treasury_tax = (total_rewards_pot as u128 * tau_num as u128 / tau_den as u128) as u64;
-    QueryResult::RewardProvenance {
-        epoch: state.epoch.0,
-        total_rewards_pot,
-        treasury_tax,
-        active_stake: total_active_stake,
-    }
+/// dugite used to reply with a self-invented `array(4)`
+/// `[epoch, rewards_pot, treasury_tax, active_stake]`. Haskell's result type is
+/// `SL.RewardProvenance`, a **16-field `Rec`** (oracle-verified against
+/// cardano-ledger `Shelley/RewardProvenance.hs`), encoded via
+/// `LC.toEraCBOR @era`:
+///
+/// ```haskell
+/// data RewardProvenance = RewardProvenance
+///   { spe :: !Word64, blocks :: !BlocksMade, maxLL :: !Coin
+///   , deltaR1 :: !Coin, deltaR2 :: !Coin, r :: !Coin, totalStake :: !Coin
+///   , blocksCount :: !Integer, d :: !Rational, expBlocks :: !Integer
+///   , eta :: !Rational, rPot :: !Coin, deltaT1 :: !Coin, activeStake :: !Coin
+///   , pools :: !(Map (KeyHash StakePool) RewardProvenancePool)
+///   , desirabilities :: !(Map (KeyHash StakePool) Desirability)
+///   }
+/// ```
+///
+/// So the old reply was **structurally undecodable** by any real client: a
+/// decoder expecting 16 fields fails on 4 with `DeserialiseFailure`, the #993 /
+/// #968 shape — and it fails with a confusing framing error rather than
+/// anything actionable.
+///
+/// An explicit error is returned instead of the wrong shape, following #993's
+/// conclusion that an undecodable reply is worse than an honest refusal. Note
+/// the direction: upstream ANSWERS this query, so dugite is deliberately choosing
+/// a false reject over a false answer for a query with **no cardano-cli
+/// exposure** at all. Filling it in faithfully needs `RewardProvenancePool` and
+/// `Desirability` per pool plus the deltaR1/deltaR2/eta/expBlocks terms of the
+/// reward calculation, none of which dugite currently retains after a boundary —
+/// tracked separately rather than approximated here, because a plausible-looking
+/// 16-field answer built from guesses would be worse than either option.
+pub(crate) fn handle_reward_provenance(_state: &NodeStateSnapshot) -> QueryResult {
+    debug!("Query: GetRewardProvenance (tag 14) — unsupported, returning an error");
+    QueryResult::Error(
+        "GetRewardProvenance (tag 14) is not supported by dugite. Its Haskell result \
+         is a 16-field RewardProvenance record; dugite does not retain the \
+         deltaR1/deltaR2/eta/expBlocks terms or the per-pool desirabilities needed \
+         to answer it faithfully, and a wrong-arity reply would be undecodable. \
+         Use GetRewardInfoPools (tag 18) for per-pool reward data."
+            .to_string(),
+    )
 }
 
 #[cfg(test)]
@@ -604,44 +626,45 @@ mod tests {
         }
     }
 
+    /// #1030 item 5: tag 14 must answer with an EXPLICIT ERROR, not a
+    /// well-formed-but-wrong `array(4)`.
+    ///
+    /// The two tests this replaces asserted the invented shape's arithmetic
+    /// (`pot = reserves * rho`, `tax = pot * tau`) and so PINNED the divergence:
+    /// they were green for a reply no client could decode, because Haskell's
+    /// `SL.RewardProvenance` is a 16-field `Rec`. The same shape as #968, where
+    /// the test helper encoded the same wrong frame as the code.
     #[test]
-    fn test_reward_provenance() {
+    fn test_reward_provenance_is_an_explicit_error_not_a_wrong_shape() {
         let state = make_state();
-        let result = handle_reward_provenance(&state);
-        match result {
-            QueryResult::RewardProvenance {
-                epoch,
-                total_rewards_pot,
-                treasury_tax,
-                active_stake,
-            } => {
-                assert_eq!(epoch, 42);
-                // reserves=10B, rho=3/1000 => pot=30M
-                assert_eq!(total_rewards_pot, 30_000_000);
-                // pot=30M, tau=2/10 => tax=6M
-                assert_eq!(treasury_tax, 6_000_000);
-                assert_eq!(active_stake, 1_000_000_000);
+        match handle_reward_provenance(&state) {
+            QueryResult::Error(msg) => {
+                assert!(
+                    msg.contains("GetRewardProvenance"),
+                    "the error must name the query so a client can act on it: {msg}"
+                );
+                assert!(
+                    msg.contains("GetRewardInfoPools") || msg.contains("tag 18"),
+                    "point the caller at the supported alternative: {msg}"
+                );
             }
-            _ => panic!("Expected RewardProvenance"),
+            other => panic!(
+                "tag 14 must return an explicit error rather than a fabricated \
+                 payload — a wrong-arity reply is undecodable (#993). Got {other:?}"
+            ),
         }
     }
 
+    /// The reserves value must not change the answer: there is no arithmetic left
+    /// to get wrong, which is the point of removing the variant.
     #[test]
-    fn test_reward_provenance_zero_reserves() {
+    fn test_reward_provenance_error_is_state_independent() {
         let mut state = make_state();
         state.reserves = 0;
-        let result = handle_reward_provenance(&state);
-        match result {
-            QueryResult::RewardProvenance {
-                total_rewards_pot,
-                treasury_tax,
-                ..
-            } => {
-                assert_eq!(total_rewards_pot, 0);
-                assert_eq!(treasury_tax, 0);
-            }
-            _ => panic!("Expected RewardProvenance"),
-        }
+        assert!(matches!(
+            handle_reward_provenance(&state),
+            QueryResult::Error(_)
+        ));
     }
 
     #[test]
