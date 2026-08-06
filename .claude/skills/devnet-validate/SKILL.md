@@ -513,8 +513,8 @@ Evidence: `restart-endurance.csv`; denominator `restart_endurance.expected_cases
 GF_MIN_FORK_BLOCKS=3 ./genesis-fork-round.sh
 ```
 
-**Currently reports INCONCLUSIVE — the scenario cannot yet be constructed.** Kept
-in the tree deliberately; see the script header for the two measured negatives.
+**Currently reports INCONCLUSIVE — the scenario is built but resolves in the
+wrong direction.** Kept in the tree deliberately; see the script header.
 
 Splits the devnet into two islands sharing only genesis (the relay is the bridge:
 `relay -> {dugite-bp, cardano-bp}`), lets each build its own chain, then restores
@@ -523,13 +523,26 @@ the bridge and requires dugite-bp's tip **hash** to match cardano-bp's — hash,
 deliberately not restarted, so adoption must happen on the LIVE path where #1057
 bites.
 
-Why it does not yet work: a dugite BP **cannot mint the first block of a chain**.
-Fully isolated it forged 0 blocks; peered only with dugite-relay it forged 0 and
-logged ZERO `TraceStartLeadershipCheck`, because both start at Origin so nothing
-supplies the non-Origin `MsgIntersectFound` the peer-connectivity gate wants and
-the silent catch-up gate short-circuits every slot. That is Bug-A/Bug-G protection
-working as designed — and it leaves an open question on #1057, since in the
-original occurrence dugite-bp *did* forge `block_no=0`.
+Why it does not yet PASS: with roughly equal-depth genesis-divergent forks,
+dugite's own chain **wins** chain selection and cardano-bp adopts *it* — so the
+adoption path under test is never entered. Measured on main: 4-vs-5 blocks
+converged at block 11, and 9-vs-9 converged at block 13, both with **zero**
+dugite-bp chain switches. The remaining gap is that the cardano island needs a
+strictly LONGER chain at reconnect (a head start, or inverting the 60/40 stake
+split). The original occurrence had 9 blocks against 240 with the ledger frozen
+far outside the 240-slot forecast horizon, so the depth asymmetry is probably
+load-bearing.
+
+Two earlier defects in this round are worth knowing about, because both are the
+same shape as the bug it exists to catch — asserting a symptom, not a mechanism:
+
+- it once ran dugite-bp **without forging keys**, so it forged nothing and the
+  round concluded (wrongly) that a dugite BP cannot mint the first block of a
+  chain. A node with no keys looks exactly like one whose forge gates are
+  blocking it. Keys are now existence-checked.
+- it then reported PASS on **tip-hash equality alone**, which does not say which
+  side moved: dugite's fork had won and cardano adopted it. Step 3 now also
+  requires a dugite-bp chain switch / ledger rollback.
 
 Unmet preconditions report **INCONCLUSIVE and exit 3**, never PASS. Step 4
 classifies three states from log signatures so a future attempt can distinguish a
