@@ -3220,10 +3220,23 @@ impl ConnectionLifecycleManager {
                                                 let suppressed =
                                                     genesis_declines_since_warn.saturating_sub(1);
                                                 genesis_declines_since_warn = 0;
+                                                // `ledger_can_reach_origin` on THIS line, not
+                                                // only on the chain-selection one. The
+                                                // chain-selection WARN never fires in this
+                                                // scenario — BlockFetch declines, so no blocks
+                                                // arrive, so chain selection never sees a
+                                                // competing fork — which made the first round
+                                                // of instrumentation useless. Instrument where
+                                                // the decision is MADE, not only where a
+                                                // downstream consequence would appear.
                                                 warn!(
                                                     %addr,
                                                     first_slot = first.slot,
                                                     suppressed_since_last = suppressed,
+                                                    ledger_can_reach_origin =
+                                                        ledger_can_reach_origin.load(
+                                                            std::sync::atomic::Ordering::Relaxed,
+                                                        ),
                                                     "BlockFetch: declining a range rooted at \
                                                      GENESIS — this node holds a chain that \
                                                      diverges from the peer's at genesis and \

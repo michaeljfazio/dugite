@@ -261,12 +261,14 @@ ok "genesis regenerated (two-forger)"
 
 RELAY_TOPO="$LD_CONFIG/dugite-relay.topology.json"
 CBP_TOPO="$LD_CONFIG/cardano-bp.topology.json"
+BP_TOPO="$LD_CONFIG/dugite-bp.topology.json"
 cp "$RELAY_TOPO" "$LD_STATE/relay.topology.real.json" || exit 2
 cp "$CBP_TOPO"   "$LD_STATE/cbp.topology.real.json"   || exit 2
 
 cleanup() {
     [ -f "$LD_STATE/relay.topology.real.json" ] && cp "$LD_STATE/relay.topology.real.json" "$RELAY_TOPO" 2>/dev/null
     [ -f "$LD_STATE/cbp.topology.real.json" ]   && cp "$LD_STATE/cbp.topology.real.json"   "$CBP_TOPO"   2>/dev/null
+    [ -f "$LD_STATE/bp.topology.real.json" ]    && cp "$LD_STATE/bp.topology.real.json"    "$BP_TOPO"    2>/dev/null
     return 0
 }
 trap cleanup EXIT
@@ -362,8 +364,47 @@ fi
 # is NOT restarted — the adoption still has to happen on the live path.
 step "2b. freeze the dugite island; cardano runs >= ${HEAD_START_SLOTS} slots ahead"
 
-stop_pid_file "$LD_STATE/dugite-relay.pid" || note "dugite-relay did not exit within 60s of SIGTERM"
-sleep 5
+# FREEZE BY SIGHUP, NOT BY STOPPING THE RELAY — and the difference is the whole
+# reason the live fix can be tested at all.
+#
+# `reanchor_ledger_seq` sets the LedgerSeq anchor to the CURRENT ledger state, and
+# `run()` calls it after startup replay. So ANY restart with a non-empty ChainDB
+# moves the anchor off Origin, which closes the `ledger_can_reach_origin` gate — the
+# precondition the live genesis-adoption path needs. Stopping the relay here (and
+# restarting it in step 3) therefore destroyed the very condition under test, and no
+# amount of fixing the node could have made the round pass.
+#
+# Dropping the relay's dugite-bp edge via SIGHUP achieves the same freeze — dugite-bp
+# goes peerless and the peer-connectivity forge gate stops it extending its chain —
+# while the relay keeps running with its anchor still at Origin.
+# BOTH EDGES, because the link is bidirectional. Dropping only the relay's
+# dugite-bp edge left dugite-bp dialling the relay itself (its own topology has
+# localRoots = [127.0.0.1:3002]), so it kept a hot peer and kept forging — measured:
+# it ran to block 111 while cardano-bp reached 86, collapsing the slot gap to 1 and
+# inverting the very asymmetry step 2b exists to create.
+jq '.localRoots = []' "$LD_STATE/relay.topology.real.json" > "$RELAY_TOPO" 2>/dev/null \
+    || echo '{"localRoots":[],"publicRoots":[],"useLedgerAfterSlot":-1}' > "$RELAY_TOPO"
+cp "$BP_TOPO" "$LD_STATE/bp.topology.real.json" 2>/dev/null
+jq '.localRoots = []' "$LD_STATE/bp.topology.real.json" > "$BP_TOPO" 2>/dev/null \
+    || echo '{"localRoots":[],"publicRoots":[],"useLedgerAfterSlot":-1}' > "$BP_TOPO"
+
+RELAY_PID=$(cat "$LD_STATE/dugite-relay.pid" 2>/dev/null)
+BP_PID=$(cat "$LD_STATE/dugite-bp.pid" 2>/dev/null)
+hup_ok=1
+if [ -n "$RELAY_PID" ] && kill -HUP "$RELAY_PID" 2>/dev/null; then
+    note "SIGHUP -> dugite-relay (pid $RELAY_PID): dropped its dugite-bp edge"
+else
+    bad "could not SIGHUP dugite-relay (pid ${RELAY_PID:-none})"
+    hup_ok=0
+fi
+if [ -n "$BP_PID" ] && kill -HUP "$BP_PID" 2>/dev/null; then
+    note "SIGHUP -> dugite-bp (pid $BP_PID): dropped its OWN relay edge, so it cannot re-dial"
+else
+    bad "could not SIGHUP dugite-bp (pid ${BP_PID:-none})"
+    hup_ok=0
+fi
+[ "$hup_ok" -eq 1 ] && note "both dugite nodes stay UP, so dugite-relay's LedgerSeq anchor stays at Origin — the precondition the live genesis-adoption path needs"
+sleep 30
 DBP_FROZEN_SLOT=$(tip_field "$LD_DUGITE_BP_SOCK" .slot); DBP_FROZEN_SLOT=${DBP_FROZEN_SLOT:-0}
 DBP_FROZEN_BLK=$(tip_field "$LD_DUGITE_BP_SOCK" .block); DBP_FROZEN_BLK=${DBP_FROZEN_BLK:-0}
 note "dugite-bp frozen at slot=$DBP_FROZEN_SLOT block=$DBP_FROZEN_BLK (peerless)"
@@ -405,30 +446,42 @@ ok "preconditions met: dugite-bp holds its own $DBP_NOW_BLK-block genesis-rooted
 # ── step 3: restore the bridge; dugite-bp must adopt ───────────────────────
 step "3. restore the bridge — dugite-bp must adopt a chain diverging at GENESIS"
 MARK=$(wc -l < "$LD_LOGS/dugite-bp.log" 2>/dev/null)
-# Both node logs are APPENDED across the restart, so step 4 must count only what
-# happens after the bridge is restored. The pre-restore relay never saw cardano-bp
-# at all, but relying on that is fragile — mark it explicitly.
+# Step 4 must count only what happens after the bridge is restored. Nothing is
+# restarted here any more (the bridge comes back via SIGHUP), but the relay's log
+# still spans the whole run, and the pre-restore relay never saw cardano-bp at all —
+# relying on that is fragile, so mark it explicitly.
 RELAY_MARK=$(wc -l < "$LD_LOGS/dugite-relay.log" 2>/dev/null)
 
-stop_pid_file "$LD_STATE/cardano-bp.pid"   || note "cardano-bp did not exit within 60s of SIGTERM"
-
+# RESTORED BY SIGHUP ON BOTH NODES — NO RESTARTS.
+#
+# Same reason as step 2b: restarting dugite-relay would move its LedgerSeq anchor off
+# Origin and close the gate before cardano-bp's chain ever arrives. Both dugite and
+# cardano-node reload `localRoots` from the topology file on SIGHUP, so the bridge can
+# be reconnected without touching either process.
 cp "$LD_STATE/relay.topology.real.json" "$RELAY_TOPO"
 cp "$LD_STATE/cbp.topology.real.json"   "$CBP_TOPO"
-note "bridge restored (relay -> dugite-bp + cardano-bp; cardano-bp -> relay)"
+[ -f "$LD_STATE/bp.topology.real.json" ] && cp "$LD_STATE/bp.topology.real.json" "$BP_TOPO"
 
-start_dugite dugite-relay "$LD_RELAY_PORT" "$LD_DUGITE_RELAY_METRICS_PORT" "$LD_RELAY_SOCK"
-cardano-node run \
-    --config        "$LD_CONFIG/cardano-bp.config.json" \
-    --topology      "$CBP_TOPO" \
-    --database-path "$LD_STATE/cardano-bp.db" \
-    --socket-path   "$LD_CARDANO_BP_SOCK" \
-    --host-addr     127.0.0.1 \
-    --port          "$LD_CARDANO_BP_PORT" \
-    --shelley-kes-key                 "$LD_KEYS/pool2/kes.skey" \
-    --shelley-vrf-key                 "$LD_KEYS/pool2/vrf.skey" \
-    --shelley-operational-certificate "$LD_KEYS/pool2/opcert.cert" \
-    >> "$LD_LOGS/cardano-bp.log" 2>&1 &
-echo $! > "$LD_STATE/cardano-bp.pid"
+BP_PID=$(cat "$LD_STATE/dugite-bp.pid" 2>/dev/null)
+if [ -n "$BP_PID" ] && kill -HUP "$BP_PID" 2>/dev/null; then
+    note "SIGHUP -> dugite-bp (pid $BP_PID): re-added its relay edge"
+else
+    bad "could not SIGHUP dugite-bp (pid ${BP_PID:-none}) — it would stay peerless and could not adopt anything"
+fi
+
+RELAY_PID=$(cat "$LD_STATE/dugite-relay.pid" 2>/dev/null)
+CBP_PID=$(cat "$LD_STATE/cardano-bp.pid" 2>/dev/null)
+if [ -n "$RELAY_PID" ] && kill -HUP "$RELAY_PID" 2>/dev/null; then
+    note "SIGHUP -> dugite-relay (pid $RELAY_PID): re-added dugite-bp + cardano-bp"
+else
+    bad "could not SIGHUP dugite-relay (pid ${RELAY_PID:-none}) — bridge not restored on the dugite side"
+fi
+if [ -n "$CBP_PID" ] && kill -HUP "$CBP_PID" 2>/dev/null; then
+    note "SIGHUP -> cardano-bp (pid $CBP_PID): re-added the relay"
+else
+    bad "could not SIGHUP cardano-bp (pid ${CBP_PID:-none}) — bridge not restored on the cardano side"
+fi
+note "bridge restored WITHOUT restarts, so dugite-relay's LedgerSeq anchor is still at Origin
 
 # dugite-bp is deliberately NOT restarted: the adoption must happen on the LIVE
 # path, which is where #1057 bites. A restart would exercise startup replay
