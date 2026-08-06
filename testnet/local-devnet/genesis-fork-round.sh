@@ -569,7 +569,24 @@ if [ "$CONVERGED" -ne 1 ] && [ "${GF_SKIP_RESTART_PROBE:-0}" -ne 1 ]; then
     if [ "$R_CONVERGED" -eq 1 ]; then
         note "RESTART PATH IS SUFFICIENT: with a genesis ledger, dugite-bp adopted the peer's chain (block ${R_DBP:-?} == cardano-bp). The fix is marker + clean exit + the existing from-genesis startup path; the storage/BlockFetch genesis clauses are NOT required."
     else
-        note "RESTART PATH IS NOT SUFFICIENT: dugite-bp came up at genesis and STILL did not adopt (block ${R_DBP:-?} vs cardano-bp ${R_CBP:-?}, horizon drops ${R_HORIZON:-0}). The ChainDB fork blocks adoption independently of ledger state, so BlockFetch's #735 invariant and switch_chain's anchor test both need their genesis clause."
+        # TWO DIFFERENT CAUSES look identical here, and conflating them wasted a
+        # cycle: the genesis clause may be ABSENT, or it may be PRESENT but gated
+        # off. #1057 half A gates both layers on `ledger_at_origin`, and that turns
+        # out to be a transient boot state — `run()` replays the ChainDB and
+        # re-applies the node's own fork within seconds, so the ledger has left
+        # Origin long before a peer offers a genesis-rooted range. Measured:
+        # `tip_slot=36` twelve seconds after boot, `lag_slots=766`.
+        #
+        # The discriminator is dugite-bp's OWN ledger tip after the restart. If it
+        # is at its own fork's tip rather than Origin, the clause was gated off, not
+        # missing.
+        R_DBP_SLOT=$(tip_field "$LD_DUGITE_BP_SOCK" .slot)
+        note "RESTART PATH IS NOT SUFFICIENT: dugite-bp came up at genesis and STILL did not adopt (block ${R_DBP:-?} vs cardano-bp ${R_CBP:-?}, slot ${R_DBP_SLOT:-?}, horizon drops ${R_HORIZON:-0})."
+        if [ "${R_DBP_SLOT:-0}" -gt 0 ]; then
+            note "  ... and its ledger is at slot ${R_DBP_SLOT} — NOT Origin. The startup ChainDB replay re-applied its own fork, so any fix gated on \"the ledger is at Origin\" is DORMANT: the precondition is false by the time it would matter. The gate needs to be \"the ledger CAN be taken to Origin\" (local chain within k of genesis, matching ChainSync's own clause) plus a real genesis re-init — #1057 half B."
+        else
+            note "  ... and its ledger IS still at Origin, so the genesis clause in BlockFetch's #735 invariant / switch_chain's anchor test is genuinely missing or not reached."
+        fi
     fi
 fi
 
