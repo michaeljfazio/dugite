@@ -20,6 +20,8 @@
 #[allow(dead_code)]
 pub(crate) mod connection_lifecycle;
 pub(crate) mod epoch;
+// #1057: the on-disk marker that makes a restart recover a genesis-divergent node.
+pub(crate) mod genesis_divergence;
 pub(crate) mod ledger_view;
 pub(crate) mod n2c_query;
 pub(crate) mod networking;
@@ -1163,11 +1165,68 @@ impl Node {
         // Uses default epoch parameters (epoch 0, length 432000) since era_history
         // isn't built yet. The active chunk gets correctly named at the first
         // finalize_chunk() call during epoch transitions, which passes real epoch info.
-        let chain_db = Arc::new(RwLock::new(ChainDB::open_with_config(
+        let mut opened_chain_db = ChainDB::open_with_config(
             &args.database_path,
             &args.storage_config.immutable,
             security_param_k,
-        )?));
+        )?;
+
+        // #1057: act on the genesis-divergence marker HERE, while the ChainDB is
+        // still unshared.
+        //
+        // The marker means a previous run established that this node cannot rejoin
+        // the network because its chain diverges at GENESIS: BlockFetch declines
+        // every range rooted at genesis, so the ledger never advances and peers
+        // churn forever. Restarting alone does NOT recover — measured on a
+        // two-forger devnet, `run()`'s replay re-applies the node's own fork within
+        // twelve seconds and it still did not adopt the peer's chain. The dead-end
+        // chain has to go, not just the ledger derived from it.
+        //
+        // Doing it at startup means the whole reset rides the ALREADY-VALIDATED
+        // from-genesis path: a fresh `init_fresh_ledger` plus the LSM
+        // `wipe_utxo_store_before_replay` whose own comment records that a stale
+        // store roughly doubles `sumCoinUTxO` at the Byron→Shelley boundary and
+        // underflows the first MIR debit. No live in-place ledger re-initialisation
+        // — that is what #989 deleted `reset_to_origin` over.
+        //
+        // Placed before the `Arc<RwLock<_>>` wrap deliberately: `Node::new` is not
+        // async, and `blocking_read()` on a tokio lock from inside a runtime panics.
+        // Owning the value outright is simpler than making the constructor async and
+        // is safe precisely because nothing else can hold it yet.
+        //
+        // Both bounds live in `genesis_divergence::decide` and are unit-tested: a
+        // node with anything flushed to the ImmutableDB is REFUSED (a rollback past
+        // the immutable tip is protocol-impossible under k-finality), and repeated
+        // resets are refused as the configuration error they almost certainly are.
+        let genesis_reset = {
+            let decision = genesis_divergence::decide(
+                genesis_divergence::read_attempts(&args.database_path),
+                opened_chain_db.get_immutable_tip_point().is_none(),
+            );
+            genesis_divergence::log_decision(decision, &args.database_path);
+            match decision {
+                genesis_divergence::ResetDecision::Reset { .. } => true,
+                genesis_divergence::ResetDecision::None => false,
+                genesis_divergence::ResetDecision::Refused(_) => {
+                    // Cleared so a stale marker does not make every future start
+                    // suspicious. If the wedge is still real the node re-detects it
+                    // and writes a fresh marker, which is the honest outcome.
+                    genesis_divergence::clear(&args.database_path);
+                    false
+                }
+            }
+        };
+        if genesis_reset {
+            // Discard the dead-end chain. `clear_volatile` truncates the WAL too, so
+            // the fork does not come back on the next start, and startup replay then
+            // has nothing to re-apply — which is what leaves the ledger at Origin.
+            let cleared = opened_chain_db.volatile_block_count();
+            opened_chain_db.clear_volatile();
+            genesis_divergence::log_reset_performed(cleared);
+            genesis_divergence::clear(&args.database_path);
+        }
+
+        let chain_db = Arc::new(RwLock::new(opened_chain_db));
 
         // Load Shelley genesis if configured (with hash for nonce initialization)
         let (shelley_genesis, shelley_genesis_hash) =
@@ -1438,11 +1497,23 @@ impl Node {
         // the setup (see `utxo_store_is_usable`). `wipe_utxo_store_before_replay`
         // is honoured in the LSM block further down.
         let mut wipe_utxo_store_before_replay = false;
-        let snapshot_usable = if snapshot_path.exists()
+
+        // #1057: the reset itself already happened at ChainDB open (above). Here it
+        // only has to force the ledger side: any snapshot describes the chain that
+        // was just discarded, and the on-disk UTxO store must be rebuilt.
+        if genesis_reset {
+            wipe_utxo_store_before_replay = true;
+        }
+
+        let snapshot_usable = if genesis_reset {
+            // Any snapshot describes the chain we just discarded.
+            false
+        } else if snapshot_path.exists()
             && matches!(
                 args.storage_config.utxo.backend,
                 dugite_storage::UtxoBackend::Lsm
-            ) {
+            )
+        {
             let probe_slot = Self::peek_snapshot_slot(&snapshot_path).unwrap_or(0);
             let ok = Self::utxo_store_is_usable(
                 &args.database_path.join("utxo-store"),

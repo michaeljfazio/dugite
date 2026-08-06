@@ -1,0 +1,43 @@
+# Expected error-class log lines for genesis-fork-round.sh (#1057).
+#
+# This round DELIBERATELY constructs an unrecoverable state: two islands that
+# share only genesis, then a reconnect where one dugite node must adopt a chain
+# diverging at Origin. Until #1057 half B lands the node cannot, and it now says
+# so loudly — those lines are the round's evidence, not a regression.
+#
+# Kept deliberately NARROW. An over-broad allowlist is how a round reports
+# success while measuring nothing (#916/#923/#945/#953/#959) — a pattern like
+# "ERROR" would swallow the ledger-rollback failure this round exists to
+# distinguish a BAD fix by. Each entry below is one specific, mechanically-caused
+# line.
+#
+# Format: one extended-regex per line; '#' comments and blank lines ignored.
+
+# The frozen island's forge loop cannot build a ledger view for the current slot,
+# because step 2b deliberately parks its tip ~300 slots behind. Expected on
+# dugite-bp for the whole freeze and reconnect window.
+TraceNoLedgerView
+
+# #1057 itself: the wedge announcing itself. The WARN fires per declined range and
+# the ERROR once per worker with the operator remedy. Their ABSENCE is what step 4
+# treats as a failure — a silent unrecoverable state cannot be diagnosed in the
+# field.
+declining a range rooted at GENESIS
+#1057: this node cannot rejoin the network
+
+# The relay's ChainSync task is dropped when the peer's headers sit beyond the
+# forecast horizon and the ledger has not advanced. This is the park→disconnect
+# half of the loop and is counted by step 4.
+beyond forecast horizon
+
+# Step 2b stops dugite-relay and step 3 stops cardano-bp to swap topologies, so
+# their peers legitimately observe the disconnect and re-dial.
+removed dead connection
+shutting down peer connection
+
+# NOT allowlisted, on purpose — these must fail the round if they appear:
+#   "Fork rollback failed"                         (the BAD-FIX shape: storage
+#                                                   emitted a genesis-rooted plan
+#                                                   the ledger could not execute)
+#   "Rollback target outside LedgerSeq"            (same, one layer down)
+#   "LedgerSeq was incoherent"                     (#985's chimera)

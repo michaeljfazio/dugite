@@ -126,6 +126,10 @@
 
 cd "$(dirname "${BASH_SOURCE[0]}")" || exit 2
 . ./lib/common.sh
+# The shared expected-error/allowlist oracle (#1041), same as kes-round and
+# rollback-round. Sourced BEFORE the errexit relaxation below for the same
+# order-is-load-bearing reason: anything it pulls in may `set -e`.
+. ./lib/expect-log-errors.sh
 
 # ORDER IS LOAD-BEARING: lib/common.sh line 4 is `set -euo pipefail`, so relaxing
 # errexit before sourcing it does nothing. A round that ABORTS instead of FAILING
@@ -486,13 +490,62 @@ count_sig() { # <phrase> [logfile] [mark]
 ORIGIN_ACCEPT=$(count_sig "intersection at Origin with non-Origin local chain")
 ORIGIN_RB=$(count_sig "rollback_point=origin")
 HORIZON=$(count_sig "beyond forecast horizon")
+# The decline itself, now observable at the DEFAULT log level. It used to be a
+# `debug!` indistinguishable from the ordinary far-ahead decline, which is half of
+# why this step once reported 0/0/0/0 through a live wedge.
+GENESIS_DECLINE=$(count_sig "declining a range rooted at GENESIS")
+CANNOT_REJOIN=$(count_sig "#1057: this node cannot rejoin the network")
 ROLLBACK_FAIL=$(count_sig "Fork rollback failed")
 ROLLBACK_FAIL_BP=$(count_sig "Fork rollback failed" "$LD_LOGS/dugite-bp.log" "${MARK:-0}")
 ROLLBACK_FAIL=$(( ROLLBACK_FAIL + ROLLBACK_FAIL_BP ))
 note "relay accepted an Origin intersection : ${ORIGIN_ACCEPT:-0}"
 note "relay rolled ChainSync back to Origin : ${ORIGIN_RB:-0}"
+note "BlockFetch declined a GENESIS range   : ${GENESIS_DECLINE:-0}"
+note "escalated 'cannot rejoin' ERROR       : ${CANNOT_REJOIN:-0}"
 note "peer dropped at forecast horizon      : ${HORIZON:-0}"
 note "Fork rollback FAILED (either node)    : ${ROLLBACK_FAIL:-0}"
+
+# The diagnostics are an ASSERTION, not decoration — via the SHARED oracle
+# (lib/expect-log-errors.sh, #1041) rather than a hand-rolled count, so this round
+# classifies error-class lines the same way analyze-evidence.sh and
+# generate-release-report.sh do. A round with its own private notion of "an error"
+# is how three components come to disagree (#916).
+#
+# Two directions, both required:
+#   expect_log_errors      — the fault MUST have produced its diagnostic. A wedge
+#                            that logs nothing at the default level is the state an
+#                            operator cannot act on, and the state this round itself
+#                            was fooled by.
+#   assert_no_other_errors — no UNDECLARED error-class line. This is what would
+#                            catch the BAD-FIX shape ("Fork rollback failed") or
+#                            #985's "LedgerSeq was incoherent", neither of which is
+#                            allowlisted on purpose.
+if [ "$CONVERGED" -ne 1 ]; then
+    if expect_log_errors "$LD_LOGS/dugite-relay.log" "${RELAY_MARK:-0}" \
+            "declining a range rooted at GENESIS" \
+            "beyond forecast horizon"; then
+        ok "the wedge is self-announcing: the genesis-range decline WARN and the horizon drop both appear on dugite-relay after the reconnect (#1057)"
+    else
+        bad "the node wedged SILENTLY: a required diagnostic is missing from dugite-relay (see stderr above). An unrecoverable state that logs nothing at the default level cannot be diagnosed in the field (#1057)"
+    fi
+
+    # The WARN is rate-limited to one per 30s per worker. A count in the hundreds
+    # would mean the throttle regressed — the unthrottled first version emitted
+    # 29,435 lines / 17 MB in ten minutes, which buries every other line and can
+    # fill a disk.
+    if [ "${GENESIS_DECLINE:-0}" -gt 200 ]; then
+        bad "genesis-decline WARN appeared ${GENESIS_DECLINE} times — the 30s throttle has regressed (#1057). A diagnostic that floods the log is not an improvement on silence."
+    else
+        ok "genesis-decline WARN is throttled (${GENESIS_DECLINE} line(s) for the whole wedge window)"
+    fi
+
+    if assert_no_other_errors "$LD_LOGS/dugite-relay.log" "${RELAY_MARK:-0}" \
+            ./genesis-fork-round.allowed-errors; then
+        ok "no UNDECLARED error-class line on dugite-relay after the reconnect"
+    else
+        bad "undeclared error-class line(s) on dugite-relay — listed above. If one of them is 'Fork rollback failed' or 'LedgerSeq was incoherent', that is the BAD-FIX / #985 shape, not something to allowlist."
+    fi
+fi
 RELAY_TIP=$(tip_field "$LD_RELAY_SOCK" .block)
 note "dugite-relay block=${RELAY_TIP:-?} vs cardano-bp block=${CBP_AFTER:-?}"
 

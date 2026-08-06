@@ -198,6 +198,15 @@ pub(crate) fn fetch_range_connects_fast(already_fetched: bool) -> bool {
     already_fetched
 }
 
+/// Should the rate-limited #1057 genesis-decline WARN be emitted now?
+///
+/// Extracted so the throttle is unit-testable rather than only observable by
+/// counting log lines after a 20-minute devnet round — which is how the
+/// unthrottled first version got as far as 29,435 lines before anyone noticed.
+pub(crate) fn genesis_warn_due(last_warn_ms: Option<u64>, now_ms: u64, interval_ms: u64) -> bool {
+    last_warn_ms.is_none_or(|last| now_ms.saturating_sub(last) >= interval_ms)
+}
+
 /// #735 gross-request invariant, locked half: consulted only when
 /// [`fetch_range_connects_fast`] returned `false`.
 ///
@@ -2775,6 +2784,15 @@ impl ConnectionLifecycleManager {
                 // Haskell starvation path cannot reach (it requires a current
                 // fetch peer with an outstanding request).
                 let mut unproductive_since_ms: Option<u64> = None;
+                // #1057: latch so the actionable "cannot rejoin" ERROR is emitted ONCE
+                // per worker rather than on every declined range. Repeating the remedy
+                // every few seconds would bury it.
+                let mut genesis_wedge_reported = false;
+                // #1057: rate-limit state for the per-decline WARN. BlockFetch re-claims
+                // the declined range continuously — measured at ~100 declines/second, so
+                // an unthrottled WARN produced 29,435 lines / 17 MB in ten minutes.
+                let mut last_genesis_warn_ms: Option<u64> = None;
+                let mut genesis_declines_since_warn: u64 = 0;
 
                 info!(%addr, "blockfetch worker started (waiting for turn)");
 
@@ -3127,6 +3145,13 @@ impl ConnectionLifecycleManager {
                                     )
                                 {
                                     let prev = hdr.prev_hash;
+                                    // Hoisted out of the `else` below because the
+                                    // decline branch needs it too: a range rooted at
+                                    // genesis is the #1057 wedge and gets its own
+                                    // diagnostic, distinct from the ordinary
+                                    // far-ahead decline.
+                                    let prev_is_genesis =
+                                        prev == dugite_primitives::hash::Hash32::ZERO;
                                     // The decision itself lives in the pure
                                     // `fetch_range_connects` (unit-tested);
                                     // here we only supply its inputs, taking
@@ -3144,8 +3169,6 @@ impl ConnectionLifecycleManager {
                                         // sentinel, so the ordinary
                                         // frontier-extension path takes exactly the
                                         // one lock it always did.
-                                        let prev_is_genesis =
-                                            prev == dugite_primitives::hash::Hash32::ZERO;
                                         let ledger_at_origin = prev_is_genesis
                                             && ledger_state.read().await.tip.point
                                                 == dugite_primitives::Point::Origin;
@@ -3158,14 +3181,56 @@ impl ConnectionLifecycleManager {
                                         )
                                     };
                                     if !connects {
-                                        debug!(
-                                            %addr,
-                                            first_slot = first.slot,
-                                            prev = %prev.to_hex(),
-                                            "BlockFetch: declining far-ahead range — \
-                                             first block does not extend a stored block \
-                                             (gross-request invariant, #735)"
-                                        );
+                                        if prev_is_genesis {
+                                            // RATE-LIMITED, and the first version was not.
+                                            //
+                                            // BlockFetch re-claims the range continuously, so
+                                            // an unconditional per-decline WARN emitted 29,435
+                                            // lines and 17 MB of log in ten minutes on the
+                                            // devnet round — roughly 100/second. A diagnostic
+                                            // that buries every other line, and can fill a
+                                            // disk, is not an improvement on silence; it just
+                                            // moves the operator's problem.
+                                            //
+                                            // One line per 30s per worker, carrying the count
+                                            // suppressed since the last one so the recurrence
+                                            // is still visible without the volume.
+                                            const GENESIS_WARN_INTERVAL_MS: u64 = 30_000;
+                                            let now_ms = std::time::SystemTime::now()
+                                                .duration_since(std::time::UNIX_EPOCH)
+                                                .map(|d| d.as_millis() as u64)
+                                                .unwrap_or(0);
+                                            genesis_declines_since_warn += 1;
+                                            if genesis_warn_due(
+                                                last_genesis_warn_ms,
+                                                now_ms,
+                                                GENESIS_WARN_INTERVAL_MS,
+                                            ) {
+                                                last_genesis_warn_ms = Some(now_ms);
+                                                let suppressed =
+                                                    genesis_declines_since_warn.saturating_sub(1);
+                                                genesis_declines_since_warn = 0;
+                                                warn!(
+                                                    %addr,
+                                                    first_slot = first.slot,
+                                                    suppressed_since_last = suppressed,
+                                                    "BlockFetch: declining a range rooted at \
+                                                     GENESIS — this node holds a chain that \
+                                                     diverges from the peer's at genesis and \
+                                                     cannot adopt it in place (#1057). The \
+                                                     ledger will not advance from this peer."
+                                                );
+                                            }
+                                        } else {
+                                            debug!(
+                                                %addr,
+                                                first_slot = first.slot,
+                                                prev = %prev.to_hex(),
+                                                "BlockFetch: declining far-ahead range — \
+                                                 first block does not extend a stored block \
+                                                 (gross-request invariant, #735)"
+                                            );
+                                        }
                                         // #742 watchdog: a perpetual decline is the
                                         // exact #735 far-ahead wedge — same treatment
                                         // as the empty-runs case above: rotate the
@@ -3178,6 +3243,88 @@ impl ConnectionLifecycleManager {
                                         if unproductive_since_ms.is_none() {
                                             unproductive_since_ms = Some(now_ms);
                                         }
+
+                                        // #1057: escalate ONCE to an actionable ERROR when
+                                        // the genesis decline has persisted past the
+                                        // watchdog window, and PERSIST A MARKER so the
+                                        // next start recovers.
+                                        //
+                                        // By this point it is not a transient or hostile
+                                        // peer: the same condition has held for 3x the
+                                        // BlockFetch grace period.
+                                        //
+                                        // The node does NOT exit itself. The trigger is a
+                                        // peer's claim, so turning it into an automatic
+                                        // discard-my-chain-and-resync would be a
+                                        // remotely-triggerable forced resync — and
+                                        // dugite-node is adversarial-deployment software.
+                                        // The marker makes "restart the node" sufficient
+                                        // (which today it is NOT — measured); WHEN to
+                                        // restart stays with the operator or supervisor.
+                                        //
+                                        // `genesis_divergence::decide` then applies two
+                                        // bounds at startup: refuse if anything is flushed
+                                        // to the ImmutableDB (a rollback past the immutable
+                                        // tip is protocol-impossible), and refuse after
+                                        // MAX_RESET_ATTEMPTS, since a divergence that
+                                        // survives a full re-sync is a genesis-config error.
+                                        if prev_is_genesis && !genesis_wedge_reported {
+                                            if let Some(since) = unproductive_since_ms {
+                                                let wedge_ms = 3 * block_fetch_grace_period
+                                                    .as_millis()
+                                                    as u64;
+                                                if now_ms.saturating_sub(since) >= wedge_ms {
+                                                    genesis_wedge_reported = true;
+                                                    let db_path = {
+                                                        let cdb = chain_db.read().await;
+                                                        cdb.db_path().to_path_buf()
+                                                    };
+                                                    let attempt =
+                                                        crate::node::genesis_divergence::record(
+                                                            &db_path,
+                                                            &addr.to_string(),
+                                                            first.slot,
+                                                        );
+                                                    match attempt {
+                                                        Ok(n) => tracing::error!(
+                                                            %addr,
+                                                            wedged_secs = now_ms
+                                                                .saturating_sub(since)
+                                                                / 1000,
+                                                            attempt = n,
+                                                            "#1057: this node cannot rejoin the \
+                                                             network. Its chain diverges from \
+                                                             the peers' at GENESIS, so every \
+                                                             block range they offer is rooted \
+                                                             at genesis and is declined; the \
+                                                             ledger cannot advance and peers \
+                                                             will churn indefinitely. This does \
+                                                             NOT recover on its own. RESTART \
+                                                             THE NODE: a marker has been \
+                                                             written, and on the next start \
+                                                             dugite discards the local \
+                                                             dead-end chain and re-syncs from \
+                                                             genesis (only while the \
+                                                             ImmutableDB is empty — otherwise \
+                                                             it refuses and the operator must \
+                                                             decide)."
+                                                        ),
+                                                        Err(e) => tracing::error!(
+                                                            %addr,
+                                                            "#1057: this node cannot rejoin the \
+                                                             network (its chain diverges from \
+                                                             the peers' at GENESIS) AND the \
+                                                             recovery marker could not be \
+                                                             written: {e}. REMEDY: stop the \
+                                                             node, delete its database \
+                                                             directory, and re-sync or restore \
+                                                             a Mithril snapshot."
+                                                        ),
+                                                    }
+                                                }
+                                            }
+                                        }
+
                                         if let (Some(ref cs), Some(since)) =
                                             (&csj, unproductive_since_ms)
                                         {
@@ -7541,6 +7688,40 @@ mod range_byte_abort_751_tests {
             "with a non-Origin ledger the genesis clause MUST NOT fire — that is \
              the reverted two-layer fix, which left the node at block 4 while the \
              network was at 84"
+        );
+    }
+
+    /// #1057: the genesis-decline WARN must be THROTTLED.
+    ///
+    /// This exists because the first version was not. BlockFetch re-claims the
+    /// declined range continuously — measured at roughly 100 declines/second — so
+    /// an unconditional per-decline WARN wrote **29,435 lines and 17 MB** of log
+    /// in a ten-minute devnet round. A diagnostic that buries every other line and
+    /// can fill a disk is not an improvement on silence.
+    ///
+    /// Caught only by looking at the log volume after the round, which is why the
+    /// decision is now a pure function with a test rather than an inline
+    /// comparison.
+    #[test]
+    fn genesis_warn_is_throttled_to_one_per_interval() {
+        const IVL: u64 = 30_000;
+
+        // First ever decline always warns — the operator must learn immediately.
+        assert!(genesis_warn_due(None, 1_000, IVL));
+
+        // Inside the window: suppressed, including at the boundary-1.
+        assert!(!genesis_warn_due(Some(1_000), 1_000, IVL));
+        assert!(!genesis_warn_due(Some(1_000), 1_000 + IVL - 1, IVL));
+
+        // Exactly at the interval: due (`>=`).
+        assert!(genesis_warn_due(Some(1_000), 1_000 + IVL, IVL));
+        assert!(genesis_warn_due(Some(1_000), 10_000_000, IVL));
+
+        // A clock that goes BACKWARDS must not produce a warn storm: the
+        // saturating subtraction yields 0, which is inside the window.
+        assert!(
+            !genesis_warn_due(Some(10_000), 5_000, IVL),
+            "a backwards clock must suppress, not spam — SystemTime is not monotonic"
         );
     }
 

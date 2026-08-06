@@ -511,6 +511,15 @@ impl ChainDB {
         self.volatile.selected_chain_len()
     }
 
+    /// The database directory this ChainDB was opened from.
+    ///
+    /// Needed by #1057's genesis-divergence marker: the BlockFetch worker that
+    /// detects the wedge has the ChainDB but not the node's config, and the marker
+    /// must land next to the data it describes.
+    pub fn db_path(&self) -> &Path {
+        &self._path
+    }
+
     /// Clear all volatile blocks. Used when the volatile DB has blocks from
     /// a fork that no longer connects to the ledger tip (e.g., after crash
     /// or restart with a different chain).
