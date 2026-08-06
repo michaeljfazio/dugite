@@ -50,25 +50,22 @@
 # shipping PV11 support: treat any FAIL from step 4 (the PV flip assertion)
 # as blocking, not as a harness flake.
 #
-# CONFIG INJECTION — RENDERED CONFIGS, NOT TEMPLATES
+# NO CONFIG INJECTION — PV11 IS NATIVE ON cardano-node 11.0.1
 # ----------------------------------------------------
-# config/templates/cardano-bp.config.tmpl.json and
-# config/templates/cardano-arbiter.config.tmpl.json both ship with
-# "ExperimentalHardForksEnabled": false. This round does NOT edit those
-# templates (every other round renders from them and must keep getting
-# false-by-default). Instead, after ./setup.sh has rendered them to
-# $LD_CONFIG/cardano-bp.config.json (and cardano-arbiter.config.json, which
-# setup.sh always renders even though only two-forger mode starts that
-# node), this round flips the flag to `true` in the RENDERED copies with
-# `jq`, in place, before ./run.sh reads them.
+# PRE-FLIGHT RESOLVED (issue #1042 step 2): PV10->PV11 is an INTRA-Conway
+# HardForkInitiation (PV11 is still the Conway era), which cardano-node 11.0.1
+# enacts natively — preview mainnet has run PV11 on 11.0.1 since before this
+# round was written.
 #
-# Belt-and-braces note: preview mainnet has been running PV11 on
-# cardano-node 11.0.1 since before this issue was filed, and 11.0.1
-# arguably does not gate a same-major-line hard fork behind this flag at
-# all in the way older testnet-only forks did. This round sets it anyway
-# — it costs nothing, and if a future cardano-node release DOES gate PV11
-# behind it, this round silently keeps working instead of silently NO-OP
-# ratifying nothing.
+# An earlier revision of this round flipped ExperimentalHardForksEnabled to
+# `true` in the rendered cardano configs as "belt-and-braces". That is WRONG on
+# 11.0.1 and was caught on the first live run: enabling experimental hard forks
+# makes cardano-node require a DijkstraGenesisFile (the NEXT, experimental era
+# after Conway) and refuse to start with `key "DijkstraGenesisFile" not found`.
+# The flag gates the *next* era, not an intra-Conway PV bump. So this round now
+# leaves the rendered configs at their template default
+# (ExperimentalHardForksEnabled=false) — the exact config every other round
+# starts cardano-bp with.
 #
 # WHAT THIS ROUND REUSES, AND FROM WHERE
 # ---------------------------------------
@@ -130,7 +127,7 @@ bad()  { printf '\033[0;31m[FAIL]\033[0m %s: %s\n' "$1" "${*:2}"; record "$1" FA
 note() { printf '\033[0;33m[NOTE]\033[0m %s: %s\n' "$1" "${*:2}"; record "$1" NOTE "${*:2}"; }
 
 # ─────────────────────────────────────────────────────────────────────────
-step "0. fresh devnet + inject ExperimentalHardForksEnabled=true"
+step "0. fresh devnet (no config injection — PV11 HFI is native on cardano-node 11.0.1)"
 # ─────────────────────────────────────────────────────────────────────────
 if [ "$SKIP_SETUP" -eq 0 ]; then
     ./stop.sh  >/dev/null 2>&1
@@ -146,19 +143,17 @@ CSV="$EVID/hardfork-round.csv"
 echo "ts,step,outcome,detail" > "$CSV"
 
 if [ "$SKIP_SETUP" -eq 0 ]; then
-    note "0-inject-flag" "preview mainnet is already PV11 on cardano-node 11.0.1 — this injection is belt-and-braces, see header"
-    INJECT_OK=1
-    for f in "$LD_CONFIG/cardano-bp.config.json" "$LD_CONFIG/cardano-arbiter.config.json"; do
-        [ -f "$f" ] || continue
-        TMP=$(mktemp)
-        if jq '.ExperimentalHardForksEnabled = true' "$f" > "$TMP" && mv "$TMP" "$f"; then
-            note "0-inject-flag" "$f: ExperimentalHardForksEnabled -> true"
-        else
-            bad "0-inject-flag" "jq injection failed for $f"
-            INJECT_OK=0
-        fi
-    done
-    [ "$INJECT_OK" -eq 1 ] && ok "0-inject-flag" "rendered configs patched before ./run.sh"
+    # PRE-FLIGHT RESOLVED (issue #1042 step 2): PV10->PV11 is an INTRA-Conway
+    # HardForkInitiation — PV11 is still the Conway era, not a new one — and
+    # cardano-node 11.0.1 enacts it NATIVELY (preview mainnet has run PV11 on
+    # 11.0.1 since before this round was written). ExperimentalHardForksEnabled
+    # is NOT needed and is actively HARMFUL on 11.0.1: setting it true makes
+    # cardano-node require a DijkstraGenesisFile (the NEXT, experimental era)
+    # and refuse to start ("key DijkstraGenesisFile not found"). So the round
+    # leaves the rendered configs at their template default (flag=false) — the
+    # same config every other round starts cardano-bp with.
+    note "0-inject-flag" "no config injection — PV11 HFI is intra-Conway and native on cardano-node 11.0.1 (ExperimentalHardForksEnabled would pull in the Dijkstra era and break startup)"
+    ok "0-inject-flag" "rendered configs left at template default (ExperimentalHardForksEnabled=false)"
 
     ./run.sh >/dev/null 2>&1 || { bad "0-run" "RUN FAILED"; exit 2; }
 fi
@@ -377,8 +372,16 @@ classify_sampler() {
 }
 
 # ─────────────────────────────────────────────────────────────────────────
-step "1. assert current PV=10 on both sockets; run 16e pre-HF"
+step "1. zoo setup, then assert PV=10 on both sockets + run 16e pre-HF"
 # ─────────────────────────────────────────────────────────────────────────
+# The zoo --setup (keys + on-chain funding for wallet-a) MUST run before the
+# pre-HF 16e: 16e builds a stake-registration tx from wallet-a, so without
+# funding it fails at build time (`build-failed`) rather than reaching the
+# IncorrectDepositDELEG constructor it asserts. An earlier revision ran the
+# setup in step 2, after this 16e call — caught on the first live run.
+if [ "$SKIP_SETUP" -eq 0 ]; then
+    ./tx-zoo/run-all.sh --setup >/dev/null 2>&1
+fi
 PVD=$(pv_major "$LD_RELAY_SOCK")
 PVH=$(pv_major "$LD_CARDANO_BP_SOCK")
 echo "  protocolVersion.major: dugite(relay)=$PVD haskell(cardano-bp)=$PVH"
@@ -394,10 +397,9 @@ fi
 run_16e "1-16e-pre-hf" 10 "$EVID/16e-pre-hf.csv"
 
 # ─────────────────────────────────────────────────────────────────────────
-step "2. zoo setup + DRep power + propose/vote HardForkInitiation PV11"
+step "2. DRep power + propose/vote HardForkInitiation PV11"
 # ─────────────────────────────────────────────────────────────────────────
 if [ "$SKIP_SETUP" -eq 0 ]; then
-    ./tx-zoo/run-all.sh --setup >/dev/null 2>&1
     ZOO_SOCKET="$LD_RELAY_SOCK" bash ./tx-zoo/04-stake/04a-stake-register.sh 2>&1 | tail -2
     ZOO_SOCKET="$LD_RELAY_SOCK" bash ./tx-zoo/05-governance-certs/05a-drep-register.sh 2>&1 | tail -1
     ZOO_SOCKET="$LD_RELAY_SOCK" bash ./tx-zoo/05-governance-certs/05g-cc-hot-key-authorization.sh 2>&1 | tail -1
