@@ -22,6 +22,9 @@
 - [Reward formula 3-stage floor chain + sigma vs sigmaA](reward-calc-floor-chain-and-sigma-vs-sigmaA.md) — 3 independent `rationalToCoinViaFloor` stages; sigma vs sigmaA distinct; PParams from prior epoch; pledge-gate `<=` on go-snapshot (live-verified 2026-07-07)
 - [mkPoolRewardInfo zero-block-pool gate](mkpoolrewardinfo-zero-block-pool-gate.md) — gate lives INSIDE mkPoolRewardInfo (`Map.lookup` into BlocksMade), not in startStep's iteration; mkApparentPerformance's `d>=0.8=>1` branch is unreachable for a zero-block pool; zero-block pool gets NO reward at all, leader or member (live-verified 2026-08-05 @ 4849c13d)
 
+## Predicate-Failure CBOR (ConwayUtxoPredFailure and friends)
+- [Conway UTXO collateral predicate-failure CBOR: tags + payload shapes](conway-utxo-collateral-predfailure-cbor.md) — InsufficientCollateral=12 (DeltaCoin,Coin), CollateralContainsNonADA=15 (full MaryValue; TRIGGER is netted inputs-minus-return via canonical-zero-pruning MultiAsset subtraction, only the error PAYLOAD picks a non-netted value in 2/3 branches — corrected 2026-08-06 after a tech-lead catch), BabbageNonDisjointRefInputs=22 (bare NonEmpty TxIn array, no tag 258). DeltaCoin EncCBOR = derived-newtype plain signed Integer. Live-verified 2026-08-06 @ f8d6ead7c8.
+
 ## CBOR Structure Reference
 - [NewEpochState/EpochState/LedgerState/UTxOState encoding](newepochstate-complete-encoding.md) — field order, array sizes. Re-verified verbatim 2026-08-05 @ a88b60bd; corrected a wrong `()`=array(0) claim (see below).
 - [Conway PParams array(31) field order](conway-pparams-field-order.md) — all 31 fields indexed 0-30

@@ -809,6 +809,16 @@ impl ValidationContext {
 // Public error type
 // ---------------------------------------------------------------------------
 
+/// Sentinel `output_index` for [`ValidationError::OutputTooSmall`] meaning the
+/// offending output is `body.collateral_return`, not an entry of
+/// `body.outputs`. Haskell's `validateOutputTooSmallUTxO` folds over
+/// `allSizedOutputsTxBodyF` — the regular outputs PLUS the collateral-return
+/// output — so both feed the same `BabbageOutputTooSmallUTxO` failure; a real
+/// tx can never have `usize::MAX` outputs, and a resolver that forgets this
+/// sentinel fails closed (lookup misses, error degrades to the generic arm)
+/// rather than naming the wrong output.
+pub const COLLATERAL_RETURN_OUTPUT_INDEX: usize = usize::MAX;
+
 #[derive(Debug, thiserror::Error)]
 pub enum ValidationError {
     #[error("No inputs in transaction")]
@@ -819,8 +829,24 @@ pub enum ValidationError {
     ValueNotConserved { inputs: u64, outputs: u64, fee: u64 },
     #[error("Fee too small: minimum={minimum}, actual={actual}")]
     FeeTooSmall { minimum: u64, actual: u64 },
-    #[error("Output too small: minimum={minimum}, actual={actual}")]
-    OutputTooSmall { minimum: u64, actual: u64 },
+    /// One transaction output below the era's minimum UTxO value. Haskell's
+    /// `BabbageOutputTooSmallUTxO` (Conway `ConwayUtxoPredFailure` tag 21)
+    /// aggregates EVERY offending output in a tx into one `NonEmpty` list —
+    /// dugite raises one `OutputTooSmall` per offending output (this loop
+    /// runs once per `body.outputs` entry), so `output_index` lets a caller
+    /// re-group multiple occurrences from one `validate_transaction` call
+    /// back into that single Haskell-shaped failure, mirroring
+    /// [`Self::OutputBootAddrAttrsTooBig`]'s own per-tx aggregation above.
+    #[error("Output too small: minimum={minimum}, actual={actual}, output_index={output_index}")]
+    OutputTooSmall {
+        /// Required minimum coin for this output (era/PV-dependent formula).
+        minimum: u64,
+        /// The coin actually present in the output.
+        actual: u64,
+        /// Zero-based index of the offending output in `tx.body.outputs`, or
+        /// [`COLLATERAL_RETURN_OUTPUT_INDEX`] for `body.collateral_return`.
+        output_index: usize,
+    },
     #[error("Transaction too large: maximum={maximum}, actual={actual}")]
     TxTooLarge { maximum: u64, actual: u64 },
     #[error("Missing required signer: {0}")]
@@ -833,14 +859,33 @@ pub enum ValidationError {
     NotYetValid { current_slot: u64, valid_from: u64 },
     #[error("Script validation failed: {0}")]
     ScriptFailed(String),
-    #[error("Insufficient collateral")]
-    InsufficientCollateral,
+    /// Haskell `InsufficientCollateral DeltaCoin Coin` (Conway
+    /// `ConwayUtxoPredFailure` tag 12). `balance` is the collateral balance
+    /// actually present (sum of collateral inputs minus `collateral_return`,
+    /// kept as a SIGNED value since an over-declared `collateral_return` can
+    /// drive it negative — see `effective_collateral` in
+    /// [`collateral::check_collateral`]); `required` is
+    /// `ceil(fee * collateral_percentage / 100)`.
+    ///
+    /// Without these two fields the failure could not be wire-encoded and
+    /// degraded to the generic `ConwayMempoolFailure` fallback (#1050).
+    #[error("Insufficient collateral: balance={balance}, required={required}")]
+    InsufficientCollateral { balance: i128, required: u64 },
     #[error("Too many collateral inputs: max={max}, actual={actual}")]
     TooManyCollateralInputs { max: u64, actual: u64 },
     #[error("Collateral input not found in UTxO set: {0}")]
     CollateralNotFound(String),
-    #[error("Collateral input contains tokens (must be pure ADA): {0}")]
-    CollateralHasTokens(String),
+    /// Haskell `CollateralContainsNonADA (Value era)` (Conway
+    /// `ConwayUtxoPredFailure` tag 15) — the FULL multi-asset `Value`
+    /// Haskell's `validateCollateralContainsNonADA` reports: either the raw
+    /// sum of collateral-input `Value`s, or — only when the collateral
+    /// INPUTS are ada-only but `collateral_return` itself carries tokens —
+    /// the return output's own `Value`. Oracle-verified against
+    /// `Cardano.Ledger.Babbage.Rules.Utxo` (#1050): this is NEVER the netted
+    /// (inputs minus return) balance in the general case, so a plain string
+    /// reason could not carry the wire payload.
+    #[error("Collateral input contains tokens (must be pure ADA): {0:?}")]
+    CollateralHasTokens(dugite_primitives::value::Value),
     #[error("Collateral mismatch: total_collateral={declared}, effective={computed}")]
     CollateralMismatch { declared: u64, computed: u64 },
     #[error("Reference input not found in UTxO set: {0}")]
@@ -1744,6 +1789,26 @@ pub enum ValidationError {
          (DelegateeStakePoolNotRegisteredDELEG)"
     )]
     DelegateePoolNotRegistered {
+        /// Hex-encoded pool ID (Hash28).
+        pool_id: String,
+    },
+    /// Haskell `StakePoolNotRegisteredOnKeyPOOL`: a `PoolRetirement`
+    /// certificate names a pool ID that is not currently registered.
+    ///
+    /// This is a DISTINCT predicate from [`Self::DelegateePoolNotRegistered`]
+    /// above — Haskell raises it through the POOL rule (nested under
+    /// `ConwayCertPredFailure::PoolFailure`), not the DELEG rule, even
+    /// though both share the same "unregistered pool ID" shape. Conway
+    /// reuses `ShelleyPoolPredFailure` unmodified for this ("used in Conway
+    /// POOL rule, keep serialization unchanged").
+    ///
+    /// Reference: Haskell `StakePoolNotRegisteredOnKeyPOOL` predicate in
+    /// `cardano-ledger-shelley:Cardano.Ledger.Shelley.Rules.Pool`.
+    #[error(
+        "Pool retirement rejected: pool {pool_id} is not registered \
+         (StakePoolNotRegisteredOnKeyPOOL)"
+    )]
+    StakePoolNotRegisteredForRetirement {
         /// Hex-encoded pool ID (Hash28).
         pool_id: String,
     },
@@ -3647,12 +3712,15 @@ pub fn validate_transaction_with_pools(
     // the Haskell sequential semantics here so dugite admission matches
     // what cardano-node accepts and rejects.
     //
-    // Covered cert variants and the predicate they fire:
-    //   * `StakeDelegation`     (tag 2 ) → `DelegateeStakePoolNotRegisteredDELEG`
+    // Covered cert variants and the predicate they fire — raised as TWO
+    // distinct `ValidationError` variants below (DELEG-rule vs POOL-rule)
+    // even though the "unregistered pool ID" condition is identical, since
+    // they encode to different wire shapes on the reject path:
+    //   * `StakeDelegation`     (tag 2 ) → `DelegateeStakePoolNotRegisteredDELEG` (DELEG)
     //   * `RegStakeDeleg`       (tag 11) → same
     //   * `StakeVoteDelegation` (tag 13) → same
     //   * `RegStakeVoteDeleg`   (tag 14) → same
-    //   * `PoolRetirement`              → `StakePoolNotRegisteredOnKeyPOOL`
+    //   * `PoolRetirement`              → `StakePoolNotRegisteredOnKeyPOOL` (POOL)
     //
     // `VoteRegDeleg` (tag 15) does NOT include a pool delegation component —
     // it registers and sets a DRep vote delegation only — so it is excluded.
@@ -3697,15 +3765,27 @@ pub fn validate_transaction_with_pools(
                     pool_hash,
                     ..
                 } => Some(*pool_hash),
-                dugite_primitives::transaction::Certificate::PoolRetirement {
-                    pool_hash, ..
-                } => Some(*pool_hash),
                 _ => None,
             };
             if let Some(pool_id) = opt_target {
                 if !pools.contains(&pool_id) && !new_pools.contains(&pool_id) {
                     errors.push(ValidationError::DelegateePoolNotRegistered {
                         pool_id: pool_id.to_hex(),
+                    });
+                }
+            }
+
+            // `PoolRetirement` fires the DISTINCT POOL-rule predicate
+            // (`StakePoolNotRegisteredOnKeyPOOL`), not the DELEG-rule one
+            // above — Conway raises this through
+            // `ConwayCertPredFailure::PoolFailure`, not `DelegFailure`.
+            if let dugite_primitives::transaction::Certificate::PoolRetirement {
+                pool_hash, ..
+            } = cert
+            {
+                if !pools.contains(pool_hash) && !new_pools.contains(pool_hash) {
+                    errors.push(ValidationError::StakePoolNotRegisteredForRetirement {
+                        pool_id: pool_hash.to_hex(),
                     });
                 }
             }

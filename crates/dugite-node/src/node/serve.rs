@@ -586,6 +586,54 @@ fn enrich_validation_errors(
         }
     }
 
+    // ── BabbageOutputTooSmallUTxO (Conway UTXO tag 21) ──
+    //
+    // Haskell aggregates EVERY offending output in the tx into ONE
+    // `NonEmpty (TxOut era, Coin)` failure; dugite's Phase-1 validator
+    // raises one `ValidationError::OutputTooSmall` PER offending output
+    // (carrying its `output_index` into `tx.body.outputs`), so this groups
+    // every occurrence from a single `validate_transaction` call back into
+    // the one Haskell-shaped failure — same aggregation pattern as
+    // `OutputBootAddrAttrsTooBigUTXO` above, except each `ValidationError`
+    // here already carries its own index rather than one error carrying
+    // many.
+    let output_too_small_idx: Vec<usize> = errors
+        .iter()
+        .enumerate()
+        .filter_map(|(i, e)| matches!(e, VE::OutputTooSmall { .. }).then_some(i))
+        .collect();
+    if !output_too_small_idx.is_empty() {
+        let outs: Option<Vec<(String, u64)>> = output_too_small_idx
+            .iter()
+            .map(|&i| match &errors[i] {
+                VE::OutputTooSmall {
+                    minimum,
+                    output_index,
+                    ..
+                } => {
+                    // The sentinel index points at `collateral_return`, which
+                    // Haskell folds into the SAME `BabbageOutputTooSmallUTxO`
+                    // via `allSizedOutputsTxBodyF`.
+                    let out = if *output_index
+                        == dugite_ledger::validation::COLLATERAL_RETURN_OUTPUT_INDEX
+                    {
+                        tx.body.collateral_return.as_ref()
+                    } else {
+                        tx.body.outputs.get(*output_index)
+                    };
+                    out.map(|o| (raw_output_hex(o), *minimum))
+                }
+                _ => unreachable!("filtered above"),
+            })
+            .collect();
+        if let Some(outputs) = outs {
+            mapped.push(TxValidationError::BabbageOutputTooSmallUTxO { outputs });
+            for &i in &output_too_small_idx {
+                consumed[i] = true;
+            }
+        }
+    }
+
     // ── MissingRedeemersUTXOW (UTXOW tag 10) ──
     //
     // Haskell raises ONE `MissingRedeemers (NonEmpty (PlutusPurpose AsItem era,
@@ -878,9 +926,9 @@ pub(crate) fn convert_validation_error(
             fee,
         },
         VE::FeeTooSmall { minimum, actual } => TxValidationError::FeeTooSmall { minimum, actual },
-        VE::OutputTooSmall { minimum, actual } => {
-            TxValidationError::OutputTooSmall { minimum, actual }
-        }
+        VE::OutputTooSmall {
+            minimum, actual, ..
+        } => TxValidationError::OutputTooSmall { minimum, actual },
         VE::TxTooLarge { maximum, actual } => TxValidationError::TxTooLarge { maximum, actual },
         VE::MissingRequiredSigner(signer) => TxValidationError::MissingRequiredSigner { signer },
         VE::MissingWitness(input) => TxValidationError::MissingWitness { input },
@@ -893,7 +941,9 @@ pub(crate) fn convert_validation_error(
             valid_from,
         },
         VE::ScriptFailed(reason) => TxValidationError::ScriptFailed { reason },
-        VE::InsufficientCollateral => TxValidationError::InsufficientCollateral,
+        VE::InsufficientCollateral { balance, required } => {
+            TxValidationError::InsufficientCollateral { balance, required }
+        }
         VE::TooManyCollateralInputs { max, actual } => {
             TxValidationError::TooManyCollateralInputs { max, actual }
         }
@@ -910,7 +960,7 @@ pub(crate) fn convert_validation_error(
             ),
         },
         VE::CollateralNotFound(input) => TxValidationError::CollateralNotFound { input },
-        VE::CollateralHasTokens(input) => TxValidationError::CollateralHasTokens { input },
+        VE::CollateralHasTokens(value) => TxValidationError::CollateralHasTokens { value },
         VE::CollateralMismatch { declared, computed } => {
             TxValidationError::CollateralMismatch { declared, computed }
         }
@@ -1113,6 +1163,11 @@ pub(crate) fn convert_validation_error(
         }
         VE::DelegateePoolNotRegistered { pool_id } => {
             TxValidationError::DelegateeStakePoolNotRegisteredDELEG {
+                pool_id: pool_id.clone(),
+            }
+        }
+        VE::StakePoolNotRegisteredForRetirement { pool_id } => {
+            TxValidationError::StakePoolNotRegisteredOnKeyPOOL {
                 pool_id: pool_id.clone(),
             }
         }
@@ -1728,8 +1783,43 @@ mod tests {
             }
         ));
 
-        let e = convert_validation_error(VE::InsufficientCollateral);
-        assert!(matches!(e, TxValidationError::InsufficientCollateral));
+        let e = convert_validation_error(VE::InsufficientCollateral {
+            balance: -500,
+            required: 1_500_000,
+        });
+        assert!(matches!(
+            e,
+            TxValidationError::InsufficientCollateral {
+                balance: -500,
+                required: 1_500_000,
+            }
+        ));
+
+        // `VE::CollateralHasTokens` must carry the offending `Value` straight
+        // through to the wire-facing variant — the whole point of #1050 is
+        // that a plain reason string can no longer represent this payload.
+        let mut multi_asset = std::collections::BTreeMap::new();
+        multi_asset.insert(
+            dugite_primitives::hash::Hash28::from_bytes([0x11; 28]),
+            std::collections::BTreeMap::from([(
+                dugite_primitives::value::AssetName(b"x".to_vec()),
+                7u64,
+            )]),
+        );
+        let value = dugite_primitives::value::Value {
+            coin: dugite_primitives::value::Lovelace(123),
+            multi_asset,
+        };
+        let e = convert_validation_error(VE::CollateralHasTokens(value.clone()));
+        match e {
+            TxValidationError::CollateralHasTokens { value: got } => {
+                assert_eq!(
+                    got, value,
+                    "the exact offending Value must survive conversion"
+                );
+            }
+            other => panic!("expected CollateralHasTokens, got {other:?}"),
+        }
 
         let e = convert_validation_error(VE::NoInputs);
         assert!(matches!(e, TxValidationError::NoInputs));
@@ -2190,6 +2280,142 @@ mod tests {
         assert!(matches!(&mapped[0], TxValidationError::ScriptFailed { .. }));
     }
 
+    /// `BabbageOutputTooSmallUTxO` must aggregate every offending
+    /// `ValidationError::OutputTooSmall` occurrence from ONE
+    /// `validate_transaction` call into a single typed arm, re-encoding
+    /// each offending output via its `output_index` — mirroring Haskell's
+    /// per-tx (not per-output) `NonEmpty` aggregation.
+    #[test]
+    fn enrich_output_too_small_aggregates_multiple_outputs_by_index() {
+        use dugite_primitives::address::{Address, EnterpriseAddress};
+        use dugite_primitives::credentials::Credential;
+        use dugite_primitives::hash::Hash28;
+        use dugite_primitives::network::NetworkId;
+        use dugite_primitives::transaction::{OutputDatum, TransactionOutput};
+        use dugite_primitives::value::Value;
+
+        let make_output = |raw: Vec<u8>, coin: u64| TransactionOutput {
+            address: Address::Enterprise(EnterpriseAddress {
+                network: NetworkId::Mainnet,
+                payment: Credential::VerificationKey(Hash28::from_bytes([0x11; 28])),
+            }),
+            value: Value {
+                coin: Lovelace(coin),
+                multi_asset: Default::default(),
+            },
+            datum: OutputDatum::None,
+            script_ref: None,
+            is_legacy: false,
+            raw_cbor: Some(raw),
+        };
+        let mut body = dugite_primitives::transaction::TransactionBody::default();
+        body.outputs.push(make_output(vec![0x82, 0x01, 0x02], 1)); // index 0
+        body.outputs
+            .push(make_output(vec![0x82, 0x03, 0x04], 999_999)); // index 1, NOT offending
+        body.outputs.push(make_output(vec![0x82, 0x05, 0x06], 2)); // index 2
+        let tx = minimal_tx(body);
+
+        let errors = vec![
+            VE::OutputTooSmall {
+                minimum: 1_000_000,
+                actual: 1,
+                output_index: 0,
+            },
+            VE::OutputTooSmall {
+                minimum: 2_000_000,
+                actual: 2,
+                output_index: 2,
+            },
+        ];
+        let mapped = enrich_validation_errors(errors, &tx, &EmptyUtxo, 10);
+        assert_eq!(mapped.len(), 1);
+        match &mapped[0] {
+            TxValidationError::BabbageOutputTooSmallUTxO { outputs } => {
+                assert_eq!(
+                    outputs,
+                    &vec![
+                        (hex::encode([0x82, 0x01, 0x02]), 1_000_000),
+                        (hex::encode([0x82, 0x05, 0x06]), 2_000_000),
+                    ]
+                );
+            }
+            other => panic!("expected BabbageOutputTooSmallUTxO, got {other:?}"),
+        }
+    }
+
+    /// The sentinel index resolves to `body.collateral_return` — Haskell
+    /// folds the collateral-return output into the SAME
+    /// `BabbageOutputTooSmallUTxO` via `allSizedOutputsTxBodyF`, and 18d in
+    /// the tx-zoo pins this on the wire.
+    #[test]
+    fn enrich_output_too_small_resolves_collateral_return_sentinel() {
+        use dugite_primitives::address::{Address, EnterpriseAddress};
+        use dugite_primitives::credentials::Credential;
+        use dugite_primitives::hash::Hash28;
+        use dugite_primitives::network::NetworkId;
+        use dugite_primitives::transaction::{OutputDatum, TransactionOutput};
+        use dugite_primitives::value::Value;
+
+        let body = dugite_primitives::transaction::TransactionBody {
+            collateral_return: Some(TransactionOutput {
+                address: Address::Enterprise(EnterpriseAddress {
+                    network: NetworkId::Mainnet,
+                    payment: Credential::VerificationKey(Hash28::from_bytes([0x22; 28])),
+                }),
+                value: Value {
+                    coin: Lovelace(1),
+                    multi_asset: Default::default(),
+                },
+                datum: OutputDatum::None,
+                script_ref: None,
+                is_legacy: false,
+                raw_cbor: Some(vec![0x82, 0x0a, 0x0b]),
+            }),
+            ..Default::default()
+        };
+        let tx = minimal_tx(body);
+
+        let errors = vec![VE::OutputTooSmall {
+            minimum: 1_500_000,
+            actual: 1,
+            output_index: dugite_ledger::validation::COLLATERAL_RETURN_OUTPUT_INDEX,
+        }];
+        let mapped = enrich_validation_errors(errors, &tx, &EmptyUtxo, 10);
+        assert_eq!(mapped.len(), 1);
+        match &mapped[0] {
+            TxValidationError::BabbageOutputTooSmallUTxO { outputs } => {
+                assert_eq!(outputs, &vec![(hex::encode([0x82, 0x0a, 0x0b]), 1_500_000)]);
+            }
+            other => panic!("expected BabbageOutputTooSmallUTxO, got {other:?}"),
+        }
+    }
+
+    /// An out-of-range `output_index` must NOT panic or silently drop the
+    /// failure — it falls through to `convert_validation_error`'s existing
+    /// (unenriched) `TxValidationError::OutputTooSmall` mapping rather than
+    /// shipping a truncated `outputs` list. Unlike `OutputBootAddrAttrsTooBig`
+    /// above, `OutputTooSmall` already has a direct (if wire-unencoded)
+    /// `TxValidationError` counterpart, so the fallback here is that
+    /// variant, not `ScriptFailed`.
+    #[test]
+    fn enrich_output_too_small_falls_back_on_bad_index() {
+        let tx = minimal_tx(dugite_primitives::transaction::TransactionBody::default());
+        let errors = vec![VE::OutputTooSmall {
+            minimum: 1_000_000,
+            actual: 1,
+            output_index: 0, // tx has ZERO outputs
+        }];
+        let mapped = enrich_validation_errors(errors, &tx, &EmptyUtxo, 10);
+        assert_eq!(mapped.len(), 1);
+        assert!(matches!(
+            &mapped[0],
+            TxValidationError::OutputTooSmall {
+                minimum: 1_000_000,
+                actual: 1,
+            }
+        ));
+    }
+
     /// `MissingRequiredDatumsUTXOW`'s "provided" set needs the preserved raw
     /// CBOR spans; without them (`raw_plutus_data_cbor: None`, e.g. from a
     /// re-serialized tx), enrichment must decline rather than guess, and the
@@ -2406,6 +2632,9 @@ mod tests {
                 drep_id: "00".repeat(32),
             },
             VE::DelegateePoolNotRegistered {
+                pool_id: "11".repeat(28),
+            },
+            VE::StakePoolNotRegisteredForRetirement {
                 pool_id: "11".repeat(28),
             },
             VE::StakeRegistrationDepositMismatch {

@@ -175,7 +175,47 @@ fn encode_conway_ledger_pred_failure(enc: &mut Encoder<&mut Vec<u8>>, err: &TxVa
             });
         }
 
-        // Tag 12: InsufficientCollateral — [balance_delta (DeltaCoin), required (Coin)]
+        // Tag 12: InsufficientCollateral — [balance (DeltaCoin), required (Coin)]
+        //
+        // `Sum InsufficientCollateral 12 !> To a !> To b` with `a :: DeltaCoin`
+        // (the balance) first, `b :: Coin` (the requirement) second —
+        // oracle-verified against `Cardano.Ledger.Babbage.Rules.Utxo` (#1050).
+        // `DeltaCoin` is `newtype DeltaCoin = DeltaCoin Integer` with a
+        // newtype-derived `EncCBOR`, i.e. a BARE signed CBOR integer — no
+        // array/group wrapper, unlike `IncorrectTotalCollateralField` below
+        // whose two fields happen to share the same (int, uint) shape but are
+        // a DIFFERENT predicate (tag 20).
+        TxValidationError::InsufficientCollateral { balance, required } => {
+            match i64::try_from(*balance) {
+                Ok(balance_i64) => {
+                    encode_utxo_failure(enc, 12, |enc| {
+                        enc.i64(balance_i64).expect("infallible");
+                        enc.u64(*required).expect("infallible");
+                    });
+                }
+                // Practically unreachable (collateral balances never approach
+                // i64's range), but an out-of-range value must fall back
+                // rather than silently truncate into a WRONG balance (#979
+                // rule: an unverified/lossy typed arm can be worse than the
+                // generic one).
+                Err(_) => partial_fallback(enc, err),
+            }
+        }
+
+        // Tag 15: CollateralContainsNonADA — the FULL `Value` (Coin +
+        // multi-asset) Haskell's `validateCollateralContainsNonADA` reports.
+        // `Sum CollateralContainsNonADA 15 !> To a` with `a :: Value era` —
+        // oracle-verified (#1050). Re-encoded with
+        // `dugite_serialization::encode_value`, the SAME encoder transaction
+        // outputs use, so the two paths stay byte-identical by construction.
+        TxValidationError::CollateralHasTokens { value } => {
+            encode_utxo_failure(enc, 15, |enc| {
+                let raw = dugite_serialization::encode_value(value);
+                enc.writer_mut().extend_from_slice(&raw);
+            });
+        }
+
+        // Tag 20: IncorrectTotalCollateralField — [delta_coin_int, declared_coin_uint]
         // DeltaCoin is a signed integer; Coin is unsigned.
         TxValidationError::CollateralMismatch { declared, computed } => {
             encode_utxo_failure(enc, 20, |enc| {
@@ -240,17 +280,30 @@ fn encode_conway_ledger_pred_failure(enc: &mut Encoder<&mut Vec<u8>>, err: &TxVa
             }
         }
 
-        // Tag 22: BabbageNonDisjointRefInputs
+        // Tag 22: BabbageNonDisjointRefInputs — `NonEmpty TxIn`.
+        //
+        // #1051: this MUST be a bare list, NOT a `Set` — `Sum
+        // BabbageNonDisjointRefInputs 22 !> To x` with `x :: NonEmpty TxIn`,
+        // and `EncCBOR (NonEmpty a) = encCBOR . toList` never emits CBOR tag
+        // 258 (that tag belongs exclusively to `Set`'s `encodeWithSetTag`).
+        // The previous `enc.tag(CBOR_TAG_SET)` here produced a frame
+        // cardano-cli's decoder rejects outright (`DeserialiseFailure
+        // "expected list len or indef"`), oracle-verified against
+        // `Cardano.Ledger.Conway.Rules.Utxo`.
         TxValidationError::ReferenceInputOverlapsInput { input } => {
             if let Some((tx_hash, tx_ix)) = parse_tx_input(input) {
                 encode_utxo_failure(enc, 22, |enc| {
-                    // NonEmpty set of overlapping TxIn
-                    enc.tag(minicbor::data::Tag::new(CBOR_TAG_SET))
-                        .expect("infallible");
-                    enc.array(1).expect("infallible");
+                    // NonEmpty TxIn: a bare `variableListLenEncoding` list —
+                    // dugite raises one input per occurrence today, so this
+                    // is always a 1-element list, but `list_open`/`list_close`
+                    // are used (rather than a literal `array(1)`) so the
+                    // shape stays correct if a future caller aggregates more
+                    // than one overlapping input into a single failure.
+                    list_open(enc, 1);
                     enc.array(2).expect("infallible");
                     enc.bytes(&tx_hash).expect("infallible");
                     enc.u32(tx_ix).expect("infallible");
+                    list_close(enc, 1);
                 });
             } else {
                 {
@@ -753,6 +806,16 @@ fn encode_conway_ledger_pred_failure(enc: &mut Encoder<&mut Vec<u8>>, err: &TxVa
         }
 
         // ══ #979: typed POOL failures (hand-rolled arities) ═════════════
+        TxValidationError::StakePoolNotRegisteredOnKeyPOOL { pool_id } => {
+            match parse_hex_28(pool_id) {
+                Some(h) => encode_pool_failure(enc, |e| {
+                    e.array(2).expect("infallible");
+                    e.u8(0).expect("infallible");
+                    e.bytes(&h).expect("infallible");
+                }),
+                None => partial_fallback(enc, err),
+            }
+        }
         TxValidationError::StakePoolCostTooLowPOOL { supplied, expected } => {
             encode_pool_failure(enc, |e| {
                 e.array(3).expect("infallible");
@@ -1020,6 +1083,27 @@ fn encode_conway_ledger_pred_failure(enc: &mut Encoder<&mut Vec<u8>>, err: &TxVa
                         e.writer_mut().extend_from_slice(out);
                     }
                     map_close(e, parsed.len());
+                });
+            }
+        }
+        TxValidationError::BabbageOutputTooSmallUTxO { outputs } => {
+            let parsed: Vec<(Vec<u8>, u64)> = outputs
+                .iter()
+                .filter_map(|(out_hex, min)| hex::decode(out_hex).ok().map(|raw| (raw, *min)))
+                .collect();
+            if parsed.len() != outputs.len() || parsed.is_empty() {
+                partial_fallback(enc, err);
+            } else {
+                // `NonEmpty (TxOut era, Coin)` — a LIST of array(2) pairs,
+                // NOT a set and NOT a map (the same TxOut could repeat).
+                encode_utxo_failure(enc, 21, |e| {
+                    list_open(e, parsed.len());
+                    for (raw, min) in &parsed {
+                        e.array(2).expect("infallible");
+                        e.writer_mut().extend_from_slice(raw);
+                        e.u64(*min).expect("infallible");
+                    }
+                    list_close(e, parsed.len());
                 });
             }
         }
@@ -1963,6 +2047,38 @@ mod tests {
         );
     }
 
+    /// `StakePoolNotRegisteredOnKeyPOOL` — POOL tag 0, ONE field, a bare
+    /// `KeyHash StakePool` bstr(28). Raised by `PoolRetirement` of an
+    /// unregistered pool (dugite #1023-class issue: distinct from
+    /// `DelegateeStakePoolNotRegisteredDELEG`, which is DELEG tag 6 above —
+    /// same "unregistered pool" condition, different rule, different wire
+    /// nesting).
+    #[test]
+    fn golden_stake_pool_not_registered_on_key_pool_is_pool_tag_0() {
+        let mut want = pool_prefix();
+        want.extend_from_slice(&[0x82, 0x00, 0x58, 0x1c]);
+        want.extend_from_slice(&[0x77; 28]);
+        assert_ledger_bytes(
+            &TxValidationError::StakePoolNotRegisteredOnKeyPOOL {
+                pool_id: hex::encode([0x77; 28]),
+            },
+            &want,
+            "StakePoolNotRegisteredOnKeyPOOL",
+        );
+    }
+
+    /// Malformed pool-id hex must fall back to the generic mempool failure
+    /// rather than emit a wrong-shaped typed frame.
+    #[test]
+    fn golden_stake_pool_not_registered_on_key_pool_falls_back_on_malformed_hex() {
+        let got = ledger_failure_bytes(&TxValidationError::StakePoolNotRegisteredOnKeyPOOL {
+            pool_id: "not-hex".to_string(),
+        });
+        // ConwayMempoolFailure: [7, text]
+        assert_eq!(got[0], 0x82);
+        assert_eq!(got[1], 0x07);
+    }
+
     /// POOL's `EncCBOR` is hand-rolled: `encodeListLen 3 <> 3 <> supplied <>
     /// expected`. There is no tag 2 in this rule.
     #[test]
@@ -2188,6 +2304,67 @@ mod tests {
             &want,
             "ScriptsNotPaidUTxOUTXO",
         );
+    }
+
+    /// `BabbageOutputTooSmallUTxO (NonEmpty (TxOut era, Coin))` — Conway
+    /// UTXO tag 21. A LIST of `array(2)[txout, min_coin]` pairs — neither a
+    /// set nor a map, unlike its UTXO-tag-13/10 neighbors above.
+    #[test]
+    fn golden_babbage_output_too_small_utxo() {
+        let raw = vec![0x82u8, 0x01, 0x02];
+        let mut want = vec![
+            0x82, 0x01, // Ledger: [1, ...]
+            0x82, 0x00, // Utxow: [0, ...]
+            0x82, 0x15, // Utxo: [21, list]  (0x15 = 21)
+            0x81, // list(1)
+            0x82, // pair: array(2)
+        ];
+        want.extend_from_slice(&raw); // the raw "TxOut" bytes, embedded verbatim
+        want.extend_from_slice(&[0x1A, 0x00, 0x0F, 0x42, 0x40]); // min_coin = 1_000_000
+        assert_ledger_bytes(
+            &TxValidationError::BabbageOutputTooSmallUTxO {
+                outputs: vec![(hex::encode(&raw), 1_000_000)],
+            },
+            &want,
+            "BabbageOutputTooSmallUTxO",
+        );
+    }
+
+    /// Multiple offending outputs aggregate into ONE `NonEmpty` list —
+    /// mirroring Haskell's per-tx (not per-output) predicate failure.
+    #[test]
+    fn golden_babbage_output_too_small_utxo_aggregates_multiple_outputs() {
+        let raw_a = vec![0x82u8, 0x0A, 0x0B];
+        let raw_b = vec![0x82u8, 0x0C, 0x0D];
+        let mut want = vec![
+            0x82, 0x01, 0x82, 0x00, 0x82, 0x15, // Ledger/Utxow/Utxo[21]
+            0x82, // list(2)
+            0x82, // pair 1: array(2)
+        ];
+        want.extend_from_slice(&raw_a);
+        want.push(0x01); // min_coin = 1
+        want.push(0x82); // pair 2: array(2)
+        want.extend_from_slice(&raw_b);
+        want.push(0x02); // min_coin = 2
+        assert_ledger_bytes(
+            &TxValidationError::BabbageOutputTooSmallUTxO {
+                outputs: vec![(hex::encode(&raw_a), 1), (hex::encode(&raw_b), 2)],
+            },
+            &want,
+            "BabbageOutputTooSmallUTxO (multiple outputs)",
+        );
+    }
+
+    /// Malformed output hex must fall back to the generic mempool failure
+    /// rather than emit a wrong-shaped typed frame.
+    #[test]
+    fn golden_babbage_output_too_small_utxo_falls_back_on_malformed_hex() {
+        let got = ledger_failure_bytes(&TxValidationError::BabbageOutputTooSmallUTxO {
+            outputs: vec![("not-hex".to_string(), 1_000_000)],
+        });
+        // ConwayMempoolFailure: [7, text]
+        assert_eq!(got[0], 0x82);
+        assert_eq!(got[1], 0x07);
     }
 
     /// `ZeroTreasuryWithdrawals (GovAction era)` — GOV tag 15. The field is
@@ -3051,25 +3228,235 @@ mod tests {
         assert_eq!(declared, 5_000_000);
     }
 
+    // ── #1050: `InsufficientCollateral` (Ledger tag 1, UTXOW tag 0, UTXO tag 12) ──
+
+    /// CBOR golden: `InsufficientCollateral DeltaCoin Coin` = `array(3)[12,
+    /// balance_int, required_uint]`. `DeltaCoin` is a BARE signed CBOR
+    /// integer (newtype-derived `EncCBOR`, no wrapper) — this pins that the
+    /// balance is emitted as a plain negative int, not an array or a
+    /// `Mismatch`-shaped pair.
     #[test]
-    fn test_encode_reference_input_overlaps() {
+    fn test_encode_insufficient_collateral_golden() {
+        let err = TxValidationError::InsufficientCollateral {
+            balance: -500_000,
+            required: 1_500_000,
+        };
+        let want = vec![
+            0x82, 0x01, // Ledger: [1, ...]
+            0x82, 0x00, // Utxow: [0, ...]
+            0x83, 0x0c, // Utxo: [12, balance, required]  (0x0c = 12)
+            0x3a, 0x00, 0x07, 0xa1, 0x1f, // balance = -500_000 (CBOR negative int)
+            0x1a, 0x00, 0x16, 0xe3, 0x60, // required = 1_500_000 (CBOR uint)
+        ];
+        assert_ledger_bytes(&err, &want, "InsufficientCollateral");
+    }
+
+    /// A positive balance (sufficient-looking collateral that still fails
+    /// some OTHER check upstream of this rule, or a boundary value) must
+    /// still encode as a plain non-negative CBOR int through the same path —
+    /// `DeltaCoin`'s sign is not special-cased.
+    #[test]
+    fn test_encode_insufficient_collateral_positive_balance() {
+        let err = TxValidationError::InsufficientCollateral {
+            balance: 151,
+            required: 152,
+        };
+        let want = vec![
+            0x82, 0x01, 0x82, 0x00, 0x83, 0x0c, // Ledger/Utxow/Utxo[12]
+            0x18, 0x97, // balance = 151
+            0x18, 0x98, // required = 152
+        ];
+        assert_ledger_bytes(&err, &want, "InsufficientCollateral (positive balance)");
+    }
+
+    /// A `balance` outside `i64`'s range must fall back to the generic
+    /// mempool failure rather than silently truncate into a WRONG value —
+    /// the standing #979 rule that an unverified/lossy typed arm can be
+    /// worse than the generic one. Collateral balances never approach this
+    /// range in practice; this only pins the defensive path.
+    #[test]
+    fn insufficient_collateral_falls_back_on_out_of_range_balance() {
+        let err = TxValidationError::InsufficientCollateral {
+            balance: i128::MAX,
+            required: 1,
+        };
+        let got = ledger_failure_bytes(&err);
+        // ConwayMempoolFailure: [7, text]
+        assert_eq!(got[0], 0x82);
+        assert_eq!(got[1], 0x07);
+    }
+
+    // ── #1050: `CollateralHasTokens` → `CollateralContainsNonADA` (UTXO tag 15) ──
+
+    /// CBOR golden: `CollateralContainsNonADA (Value era)` = `array(2)[15,
+    /// value]` where `value` is the FULL multi-asset `Value` (coin +
+    /// multi-asset map), re-encoded with the SAME `dugite_serialization::
+    /// encode_value` transaction outputs use — never the netted balance.
+    #[test]
+    fn test_encode_collateral_has_tokens_golden() {
+        use dugite_primitives::hash::Hash28;
+        use dugite_primitives::value::{AssetName, Lovelace, Value};
+        use std::collections::BTreeMap;
+
+        let mut assets = BTreeMap::new();
+        assets.insert(AssetName(b"tok".to_vec()), 100u64);
+        let mut multi_asset = BTreeMap::new();
+        multi_asset.insert(Hash28::from_bytes([0xAB; 28]), assets);
+        let value = Value {
+            coin: Lovelace(5_000_000),
+            multi_asset,
+        };
+
+        let err = TxValidationError::CollateralHasTokens {
+            value: value.clone(),
+        };
+
+        let mut want = vec![
+            0x82, 0x01, // Ledger: [1, ...]
+            0x82, 0x00, // Utxow: [0, ...]
+            0x82, 0x0f, // Utxo: [15, value]  (0x0f = 15)
+        ];
+        want.extend_from_slice(&dugite_serialization::encode_value(&value));
+        assert_ledger_bytes(&err, &want, "CollateralHasTokens");
+
+        // The embedded payload must be byte-identical to what the ordinary
+        // tx-output Value encoder produces for the same value — the two
+        // paths must stay in lockstep by construction, not by review (the
+        // #932/#938 lesson).
+        let raw = dugite_serialization::encode_value(&value);
+        let got = ledger_failure_bytes(&err);
+        assert_eq!(
+            &got[6..],
+            &raw[..],
+            "payload must reuse encode_value verbatim"
+        );
+    }
+
+    /// An ada-only `Value` (the degenerate/unreachable-in-practice case,
+    /// since this predicate only fires when there ARE tokens) must still
+    /// encode via the same bare-uint `encode_value` path, not an array —
+    /// pins that no special-casing was added for the collateral call site.
+    #[test]
+    fn test_encode_collateral_has_tokens_ada_only_value_shape() {
+        use dugite_primitives::value::{Lovelace, Value};
+
+        let value = Value {
+            coin: Lovelace(42),
+            multi_asset: Default::default(),
+        };
+        let err = TxValidationError::CollateralHasTokens { value };
+        let got = ledger_failure_bytes(&err);
+        // Ledger[1,...] / Utxow[0,...] / Utxo[15, 42] — the value is a bare
+        // uint, not array(2).
+        assert_eq!(&got, &[0x82, 0x01, 0x82, 0x00, 0x82, 0x0f, 0x18, 0x2a]);
+    }
+
+    // ── #1051: `ReferenceInputOverlapsInput` → `BabbageNonDisjointRefInputs` (UTXO tag 22) ──
+
+    /// CBOR golden pinning the FULL byte shape — including that the payload
+    /// is a BARE list, NOT wrapped in CBOR tag 258. The previous
+    /// implementation wrapped a `NonEmpty TxIn` in a spurious `Set` tag,
+    /// producing bytes cardano-cli's decoder rejects outright
+    /// (`DeserialiseFailure "expected list len or indef"`) — this test would
+    /// have caught that: the prior version of this test only asserted the
+    /// tag number (22) and never inspected the payload bytes, so it PINNED
+    /// the bug rather than catching it (the #948-class "test pinned the
+    /// bug" trap).
+    #[test]
+    fn test_encode_reference_input_overlaps_golden() {
+        let hash_hex = "ff".repeat(32);
+        let input = format!("{hash_hex}#0");
+        let err = TxValidationError::ReferenceInputOverlapsInput { input };
+
+        let mut want = vec![
+            0x82, 0x01, // Ledger: [1, ...]
+            0x82, 0x00, // Utxow: [0, ...]
+            0x82, 0x16, // Utxo: [22, list]  (0x16 = 22)
+            0x81, // list(1) — NOT tag(258) + list(1)
+            0x82, // pair: array(2)
+            0x58, 0x20, // bstr(32) header
+        ];
+        want.extend_from_slice(&[0xff; 32]);
+        want.push(0x00); // tx_ix = 0
+        assert_ledger_bytes(&err, &want, "ReferenceInputOverlapsInput");
+    }
+
+    /// Explicitly assert the ABSENCE of CBOR tag 258 (`0xd9, 0x01, 0x02`)
+    /// anywhere in the encoded failure — the direct regression pin for
+    /// #1051 (`Set` tag on a `NonEmpty` payload).
+    #[test]
+    fn reference_input_overlaps_never_emits_set_tag() {
+        let hash_hex = "ab".repeat(32);
+        let input = format!("{hash_hex}#3");
+        let err = TxValidationError::ReferenceInputOverlapsInput { input };
+        let got = ledger_failure_bytes(&err);
+        let set_tag_bytes = [0xd9u8, 0x01, 0x02]; // tag(258), 2-byte form
+        assert!(
+            !got.windows(3).any(|w| w == set_tag_bytes),
+            "BabbageNonDisjointRefInputs must never emit CBOR tag 258 (Set): {got:02x?}"
+        );
+    }
+
+    // ── #1050/#1051: round-trip through dugite's OWN N2C decoder ──
+    //
+    // A same-process round-trip is necessary but NOT sufficient (a shared
+    // wrong shape on both halves still passes — the standing caveat on
+    // every golden test in this file); the oracle-verified byte-exact
+    // goldens above are the real check. This is the encoder/decoder
+    // AGREEMENT check the task calls for: dugite's own `n2c_client`
+    // `decode_reject_reason` must not choke on what this encoder now
+    // produces (previously it wouldn't have reached these arms at all —
+    // they fell back to the generic `ConwayMempoolFailure` text).
+    #[test]
+    fn insufficient_collateral_round_trips_through_n2c_client_decoder() {
+        let err = TxValidationError::InsufficientCollateral {
+            balance: -500_000,
+            required: 1_500_000,
+        };
+        let bytes = encode_apply_tx_err(&err, 6);
+        let mut dec = Decoder::new(&bytes);
+        let reason = crate::n2c_client::decode_reject_reason(&mut dec)
+            .expect("dugite's own decoder must parse its own encoder's output");
+        assert!(reason.contains("InsufficientCollateral"), "got: {reason}");
+        assert!(reason.contains("-500000"), "got: {reason}");
+        assert!(reason.contains("1500000"), "got: {reason}");
+    }
+
+    #[test]
+    fn collateral_has_tokens_round_trips_through_n2c_client_decoder() {
+        use dugite_primitives::hash::Hash28;
+        use dugite_primitives::value::{AssetName, Lovelace, Value};
+        use std::collections::BTreeMap;
+
+        let mut assets = BTreeMap::new();
+        assets.insert(AssetName(b"tok".to_vec()), 100u64);
+        let mut multi_asset = BTreeMap::new();
+        multi_asset.insert(Hash28::from_bytes([0xAB; 28]), assets);
+        let value = Value {
+            coin: Lovelace(5_000_000),
+            multi_asset,
+        };
+        let err = TxValidationError::CollateralHasTokens { value };
+        let bytes = encode_apply_tx_err(&err, 6);
+        let mut dec = Decoder::new(&bytes);
+        let reason = crate::n2c_client::decode_reject_reason(&mut dec)
+            .expect("dugite's own decoder must parse its own encoder's output");
+        assert!(reason.contains("CollateralContainsNonADA"), "got: {reason}");
+    }
+
+    #[test]
+    fn reference_input_overlaps_round_trips_through_n2c_client_decoder() {
         let hash_hex = "ff".repeat(32);
         let input = format!("{hash_hex}#0");
         let err = TxValidationError::ReferenceInputOverlapsInput { input };
         let bytes = encode_apply_tx_err(&err, 6);
-
         let mut dec = Decoder::new(&bytes);
-        dec.array().unwrap();
-        dec.array().unwrap();
-        dec.u16().unwrap();
-        dec.array().unwrap();
-        assert_eq!(decode_ledger_tag(&mut dec), 1);
-        assert_eq!(decode_utxow_tag(&mut dec), 0);
-
-        let arr_len = dec.array().unwrap().unwrap();
-        assert_eq!(arr_len, 2);
-        let tag = dec.u8().unwrap();
-        assert_eq!(tag, 22, "BabbageNonDisjointRefInputs");
+        let reason = crate::n2c_client::decode_reject_reason(&mut dec)
+            .expect("dugite's own decoder must parse its own encoder's output");
+        assert!(
+            reason.contains("BabbageNonDisjointRefInputs"),
+            "got: {reason}"
+        );
     }
 
     /// dugite #470 wire test: round-trip

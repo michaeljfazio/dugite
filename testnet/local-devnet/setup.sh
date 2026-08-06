@@ -1,6 +1,13 @@
 #!/usr/bin/env bash
 # Bootstrap the local-devnet: generate genesis, keys, configs.
 # Run once before run.sh. Idempotent — re-running wipes prior state.
+#
+# Optional environment:
+#   LD_TWO_FORGERS=1          two-forger mode (#957) — see Step D.4
+#   LD_SEED_GUARDRAILS=1      seat a guardrails script on the constitution
+#   LD_SHELLEY_SPEC_EXTRA=f   path to a JSON fragment merged as a THIRD
+#   LD_CONWAY_SPEC_EXTRA=f    overlay onto the shelley/conway genesis spec
+#                             (#1036; checked-in fragments: config/spec/overlays/)
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -98,14 +105,38 @@ cardano-cli conway genesis create-testnet-data \
     --pools 0 --testnet-magic 1 --out-dir "$TMP_DEFAULTS/defaults" >/dev/null
 
 # Step B: deep-merge our override fragments onto the defaults.
+#
+# An optional THIRD overlay per spec lets a round override genesis parameters
+# without editing the checked-in spec files (#1036): set
+# LD_SHELLEY_SPEC_EXTRA and/or LD_CONWAY_SPEC_EXTRA to the PATH of a JSON
+# fragment (checked-in occupants live in config/spec/overlays/). Unset, the
+# merge is byte-identical to the two-layer form. A set-but-unusable path is a
+# hard failure: a silently-ignored override is the "measures nothing" class
+# (#953) — the round would then assert short-KES/short-lifetime behaviour
+# against a devnet that never had it.
+spec_overlay() {
+    local var_name="$1" defaults="$2" repo_spec="$3" out="$4"
+    local extra="${!var_name:-}"
+    if [ -z "$extra" ]; then
+        jq -s '.[0] * .[1]' "$defaults" "$repo_spec" > "$out"
+        return
+    fi
+    [ -f "$extra" ] || die "$var_name=$extra is set but the file does not exist"
+    jq empty "$extra" 2>/dev/null || die "$var_name=$extra is not valid JSON"
+    log_info "Applying $var_name overlay: $extra ($(jq -c 'del(._comment)' "$extra"))"
+    # del(._comment): the overlay files are self-documenting; the comment key
+    # must not leak into the generated genesis (dugite's loader and the genesis
+    # hash both see every key).
+    jq -s '.[0] * .[1] * (.[2] | del(._comment))' "$defaults" "$repo_spec" "$extra" > "$out"
+}
 TMP_SPEC="$(mktemp -d)"
 trap 'rm -rf "$TMP_DEFAULTS" "$TMP_SPEC"' EXIT
-jq -s '.[0] * .[1]' \
+spec_overlay LD_SHELLEY_SPEC_EXTRA \
     "$TMP_DEFAULTS/defaults/shelley-genesis.json" \
-    "$LD_CONFIG/spec/shelley-spec.json" > "$TMP_SPEC/shelley-spec.json"
-jq -s '.[0] * .[1]' \
+    "$LD_CONFIG/spec/shelley-spec.json" "$TMP_SPEC/shelley-spec.json"
+spec_overlay LD_CONWAY_SPEC_EXTRA \
     "$TMP_DEFAULTS/defaults/conway-genesis.json" \
-    "$LD_CONFIG/spec/conway-spec.json" > "$TMP_SPEC/conway-spec.json"
+    "$LD_CONFIG/spec/conway-spec.json" "$TMP_SPEC/conway-spec.json"
 
 # Step B.5: pre-generate TWO Constitutional Committee key pairs so we can patch
 # the conway-genesis.json after Step D. cardano-cli 11.0.0's
@@ -309,7 +340,12 @@ log_info "conway-genesis.committee now: $(jq -c .committee "$LD_GENESIS/conway-g
 # 13h can satisfy it. Any proposal that must pass under this genesis needs
 # `--constitution-script-hash <that hash>`.
 if [ "${LD_SEED_GUARDRAILS:-0}" = "1" ]; then
-    _guard_script="$LD_ROOT/tx-zoo/lib/plutus/always-true-v3.plutus"
+    # LD_GUARDRAILS_SCRIPT overrides the default always-true script with a real
+    # guardrail validator (e.g. the vendored cardano-constitution script), so a
+    # round can enact-at-genesis and exercise the predicate cases without the
+    # full propose->vote->boundary NewConstitution sequence. Default stays the
+    # always-true V3 script the tx-zoo already vendors (13h's Proposing purpose).
+    _guard_script="${LD_GUARDRAILS_SCRIPT:-$LD_ROOT/tx-zoo/lib/plutus/always-true-v3.plutus}"
     if [ -s "$_guard_script" ]; then
         _guard_hash=$(cardano-cli conway transaction policyid --script-file "$_guard_script")
         jq --arg h "$_guard_hash" '.constitution.script = $h' \

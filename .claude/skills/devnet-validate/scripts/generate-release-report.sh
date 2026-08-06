@@ -177,10 +177,18 @@ ratify_state_parity|ratify-state-parity.csv|any
 throughput|throughput.csv|any
 resource_samples|resource-samples.csv|any
 log_anomalies|log-anomalies.csv|any
+gov_round|gov-round.csv|any
+rewards_round|rewards-round.csv|any
+kes_round|kes-round.csv|any
+rollback_round|rollback-round.csv|any
 EOF
             ;;
     esac
 }
+# hardfork-round.csv is deliberately NOT in any preset manifest: the hardfork
+# round is release-OPTIONAL (#1042, terminal, ~45 min on its own devnet).
+# When it runs, its CSV still lands in evidence/ and reviewers read it
+# directly; requiring it here would fail every extended gate that skips it.
 
 # Accumulates human-readable gate-integrity violations.
 MISSING=()

@@ -44,7 +44,17 @@ pub(crate) fn check_collateral(
 
     // Rule 11 – collateral inputs must be present
     if body.collateral.is_empty() {
-        errors.push(ValidationError::InsufficientCollateral);
+        // No collateral inputs ⇒ balance is trivially 0. Haskell's own
+        // `NoCollateralInputs` (tag 19) is a distinct, fieldless predicate
+        // for this exact case (see the note on tag 19 in
+        // `dugite-network`'s `encode.rs`); dugite has historically raised
+        // `InsufficientCollateral` here instead and this fix does not widen
+        // scope to add the separate tag — only makes the payload
+        // wire-correct for the predicate dugite already raises.
+        errors.push(ValidationError::InsufficientCollateral {
+            balance: 0,
+            required: required_collateral(body.fee.0, params.collateral_percentage),
+        });
         // Cannot proceed with further collateral checks without inputs
         check_ex_units(tx, params, errors);
         check_redeemer_indices(tx, errors);
@@ -57,7 +67,16 @@ pub(crate) fn check_collateral(
     // `validate_transaction_with_pools`. Checking it here too would
     // double-report the same predicate failure for Plutus transactions.
 
-    // Accumulate collateral value and multi-asset balances
+    // Accumulate collateral value and multi-asset balances.
+    //
+    // `collateral_multi_asset` starts as the RAW sum of the collateral
+    // INPUTS' multi-asset balances (never negative at this point — every
+    // term added here comes straight from a resolved UTxO's `Value`). Once
+    // `collateral_return` is folded in below it becomes the NETTED balance
+    // used for the trigger check; the pre-netting snapshot taken right
+    // after this loop is Haskell's `collateralBalance` / `sumAllValue
+    // utxoCollateral`, needed for `CollateralContainsNonADA`'s payload
+    // (#1050).
     let mut collateral_value = 0u64;
     let mut collateral_multi_asset: BTreeMap<PolicyId, BTreeMap<AssetName, i128>> = BTreeMap::new();
     let mut script_locked_inputs: Vec<String> = Vec::new();
@@ -108,6 +127,21 @@ pub(crate) fn check_collateral(
         });
     }
 
+    // Haskell `utxoCollateralHasOnlyAda` — whether the collateral INPUTS
+    // alone (before folding in `collateral_return`) carry no non-ADA
+    // tokens. `collateral_multi_asset` is still the raw, un-netted
+    // per-input sum at this point, so "empty" here means exactly that.
+    let inputs_have_only_ada = collateral_multi_asset
+        .values()
+        .all(|assets| assets.values().all(|qty| *qty == 0));
+    // Haskell `collateralBalance` / `sumAllValue utxoCollateral` — the raw
+    // (un-netted) `Value` of the collateral inputs. Snapshotted here, before
+    // `collateral_return` is folded into `collateral_multi_asset` below.
+    let collateral_balance_value = dugite_primitives::value::Value {
+        coin: dugite_primitives::value::Lovelace(collateral_value),
+        multi_asset: multi_asset_i128_to_value(&collateral_multi_asset),
+    };
+
     // Account for collateral return output (Babbage+).
     //
     // Kept as a SIGNED i128 (not `saturating_sub`) so that an over-declared
@@ -141,9 +175,24 @@ pub(crate) fn check_collateral(
         .values()
         .any(|assets: &BTreeMap<AssetName, i128>| assets.values().any(|qty| *qty != 0));
     if has_net_tokens {
-        errors.push(ValidationError::CollateralHasTokens(
-            "net collateral has non-ADA tokens after collateral_return".to_string(),
-        ));
+        // Haskell `validateCollateralContainsNonADA`'s payload,
+        // `valueWithNonAda` (oracle-verified against
+        // `Cardano.Ledger.Babbage.Rules.Utxo`, #1050) — NEVER the netted
+        // balance computed above (that only decides WHETHER to fire):
+        //   SNothing (no return)        => collateralBalance (raw inputs)
+        //   SJust ret, inputs ada-only  => ret.value (the return's own Value)
+        //   SJust ret, inputs NOT ada-only => collateralBalance (raw inputs)
+        let value_with_non_ada = match &body.collateral_return {
+            None => collateral_balance_value.clone(),
+            Some(ret) => {
+                if inputs_have_only_ada {
+                    ret.value.clone()
+                } else {
+                    collateral_balance_value.clone()
+                }
+            }
+        };
+        errors.push(ValidationError::CollateralHasTokens(value_with_non_ada));
     }
 
     // If total_collateral is declared, it must match the effective collateral.
@@ -175,7 +224,10 @@ pub(crate) fn check_collateral(
     if 100i128 * effective_collateral
         < (params.collateral_percentage as i128) * (body.fee.0 as i128)
     {
-        errors.push(ValidationError::InsufficientCollateral);
+        errors.push(ValidationError::InsufficientCollateral {
+            balance: effective_collateral,
+            required: required_collateral(body.fee.0, params.collateral_percentage),
+        });
     }
 
     // Rule 11 – execution unit limits
@@ -183,6 +235,37 @@ pub(crate) fn check_collateral(
 
     // Rule 11b – redeemer index bounds
     check_redeemer_indices(tx, errors);
+}
+
+/// `ceil(fee * collateral_percentage / 100)` — Haskell's collateral
+/// requirement (`Coin`), the wire `required` field of `InsufficientCollateral`
+/// (#1050). Equivalent to the cross-multiplied comparison
+/// `check_collateral` uses to decide whether to fire, but materialised as an
+/// actual value for the wire payload. Computed in `u128` (fee and
+/// `collateral_percentage` are both `u64`) so the multiply cannot overflow
+/// on an attacker-controlled fee, mirroring the existing i128 arithmetic
+/// above (#801).
+fn required_collateral(fee: u64, collateral_percentage: u64) -> u64 {
+    let product = (fee as u128) * (collateral_percentage as u128);
+    u64::try_from(product.div_ceil(100)).unwrap_or(u64::MAX)
+}
+
+/// Convert a raw (never-negative at the call sites used) `i128` multi-asset
+/// accumulator into the `u64` shape `dugite_primitives::value::Value`
+/// expects, dropping any zero-quantity entries so the result matches what a
+/// `Value` built directly from UTxO outputs would contain.
+fn multi_asset_i128_to_value(
+    raw: &BTreeMap<PolicyId, BTreeMap<AssetName, i128>>,
+) -> BTreeMap<PolicyId, BTreeMap<AssetName, u64>> {
+    raw.iter()
+        .filter_map(|(policy, assets)| {
+            let filtered: BTreeMap<AssetName, u64> = assets
+                .iter()
+                .filter_map(|(name, qty)| (*qty > 0).then_some((name.clone(), *qty as u64)))
+                .collect();
+            (!filtered.is_empty()).then_some((*policy, filtered))
+        })
+        .collect()
 }
 
 /// Rule 11 — max collateral inputs count (Haskell `TooManyCollateralInputs`).
@@ -1456,7 +1539,7 @@ mod tests {
             .filter(|e| {
                 matches!(
                     e,
-                    ValidationError::InsufficientCollateral
+                    ValidationError::InsufficientCollateral { .. }
                         | ValidationError::TooManyCollateralInputs { .. }
                         | ValidationError::CollateralHasTokens(_)
                         | ValidationError::CollateralMismatch { .. }
@@ -1486,7 +1569,7 @@ mod tests {
         assert!(
             errors
                 .iter()
-                .any(|e| matches!(e, ValidationError::InsufficientCollateral)),
+                .any(|e| matches!(e, ValidationError::InsufficientCollateral { .. })),
             "expected InsufficientCollateral, got: {errors:?}"
         );
     }
@@ -1552,7 +1635,7 @@ mod tests {
         assert!(
             errors
                 .iter()
-                .any(|e| matches!(e, ValidationError::InsufficientCollateral)),
+                .any(|e| matches!(e, ValidationError::InsufficientCollateral { .. })),
             "expected InsufficientCollateral, got: {errors:?}"
         );
     }
@@ -1729,7 +1812,7 @@ mod tests {
         assert!(
             errors
                 .iter()
-                .any(|e| matches!(e, ValidationError::InsufficientCollateral)),
+                .any(|e| matches!(e, ValidationError::InsufficientCollateral { .. })),
             "negative effective collateral at fee=0 must produce \
              InsufficientCollateral, got: {errors:?}"
         );

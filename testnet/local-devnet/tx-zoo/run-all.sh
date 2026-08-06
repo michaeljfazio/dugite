@@ -60,6 +60,15 @@ ALL_CATEGORIES=(
     # script locks and spends its own UTxO and touches no shared state, so the
     # position is not load-bearing; last keeps the governance ordering intact.
     17-context-inspecting
+    # Collateral / reference-input / datum edge cases (#1033). Every script
+    # locks and funds its own UTxO (the 17 isolation argument), so the
+    # position is not load-bearing; after 17 keeps the governance ordering
+    # comments above intact.
+    18-plutus-edges
+    # Conway wire-rejection of legacy-era artifacts (#1034). Pure negatives
+    # asserted against both sockets in-script; self-contained, touches no
+    # shared credential or governance state.
+    19-era-negatives
 )
 
 # A category on disk but NOT in the array above simply never runs, and a green

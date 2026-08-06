@@ -456,7 +456,7 @@ proptest! {
         // Should not contain InsufficientCollateral
         if let Err(errors) = &result {
             prop_assert!(
-                !has_error(errors, |e| matches!(e, ValidationError::InsufficientCollateral)),
+                !has_error(errors, |e| matches!(e, ValidationError::InsufficientCollateral { .. })),
                 "Should not have InsufficientCollateral with sufficient collateral, got: {:?}",
                 errors
             );
@@ -502,7 +502,7 @@ proptest! {
         prop_assert!(result.is_err());
         let errors = result.unwrap_err();
         prop_assert!(
-            has_error(&errors, |e| matches!(e, ValidationError::InsufficientCollateral)),
+            has_error(&errors, |e| matches!(e, ValidationError::InsufficientCollateral { .. })),
             "Should contain InsufficientCollateral, got: {:?}",
             errors
         );

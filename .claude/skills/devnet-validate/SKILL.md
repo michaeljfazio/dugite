@@ -57,6 +57,8 @@ Do NOT invoke for unit tests (`just test`), public-testnet soak (`scripts/soak/`
 
 A 7-minute round crosses exactly one epoch boundary. See `references/parameters.md` for the math and how to override per-run.
 
+**Per-round genesis overrides (#1036):** `setup.sh` accepts `LD_SHELLEY_SPEC_EXTRA=<path>` and `LD_CONWAY_SPEC_EXTRA=<path>`, each a JSON fragment merged as a THIRD overlay on top of the cardano-cli defaults and the repo spec (`jq -s '.[0] * .[1] * .[2]'`; a top-level `_comment` key in the fragment is stripped). Unset, the generated genesis is identical to the two-layer form. A set-but-missing/unparseable path fails setup loudly — never silently ignored. Checked-in fragments live in `testnet/local-devnet/config/spec/overlays/`: `kes-short.json` (`slotsPerKESPeriod=120`, `maxKESEvolutions=10` — KES death at slot 1200, for the KES round) and `gov-lifetime-2.json` (`govActionLifetime=2`, for the gov-expiry act). Rounds that need an overlay name it explicitly; no other round may assume one is active.
+
 ## Prerequisites — verify before starting
 
 ```bash
@@ -79,7 +81,7 @@ If `cardano-node` is older than 11.0.1, abort: PV10 conway-genesis rejects it. S
 
 Before running rounds, understand what each round contributes to the overall coverage charter. The skill exercises six orthogonal axes (see `references/test-methodology.md` for the full catalogue):
 
-1. **Tx-type** — every Conway tx class (123 zoo scripts spanning bookkeeping, native, Plutus V1/V2/V3, stake, gov certs, gov proposals, voting, gov lifecycle, mempool, post-enactment, script purposes, gov negatives, asset lattice, context-inspecting — the 19 phase-1 negatives are among them). The authoritative count is `tx_zoo.expected_scripts` in `schemas/denominators.json`; a number quoted in prose is stale by construction.
+1. **Tx-type** — every Conway tx class (154 zoo scripts spanning bookkeeping, native, Plutus V1/V2/V3, stake, gov certs, gov proposals, voting, gov lifecycle, mempool, post-enactment, script purposes, gov negatives, asset lattice, context-inspecting, plutus-edges, era-negatives — the 20 phase-1 negatives are among them). The authoritative count is `tx_zoo.expected_scripts` in `schemas/denominators.json`; a number quoted in prose is stale by construction.
 2. **Validity** — every positive class has a matched negative; both must be classified identically by dugite and Haskell.
 3. **Submit-path** — txs submitted to **every** N2C ingestion socket: `dugite-bp.sock`, `dugite-relay.sock`, `cardano-bp.sock` (override via `ZOO_SOCKET=...`), plus `dugite-cli` vs `cardano-cli` on each. Also the UTxO RPC gRPC `submit_tx` (when `--rpc-port` is enabled).
 4. **Propagation-direction** — observe each tx at every node (mempool + ledger), in both forward (dugite-bp → relay → cardano-bp) and reverse (cardano-bp → relay → dugite-bp) directions through the hub.
@@ -93,8 +95,8 @@ Before running rounds, understand what each round contributes to the overall cov
 The **bidirectional parity oracle** is the most important predicate this skill
 enforces: *for every transaction T, dugite and Haskell must reach the same
 accept/reject decision regardless of which node ingested it first.* Off-diagonal
-cells (one accepts, the other rejects) are P0 bugs. It covers **79 zoo scripts**
-across 9 categories; the matrix lands in `evidence/<ts>/parity-matrix.csv`
+cells (one accepts, the other rejects) are P0 bugs. It covers **99 zoo scripts**
+across 10 categories; the matrix lands in `evidence/<ts>/parity-matrix.csv`
 with a `parity-matrix.meta.json` sidecar carrying the denominator the invocation
 intended to cover.
 
@@ -155,7 +157,7 @@ sleep 30                            # let the chain advance past slot 0
 EVD="$LD_EVIDENCE/round1-$(date -u +%Y%m%dT%H%M%SZ)"; mkdir -p "$EVD"
 
 ./tx-zoo/run-all.sh --setup         # ~20s — keys + plutus binaries (one-time per setup)
-EVIDENCE_DIR="$EVD" ./tx-zoo/run-all.sh   # ~17 min — all 123 tx scripts (via dugite-relay socket)
+EVIDENCE_DIR="$EVD" ./tx-zoo/run-all.sh   # ~22 min — all 154 tx scripts (via dugite-relay socket; +5 min from the #1031 P0 adoptions, 11e's 100-tx chain is most of it)
 # NB: the bidirectional parity oracle deliberately does NOT run in this round.
 # See "Round 1p" below — it needs its own devnet.
 ./tx-zoo/09-cli-parity/run.sh "$EVD"   # ~1 min — 22 LSQ parity checks; writes cli-parity.csv
@@ -197,7 +199,7 @@ tail -F logs/cardano-bp.log   | grep -E 'AddedToCurrentChain|AddBlockValidation\
 ```
 
 **Round 1 PASSES iff** all of:
-- `tx-zoo/state/results.csv` shows `tx_zoo.expected_scripts` rows (123 as of #969) with 0 FAIL (`04g-reward-withdrawal` state-skips until rewards mature — see #958). No Plutus toolchain is required: the validators are IntersectMBO's own plutus-tx output, vendored at `tests/conformance/upstream/plutus-examples.json` and materialised by `lib/build-plutus.sh`, which verifies every envelope against cardano-ledger's recorded ScriptHash before use (#969/#970). the pin lives in `schemas/denominators.json`; if you see 85 or 105 quoted anywhere it is stale
+- `tx-zoo/state/results.csv` shows `tx_zoo.expected_scripts` rows (154 as of #1032-#1035) with 0 FAIL (`04g-reward-withdrawal` state-skips until rewards mature — see #958). No Plutus toolchain is required: the validators are IntersectMBO's own plutus-tx output, vendored at `tests/conformance/upstream/plutus-examples.json` and materialised by `lib/build-plutus.sh`, which verifies every envelope against cardano-ledger's recorded ScriptHash before use (#969/#970). the pin lives in `schemas/denominators.json`; if you see 85, 105 or 123 quoted anywhere it is stale
 - `verify.sh` reports 4/4 predicates pass
 - Zero invalid-block events in `logs/cardano-bp.log` (match BOTH legacy `TraceForgedInvalidBlock` and cardano-node 11.x `ChainDB.AddBlockEvent.AddBlockValidation.InvalidBlock` / `Forge.Loop.ForgedInvalidBlock`)
 - `dugite_tip_age_seconds` stays <5 throughout the soak
@@ -225,7 +227,7 @@ executions on a single devnet, and that reliably breaks the round in two ways
    tip-sensitive suite after that point records `TIP_UNSTABLE` skips, i.e.
    becomes *unmeasurable* rather than failing.
 
-Splitting it out costs no coverage: the same 79 scripts still run through both
+Splitting it out costs no coverage: the same 99 scripts still run through both
 sockets, and the standard preset manifest scopes `parity-matrix.csv` as `any`
 (required in *at least one* round, never every round).
 
@@ -237,7 +239,7 @@ EVD="$LD_EVIDENCE/round1p-$(date -u +%Y%m%dT%H%M%SZ)"; mkdir -p "$EVD"
 ./tx-zoo/run-all.sh --setup
 # No full zoo run here — the oracle runs it twice itself.
 # With no categories named it uses the STANDARD set from
-# schemas/denominators.json (9 categories, 79 scripts). Naming categories at
+# schemas/denominators.json (10 categories, 99 scripts). Naming categories at
 # the call site is how it stayed at 4 categories / 41 scripts while the notes
 # said "41/41" (#954).
 ../../.claude/skills/devnet-validate/scripts/bidirectional-parity.sh \
@@ -411,25 +413,53 @@ Runs `LD_TWO_FORGERS=1 ./setup.sh`, which splits the genesis delegation 60/40, g
 
 > Two-forger mode sets the genesis start 150s out. If both producers reach slot 0 before they are connected they fork at genesis, exceed `k=40`, and can never re-converge (`ChainSync intersection only at genesis`) — a permanently partitioned devnet on which every cross-node comparison is meaningless. Do not shorten `LD_GENESIS_DELAY`.
 
-### Round 6 — Governance enactment (~40 min, its own devnet) — #956
+### Round 6 — Governance enactment (~55 min, its own devnet) — #956, #1039, #1043
 
 ```bash
 ./gov-enactment-round.sh          # GOV_PROBE_ONLY=1 skips the boundary waits
 ```
 
-Proposes a TreasuryWithdrawal, votes DRep + CC (**SPOs may not vote on this action type** — `DisallowedVoters`), waits for enactment, and asserts the reward-account credit is byte-exact against the requested transfer plus treasury/gov-state/constitution parity with cardano-node.
+Sets up with `LD_CONWAY_SPEC_EXTRA=overlays/gov-lifetime-2.json` by default (**every act is scheduled against `govActionLifetime=2`**), then runs three acts plus the guardrail breadth block (see the script header for the oracle-verified epoch timeline):
+- **Act 1** — TreasuryWithdrawal proposed + voted DRep + CC (**SPOs may not vote on this action type** — `DisallowedVoters`); asserts the reward-account credit byte-exact (transfer + deposit refund) and treasury parity.
+- **Act 3 (#1039)** — three TreasuryWithdrawals with upstream's losing vote patterns, doomed to expire. One casts its losing votes in the action's FINAL countable epoch (the #990 path). Asserts the `expiredGovActions` preview window parity, deposits NOT returned early (the #990 trap inverted), then removal + per-action deposit return, exact, both sockets.
+- **Act 2 (#1043)** — NewConstitution seating the REAL upstream guardrail script (vendored hash-verified). Deliberately enacted one RATIFY pass before Act 3's expiry pass: a delaying action enacting in the same pass would `rsDelayed`-skip the expiring actions' final vote evaluation.
+- **Guardrail breadth (#1043)** — ~12 predicate-violating ParameterChange proposals from `config/guardrails-cases.json`, each submitted via **build-raw** with explicit ExUnits so BOTH nodes run the guardrail script server-side (a client-side `transaction build` failure would prove nothing about dugite), all phase-2-rejected by both sockets; plus 2 valid proposals that must be ACCEPTED. Evidence: `gov-round.csv`.
 
 Two preconditions are established first, and both are load-bearing:
 - **DRep voting power.** `dRepAcceptedRatio` folds over the stake *distribution*, never over who voted. With no `vote_delegation` anywhere the map is empty and the ratio is 0, so every DRep-gated action is unratifiable regardless of votes.
 - **A funded `ensTreasury` one boundary earlier.** RATIFY reads the treasury sealed into the *previous* pulser, so a withdrawal proposed before the first RUPD fails on affordability even though the post-boundary state looks ample.
 
-### Round 7 — Reward withdrawal (~30 min, its own devnet) — #958
+### Round 7 — Reward withdrawal (~50 min, its own devnet) — #958, #1038
 
 ```bash
 ./rewards-round.sh
 ```
 
-Uses a **genesis** stake delegator (reward matures at epoch 3 rather than M+4) and submits a `vote_delegation` first, because at PV10 `ConwayWdrlNotDelegatedToDRep` fires *before* any amount check and genesis registration structurally cannot set a DRep delegation. Covers the negative twin (wrong amount → `WithdrawalsNotInRewardsCERTS`), the exact-balance positive, and a multi-account withdrawal.
+Uses a **genesis** stake delegator (reward matures at epoch 3 rather than M+4) and submits a `vote_delegation` first, because at PV10 `ConwayWdrlNotDelegatedToDRep` fires *before* any amount check and genesis registration structurally cannot set a DRep delegation. Covers the negative twin (wrong amount → `WithdrawalsNotInRewardsCERTS`), the exact-balance positive, and a multi-account withdrawal. The #1038 segments extend it: a mark/set/go membership tracker asserted at every boundary on both sockets, pledge broken by CERT ⇒ zero rewards (then restored), the pool reward account delegated to its own pool (member + leader rewards), retirement cancel by re-registration (no refund), a real retirement with exact deposit return, and a deposit FORFEITED to treasury when the reward account is deregistered before the retirement boundary (Shelley POOLREAP). Evidence: `rewards-round.csv`; runtime ~50 min.
+
+### Round 8 — KES expiry + opcert rotation (~35 min, its own devnet, TERMINAL) — #1037
+
+```bash
+./kes-round.sh
+```
+
+Two-forger devnet on the `kes-short.json` overlay (`slotsPerKESPeriod=120` × `maxKESEvolutions=10` ⇒ the genesis opcerts' KES keys die at slot 1200). cardano-bp's KES is refreshed near the period deadline (an unrefreshed control would die alongside the subject); dugite-bp is left to die, then driven through: future-period opcert (must not forge), counter +2 opcert (**if dugite forges, the Haskell nodes must reject the headers** — the accept-where-Haskell-rejects wedge class), and a valid +1 rotation (forging resumes, arbiter adopts, `kes-period-info` parity). Steps issue doomed opcerts against throwaway counter-file copies so the final +1 is genuine. Log assertions ride `lib/expect-log-errors.sh` with the checked-in `kes-round.allowed-errors`. **Terminal: the devnet is torn down at the end.** Evidence: `kes-round.csv`.
+
+### Round 9 — Rollback vs securityParam (~15 min, its own devnet, TERMINAL) — #1040
+
+```bash
+./rollback-round.sh               # needs passwordless sudo for pfctl/iptables; else ENV_SKIP (exit 3)
+```
+
+Two-forger + arbiter devnet. Case 1: ~30s firewall partition (port-pair pfctl/iptables rules under a dedicated anchor), heal, ONE tip hash on all four nodes within 60s, and the losing side provably rolled back (`dugite_rollback_count_total` + fork-switch log lines + cardano's `SwitchedToAFork`). Case 2: ~260s partition so BOTH sides exceed k=40, heal, NO convergence, dugite logs its fork-too-deep class and keeps answering N2C. **Terminal.** Evidence: `rollback-round.csv`.
+
+### Round 10 — Hardfork PV10→PV11 (~45 min, its own devnet, TERMINAL, release-OPTIONAL) — #1042
+
+```bash
+./hardfork-round.sh
+```
+
+Actually enacts a HardForkInitiation PV 11.0 (DRep + SPO + CC votes; `ExperimentalHardForksEnabled` injected into the RENDERED cardano configs only). Runs 16e pre-HF (PV10 constructor `IncorrectDepositDELEG`) and post-HF (PV11 `DepositIncorrectDELEG` Mismatch form) — both inversion arms in one round; the futurePParams and ratify-state samplers run across the ratification + enactment boundaries (their first exercise over a REAL hard fork); both sockets must flip to PV11 in the SAME epoch; then a 01/08/16 zoo smoke at PV11 (18-plutus-edges deliberately excluded — 18f's constructor inverts at PV11). **Terminal**, and deliberately absent from the preset manifests: when it runs, read `hardfork-round.csv` directly.
 
 ## Final report
 
