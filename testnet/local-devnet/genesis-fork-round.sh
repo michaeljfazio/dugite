@@ -445,7 +445,17 @@ DBP_SWITCHED=$(awk -v m="${MARK:-0}" '
 note "dugite-bp chain-switch / ledger-rollback lines after reconnect: ${DBP_SWITCHED:-0}"
 
 if [ "$CONVERGED" -ne 1 ]; then
-    bad "dugite-bp did NOT converge with cardano-bp within ${CONVERGE_TIMEOUT}s (stuck at block ${DBP_AFTER:-?}, cardano-bp at ${CBP_AFTER:-?}) — this is #1057"
+    # NOT a failure by itself, and this is a deliberate change of semantics.
+    #
+    # #1057 half B does not make the LIVE path self-heal — it makes the wedge
+    # RECOVERABLE BY RESTART, which is a different and weaker claim, honestly stated.
+    # The node still cannot adopt a genesis-divergent chain in place: doing that
+    # automatically off a peer's claim would be a remotely-triggerable forced resync.
+    #
+    # So the verdict moved to step 5. Keeping a hard FAIL here would mean the round
+    # could never pass however well recovery worked, and a check that can only ever
+    # fail stops being read.
+    note "dugite-bp did NOT converge on the live path (stuck at block ${DBP_AFTER:-?}, cardano-bp at ${CBP_AFTER:-?}) — EXPECTED with #1057 half B, which recovers by restart rather than in place. Step 5 carries the verdict."
 elif [ "${DBP_SWITCHED:-0}" -eq 0 ]; then
     inconc "tips agree at block ${DBP_AFTER:-?} but dugite-bp logged NO chain switch — its own fork WON chain selection and cardano-bp adopted it, so the genesis-rooted adoption under test never happened. Not a pass: the scenario resolved in the wrong direction. Raise GF_HEAD_START_SLOTS so the cardano island's chain is longer by a wider margin."
 else
@@ -494,7 +504,7 @@ HORIZON=$(count_sig "beyond forecast horizon")
 # `debug!` indistinguishable from the ordinary far-ahead decline, which is half of
 # why this step once reported 0/0/0/0 through a live wedge.
 GENESIS_DECLINE=$(count_sig "declining a range rooted at GENESIS")
-CANNOT_REJOIN=$(count_sig "#1057: this node cannot rejoin the network")
+CANNOT_REJOIN=$(count_sig "1057: this node cannot rejoin the network")
 ROLLBACK_FAIL=$(count_sig "Fork rollback failed")
 ROLLBACK_FAIL_BP=$(count_sig "Fork rollback failed" "$LD_LOGS/dugite-bp.log" "${MARK:-0}")
 ROLLBACK_FAIL=$(( ROLLBACK_FAIL + ROLLBACK_FAIL_BP ))
@@ -521,12 +531,21 @@ note "Fork rollback FAILED (either node)    : ${ROLLBACK_FAIL:-0}"
 #                            #985's "LedgerSeq was incoherent", neither of which is
 #                            allowlisted on purpose.
 if [ "$CONVERGED" -ne 1 ]; then
+    # REQUIRE ONLY WHAT THE NODE UNDER TEST MUST SAY ABOUT ITSELF.
+    #
+    # The genesis-decline WARN is dugite's own diagnostic for its own state, so its
+    # absence is unambiguously a defect. "beyond forecast horizon" was in this set on
+    # the first run and produced a FALSE FAILURE: it is a downstream CONSEQUENCE
+    # whose appearance depends on the 60s park timer landing inside the observation
+    # window and on the log being flushed by the time step 4 reads it — step 4's own
+    # counter saw it while `expect_log_errors` did not, in the same run. A
+    # timing-dependent side effect belongs in the reported NOTEs, not in a hard
+    # assertion.
     if expect_log_errors "$LD_LOGS/dugite-relay.log" "${RELAY_MARK:-0}" \
-            "declining a range rooted at GENESIS" \
-            "beyond forecast horizon"; then
-        ok "the wedge is self-announcing: the genesis-range decline WARN and the horizon drop both appear on dugite-relay after the reconnect (#1057)"
+            "declining a range rooted at GENESIS"; then
+        ok "the wedge is self-announcing: dugite-relay logs the genesis-range decline at the DEFAULT log level (#1057)"
     else
-        bad "the node wedged SILENTLY: a required diagnostic is missing from dugite-relay (see stderr above). An unrecoverable state that logs nothing at the default level cannot be diagnosed in the field (#1057)"
+        bad "the node wedged SILENTLY: dugite-relay never logged 'declining a range rooted at GENESIS'. An unrecoverable state that logs nothing at the default level cannot be diagnosed in the field (#1057)"
     fi
 
     # The WARN is rate-limited to one per 30s per worker. A count in the hundreds
@@ -566,42 +585,91 @@ else
     note "the round FAILED but neither the unfixed nor the bad-fix signature is present — read $LD_LOGS/dugite-relay.log directly before drawing any conclusion"
 fi
 
-# ── step 5: does a genesis-ledger RESTART clear the wedge? ─────────────────
+# ── step 5: does a RESTART recover the node? (#1057 half B) ────────────────
 #
-# DIAGNOSTIC, not an assertion. It runs only when step 3 already established the
-# wedge, and it never changes the verdict — it answers the one question the fix
-# plan turns on.
+# ASSERTION now, not a diagnostic. Half B writes a marker when the wedge is
+# confirmed, and `Node::new` acts on it: discard the dead-end VolatileDB chain
+# (WAL truncated), treat the ledger snapshot as unusable, and wipe the on-disk UTxO
+# store — all on the already-validated from-genesis startup path. So a plain
+# restart MUST now recover, where before it demonstrably did not.
 #
-# The candidate fix is to MARK-AND-RESTART rather than re-initialise the ledger in
-# place: a rollback-to-Origin persists a marker, the node exits cleanly, and
-# `Node::new`'s already-validated from-genesis path rebuilds. That path matters
-# because it WIPES the on-disk LSM UTxO store, and that wipe is load-bearing — the
-# code comment on it records that a stale store makes `sumCoinUTxO` roughly double
-# at the Byron→Shelley boundary, drives the reserves recompute to 0, and underflows
-# the first MIR debit into a panic. A live in-place re-init would have to invent
-# that teardown against open handles; the startup path already has it.
+# BOTH DUGITE NODES ARE RESTARTED, RELAY FIRST, and the order is the point.
 #
-# For that plan to be sufficient, a dugite node whose LEDGER is at Origin but whose
-# ChainDB still holds its own dead-end fork must be able to adopt the peer's chain.
-# Deleting `ledger-snapshot.bin` and restarting reproduces exactly that state.
+# dugite-relay is the node that peers with cardano-bp, so it is the one that
+# declines the genesis-rooted ranges and therefore the one that writes the marker.
+# dugite-bp never sees a genesis-rooted range from the relay while they share a
+# chain — it is stranded behind the relay, not independently wedged. Recovery is
+# therefore TWO HOP: the relay resets and adopts the canonical chain, and only then
+# does dugite-bp see a chain diverging from its own at genesis, wedge in turn, write
+# its own marker, and need its own restart.
 #
-#   adopts -> the restart path alone is sufficient; the storage/BlockFetch genesis
-#             clauses are NOT needed, and the reverted two-layer attempt was
-#             solving the wrong problem entirely.
-#   wedged -> the ChainDB fork blocks adoption regardless of ledger state, so
-#             BlockFetch's #735 gross-request invariant and `switch_chain`'s
-#             ImmutableDB-anchor test each need their genesis clause as well.
+# An operator restarting "the node" would hit exactly this, so the round models it:
+# restart the relay, let it converge, then restart dugite-bp. Anything less would
+# pass a fix that only works on a single-node topology.
 if [ "$CONVERGED" -ne 1 ] && [ "${GF_SKIP_RESTART_PROBE:-0}" -ne 1 ]; then
-    step "5. DIAGNOSTIC — does a genesis-ledger restart clear the wedge?"
-    stop_pid_file "$LD_STATE/dugite-bp.pid" || note "dugite-bp did not exit within 60s of SIGTERM"
-    SNAP="$LD_STATE/dugite-bp.db/ledger-snapshot.bin"
-    if [ -f "$SNAP" ]; then
-        rm -f "$SNAP"
-        note "removed $SNAP — dugite-bp will come up with a GENESIS ledger over a ChainDB that still holds its own ${DBP_NOW_BLK}-block fork"
+    step "5. #1057 half B — a restart must recover both dugite nodes"
+
+    # The marker is the mechanism; if it is absent the rest cannot work, and saying
+    # so here is more useful than a convergence timeout 300s later.
+    RELAY_MARKER="$LD_STATE/dugite-relay.db/genesis-divergence-detected"
+    if [ -f "$RELAY_MARKER" ]; then
+        ok "dugite-relay wrote the #1057 recovery marker: $(tr '\n' ' ' < "$RELAY_MARKER" | cut -c1-120)"
     else
-        note "no ledger-snapshot.bin present; dugite-bp already comes up from genesis"
+        bad "dugite-relay did NOT write $RELAY_MARKER — half B's recovery cannot trigger, so a restart will not help (#1057)"
     fi
-    RESTART_MARK=$(wc -l < "$LD_LOGS/dugite-bp.log" 2>/dev/null)
+
+    # ── hop 1: the relay ──
+    stop_pid_file "$LD_STATE/dugite-relay.pid" || note "dugite-relay did not exit within 60s of SIGTERM"
+    RELAY_RESTART_MARK=$(wc -l < "$LD_LOGS/dugite-relay.log" 2>/dev/null)
+    start_dugite dugite-relay "$LD_RELAY_PORT" "$LD_DUGITE_RELAY_METRICS_PORT" "$LD_RELAY_SOCK"
+    wait_for_socket "$LD_RELAY_SOCK" 180 >/dev/null 2>&1
+
+    if expect_log_errors "$LD_LOGS/dugite-relay.log" "${RELAY_RESTART_MARK:-0}" \
+            "#1057 recovery"; then
+        ok "dugite-relay acted on the marker at startup (#1057 half B)"
+    else
+        bad "dugite-relay restarted but did NOT act on the #1057 marker — check the ImmutableDB-empty and attempt bounds in genesis_divergence::decide"
+    fi
+
+    R_RELAY_CONVERGED=0
+    deadline=$(( $(date +%s) + CONVERGE_TIMEOUT ))
+    while [ "$(date +%s)" -lt "$deadline" ]; do
+        sleep 5
+        RH=$(tip_field "$LD_RELAY_SOCK" .hash)
+        CH=$(tip_field "$LD_CARDANO_BP_SOCK" .hash)
+        if [ -n "$RH" ] && [ -n "$CH" ] && [ "$RH" = "$CH" ]; then
+            R_RELAY_CONVERGED=1
+            break
+        fi
+    done
+    R_RELAY_BLK=$(tip_field "$LD_RELAY_SOCK" .block)
+    R_CBP=$(tip_field "$LD_CARDANO_BP_SOCK" .block)
+    if [ "$R_RELAY_CONVERGED" -eq 1 ]; then
+        ok "hop 1: dugite-relay re-synced from genesis and now matches cardano-bp at block ${R_RELAY_BLK:-?}"
+    else
+        bad "hop 1: dugite-relay did NOT converge with cardano-bp within ${CONVERGE_TIMEOUT}s after the marker restart (relay=${R_RELAY_BLK:-?} cardano-bp=${R_CBP:-?}) — #1057 half B did not recover it"
+    fi
+
+    # ── hop 2: dugite-bp, now facing a relay on the canonical chain ──
+    #
+    # dugite-bp is NOT given any manual help: no snapshot deletion, no marker
+    # written by hand. It must detect the divergence itself, write its own marker,
+    # and recover on its own restart — which is what makes this a test of the
+    # mechanism rather than of the harness.
+    note "hop 2: dugite-bp still holds its own ${DBP_NOW_BLK:-?}-block chain; waiting for it to detect the divergence and write its own marker"
+    BP_MARKER="$LD_STATE/dugite-bp.db/genesis-divergence-detected"
+    deadline=$(( $(date +%s) + 240 ))
+    while [ "$(date +%s)" -lt "$deadline" ]; do
+        [ -f "$BP_MARKER" ] && break
+        sleep 5
+    done
+    if [ -f "$BP_MARKER" ]; then
+        ok "dugite-bp detected the divergence and wrote its own marker"
+    else
+        bad "dugite-bp never wrote $BP_MARKER — a node stranded behind a recovered relay must detect its own genesis divergence (#1057)"
+    fi
+
+    stop_pid_file "$LD_STATE/dugite-bp.pid" || note "dugite-bp did not exit within 60s of SIGTERM"
     start_dugite dugite-bp "$LD_DUGITE_BP_PORT" "$LD_DUGITE_BP_METRICS_PORT" "$LD_DUGITE_BP_SOCK" pool1
     wait_for_socket "$LD_DUGITE_BP_SOCK" 180 >/dev/null 2>&1
 
@@ -618,28 +686,10 @@ if [ "$CONVERGED" -ne 1 ] && [ "${GF_SKIP_RESTART_PROBE:-0}" -ne 1 ]; then
     done
     R_DBP=$(tip_field "$LD_DUGITE_BP_SOCK" .block)
     R_CBP=$(tip_field "$LD_CARDANO_BP_SOCK" .block)
-    R_HORIZON=$(count_sig "beyond forecast horizon" "$LD_LOGS/dugite-bp.log" "${RESTART_MARK:-0}")
     if [ "$R_CONVERGED" -eq 1 ]; then
-        note "RESTART PATH IS SUFFICIENT: with a genesis ledger, dugite-bp adopted the peer's chain (block ${R_DBP:-?} == cardano-bp). The fix is marker + clean exit + the existing from-genesis startup path; the storage/BlockFetch genesis clauses are NOT required."
+        ok "hop 2: dugite-bp recovered too — tip hash matches cardano-bp at block ${R_DBP:-?}. #1057 is RECOVERABLE BY RESTART."
     else
-        # TWO DIFFERENT CAUSES look identical here, and conflating them wasted a
-        # cycle: the genesis clause may be ABSENT, or it may be PRESENT but gated
-        # off. #1057 half A gates both layers on `ledger_at_origin`, and that turns
-        # out to be a transient boot state — `run()` replays the ChainDB and
-        # re-applies the node's own fork within seconds, so the ledger has left
-        # Origin long before a peer offers a genesis-rooted range. Measured:
-        # `tip_slot=36` twelve seconds after boot, `lag_slots=766`.
-        #
-        # The discriminator is dugite-bp's OWN ledger tip after the restart. If it
-        # is at its own fork's tip rather than Origin, the clause was gated off, not
-        # missing.
-        R_DBP_SLOT=$(tip_field "$LD_DUGITE_BP_SOCK" .slot)
-        note "RESTART PATH IS NOT SUFFICIENT: dugite-bp came up at genesis and STILL did not adopt (block ${R_DBP:-?} vs cardano-bp ${R_CBP:-?}, slot ${R_DBP_SLOT:-?}, horizon drops ${R_HORIZON:-0})."
-        if [ "${R_DBP_SLOT:-0}" -gt 0 ]; then
-            note "  ... and its ledger is at slot ${R_DBP_SLOT} — NOT Origin. The startup ChainDB replay re-applied its own fork, so any fix gated on \"the ledger is at Origin\" is DORMANT: the precondition is false by the time it would matter. The gate needs to be \"the ledger CAN be taken to Origin\" (local chain within k of genesis, matching ChainSync's own clause) plus a real genesis re-init — #1057 half B."
-        else
-            note "  ... and its ledger IS still at Origin, so the genesis clause in BlockFetch's #735 invariant / switch_chain's anchor test is genuinely missing or not reached."
-        fi
+        bad "hop 2: dugite-bp did NOT converge within ${CONVERGE_TIMEOUT}s after its own marker restart (dugite-bp=${R_DBP:-?} cardano-bp=${R_CBP:-?}) — #1057"
     fi
 fi
 
@@ -654,7 +704,7 @@ elif [ "$INCONCLUSIVE" -gt 0 ]; then
     ./stop.sh >/dev/null 2>&1
     exit 3
 else
-    echo "GENESIS-FORK ROUND: PASS — dugite-bp crossed a genesis-rooted fork"
+    echo "GENESIS-FORK ROUND: PASS — the genesis divergence was detected, announced, and RECOVERED (see step 5). Note this is recovery-by-restart, not live self-healing: #1057's wedge still occurs, it is no longer permanent."
     ./stop.sh >/dev/null 2>&1
     exit 0
 fi

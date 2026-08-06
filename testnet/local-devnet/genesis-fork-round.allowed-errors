@@ -18,12 +18,19 @@
 # dugite-bp for the whole freeze and reconnect window.
 TraceNoLedgerView
 
-# #1057 itself: the wedge announcing itself. The WARN fires per declined range and
-# the ERROR once per worker with the operator remedy. Their ABSENCE is what step 4
-# treats as a failure — a silent unrecoverable state cannot be diagnosed in the
-# field.
+# #1057 itself: the wedge announcing itself. The WARN fires per declined range
+# (rate-limited to one per 30s) and the ERROR once per worker with the operator
+# remedy. Their ABSENCE is what step 4 treats as a failure — a silent unrecoverable
+# state cannot be diagnosed in the field.
+#
+# NOTE THE MISSING '#'. The parser treats any line starting with '#' as a COMMENT
+# (`case "$pat" in ''|\#*) continue ;;`), so a pattern written as
+# "#1057: this node cannot rejoin…" is silently DROPPED and the line it was meant
+# to allow then fails the round. That is exactly what happened on the first run
+# here — the silently-weakened-check class (#953) reproduced inside an allowlist.
+# Never start a pattern with '#'.
 declining a range rooted at GENESIS
-#1057: this node cannot rejoin the network
+1057: this node cannot rejoin the network
 
 # The relay's ChainSync task is dropped when the peer's headers sit beyond the
 # forecast horizon and the ledger has not advanced. This is the park→disconnect
