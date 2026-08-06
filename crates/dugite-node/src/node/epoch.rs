@@ -264,7 +264,7 @@ pub(crate) fn prune_old_snapshots_in_dir(
             if protected.as_ref() == Some(&path) {
                 debug!(
                     epoch,
-                    "Sparing restart-recovery snapshot (<= immutable tip) from prune (#762)"
+                    "Sparing restart-recovery snapshot (<= immutable tip) from prune"
                 );
                 continue;
             }
