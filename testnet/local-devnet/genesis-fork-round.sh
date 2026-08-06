@@ -59,6 +59,24 @@
 #
 # Terminal: tears the devnet down at the end.
 #
+# EARLIER FALSE NEGATIVE, recorded so it is not repeated: the first version of
+# this round reported dugite-bp forging 0 blocks with 0 leadership checks — both
+# fully isolated and paired with the relay — and concluded that a dugite BP cannot
+# mint the first block of a chain. That conclusion was WRONG. `start_dugite` was
+# omitting the --shelley-{kes,vrf,operational-certificate} triple, so dugite-bp ran
+# as a plain relay with no forging keys. A node with no forging keys is
+# indistinguishable, from the outside, from a node whose forge gates are blocking
+# it: no forges, no leadership checks, no "Deferring forge" line either.
+#
+# The lesson generalises past this script: when a negative result says "the node
+# refused to do X", first prove the node was CONFIGURED to do X.
+#
+# Usage:
+#   ./genesis-fork-round.sh
+#   GF_MIN_FORK_BLOCKS=3 ./genesis-fork-round.sh
+#
+# Terminal: tears the devnet down at the end.
+#
 # STATUS: THIS CONSTRUCTION DOES NOT YET WORK. Two attempts, both measured:
 #
 #   (a) dugite-bp fully isolated (empty topology): forged 0 blocks while
@@ -120,8 +138,34 @@ tip_field() {
 }
 forge_count() { awk '/TraceForgedBlock/ {c++} END{print c+0}' "$1" 2>/dev/null; }
 
-start_dugite() { # <name> <port> <metrics> <sock>
-    local name="$1" port="$2" metrics="$3" sock="$4"
+# start_dugite <name> <port> <metrics> <sock> [forge-pool]
+#
+# `forge-pool` is REQUIRED for dugite-bp. Omitting the
+# --shelley-{kes-key,vrf-key,operational-certificate} triple starts a plain RELAY
+# with no forging keys: it forges nothing and runs no leadership checks, which
+# looks identical to a node blocked by the forge gates.
+#
+# The first version of this round made exactly that mistake and concluded — wrongly
+# — that "a dugite BP cannot mint the first block of a chain". It had never started
+# a BP. The keys are validated for existence here so a missing keypair fails loudly
+# instead of silently degrading the node to a relay and producing another false
+# negative.
+start_dugite() {
+    local name="$1" port="$2" metrics="$3" sock="$4" pool="${5:-}"
+    local forge_args=() f
+    if [ -n "$pool" ]; then
+        for f in kes.skey vrf.skey opcert.cert; do
+            [ -s "$LD_KEYS/$pool/$f" ] || {
+                echo "REFUSING TO RUN: forging key missing: $LD_KEYS/$pool/$f"
+                exit 2
+            }
+        done
+        forge_args=(
+            --shelley-kes-key                 "$LD_KEYS/$pool/kes.skey"
+            --shelley-vrf-key                 "$LD_KEYS/$pool/vrf.skey"
+            --shelley-operational-certificate "$LD_KEYS/$pool/opcert.cert"
+        )
+    fi
     caffeinate_if_macos "$DUGITE_BIN" run \
         --config        "$LD_CONFIG/$name.config.json" \
         --topology      "$LD_CONFIG/$name.topology.json" \
@@ -130,6 +174,7 @@ start_dugite() { # <name> <port> <metrics> <sock>
         --host-addr     127.0.0.1 \
         --port          "$port" \
         --metrics-port  "$metrics" \
+        "${forge_args[@]+"${forge_args[@]}"}" \
         >> "$LD_LOGS/$name.log" 2>&1 &
     write_node_pidfile "$LD_STATE/$name.db" "$LD_STATE/$name.pid" \
         || echo $! > "$LD_STATE/$name.pid"
@@ -183,7 +228,7 @@ jq '.localRoots = []' "$LD_STATE/cbp.topology.real.json" > "$CBP_TOPO" 2>/dev/nu
     || echo '{"localRoots":[],"publicRoots":[],"useLedgerAfterSlot":-1}' > "$CBP_TOPO"
 note "relay -> dugite-bp only; cardano-bp -> (none). Bridge cut."
 
-start_dugite dugite-bp    "$LD_DUGITE_BP_PORT" "$LD_DUGITE_BP_METRICS_PORT"    "$LD_DUGITE_BP_SOCK"
+start_dugite dugite-bp    "$LD_DUGITE_BP_PORT" "$LD_DUGITE_BP_METRICS_PORT"    "$LD_DUGITE_BP_SOCK" pool1
 start_dugite dugite-relay "$LD_RELAY_PORT"     "$LD_DUGITE_RELAY_METRICS_PORT" "$LD_RELAY_SOCK"
 
 cardano-node run \
@@ -297,10 +342,29 @@ DBP_AFTER=$(tip_field "$LD_DUGITE_BP_SOCK" .block)
 CBP_AFTER=$(tip_field "$LD_CARDANO_BP_SOCK" .block)
 note "after reconnect: dugite-bp block=${DBP_AFTER:-?} cardano-bp block=${CBP_AFTER:-?}"
 
-if [ "$CONVERGED" -eq 1 ]; then
-    ok "dugite-bp ADOPTED the genesis-divergent chain (tip hash matches cardano-bp at block ${DBP_AFTER:-?})"
+# DIRECTION MATTERS, and tip-hash equality alone does NOT establish it.
+#
+# Two chains converging tells us nothing about WHICH side moved. On the first
+# working run of this round the hashes matched at block 11 with dugite-bp having
+# logged ZERO chain switches — cardano-bp had adopted DUGITE's chain, because
+# dugite's fork won chain selection. Reporting that as "dugite-bp adopted the
+# genesis-divergent chain" was a false positive, and the same mistake shape as
+# #1057's original bad fix: asserting a symptom instead of the mechanism.
+#
+# So require BOTH: the tips agree, AND dugite-bp actually moved off its own fork.
+# A chain switch / ledger rollback in its log after the bridge was restored is the
+# only direct evidence it crossed the fork rather than winning it.
+DBP_SWITCHED=$(awk -v m="${MARK:-0}" '
+    NR > m && (/switching to longer fork/ || /chain switch/ || /rolling back ledger to intersection/) {c++}
+    END{print c+0}' "$LD_LOGS/dugite-bp.log" 2>/dev/null)
+note "dugite-bp chain-switch / ledger-rollback lines after reconnect: ${DBP_SWITCHED:-0}"
+
+if [ "$CONVERGED" -ne 1 ]; then
+    bad "dugite-bp did NOT converge with cardano-bp within ${CONVERGE_TIMEOUT}s (stuck at block ${DBP_AFTER:-?}, cardano-bp at ${CBP_AFTER:-?}) — this is #1057"
+elif [ "${DBP_SWITCHED:-0}" -eq 0 ]; then
+    inconc "tips agree at block ${DBP_AFTER:-?} but dugite-bp logged NO chain switch — its own fork WON chain selection and cardano-bp adopted it, so the genesis-rooted adoption under test never happened. Not a pass: the scenario resolved in the wrong direction. Give the cardano island a head start (raise GF_MIN_FORK_BLOCKS or start it first) so its chain is strictly longer."
 else
-    bad "dugite-bp did NOT adopt the genesis-divergent chain within ${CONVERGE_TIMEOUT}s (stuck at block ${DBP_AFTER:-?}, cardano-bp at ${CBP_AFTER:-?}) — this is #1057"
+    ok "dugite-bp ADOPTED the genesis-divergent chain: crossed a fork it did not build (${DBP_SWITCHED} switch/rollback line(s)), tip hash matches cardano-bp at block ${DBP_AFTER:-?}"
 fi
 
 # ── step 4: name the wedge signatures ──────────────────────────────────────
@@ -323,18 +387,26 @@ note "Fork rollback FAILED                  : ${ROLLBACK_FAIL:-0}"
 # fixed    -> converged, both 0
 if [ "${ROLLBACK_FAIL:-0}" -gt 0 ]; then
     bad "BAD-FIX SHAPE: the chain switch was ATTEMPTED but the ledger could not roll back to Origin. A genesis-rooted SwitchPlan from storage is necessary but NOT sufficient — the ledger must re-initialise from genesis (#1057)"
+elif [ "$CONVERGED" -eq 1 ] && [ "${DBP_SWITCHED:-0}" -gt 0 ]; then
+    ok "no wedge signatures after a successful genesis-rooted adoption"
 elif [ "$CONVERGED" -eq 1 ]; then
-    ok "no wedge signatures after a successful adoption"
+    note "no wedge signatures — but see the INCONCLUSIVE above: dugite-bp never crossed the fork, so their absence is not evidence about #1057"
 else
     note "UNFIXED SHAPE: the switch was never attempted (BlockFetch declined the range / the horizon park dropped peers)"
 fi
 
 # ── summary ────────────────────────────────────────────────────────────────
 step "SUMMARY"
-if [ "$FAILURES" -eq 0 ]; then
-    echo "GENESIS-FORK ROUND: PASS — #1057 is fixed"
-else
+if [ "$FAILURES" -gt 0 ]; then
     echo "GENESIS-FORK ROUND: FAIL ($FAILURES assertion(s)) — #1057 reproduced"
+    ./stop.sh >/dev/null 2>&1
+    exit "$FAILURES"
+elif [ "$INCONCLUSIVE" -gt 0 ]; then
+    echo "GENESIS-FORK ROUND: INCONCLUSIVE ($INCONCLUSIVE) — the scenario did not resolve in the direction under test; NOT a pass"
+    ./stop.sh >/dev/null 2>&1
+    exit 3
+else
+    echo "GENESIS-FORK ROUND: PASS — dugite-bp crossed a genesis-rooted fork"
+    ./stop.sh >/dev/null 2>&1
+    exit 0
 fi
-./stop.sh >/dev/null 2>&1
-exit "$FAILURES"
