@@ -1,0 +1,44 @@
+# Expected error-class log lines for restart-endurance-round.sh (#1044).
+#
+# This round deliberately SIGTERMs dugite-relay 30 times, so its peer
+# (dugite-bp) legitimately observes each disconnect and re-dials. Those lines are
+# expected; anything else is a regression.
+#
+# Kept deliberately NARROW. An over-broad allowlist is how a round reports
+# success while measuring nothing (#916/#923/#945/#953/#959) — a pattern like
+# "WARN" would swallow the very leak/re-arm regressions this round exists to
+# catch. Each entry below is one specific, mechanically-caused line.
+#
+# Format: one extended-regex per line; '#' comments and blank lines ignored.
+
+# The peer went away because THIS ROUND stopped it.
+removed dead connection
+shutting down peer connection
+peer reported as failed by protocol task
+demoting warm -> cold
+warm -> cold complete
+
+# Reconnect churn while the relay is restarting: connection refused / reset
+# against a listener that is deliberately down for a moment.
+Connection refused
+connection reset
+Connection reset by peer
+os error 61
+os error 54
+
+# The relay's own clean shutdown path, once per iteration.
+SIGTERM received, shutting down
+N2C server shutting down
+N2N server shutting down
+Metrics server shutting down
+chainsync server task cancelled
+Shutdown signal received
+
+# macOS-only, environmental and unrelated to the restart (already allowlisted by
+# sibling rounds): the system DNS config is unreadable, so discovery falls back
+# to public resolvers.
+System DNS config unavailable
+
+# The N2C socket permission advisory — a devnet-only umask artefact, emitted once
+# per relay start and therefore once per iteration.
+N2C socket is world-readable
