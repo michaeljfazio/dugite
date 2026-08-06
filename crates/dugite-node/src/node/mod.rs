@@ -5056,6 +5056,12 @@ impl Node {
                 .expect("block_announcement_tx was just set")
                 .clone(),
             self.chain_db.clone(),
+            // #1057: the SAME cell chain selection gates its genesis-anchor arm on,
+            // so BlockFetch cannot decline blocks storage is prepared to switch to.
+            self.chain_sel_handle
+                .as_ref()
+                .map(|cs| cs.ledger_can_reach_origin_flag())
+                .unwrap_or_else(|| std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false))),
             self.ledger_state.clone(),
             self.ledger_view.clone(),
             self.ledger_tip_slot_tx.clone(),

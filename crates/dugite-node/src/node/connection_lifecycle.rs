@@ -1022,6 +1022,13 @@ pub struct ConnectionLifecycleManager {
     /// Shared ChainDB — protocol tasks read chain state for intersection finding.
     chain_db: Arc<RwLock<ChainDB>>,
 
+    /// #1057: can the ledger be rolled back to Origin? THE SAME CELL chain
+    /// selection reads, not a second predicate computed here — the two disagreed
+    /// once (storage on this flag, BlockFetch on `ledger tip == Origin`) and the
+    /// result was a node that would have accepted the fork switch but never
+    /// received the blocks to switch to.
+    ledger_can_reach_origin: Arc<std::sync::atomic::AtomicBool>,
+
     /// Shared LedgerState — protocol tasks read ledger tip for intersection.
     ledger_state: Arc<RwLock<LedgerState>>,
 
@@ -1330,6 +1337,7 @@ impl ConnectionLifecycleManager {
         fetched_blocks_tx: mpsc::Sender<FetchedBlock>,
         block_announcement_tx: broadcast::Sender<BlockAnnouncement>,
         chain_db: Arc<RwLock<ChainDB>>,
+        ledger_can_reach_origin: Arc<std::sync::atomic::AtomicBool>,
         ledger_state: Arc<RwLock<LedgerState>>,
         ledger_view: Arc<arc_swap::ArcSwap<super::ledger_view::LedgerView>>,
         ledger_tip_slot_tx: tokio::sync::watch::Sender<u64>,
@@ -1367,6 +1375,7 @@ impl ConnectionLifecycleManager {
             fetched_blocks_tx,
             block_announcement_tx,
             chain_db,
+            ledger_can_reach_origin,
             ledger_state,
             ledger_view,
             ledger_tip_slot_tx,
@@ -2660,11 +2669,11 @@ impl ConnectionLifecycleManager {
         let fetched_blocks_tx = self.fetched_blocks_tx.clone();
         let candidate_chains = self.candidate_chains.clone();
         let chain_db = self.chain_db.clone();
-        // #1057 half A: the gross-request invariant's genesis clause is conditional
-        // on the LEDGER being at Origin, so this worker needs the ledger tip. Read
-        // only when `prev` is the genesis sentinel — see
-        // `fetch_range_connects_via_chain_db`.
-        let ledger_state = self.ledger_state.clone();
+        // #1057: the gross-request invariant's genesis clause is conditional on the
+        // ledger being able to ROLL BACK to Origin. Read from the SAME cell chain
+        // selection uses, so the two layers cannot gate one decision on two
+        // different predicates — see `fetch_range_connects_via_chain_db`.
+        let ledger_can_reach_origin = self.ledger_can_reach_origin.clone();
         let bel = self.byron_epoch_length;
         // Shared flag: only ONE BlockFetch worker is active at a time.
         // Matches Haskell's bfcMaxConcurrencyBulkSync = 1.
@@ -3163,15 +3172,16 @@ impl ConnectionLifecycleManager {
                                     ) {
                                         true
                                     } else {
-                                        // #1057 half A: the genesis clause needs the
-                                        // LEDGER tip, not the ChainDB tip. Read it
-                                        // only when `prev` is actually the genesis
-                                        // sentinel, so the ordinary
-                                        // frontier-extension path takes exactly the
-                                        // one lock it always did.
+                                        // #1057: an atomic load, no lock — and the
+                                        // SAME cell chain selection reads. The
+                                        // previous version tested `ledger tip ==
+                                        // Origin` here while storage tested
+                                        // "can reach Origin", so BlockFetch declined
+                                        // the very blocks storage was prepared to
+                                        // switch to.
                                         let ledger_at_origin = prev_is_genesis
-                                            && ledger_state.read().await.tip.point
-                                                == dugite_primitives::Point::Origin;
+                                            && ledger_can_reach_origin
+                                                .load(std::sync::atomic::Ordering::Relaxed);
                                         let cdb = chain_db.read().await;
                                         fetch_range_connects_via_chain_db(
                                             cdb.get_tip_info().is_none(),
@@ -4676,6 +4686,9 @@ impl ConnectionLifecycleManager {
             fetched_blocks_tx,
             block_announcement_tx,
             Arc::new(RwLock::new(chain_db2)),
+            // #1057: tests default the shared flag OFF — the conservative direction,
+            // matching a node that has not published yet.
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
             ledger_arc,
             ledger_view,
             ledger_tip_slot_tx,
@@ -4754,6 +4767,9 @@ impl ConnectionLifecycleManager {
             fetched_blocks_tx,
             block_announcement_tx,
             Arc::new(RwLock::new(chain_db2)),
+            // #1057: tests default the shared flag OFF — the conservative direction,
+            // matching a node that has not published yet.
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
             ledger_arc,
             ledger_view,
             ledger_tip_slot_tx,

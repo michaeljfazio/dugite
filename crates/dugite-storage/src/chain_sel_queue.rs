@@ -847,6 +847,19 @@ impl ChainSelHandle {
         (handle, runner)
     }
 
+    /// The shared `ledger_can_reach_origin` flag (#1057).
+    ///
+    /// Handed to BlockFetch's gross-request invariant so BOTH layers read the SAME
+    /// predicate from the SAME cell. They disagreed once — storage on
+    /// `ledger_can_reach_origin` while BlockFetch still tested `ledger tip ==
+    /// Origin` — and the result was a node that would have accepted the fork switch
+    /// but never received the blocks to switch to. Two layers gating one decision on
+    /// two different predicates is a bug waiting to happen; sharing the cell makes
+    /// it inexpressible.
+    pub fn ledger_can_reach_origin_flag(&self) -> Arc<std::sync::atomic::AtomicBool> {
+        Arc::clone(&self.ledger_can_reach_origin)
+    }
+
     /// Publish whether the ledger can be rolled back to Origin (#1057).
     ///
     /// The node calls this whenever the ledger tip changes. It gates
