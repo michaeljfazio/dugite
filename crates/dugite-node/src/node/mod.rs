@@ -3303,9 +3303,26 @@ impl Node {
                     );
                 }
             } else {
-                warn!(
+                // #1055: do NOT claim leader election is disabled — it is not.
+                // On a Conway-from-genesis chain the `set` pre-fill is cleared
+                // deliberately (see `finalize_genesis_state`'s
+                // `conway_from_genesis` branch) for Haskell-faithful RUPD
+                // timing, so this branch is the NORMAL boot state there, and
+                // `LedgerState::pool_distribution_for_slot` falls back to
+                // computing the distribution from live delegations + stake and
+                // reward balances (mirroring Haskell's genesis `nesPd`, which
+                // is a separate field from `esSnapshots` and drives epoch-0
+                // leader election even though ssStakeGo/Set/Mark are `mempty`).
+                //
+                // The old wording ("leader election disabled until epoch
+                // transition") was read as the cause of a block producer that
+                // had stopped forging, which cost real investigation time; the
+                // actual cause was #1057. State the mechanism, not a verdict.
+                info!(
                     pool_id = %creds.pool_id,
-                    "Block producer: no 'set' snapshot available — leader election disabled until epoch transition"
+                    "Block producer: no 'set' snapshot yet — leader election uses the \
+                     live-delegation fallback (normal on a Conway-from-genesis chain) \
+                     until the first SNAP rotation populates it"
                 );
             }
         }
