@@ -103,51 +103,70 @@ dugite-lsm (LSM-tree on-disk storage for UTxO-HD)
 ## Current Focus
 **v2.7.0 (2026-08-06) — genesis is an anchor, and eras are checked at the wire.**
 Drop-in from v2.6.0, **SNAPSHOT unchanged at 37**. Closes #1015, #1026, #1028,
-#1046, #1047, #1048, #1050, #1051, #1054, #1055, plus **#1057** and **#1058**
-found during the sweep. Open: #1008 (CLI surface backlog), #1053 (typed phase-2
-wire class), #1030 items 4-6, #1031/#1044 (round landed, awaiting a live run).
+#1046, #1047, #1048, #1050, #1051, #1054, #1055, #1031, #1044, plus **#1058**
+found during the sweep. Open: **#1057** (P0, fully diagnosed below — the
+two-layer storage fix was attempted, verified WRONG live, and reverted), #1008
+(CLI surface backlog), #1053 (typed phase-2 wire class), #1030 items 4-6.
 
-### #1057 — a node with any block of its own never rejoins (P0, strands a BP)
+### #1057 — a node with any block of its own never rejoins (P0, OPEN)
 
-**The most serious find.** A node whose local chain must be replaced from Origin
-never adopted the canonical chain: BlockFetch declined the peer's block 0
-forever, the ledger never advanced, ChainSync's forecast-horizon park timed out,
-and **every** peer was disconnected in an endless reconnect loop — no
-self-healing, for the process lifetime.
+**Diagnosed in detail, NOT fixed — do not re-diagnose from scratch.** A node whose
+local chain must be replaced from Origin never adopts the canonical chain:
+BlockFetch declines the peer's block 0 forever, the ledger never advances,
+ChainSync's forecast-horizon park times out, and **every** peer is disconnected in
+an endless reconnect loop with no self-healing. It strands a block producer.
 
-Live evidence from a two-forger devnet: dugite-bp forged blocks 0..8 (slots
-4-21) on Origin, then froze at its own tip while the Haskell chain reached block
-240+, dying at the *same* header slot 345 on every peer, every reconnect, with
-6m15s of total log silence after slot 30. Controlled comparison, same binary and
+Live evidence: dugite-bp forged blocks 0..8 (slots 4-21) on Origin, then froze at
+its own tip while the Haskell chain reached block 240+, dying at the *same* header
+slot on every peer and every reconnect. Controlled comparison, same binary and
 devnet: **dugite-relay reached epoch 2, dugite-bp stayed at epoch 0** — the only
 difference being whether the ChainDB was non-empty when the Origin adoption was
 required.
 
-One blind spot in two independent layers — **genesis/Origin was not recognised
-as an anchor**, only a stored block or the ImmutableDB tip:
+Two layers both refuse a genesis anchor, recognising only a stored block or the
+ImmutableDB tip:
+- `connection_lifecycle.rs` — the #735 gross-request invariant exempts only a
+  COMPLETELY EMPTY ChainDB. Genesis is never a stored block, so
+  `has_block(&genesis)` is always false. **This is the branch that fires.**
+- `volatile_db.rs::switch_chain` — accepts a non-intersecting fork only when its
+  root anchors at the ImmutableDB tip; with nothing flushed yet that anchor is
+  `None`.
 
-- `connection_lifecycle.rs` (the branch that fired): the #735 gross-request
-  invariant exempted only a completely EMPTY ChainDB. Genesis is never a stored
-  block, so `has_block(&genesis)` is always false. The guard's own comment
-  documents the same wedge one case earlier (the relay declining block 1) and
-  its `is_none()` escape hatch is the bug's twin.
-- `volatile_db.rs::switch_chain`: accepted a non-intersecting fork only when its
-  root's prev_hash equalled the ImmutableDB tip. With nothing flushed yet
-  (9 blocks, k=40) that anchor is `None`, so a genesis-rooted fork was
-  "unreachable".
+**Why the obvious two-line fix is WRONG, verified live.** Teaching both layers to
+accept `prev_hash == Hash32::ZERO` was attempted and REVERTED: storage then emits a
+genesis-rooted `SwitchPlan` (`intersection = ZERO, slot 0`), chain selection asks
+the ledger to roll back to Origin, and `sync.rs` aborts —
 
-`Hash32::ZERO` was already dugite's canonical Origin parent (the encoder maps it
-to CBOR `null` == Haskell `PrevHash = GenesisHash`), so both layers now
-recognise it. Upstream needs no such guard because `AnchorGenesis` is a
-first-class constructor of `Anchor blk`, matched by `Paths.hs::isReachable`.
-The `k` cap is untouched — the new arm makes a genesis rollback *expressible*,
-not permitted.
+```
+Chain selection: fork switch at live tip — rolling back ledger to intersection
+  intersection=00000000000000000000000000000000
+ERROR Rollback target outside LedgerSeq volatile window AND no canonical
+  snapshot available. Aborting rollback
+WARN  Fork rollback failed; skipping fork replay
+```
 
-**An existing test PINNED the storage half.**
+— leaving dugite-bp at block 4 while the network was at 84. The wedge MOVES from
+BlockFetch to the ledger rollback; it does not go away. Unit tests on
+`switch_chain` in isolation all passed, because nothing drove the storage plan
+through the ledger.
+
+The complete fix needs the ledger to **re-initialise from genesis** on a
+rollback-to-Origin (a full `init_fresh_ledger`, not an in-place rewind — #989
+deleted `reset_to_origin` precisely because a partial reset cannot be correct),
+plus a LedgerSeq re-anchor (#985) and a query-state reset. That touches the code
+path that produced #985's chimera, so it needs its own focused pass with
+byte-exact validation.
+
+`Hash32::ZERO` IS dugite's canonical Origin parent (encoder → CBOR `null` ==
+Haskell `PrevHash = GenesisHash`), and upstream needs no guard at all because
+`AnchorGenesis` is a first-class constructor of `Anchor blk`, matched by
+`Paths.hs::isReachable`. Those facts are settled; the blocker is the ledger.
+
+**An existing test PINNED the storage half**:
 `test_switch_chain_reachable_via_immutable_anchor` used `h(0)` as its "immutable
-tip", and `h(0)` is `[0u8; 32]` == `Hash32::ZERO` == the genesis sentinel — so it
-was really asserting that a genesis-rooted fork stays unreachable. The #948
-trap: assert on the payload, not just the shape.
+tip", and `h(0)` is `[0u8; 32]` — the genesis sentinel. Re-pointed at a non-ZERO
+anchor so it covers the path it is named for; its `is_none()` assertion now
+documents the open wedge explicitly.
 
 ### #1015 — Babbage folded extraEntropy; Praos has 2 terms, not 3
 
@@ -229,7 +248,12 @@ dugite's encoder" — it was worth re-verifying.
 ### Testing discipline this wave
 
 Every fix landed with a test **proven RED by disarming the fix**, not merely
-written. That caught the two cases that matter most here: #1026's behavioural
+written — and the one case where that was NOT enough is the lesson of this wave:
+#1057's unit tests all passed while the fix was wrong, because they exercised
+`switch_chain` in isolation and nothing drove its output through the ledger. A
+RED-proven unit test bounds the function, not the system.
+
+Where it did work, it worked well. The two cases that matter most: #1026's behavioural
 tests were RED against the *wiring* (not the predicate), which is #977's exact
 failure mode; and #1028's not-plumbed-vs-SNothing test drives the same input
 through both and asserts they behave DIFFERENTLY, so the doubly-optional type

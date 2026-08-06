@@ -1816,47 +1816,6 @@ impl VolatileDB {
                     .and_then(|h| self.blocks.get(h))
                     .map(|b| b.prev_hash);
                 match (immutable_anchor, new_root_prev) {
-                    // #1057: the fork is rooted at GENESIS (`prev_hash ==
-                    // Hash32::ZERO` is dugite's canonical Origin parent — the
-                    // encoder maps it to CBOR `null`, i.e. Haskell's
-                    // `PrevHash = GenesisHash`; see
-                    // `encode/block.rs::encode_block_header_body`).
-                    //
-                    // Genesis is a valid anchor in its own right, exactly as
-                    // `AnchorGenesis` is a first-class constructor of
-                    // ouroboros-consensus's `Anchor blk` and is matched by
-                    // `Paths.hs::isReachable`'s `AF.Empty anchor` case. Before
-                    // this arm existed, a node holding ANY block of its own
-                    // could never adopt a chain diverging at genesis: with an
-                    // empty ImmutableDB `immutable_anchor` is `None`, so a
-                    // genesis-rooted fork fell through to "unreachable" and the
-                    // node stayed wedged on its own fork for the process
-                    // lifetime (#1057 — it stranded a block producer that
-                    // forged before completing initial sync).
-                    //
-                    // This arm is checked BEFORE the immutable-anchor arm so a
-                    // genesis-rooted fork is recognised even when an immutable
-                    // anchor also exists; the two cannot both apply to the same
-                    // fork root, since a stored immutable tip is never ZERO.
-                    //
-                    // The rollback is the WHOLE selected chain and the apply the
-                    // WHOLE new chain. Legality is still bounded by the
-                    // `max_rollback` (== k) cap immediately below, which is
-                    // deliberately left in force: this arm makes a genesis
-                    // rollback *expressible*, not unconditionally permitted.
-                    (_, Some(prev)) if prev == Hash32::ZERO => {
-                        let rollback: Vec<Hash32> =
-                            self.selected_chain.iter().rev().copied().collect();
-                        let apply: Vec<Hash32> = new_chain.clone();
-                        debug!(
-                            new_tip = %new_tip_hash,
-                            rollback_count = rollback.len(),
-                            apply_count = apply.len(),
-                            "VolatileDB: fork anchors at GENESIS — switching via \
-                             full-volatile rollback to Origin (#1057)"
-                        );
-                        (Hash32::ZERO, 0, rollback, apply)
-                    }
                     (Some((anchor_hash, anchor_slot)), Some(prev)) if anchor_hash == prev => {
                         let rollback: Vec<Hash32> =
                             self.selected_chain.iter().rev().copied().collect();
@@ -3269,15 +3228,19 @@ mod tests {
         let mut db = VolatileDB::new();
         // Anchor (immutable tip) is h(200) at slot 50 — NOT in VolatileDB.
         //
-        // #1057: this anchor MUST NOT be `h(0)`. `h(0)` is `[0u8; 32]` ==
-        // `Hash32::ZERO`, which is dugite's canonical GENESIS parent, so the
-        // original version of this test was really exercising the
+        // This anchor MUST NOT be `h(0)`. `h(0)` is `[0u8; 32]` ==
+        // `Hash32::ZERO`, which is dugite's canonical GENESIS parent (the
+        // encoder maps it to CBOR `null` == Haskell `PrevHash = GenesisHash`),
+        // so the original version of this test was really exercising the
         // genesis-rooted case while claiming to exercise the immutable-anchor
-        // case — and its `switch_chain(.., None, ..).is_none()` assertion
-        // PINNED the #1057 wedge (a genesis-rooted fork being refused when the
-        // ImmutableDB is empty). Use a non-ZERO anchor so this test covers the
-        // immutable-tip path it is named for; the genesis path has its own test
-        // below.
+        // case. Use a non-ZERO anchor so this test covers the immutable-tip path
+        // it is named for.
+        //
+        // Its `switch_chain(.., None, ..).is_none()` assertion also documents
+        // that a genesis-rooted fork is currently REFUSED when the ImmutableDB
+        // is empty — see #1057, which is that wedge and is NOT yet fixed: the
+        // storage layer can be taught to emit the plan, but the ledger cannot
+        // roll back to Origin, so the switch fails downstream instead.
         // Selected chain: h(1) → h(2), both children of h(200).
         db.add_block(h(1), 100, 10, h(200), b"s1".to_vec());
         db.add_block(h(2), 200, 20, h(1), b"s2".to_vec());
@@ -3315,99 +3278,6 @@ mod tests {
             "apply is entire new chain, oldest first"
         );
         assert_eq!(db.get_tip(), Some((350, h(12), 22)));
-    }
-
-    /// #1057: a fork rooted at GENESIS must be reachable even when the
-    /// ImmutableDB is empty (`immutable_anchor == None`).
-    ///
-    /// This is the exact live wedge: a block producer that forged its own
-    /// blocks 0..8 on Origin before initial sync completed, then had to adopt
-    /// the network's chain, which also diverges at genesis. Nothing had been
-    /// flushed to immutable (9 blocks, k=40), so `immutable_anchor` was `None`
-    /// and the genesis-rooted fork was declared "unreachable" forever — the
-    /// node never rejoined the canonical chain for the process lifetime.
-    ///
-    /// Haskell has no such gap: `AnchorGenesis` is a constructor of
-    /// `Anchor blk`, so `Paths.hs::isReachable`'s `AF.Empty anchor` case
-    /// matches a genesis anchor exactly as it matches a block anchor.
-    #[test]
-    fn test_switch_chain_reachable_via_genesis_anchor_with_empty_immutable_db() {
-        let mut db = VolatileDB::new();
-        // Our own fork, rooted at GENESIS (prev_hash == Hash32::ZERO).
-        db.add_block(h(1), 4, 0, Hash32::ZERO, b"own0".to_vec());
-        db.add_block(h(2), 21, 1, h(1), b"own1".to_vec());
-        // The network's chain, ALSO rooted at genesis — shares only Origin.
-        db.add_block(h(10), 5, 0, Hash32::ZERO, b"net0".to_vec());
-        db.add_block(h(11), 10, 1, h(10), b"net1".to_vec());
-        db.add_block(h(12), 15, 2, h(11), b"net2".to_vec());
-
-        let plan = db
-            .switch_chain(&h(12), None, u64::MAX)
-            .expect("a genesis-rooted fork must be reachable with an empty ImmutableDB (#1057)");
-        assert_eq!(
-            plan.intersection,
-            Hash32::ZERO,
-            "intersection is the genesis/Origin anchor"
-        );
-        assert_eq!(plan.intersection_slot, 0, "Origin sits at slot 0");
-        assert_eq!(
-            plan.rollback,
-            vec![h(2), h(1)],
-            "rollback is the entire self-forged chain, newest first"
-        );
-        assert_eq!(
-            plan.apply,
-            vec![h(10), h(11), h(12)],
-            "apply is the entire network chain, oldest first"
-        );
-        assert_eq!(db.get_tip(), Some((15, h(12), 2)));
-    }
-
-    /// #1057 companion: recognising genesis as an anchor must NOT weaken the
-    /// Ouroboros `k` cap. A genesis-rooted fork whose adoption would roll back
-    /// more than `k` blocks is still refused (`StoreButDontChange`).
-    ///
-    /// Without this test the fix above could be mistaken for "genesis rollbacks
-    /// are always allowed", which would reintroduce the 10 629-block-rollback
-    /// class the `max_rollback` cap exists to prevent.
-    #[test]
-    fn test_switch_chain_genesis_rooted_fork_still_respects_k() {
-        let mut db = VolatileDB::new();
-        // Our own chain: 5 blocks rooted at genesis.
-        db.add_block(h(1), 1, 0, Hash32::ZERO, b"a".to_vec());
-        db.add_block(h(2), 2, 1, h(1), b"b".to_vec());
-        db.add_block(h(3), 3, 2, h(2), b"c".to_vec());
-        db.add_block(h(4), 4, 3, h(3), b"d".to_vec());
-        db.add_block(h(5), 5, 4, h(4), b"e".to_vec());
-        let tip_before = db.get_tip();
-        let selected_len_before = db.selected_chain_len();
-
-        // A competing genesis-rooted chain. Adopting it needs a 5-block
-        // rollback, but k = 3.
-        db.add_block(h(20), 6, 0, Hash32::ZERO, b"x".to_vec());
-        db.add_block(h(21), 7, 1, h(20), b"y".to_vec());
-
-        assert!(
-            db.switch_chain(&h(21), None, 3).is_none(),
-            "a genesis-rooted fork requiring a rollback deeper than k must be refused"
-        );
-        assert_eq!(
-            db.selected_chain_len(),
-            selected_len_before,
-            "refused switch must not truncate selected_chain"
-        );
-        assert_eq!(
-            db.get_tip(),
-            tip_before,
-            "refused switch must not move the tip"
-        );
-
-        // With k large enough, the same fork IS adopted — proving the refusal
-        // above was the k cap and not the genesis arm failing to match.
-        assert!(
-            db.switch_chain(&h(21), None, 5).is_some(),
-            "the same genesis-rooted fork must be adopted once k permits it"
-        );
     }
 
     /// A `SwitchPlan` returned by `switch_chain` must carry the intersection
