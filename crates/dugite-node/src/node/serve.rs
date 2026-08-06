@@ -313,6 +313,54 @@ pub(crate) struct LedgerTxValidator {
 
 impl TxValidator for LedgerTxValidator {
     fn validate_tx(&self, era_id: u16, tx_bytes: &[u8]) -> Result<(), TxValidationError> {
+        // #1047: WIRE-ERA CHECK, before decoding.
+        //
+        // Upstream cannot even represent applying a tx from era X to a ledger in
+        // era Y: `ApplyTxErr` for the HFC is
+        // `Either (MismatchEraInfo xs) (OneEraApplyTxErr xs)`, and the HFC's
+        // mempool returns `HardForkApplyTxErrWrongEra` before any era's rules
+        // run. dugite had no such check — a legacy-era submission was rejected
+        // only as an ACCIDENTAL CBOR decode error (the standalone Shelley decoder
+        // expects a different array length than a real Shelley tx has).
+        //
+        // That accident is load-bearing today and must not be relied on: correct
+        // any one of those decoders without adding this check, and MIR /
+        // GenesisKeyDelegation / other legacy-era artifacts become ACCEPTABLE on a
+        // Conway chain where cardano-node answers
+        // `HardForkApplyTxErrWrongEra` — the accept-where-Haskell-rejects wedge
+        // class (#996/#997/#985/#1023). MIR Phase-1 validation is a documented
+        // no-op at PV>=9 and GenesisKeyDelegation has era-unconditional
+        // apply-time support, so the ledger layer would NOT catch it.
+        //
+        // The ledger's era comes from `EraHistory::current_era()`, not from
+        // ledger pparams: #985's lesson is that a stale/corrupt protocol version
+        // must never drive an era decision.
+        let ledger_era = match self.era_history.try_read() {
+            Ok(h) => Some(h.current_era()),
+            // Lock contention must not manufacture a spurious era rejection;
+            // fall through to the decoder, which is the pre-#1047 behaviour.
+            Err(_) => None,
+        };
+        if let Some(ledger_era) = ledger_era {
+            let ledger_era_index = ledger_era.to_era_index();
+            if u32::from(era_id) != ledger_era_index {
+                let tx_era = dugite_primitives::era::Era::from_era_index(era_id);
+                tracing::warn!(
+                    era_id,
+                    ledger_era = %ledger_era,
+                    "N2C tx rejected: wrong era (HardForkApplyTxErrWrongEra)"
+                );
+                return Err(TxValidationError::HardForkApplyTxErrWrongEra {
+                    tx_era_index: era_id as u8,
+                    tx_era_name: tx_era
+                        .map(|e| e.to_string())
+                        .unwrap_or_else(|| format!("UnknownEra{era_id}")),
+                    ledger_era_index: ledger_era_index as u8,
+                    ledger_era_name: ledger_era.to_string(),
+                });
+            }
+        }
+
         let tx = dugite_serialization::decode_transaction(era_id, tx_bytes).map_err(|e| {
             TxValidationError::DecodeFailed {
                 reason: e.to_string(),
