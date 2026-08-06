@@ -377,19 +377,10 @@ pub(crate) fn encode_query_result_value(
                 last_epoch_block_nonce,
             );
         }
-        QueryResult::RewardProvenance {
-            epoch,
-            total_rewards_pot,
-            treasury_tax,
-            active_stake,
-        } => {
-            // Reward provenance: array(4) [epoch, rewards_pot, treasury_tax, active_stake]
-            enc.array(4).ok();
-            enc.u64(*epoch).ok();
-            enc.u64(*total_rewards_pot).ok();
-            enc.u64(*treasury_tax).ok();
-            enc.u64(*active_stake).ok();
-        }
+        // GetRewardProvenance (tag 14) has no arm: the variant is gone. It used to
+        // emit `array(4)` where Haskell's `SL.RewardProvenance` is a 16-field
+        // `Rec`, making the reply undecodable. `handle_reward_provenance` now
+        // returns an explicit error instead.
         QueryResult::RewardInfoPools(pools) => {
             encode_reward_info_pools(enc, pools);
         }
