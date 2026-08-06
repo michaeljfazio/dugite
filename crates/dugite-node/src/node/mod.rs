@@ -2865,6 +2865,19 @@ impl Node {
         // `send` returns Err only when there are zero receivers — that's
         // fine, we don't care if no one is listening yet.
         let _ = self.ledger_tip_slot_tx.send(new_tip_slot);
+        // #1057 half A: chain selection lives in `dugite-storage`, which sits below
+        // the ledger and cannot read it, but `switch_chain`'s genesis-anchor arm
+        // must only fire when the ledger can execute the plan. Published from the
+        // ONE place that already fans out every ledger-tip change, so a new call
+        // site cannot forget it.
+        //
+        // The comparison is against `Point::Origin` and NOT `slot == 0`: genesis is
+        // slot-less, a real block can sit at slot 0, and an Origin test that is
+        // merely "slot is zero" is how a genesis sentinel gets confused with a
+        // block (see the `h(0) == Hash32::ZERO` test that pinned this very bug).
+        if let Some(ref cs) = self.chain_sel_handle {
+            cs.set_ledger_at_origin(ls.tip.point == Point::Origin);
+        }
     }
 
     /// Convenience: re-publish the view by taking the read lock and
@@ -2894,6 +2907,20 @@ impl Node {
                 mempool_txs = self.mempool.len(),
                 "Chain tip",
             );
+
+            // #1057 half A: seed the ledger-at-Origin flag HERE, not only from
+            // `publish_ledger_view`.
+            //
+            // That helper runs only on the LIVE apply path (see the #742 note
+            // below), so a node that comes up with a genesis ledger — the exact
+            // case this fix repairs — would never publish before its first applied
+            // block, and the genesis-anchor arm would stay disabled through the
+            // whole window in which it is needed. Same trap as #985's dead
+            // `recover_ledger_seq`: a mechanism wired to a path the scenario does
+            // not take is not wired at all.
+            if let Some(ref cs) = self.chain_sel_handle {
+                cs.set_ledger_at_origin(ls.tip.point == Point::Origin);
+            }
 
             // Initialize Prometheus metrics from loaded ledger state so they
             // are accurate immediately on startup (before any blocks arrive).
