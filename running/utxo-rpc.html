@@ -222,8 +222,8 @@ after <code>v1alpha</code> was frozen. The spec is pinned in-tree at
 <tr><td><code>SyncService</code></td><td><code>FollowTip</code> (stream)</td><td>✅ implemented</td></tr>
 <tr><td><code>QueryService</code></td><td><code>ReadParams</code></td><td>✅ implemented</td></tr>
 <tr><td><code>QueryService</code></td><td><code>ReadUtxos</code></td><td>✅ implemented</td></tr>
-<tr><td><code>QueryService</code></td><td><code>ReadGenesis</code></td><td>✅ implemented (minimum-viable envelope)</td></tr>
-<tr><td><code>QueryService</code></td><td><code>ReadEraSummary</code></td><td>✅ implemented</td></tr>
+<tr><td><code>QueryService</code></td><td><code>ReadGenesis</code></td><td>✅ implemented (Shelley-genesis section — see <a href="#limitations">Limitations</a>)</td></tr>
+<tr><td><code>QueryService</code></td><td><code>ReadEraSummary</code></td><td>✅ implemented (real per-era <code>start</code>/<code>end</code> boundaries)</td></tr>
 <tr><td><code>QueryService</code></td><td><code>SearchUtxos</code></td><td>✅ implemented (<code>exact_address</code> / <code>payment_part</code> / <code>delegation_part</code> / <code>asset</code> plus <code>not</code> / <code>all_of</code> / <code>any_of</code> composites)</td></tr>
 <tr><td><code>QueryService</code></td><td><code>ReadData</code></td><td>✅ implemented (bounded scan: live inline datums + mempool tx witness sets)</td></tr>
 <tr><td><code>QueryService</code></td><td><code>ReadTx</code></td><td>✅ implemented (bounded scan: mempool + last ~43 200 slots of VolatileDB)</td></tr>
@@ -231,11 +231,16 @@ after <code>v1alpha</code> was frozen. The spec is pinned in-tree at
 <tr><td><code>SubmitService</code></td><td><code>SubmitTx</code></td><td>✅ implemented</td></tr>
 <tr><td><code>SubmitService</code></td><td><code>ReadMempool</code></td><td>✅ implemented</td></tr>
 <tr><td><code>SubmitService</code></td><td><code>WaitForTx</code> (stream)</td><td>✅ implemented</td></tr>
-<tr><td><code>SubmitService</code></td><td><code>WatchMempool</code> (stream)</td><td>✅ implemented</td></tr>
+<tr><td><code>SubmitService</code></td><td><code>WatchMempool</code> (stream)</td><td>✅ implemented (full <code>TxPredicate</code> filtering, same matcher as <code>WatchTx</code>)</td></tr>
 <tr><td><code>SubmitService</code></td><td><code>EvalTx</code></td><td>✅ implemented (per-redeemer <code>ex_units</code> + Plutus traces)</td></tr>
-<tr><td><code>WatchService</code></td><td><code>WatchTx</code> (stream)</td><td>✅ implemented (full <code>TxPredicate</code> filtering: address / asset / mint / <code>not</code> / <code>all_of</code> / <code>any_of</code>)</td></tr>
+<tr><td><code>WatchService</code></td><td><code>WatchTx</code> (stream)</td><td>✅ implemented (full <code>TxPredicate</code> filtering: address / asset / mint / <code>not</code> / <code>all_of</code> / <code>any_of</code>; chain-sourced with <code>apply</code> / <code>undo</code> / <code>idle</code>) — see <a href="#limitations">Limitations</a></td></tr>
 </tbody></table>
 </div>
+<p>Every method above honours a request's <code>google.protobuf.FieldMask</code> (issue
+#1004): unselected fields are pruned from the response, recursively,
+including into repeated fields like <code>FetchBlockResponse.block</code> — see
+<code>crates/dugite-rpc/src/masking.rs</code> for the exact semantics (a mask that's
+absent or empty returns everything, matching the canonical FieldMask doc).</p>
 <h2 id="configuration"><a class="header" href="#configuration">Configuration</a></h2>
 <h3 id="json-config-block"><a class="header" href="#json-config-block">JSON config block</a></h3>
 <p>Add an <code>Rpc</code> block to <code>config/&lt;network&gt;/config.json</code>:</p>
@@ -332,6 +337,22 @@ upstream protobuf shape changes. The single-source-of-truth lives in
 updated, or vice versa) are caught by code review against the diff.</p>
 <h2 id="limitations"><a class="header" href="#limitations">Limitations</a></h2>
 <ul>
+<li><code>ReadGenesis</code> populates the full Shelley-genesis section of
+<code>cardano.Genesis</code> (network_magic, network_id, system_start,
+security_param, epoch_length, slot_length, max_lovelace_supply,
+max_kes_evolutions, slots_per_kes_period, update_quorum,
+active_slots_coeff — 10 of the message's 34 fields). Byron
+(<code>avvm_distr</code>, <code>boot_stakeholders</code>, <code>heavy_delegation</code>, <code>vss_certs</code>,
+...), Alonzo (<code>cost_models</code>, <code>execution_prices</code>, ...), and Conway
+(<code>committee</code>, <code>constitution</code>, <code>drep_voting_thresholds</code>, ...) sections
+are unset, as are Shelley's <code>gen_delegs</code> / <code>initial_funds</code> / <code>staking</code>
+— those genesis structs aren't retained past <code>dugite-node</code> startup
+today. Tracked as
+<a href="https://github.com/michaeljfazio/dugite/issues/1009">#1009</a>.</li>
+<li><code>ReadEraSummary</code>'s per-era <code>protocol_params</code> is unset: dugite's ledger
+retains only the CURRENT era's <code>PParams</code>, not a per-era history, so
+there is nothing truthful to report for a past era. <code>start</code> / <code>end</code>
+boundaries ARE real (slot, epoch, and absolute wall-clock ms).</li>
 <li><code>SearchUtxos</code> with a fully-wildcard predicate (no <code>match</code> /
 combinators) is rejected with <code>UNIMPLEMENTED</code>: dugite refuses to
 materialise the entire UTxO set in a single response. Supply at
@@ -354,10 +375,26 @@ protocol params — the CEK falls back to per-step defaults, which
 is <em>conservative</em> (over-approximates) and therefore safe for
 fee-estimation use cases but may diverge slightly from cardano-node
 on the high end.</li>
-<li><code>WatchTx</code> filters on tx output fields (<code>produces</code> / <code>has_address</code>
-/ <code>moves_asset</code>) and minting (<code>mints_asset</code>) — but not on
-<em>resolved</em> inputs (<code>consumes</code> / <code>has_certificate</code>) since those
-require live UTxO lookups against pending mempool txs.</li>
+<li><code>WatchTx</code> / <code>WatchMempool</code> filter on tx output fields (<code>produces</code> /
+<code>has_address</code> / <code>moves_asset</code>) and minting (<code>mints_asset</code>). Two
+<code>TxPattern</code> leaves are not implemented: <code>consumes</code> (needs resolved-input
+UTxO data the watch paths don't have) and <code>has_certificate</code> (needs a
+certificate-type matcher not yet built). A request naming either —
+anywhere, including nested under <code>not</code> / <code>all_of</code> / <code>any_of</code> — is
+<strong>rejected</strong> with <code>UNIMPLEMENTED</code> before it ever subscribes, rather than
+silently accepted and under-filtered.</li>
+<li><code>WatchTx</code> is <strong>chain-sourced</strong>, matching the proto's own "stream
+transactions from the chain" comment (<code>SubmitService.WatchMempool</code> is
+the pre-confirmation counterpart). It subscribes to the same
+<code>TipFeed</code>/<code>TipRollback</code> broadcast <code>FollowTip</code> uses: each applied block
+yields one <code>apply</code> <code>WatchTxResponse</code> per matching tx (with
+<code>AnyChainTx.block</code> populated) or a single <code>idle</code> if the block matched
+nothing, and a rolled-back block replays its cached matches as <code>undo</code>,
+most-recent-first. The replay data comes from a per-subscriber bounded
+history (<code>HISTORY_CAP</code> = 4,320 blocks, above mainnet <code>k</code> = 2,160) built
+from the subscriber's own apply-time observations — <code>TipRollback</code> does
+not need to carry the rolled-back block's contents. Was
+<a href="https://github.com/michaeljfazio/dugite/issues/1007">#1007</a>.</li>
 <li><code>FollowTip</code> apply events carry <code>AnyChainBlock.native_bytes</code> (the
 raw block CBOR); clients that only need tip metadata can ignore
 the payload.</li>
