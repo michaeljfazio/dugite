@@ -101,7 +101,7 @@ dugite-lsm (LSM-tree on-disk storage for UTxO-HD)
 - 28-byte hash types (DRep keys, pool voter keys, required signers) must be padded to 32 bytes via `Hash28::to_hash32_padded()` — do not use `Hash<32>::from()` directly on 28-byte hashes
 
 ## Current Focus
-**v2.7.0 (2026-08-06) — genesis is an anchor, and eras are checked at the wire.**
+**v2.7.0 (2026-08-06) — eras are checked at the wire.**
 Drop-in from v2.6.0, **SNAPSHOT unchanged at 37**. Closes #1015, #1026, #1028,
 #1046, #1047, #1048, #1050, #1051, #1054, #1055, #1031, #1044, plus **#1058**
 found during the sweep. Open: **#1057** (P0, fully diagnosed below — the
