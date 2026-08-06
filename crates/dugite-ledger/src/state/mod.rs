@@ -1140,8 +1140,13 @@ impl LedgerState {
         if let Some(net) = self.node_network {
             ctx = ctx.with_network(net);
         }
-        if let Some(h) = gov.constitution.as_ref().and_then(|c| c.script_hash) {
-            ctx = ctx.with_constitution_script_hash(h);
+        // #1028: pass the guardrail through INCLUDING its absence. If a
+        // constitution is enacted, `c.script_hash` is authoritative — `None`
+        // there means "no guardrail" (`SNothing`), which Haskell still enforces
+        // equality against. Only the total absence of a constitution leaves the
+        // context unset, which is the one case that skips the check.
+        if let Some(c) = gov.constitution.as_ref() {
+            ctx = ctx.with_constitution_guardrail(c.script_hash);
         }
         ctx
     }

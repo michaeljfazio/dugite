@@ -1265,14 +1265,15 @@ pub(crate) fn convert_validation_error(
             expected: network_id_to_wire(expected),
             accounts,
         },
-        VE::ConstitutionPolicyMismatch { expected, actual } => {
+        // #1028: both sides are now typed `Option<Hash28>` end to end, so the
+        // `StrictMaybe` distinction survives from the predicate to the wire.
+        // Previously the ledger carried hex STRINGS and used the empty string as
+        // an absence sentinel, which this arm had to re-interpret — and which
+        // could not express "the constitution has no guardrail" at all.
+        VE::InvalidGuardrailsScriptHash { got, expected } => {
             TxValidationError::InvalidGuardrailsScriptHash {
-                got: if actual.is_empty() { None } else { Some(actual) },
-                expected: if expected.is_empty() {
-                    None
-                } else {
-                    Some(expected)
-                },
+                got: got.map(|h| h.to_hex()),
+                expected: expected.map(|h| h.to_hex()),
             }
         }
         VE::UnspendableUTxONoDatumHash { input, .. } => {
@@ -2736,9 +2737,9 @@ mod tests {
                 expected: 0,
                 mismatched: vec![(format!("e0{}", "55".repeat(28)), 1)],
             },
-            VE::ConstitutionPolicyMismatch {
-                expected: "66".repeat(28),
-                actual: String::new(),
+            VE::InvalidGuardrailsScriptHash {
+                got: None,
+                expected: Some(dugite_primitives::hash::Hash28::from_bytes([0x66; 28])),
             },
             VE::WdrlNotDelegatedToDRep {
                 credential_hash: "77".repeat(28),
