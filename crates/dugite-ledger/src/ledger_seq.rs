@@ -1014,7 +1014,15 @@ impl LedgerSeq {
         if self.incoherent {
             return None;
         }
-        if &self.anchor_point == target_point {
+        // ORIGIN-EQUIVALENT, not merely equal. The anchor is `Point::Origin`, while
+        // chain selection builds its rollback target as
+        // `Point::Specific(intersection_slot, intersection_hash)` — so a genesis
+        // intersection arrives as `Specific(0, ZERO)`. Both denote the same chain
+        // position; `==` alone says they differ, which declined the rollback and left
+        // #1057's node on its dead fork with storage already switched.
+        if &self.anchor_point == target_point
+            || (self.anchor_point.denotes_origin() && target_point.denotes_origin())
+        {
             return Some(self.deltas.len());
         }
         for (i, delta) in self.deltas.iter().enumerate().rev() {
@@ -2386,6 +2394,74 @@ mod tests {
         }
         assert_eq!(seq.len(), 6);
         assert_eq!(seq.tip_state().utxo.epoch_fees.0, 4_500_000);
+    }
+
+    // ── Genesis rollback target (#1057) ───────────────────────────────────────
+
+    /// A genesis rollback must be found whichever REPRESENTATION of Origin arrives.
+    ///
+    /// This is the test the earlier attempt at #1057 did not have, and its absence is
+    /// exactly why four RED-proven unit tests passed while the node got worse. Those
+    /// tests drove `Point::Origin`, the form the LEDGER uses. Chain selection builds
+    /// its target as `Point::Specific(intersection_slot, intersection_hash)`, so a
+    /// genesis intersection arrives as `Specific(0, ZERO)` — the form the tests never
+    /// used, and the only form production actually passes.
+    ///
+    /// Measured before the fix: storage switched the chain, chain selection asked the
+    /// ledger to roll back to `Specific(0, ZERO)`, `find_rollback_n` answered None,
+    /// and the node aborted the rollback and stayed on its dead fork —
+    /// "Rollback target outside LedgerSeq volatile window AND no canonical snapshot
+    /// available", relay pinned at block 5 while the peer was at 151.
+    #[test]
+    fn find_rollback_n_accepts_either_representation_of_origin() {
+        let anchor = make_anchor();
+        let mut seq = LedgerSeq::with_defaults(anchor, 20);
+        for i in 1u8..=6 {
+            seq.push(make_delta(i as u64, i, 1_000_000));
+        }
+        assert_eq!(seq.len(), 6);
+        assert!(
+            *seq.anchor_point() == Point::Origin,
+            "precondition: the anchor is the ledger's Origin representation"
+        );
+
+        // The ledger's own form — this is what the earlier tests exercised.
+        assert_eq!(
+            seq.find_rollback_n(&Point::Origin),
+            Some(6),
+            "Point::Origin must roll the whole window back"
+        );
+
+        // The form CHAIN SELECTION passes. Same chain position, different variant.
+        assert_eq!(
+            seq.find_rollback_n(&Point::Specific(
+                dugite_primitives::time::SlotNo(0),
+                Hash32::ZERO,
+            )),
+            Some(6),
+            "Specific(0, ZERO) denotes Origin and must roll the whole window back — \
+             this is the case production hits and the one #1057 declined"
+        );
+
+        // Not origin-equivalent: a real block at slot 0 has a real hash, and a ZERO
+        // hash above slot 0 is not genesis either. Both must still miss, or the
+        // predicate would start accepting unrelated targets.
+        assert_eq!(
+            seq.find_rollback_n(&Point::Specific(
+                dugite_primitives::time::SlotNo(0),
+                make_hash(9),
+            )),
+            None,
+            "slot 0 with a REAL hash is a block, not Origin"
+        );
+        assert_eq!(
+            seq.find_rollback_n(&Point::Specific(
+                dugite_primitives::time::SlotNo(99),
+                Hash32::ZERO,
+            )),
+            None,
+            "a ZERO hash above slot 0 is not Origin"
+        );
     }
 
     // ── Reset anchor ──────────────────────────────────────────────────────────

@@ -3238,10 +3238,14 @@ impl ConnectionLifecycleManager {
                                                             std::sync::atomic::Ordering::Relaxed,
                                                         ),
                                                     "BlockFetch: declining a range rooted at \
-                                                     GENESIS — this node holds a chain that \
-                                                     diverges from the peer's at genesis and \
-                                                     cannot adopt it in place (#1057). The \
-                                                     ledger will not advance from this peer."
+                                                     GENESIS. This node holds a chain that \
+                                                     diverges from the peer's at genesis, and \
+                                                     its ledger cannot roll back that far — so \
+                                                     the fork is deeper than the k-block \
+                                                     rollback limit and the peer's chain is \
+                                                     unreachable. cardano-node keeps its own \
+                                                     chain in the same situation. The ledger \
+                                                     will not advance from this peer."
                                                 );
                                             }
                                         } else {
@@ -3267,30 +3271,24 @@ impl ConnectionLifecycleManager {
                                             unproductive_since_ms = Some(now_ms);
                                         }
 
-                                        // #1057: escalate ONCE to an actionable ERROR when
-                                        // the genesis decline has persisted past the
-                                        // watchdog window, and PERSIST A MARKER so the
-                                        // next start recovers.
+                                        // Escalate ONCE to an actionable ERROR when the
+                                        // genesis decline has persisted past the watchdog
+                                        // window. By this point it is not a transient or
+                                        // hostile peer: the same condition has held for 3x
+                                        // the BlockFetch grace period.
                                         //
-                                        // By this point it is not a transient or hostile
-                                        // peer: the same condition has held for 3x the
-                                        // BlockFetch grace period.
-                                        //
-                                        // The node does NOT exit itself. The trigger is a
-                                        // peer's claim, so turning it into an automatic
-                                        // discard-my-chain-and-resync would be a
-                                        // remotely-triggerable forced resync — and
-                                        // dugite-node is adversarial-deployment software.
-                                        // The marker makes "restart the node" sufficient
-                                        // (which today it is NOT — measured); WHEN to
-                                        // restart stays with the operator or supervisor.
-                                        //
-                                        // `genesis_divergence::decide` then applies two
-                                        // bounds at startup: refuse if anything is flushed
-                                        // to the ImmutableDB (a rollback past the immutable
-                                        // tip is protocol-impossible), and refuse after
-                                        // MAX_RESET_ATTEMPTS, since a divergence that
-                                        // survives a full re-sync is a genesis-config error.
+                                        // NO MARKER AND NO SELF-RECOVERY. An earlier version
+                                        // persisted a marker so the next start would discard
+                                        // the local chain and re-sync. That was a divergence
+                                        // from the reference implementation: cardano-node's
+                                        // `Paths.hs::isReachable` simply returns `Nothing`
+                                        // for a candidate it cannot root, chain selection
+                                        // keeps the current chain, and nothing is ever
+                                        // discarded on a peer's say-so. Reaching here now
+                                        // means the fork really is deeper than k, which
+                                        // upstream cannot switch across either — so the
+                                        // honest action is to say so and let the operator
+                                        // decide, not to delete a chain automatically.
                                         if prev_is_genesis && !genesis_wedge_reported {
                                             if let Some(since) = unproductive_since_ms {
                                                 let wedge_ms = 3 * block_fetch_grace_period
@@ -3298,52 +3296,24 @@ impl ConnectionLifecycleManager {
                                                     as u64;
                                                 if now_ms.saturating_sub(since) >= wedge_ms {
                                                     genesis_wedge_reported = true;
-                                                    let db_path = {
-                                                        let cdb = chain_db.read().await;
-                                                        cdb.db_path().to_path_buf()
-                                                    };
-                                                    let attempt =
-                                                        crate::node::genesis_divergence::record(
-                                                            &db_path,
-                                                            &addr.to_string(),
-                                                            first.slot,
-                                                        );
-                                                    match attempt {
-                                                        Ok(n) => tracing::error!(
-                                                            %addr,
-                                                            wedged_secs = now_ms
-                                                                .saturating_sub(since)
-                                                                / 1000,
-                                                            attempt = n,
-                                                            "#1057: this node cannot rejoin the \
-                                                             network. Its chain diverges from \
-                                                             the peers' at GENESIS, so every \
-                                                             block range they offer is rooted \
-                                                             at genesis and is declined; the \
-                                                             ledger cannot advance and peers \
-                                                             will churn indefinitely. This does \
-                                                             NOT recover on its own. RESTART \
-                                                             THE NODE: a marker has been \
-                                                             written, and on the next start \
-                                                             dugite discards the local \
-                                                             dead-end chain and re-syncs from \
-                                                             genesis (only while the \
-                                                             ImmutableDB is empty — otherwise \
-                                                             it refuses and the operator must \
-                                                             decide)."
-                                                        ),
-                                                        Err(e) => tracing::error!(
-                                                            %addr,
-                                                            "#1057: this node cannot rejoin the \
-                                                             network (its chain diverges from \
-                                                             the peers' at GENESIS) AND the \
-                                                             recovery marker could not be \
-                                                             written: {e}. REMEDY: stop the \
-                                                             node, delete its database \
-                                                             directory, and re-sync or restore \
-                                                             a Mithril snapshot."
-                                                        ),
-                                                    }
+                                                    tracing::error!(
+                                                        %addr,
+                                                        wedged_secs = now_ms
+                                                            .saturating_sub(since)
+                                                            / 1000,
+                                                        "This node cannot rejoin the network \
+                                                         from this peer. Its chain diverges \
+                                                         from the peer's at GENESIS and its \
+                                                         ledger cannot roll back that far, so \
+                                                         every range the peer offers is \
+                                                         declined and the ledger cannot \
+                                                         advance. A divergence deeper than k \
+                                                         blocks is not recoverable in place by \
+                                                         any Ouroboros implementation. REMEDY: \
+                                                         stop the node and re-sync its \
+                                                         database, or restore a Mithril \
+                                                         snapshot."
+                                                    );
                                                 }
                                             }
                                         }
