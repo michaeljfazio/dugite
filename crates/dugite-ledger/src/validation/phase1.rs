@@ -1723,7 +1723,27 @@ pub(super) fn run_phase1_rules(
     // limit was previously accepted at Phase-1 where cardano-node rejects
     // it outright.
     // ------------------------------------------------------------------
-    if params.protocol_version_major >= 9 {
+    // #1061: SKIPPED ENTIRELY when the tx declares `is_valid: false`.
+    //
+    // Haskell's `conwayLedgerTransition` runs this test only inside the
+    // Phase2Valid branch (`eras/conway/impl/src/Cardano/Ledger/Conway/Rules/
+    // Ledger.hs`):
+    //
+    //     if tx ^. isPhase2ValidTxL == Phase2Valid
+    //       then do
+    //         runTest $ validateTreasuryValue txBody (chainAccountState ^. casTreasuryL)
+    //         runTest $ validateRefScriptSize pp (utxoState ^. utxoL) tx
+    //
+    // so a phase-2-failing tx is never checked for either. dugite ran both
+    // unconditionally, which is a FALSE REJECT: cardano-node accepts such a tx
+    // and dugite refuses it. At block level that means refusing a block
+    // cardano-node accepts — the #985 symptom class, i.e. the dangerous
+    // direction, not the safe one.
+    //
+    // The gate must SKIP the check, not suppress its failure: an is_valid=false
+    // tx legitimately carries oversized reference scripts as far as the LEDGER
+    // rule is concerned.
+    if params.protocol_version_major >= 9 && tx.is_valid {
         const MAX_REF_SCRIPT_SIZE_PER_TX: u64 = 200 * 1024;
         let total_ref_script_size = super::scripts::calculate_ref_script_size(
             &body.inputs,
