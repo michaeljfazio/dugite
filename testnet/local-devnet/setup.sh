@@ -340,7 +340,12 @@ log_info "conway-genesis.committee now: $(jq -c .committee "$LD_GENESIS/conway-g
 # 13h can satisfy it. Any proposal that must pass under this genesis needs
 # `--constitution-script-hash <that hash>`.
 if [ "${LD_SEED_GUARDRAILS:-0}" = "1" ]; then
-    _guard_script="$LD_ROOT/tx-zoo/lib/plutus/always-true-v3.plutus"
+    # LD_GUARDRAILS_SCRIPT overrides the default always-true script with a real
+    # guardrail validator (e.g. the vendored cardano-constitution script), so a
+    # round can enact-at-genesis and exercise the predicate cases without the
+    # full propose->vote->boundary NewConstitution sequence. Default stays the
+    # always-true V3 script the tx-zoo already vendors (13h's Proposing purpose).
+    _guard_script="${LD_GUARDRAILS_SCRIPT:-$LD_ROOT/tx-zoo/lib/plutus/always-true-v3.plutus}"
     if [ -s "$_guard_script" ]; then
         _guard_hash=$(cardano-cli conway transaction policyid --script-file "$_guard_script")
         jq --arg h "$_guard_hash" '.constitution.script = $h' \

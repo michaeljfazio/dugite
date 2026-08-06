@@ -968,6 +968,45 @@ run_guardrail_cases() {
     # and redeemer 42; stay within maxTxExecutionUnits.
     local exunits="(740000000, 8000000)"
     echo '{"int": 42}' > "$ZOO_TMP/gr.redeemer.json"
+
+    # By this point wallet-a has consolidated its change into ONE UTxO, but each
+    # case needs a spend input (> govActionDeposit + fee, for positive change)
+    # PLUS a disjoint collateral input, and the two accept cases each consume a
+    # spend input. Pre-split into several fat UTxOs + one small ada-only
+    # collateral UTxO so selection never runs dry. `transaction build`
+    # auto-balances; wait for inclusion before the loop reads the new set.
+    local split_out="$ZOO_TMP/gr-split"
+    local per=$(( GOV_DEPOSIT + 50000000 ))   # deposit + 50 ADA headroom for change/fee
+    local usrc=0
+    local usplit; usplit=$(cardano-cli conway query utxo --testnet-magic "$LD_MAGIC" \
+        --socket-path "$LD_RELAY_SOCK" --address "$ADDR" --output-json 2>/dev/null \
+        | jq -r 'to_entries|sort_by(-.value.value.lovelace)|.[0].key // empty')
+    if cardano-cli conway transaction build --testnet-magic "$LD_MAGIC" --socket-path "$LD_RELAY_SOCK" \
+            --tx-in "$usplit" \
+            --tx-out "$ADDR+$per" --tx-out "$ADDR+$per" --tx-out "$ADDR+$per" \
+            --tx-out "$ADDR+$per" --tx-out "$ADDR+$per" \
+            --tx-out "$ADDR+10000000" \
+            --change-address "$ADDR" --out-file "$split_out.raw" 2>"$split_out.err" \
+       && cardano-cli conway transaction sign --testnet-magic "$LD_MAGIC" \
+            --tx-body-file "$split_out.raw" --signing-key-file "$WA/payment.skey" \
+            --out-file "$split_out.signed" 2>>"$split_out.err" \
+       && cardano-cli conway transaction submit --testnet-magic "$LD_MAGIC" \
+            --socket-path "$LD_RELAY_SOCK" --tx-file "$split_out.signed" >/dev/null 2>>"$split_out.err"; then
+        # Wait until wallet-a shows the split (>=5 UTxOs) before proceeding.
+        local w=0
+        while [ "$w" -lt 60 ]; do
+            local nu; nu=$(cardano-cli conway query utxo --testnet-magic "$LD_MAGIC" \
+                --socket-path "$LD_RELAY_SOCK" --address "$ADDR" --output-json 2>/dev/null | jq 'length')
+            [ "${nu:-0}" -ge 5 ] && break
+            sleep 2; w=$((w+2))
+        done
+        echo "  wallet-a split into $(cardano-cli conway query utxo --testnet-magic "$LD_MAGIC" --socket-path "$LD_RELAY_SOCK" --address "$ADDR" --output-json 2>/dev/null | jq 'length') UTxOs for the guardrail cases"
+    else
+        bad "guardrail UTxO split failed: $(tail -1 "$split_out.err" | cut -c1-160)"
+        gov_evidence guardrails split FAIL "see err"
+        usrc=1
+    fi
+    [ "$usrc" -ne 0 ] && return 1
     local i=0
     while [ "$i" -lt "$n_total" ]; do
         local id cls expect args_json
