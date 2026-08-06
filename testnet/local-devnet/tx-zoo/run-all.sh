@@ -51,10 +51,16 @@ ALL_CATEGORIES=(
     # Multi-asset / size lattice (#961). Independent of governance state, so
     # position is not load-bearing; last keeps the governance ordering intact.
     15-asset-lattice
-    # Certificate-level reject-REASON negatives (#979). Runs after 05 (which
-    # registers drep-1 and the wallet stake key) because 16a/16d assert on
-    # "already registered" — they need that state to exist. Independent of
-    # governance actions, so it does not perturb 06/10/12/14.
+    # Certificate-level reject-REASON negatives (#979). 16d asserts on "DRep
+    # already registered", so it needs 05a to have run.
+    #
+    # #1060 corrected the other half of this note: it used to claim 05 "registers
+    # the wallet stake key", which 05 has never done — 05a/05c register a DREP.
+    # The wallet stake key is registered by 04a. 16a depended on that, was run
+    # without it, and so was never testing its own predicate. It now establishes
+    # its own precondition and depends on neither category.
+    #
+    # Independent of governance actions, so it does not perturb 06/10/12/14.
     16-cert-negatives
     # ScriptContext-inspecting validators + the ExUnits bracket (#969). Each
     # script locks and spends its own UTxO and touches no shared state, so the

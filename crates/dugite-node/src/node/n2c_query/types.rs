@@ -227,13 +227,14 @@ pub enum QueryResult {
         /// Last epoch block nonce — lab nonce from the last block of the prior epoch
         last_epoch_block_nonce: Vec<u8>,
     },
-    /// GetRewardProvenance (tag 14): reward calculation provenance
-    RewardProvenance {
-        epoch: u64,
-        total_rewards_pot: u64,
-        treasury_tax: u64,
-        active_stake: u64,
-    },
+    // GetRewardProvenance (tag 14) has NO variant on purpose.
+    //
+    // It used to carry a self-invented `{epoch, total_rewards_pot, treasury_tax,
+    // active_stake}` that encoded as `array(4)`, while Haskell's
+    // `SL.RewardProvenance` is a 16-field `Rec` — so the reply was undecodable by
+    // any real client (#993's shape). Deleting the variant makes that wrong shape
+    // inexpressible rather than merely unused; `handle_reward_provenance` returns
+    // an explicit error and documents what a faithful answer would require.
     /// GetRewardInfoPools (tag 18): per-pool reward info
     RewardInfoPools(Vec<PoolRewardInfo>),
     /// GetPoolState (tag 19): QueryPoolStateResult

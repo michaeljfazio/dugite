@@ -20,6 +20,8 @@
 #[allow(dead_code)]
 pub(crate) mod connection_lifecycle;
 pub(crate) mod epoch;
+// #1057: the on-disk marker that makes a restart recover a genesis-divergent node.
+pub(crate) mod genesis_divergence;
 pub(crate) mod ledger_view;
 pub(crate) mod n2c_query;
 pub(crate) mod networking;
@@ -1163,11 +1165,68 @@ impl Node {
         // Uses default epoch parameters (epoch 0, length 432000) since era_history
         // isn't built yet. The active chunk gets correctly named at the first
         // finalize_chunk() call during epoch transitions, which passes real epoch info.
-        let chain_db = Arc::new(RwLock::new(ChainDB::open_with_config(
+        let mut opened_chain_db = ChainDB::open_with_config(
             &args.database_path,
             &args.storage_config.immutable,
             security_param_k,
-        )?));
+        )?;
+
+        // #1057: act on the genesis-divergence marker HERE, while the ChainDB is
+        // still unshared.
+        //
+        // The marker means a previous run established that this node cannot rejoin
+        // the network because its chain diverges at GENESIS: BlockFetch declines
+        // every range rooted at genesis, so the ledger never advances and peers
+        // churn forever. Restarting alone does NOT recover — measured on a
+        // two-forger devnet, `run()`'s replay re-applies the node's own fork within
+        // twelve seconds and it still did not adopt the peer's chain. The dead-end
+        // chain has to go, not just the ledger derived from it.
+        //
+        // Doing it at startup means the whole reset rides the ALREADY-VALIDATED
+        // from-genesis path: a fresh `init_fresh_ledger` plus the LSM
+        // `wipe_utxo_store_before_replay` whose own comment records that a stale
+        // store roughly doubles `sumCoinUTxO` at the Byron→Shelley boundary and
+        // underflows the first MIR debit. No live in-place ledger re-initialisation
+        // — that is what #989 deleted `reset_to_origin` over.
+        //
+        // Placed before the `Arc<RwLock<_>>` wrap deliberately: `Node::new` is not
+        // async, and `blocking_read()` on a tokio lock from inside a runtime panics.
+        // Owning the value outright is simpler than making the constructor async and
+        // is safe precisely because nothing else can hold it yet.
+        //
+        // Both bounds live in `genesis_divergence::decide` and are unit-tested: a
+        // node with anything flushed to the ImmutableDB is REFUSED (a rollback past
+        // the immutable tip is protocol-impossible under k-finality), and repeated
+        // resets are refused as the configuration error they almost certainly are.
+        let genesis_reset = {
+            let decision = genesis_divergence::decide(
+                genesis_divergence::read_attempts(&args.database_path),
+                opened_chain_db.get_immutable_tip_point().is_none(),
+            );
+            genesis_divergence::log_decision(decision, &args.database_path);
+            match decision {
+                genesis_divergence::ResetDecision::Reset { .. } => true,
+                genesis_divergence::ResetDecision::None => false,
+                genesis_divergence::ResetDecision::Refused(_) => {
+                    // Cleared so a stale marker does not make every future start
+                    // suspicious. If the wedge is still real the node re-detects it
+                    // and writes a fresh marker, which is the honest outcome.
+                    genesis_divergence::clear(&args.database_path);
+                    false
+                }
+            }
+        };
+        if genesis_reset {
+            // Discard the dead-end chain. `clear_volatile` truncates the WAL too, so
+            // the fork does not come back on the next start, and startup replay then
+            // has nothing to re-apply — which is what leaves the ledger at Origin.
+            let cleared = opened_chain_db.volatile_block_count();
+            opened_chain_db.clear_volatile();
+            genesis_divergence::log_reset_performed(cleared);
+            genesis_divergence::clear(&args.database_path);
+        }
+
+        let chain_db = Arc::new(RwLock::new(opened_chain_db));
 
         // Load Shelley genesis if configured (with hash for nonce initialization)
         let (shelley_genesis, shelley_genesis_hash) =
@@ -1438,11 +1497,23 @@ impl Node {
         // the setup (see `utxo_store_is_usable`). `wipe_utxo_store_before_replay`
         // is honoured in the LSM block further down.
         let mut wipe_utxo_store_before_replay = false;
-        let snapshot_usable = if snapshot_path.exists()
+
+        // #1057: the reset itself already happened at ChainDB open (above). Here it
+        // only has to force the ledger side: any snapshot describes the chain that
+        // was just discarded, and the on-disk UTxO store must be rebuilt.
+        if genesis_reset {
+            wipe_utxo_store_before_replay = true;
+        }
+
+        let snapshot_usable = if genesis_reset {
+            // Any snapshot describes the chain we just discarded.
+            false
+        } else if snapshot_path.exists()
             && matches!(
                 args.storage_config.utxo.backend,
                 dugite_storage::UtxoBackend::Lsm
-            ) {
+            )
+        {
             let probe_slot = Self::peek_snapshot_slot(&snapshot_path).unwrap_or(0);
             let ok = Self::utxo_store_is_usable(
                 &args.database_path.join("utxo-store"),
@@ -2865,6 +2936,54 @@ impl Node {
         // `send` returns Err only when there are zero receivers — that's
         // fine, we don't care if no one is listening yet.
         let _ = self.ledger_tip_slot_tx.send(new_tip_slot);
+        // #1057: chain selection lives in `dugite-storage`, which sits below the
+        // ledger and cannot read it, but `switch_chain`'s genesis-anchor arm must
+        // only fire when the ledger can EXECUTE the resulting plan. Published from
+        // the ONE place that already fans out every ledger-tip change, so a new call
+        // site cannot forget it.
+        //
+        // NOTE the genesis-anchor gate is NOT published here. It depends on the
+        // LedgerSeq ANCHOR, not on the ledger tip, and the anchor changes in exactly
+        // two places — `reanchor_ledger_seq` and `advance_anchor`. Publishing where
+        // the value actually changes is both cheaper and harder to get wrong than
+        // recomputing it on every tip change (and this fn is sync, so it could not
+        // take the seq lock anyway). See `publish_ledger_can_reach_origin`.
+    }
+
+    /// #1057: publish whether a rollback to Origin is currently EXECUTABLE.
+    ///
+    /// This is the gate on `VolatileDB::switch_chain`'s genesis-anchor arm and on
+    /// BlockFetch's genesis clause. It is deliberately NOT "the ledger tip is
+    /// Origin" — that version was implemented and measured too narrow, because
+    /// holding ANY chain disqualifies a longer genesis-divergent one. On the devnet
+    /// a node that had just recovered re-adopted a stale 10-block chain from its
+    /// sibling and was wedged again against the canonical 155-block chain thirty
+    /// seconds later.
+    ///
+    /// The executable condition is that `LedgerSeq::find_rollback_n(Origin)` will
+    /// succeed, which is its `target == anchor` full-rewind case:
+    ///
+    /// * the seq's anchor point IS Origin — true for any node that started from
+    ///   genesis and has not yet advanced its anchor past it; false for a
+    ///   snapshot-restored ledger, which is exactly why the earlier attempt hit
+    ///   "Rollback target outside LedgerSeq volatile window AND no canonical
+    ///   snapshot available";
+    /// * the window is coherent (#985) — an incoherent window makes
+    ///   `find_rollback_n` decline for every target, and reconstructing from it
+    ///   would produce a chimera.
+    ///
+    /// Nothing is inferred about the ledger TIP here: a node 10 blocks in with an
+    /// Origin anchor can roll all 10 back, which is precisely the case that has to
+    /// work.
+    pub(crate) async fn publish_ledger_can_reach_origin(&self) {
+        let Some(ref cs) = self.chain_sel_handle else {
+            return;
+        };
+        // Lock order: ledger_state before ledger_seq (per Node docs). The caller
+        // may already hold the ledger_state read guard, so only the seq is taken.
+        let seq = self.ledger_seq.read().await;
+        let can = *seq.anchor_point() == Point::Origin && !seq.is_incoherent();
+        cs.set_ledger_can_reach_origin(can);
     }
 
     /// Convenience: re-publish the view by taking the read lock and
@@ -4937,6 +5056,12 @@ impl Node {
                 .expect("block_announcement_tx was just set")
                 .clone(),
             self.chain_db.clone(),
+            // #1057: the SAME cell chain selection gates its genesis-anchor arm on,
+            // so BlockFetch cannot decline blocks storage is prepared to switch to.
+            self.chain_sel_handle
+                .as_ref()
+                .map(|cs| cs.ledger_can_reach_origin_flag())
+                .unwrap_or_else(|| std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false))),
             self.ledger_state.clone(),
             self.ledger_view.clone(),
             self.ledger_tip_slot_tx.clone(),

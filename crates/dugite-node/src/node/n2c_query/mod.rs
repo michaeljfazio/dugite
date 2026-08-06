@@ -1620,8 +1620,15 @@ mod tests {
         }
     }
 
+    /// #1030 item 5: tag 14 answers with an explicit error through the real
+    /// dispatch, not just at the handler.
+    ///
+    /// This test previously asserted `total_rewards_pot == 30_000` and
+    /// `treasury_tax == 6_000` — arithmetic on an invented `array(4)` that
+    /// Haskell's 16-field `SL.RewardProvenance` decoder could never read. It was a
+    /// green test for an undecodable reply.
     #[test]
-    fn test_query_handler_reward_provenance() {
+    fn test_query_handler_reward_provenance_returns_error() {
         let mut handler = QueryHandler::new(11);
         handler.update_state(NodeStateSnapshot {
             epoch: EpochNo(42),
@@ -1636,17 +1643,13 @@ mod tests {
             ..NodeStateSnapshot::default()
         });
         match query(&handler, 14) {
-            QueryResult::RewardProvenance {
-                epoch,
-                total_rewards_pot,
-                treasury_tax,
-                ..
-            } => {
-                assert_eq!(epoch, 42);
-                assert_eq!(total_rewards_pot, 30_000); // 10M * 3/1000
-                assert_eq!(treasury_tax, 6_000); // 30K * 2/10
-            }
-            other => panic!("Expected RewardProvenance, got {other:?}"),
+            QueryResult::Error(msg) => assert!(
+                msg.contains("GetRewardProvenance"),
+                "the error must name the query: {msg}"
+            ),
+            other => panic!(
+                "tag 14 must return an explicit error, not a fabricated payload; got {other:?}"
+            ),
         }
     }
 

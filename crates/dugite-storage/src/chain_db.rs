@@ -511,6 +511,15 @@ impl ChainDB {
         self.volatile.selected_chain_len()
     }
 
+    /// The database directory this ChainDB was opened from.
+    ///
+    /// Needed by #1057's genesis-divergence marker: the BlockFetch worker that
+    /// detects the wedge has the ChainDB but not the node's config, and the marker
+    /// must land next to the data it describes.
+    pub fn db_path(&self) -> &Path {
+        &self._path
+    }
+
     /// Clear all volatile blocks. Used when the volatile DB has blocks from
     /// a fork that no longer connects to the ledger tip (e.g., after crash
     /// or restart with a different chain).
@@ -1058,15 +1067,25 @@ impl ChainDB {
     /// Passes the current ImmutableDB tip to VolatileDB so that forks whose
     /// ancestry terminates at the immutable tip can be identified as reachable
     /// via the `AF.Empty anchor` case in Haskell's `isReachable`.
+    /// `ledger_can_reach_origin` (#1057) is forwarded as
+    /// `VolatileDB::switch_chain`'s `allow_genesis_anchor`: a fork rooted at genesis
+    /// is reachable only when the ledger can actually execute the resulting plan,
+    /// i.e. when a rollback to Origin is legal (LedgerSeq anchored at Origin, window
+    /// coherent). Storage cannot see the ledger, so the caller supplies it.
     pub fn switch_to_fork(
         &mut self,
         new_tip_hash: &BlockHeaderHash,
+        ledger_can_reach_origin: bool,
     ) -> Option<crate::volatile_db::SwitchPlan> {
         let immutable_anchor = self
             .immutable_tip
             .map(|(slot, hash, _block_no)| (hash, slot.0));
-        self.volatile
-            .switch_chain(new_tip_hash, immutable_anchor, self.security_param_k as u64)
+        self.volatile.switch_chain(
+            new_tip_hash,
+            immutable_anchor,
+            self.security_param_k as u64,
+            ledger_can_reach_origin,
+        )
     }
 
     /// Whether the volatile chain ending at `tip_hash` contains a known-invalid

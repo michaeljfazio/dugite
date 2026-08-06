@@ -307,6 +307,47 @@ fn encode_conway_ledger_pred_failure(enc: &mut Encoder<&mut Vec<u8>>, err: &TxVa
             }
         }
 
+        // ── Conway UTXOS: ValidationTagMismatch (#1053) ──
+        //
+        // Ledger(1) → Utxow(0) → Utxo(0=UtxosFailure) → Utxos(0=ValidationTagMismatch)
+        //
+        // Before these two arms existed, EVERY phase-2 script failure — the whole
+        // class, for spend/mint/cert/vote/propose — degraded to the generic
+        // `ConwayMempoolFailure "transaction validation failed"`, so a client could
+        // not tell a script failure from any other rejection. Verdict parity was
+        // never affected; only the reason was (#1053, the #979 class).
+        TxValidationError::Phase2ScriptsFailedUnexpectedly { messages } => {
+            if messages.is_empty() {
+                // `FailedUnexpectedly` carries a Haskell `NonEmpty`; an empty
+                // list is undecodable, so a truthful generic beats a broken
+                // typed frame.
+                partial_fallback(enc, err);
+            } else {
+                encode_validation_tag_mismatch(enc, true, Some(messages));
+            }
+        }
+
+        // The mirror case: the tx declared `is_valid = false` and every script
+        // PASSED (#522's DoS class) → `ValidationTagMismatch Phase2Invalid
+        // PassedUnexpectedly`.
+        //
+        // `phase2_admission_error` only ever raises this polarity — the opposite
+        // one becomes `ScriptFailed` and so reaches the arm above — but both are
+        // encoded here so the shape cannot silently go wrong if that changes.
+        TxValidationError::IsValidTagMismatch {
+            declared,
+            evaluated,
+        } => {
+            if *evaluated {
+                encode_validation_tag_mismatch(enc, *declared, None);
+            } else {
+                let synthesized = [String::from(
+                    "phase-2 script evaluation failed while the transaction declared is_valid = true",
+                )];
+                encode_validation_tag_mismatch(enc, *declared, Some(&synthesized));
+            }
+        }
+
         // Tag 22: BabbageNonDisjointRefInputs — `NonEmpty TxIn`.
         //
         // #1051: this MUST be a bare list, NOT a `Set` — `Sum
@@ -1456,6 +1497,86 @@ fn encode_conway_ledger_pred_failure(enc: &mut Encoder<&mut Vec<u8>>, err: &TxVa
 fn partial_fallback(enc: &mut Encoder<&mut Vec<u8>>, err: &TxValidationError) {
     tracing::debug!(err = ?err, "LocalTxSubmission: typed arm could not encode payload faithfully");
     encode_mempool_fallback(enc, "transaction validation failed");
+}
+
+/// Conway `UtxosFailure (ValidationTagMismatch IsPhase2Valid TagMismatchDescription)`
+/// — the phase-2 wire class (#1053).
+///
+/// `failures = None` encodes `PassedUnexpectedly`; `Some(msgs)` encodes
+/// `FailedUnexpectedly` with one `PlutusFailure` per message. **`msgs` must be
+/// non-empty** — it becomes a Haskell `NonEmpty`, and an empty list is
+/// undecodable; callers use `partial_fallback` instead.
+///
+/// Oracle-verified against cardano-ledger `master`:
+///
+/// ```haskell
+/// -- eras/conway/impl/src/Cardano/Ledger/Conway/Rules/Utxos.hs
+/// ValidationTagMismatch v descr -> Sum ValidationTagMismatch 0 !> To v !> To descr
+/// CollectErrors cs              -> Sum (CollectErrors @era) 1 !> To cs
+///
+/// -- eras/alonzo/impl/src/Cardano/Ledger/Alonzo/Rules/Utxos.hs
+/// encCBOR PassedUnexpectedly      = encode (Sum PassedUnexpectedly 0)
+/// encCBOR (FailedUnexpectedly fs) = encode (Sum FailedUnexpectedly 1 !> To fs)
+/// encCBOR (PlutusFailure s b)     = encode $ Sum PlutusFailure 1 !> To s !> To b
+/// ```
+///
+/// Four details that are easy to get wrong:
+///
+/// * `IsPhase2Valid` is `encCBOR = encCBOR . isPhase2Valid` — a **bare CBOR
+///   bool**, with no array or tag wrapper.
+/// * `PlutusFailure` is Sum tag **1**, not 0. Tag 0 belonged to a removed
+///   `OnePhaseFailure` and is deliberately absent from the decoder
+///   (`1 -> SumD PlutusFailure …; n -> Invalid n`), so emitting 0 is rejected.
+/// * `PassedUnexpectedly` has no fields, so it is `array(1) [0]` — not a bare
+///   integer.
+/// * `NonEmpty FailureDescription` is `encCBOR . toList`, a
+///   `variableListLenEncoding` list (definite at <= 23, indefinite above, #938),
+///   never a `Set` — no CBOR tag 258 (#1051's mistake).
+///
+/// **Known non-parity field, deliberate.** Haskell's second `PlutusFailure`
+/// component is `B64.encode (Plain.serialize' pwc)` — base64 of the CBOR
+/// `PlutusWithContext`, which `plutus debug` can replay. dugite has no
+/// byte-exact `PlutusWithContext` encoder, so this emits an EMPTY bytestring:
+/// well-formed and decodable, where a fabricated blob under that field name
+/// would invite a client to decode garbage. The failure `Text` — the part that
+/// carries the diagnostic — is real.
+fn encode_validation_tag_mismatch(
+    enc: &mut Encoder<&mut Vec<u8>>,
+    declared_valid: bool,
+    failures: Option<&[String]>,
+) {
+    encode_utxo_failure(enc, 0, |enc| {
+        // ConwayUtxosPredFailure: array(3) [0, IsPhase2Valid, TagMismatchDescription]
+        enc.array(3).expect("infallible");
+        enc.u8(0).expect("infallible");
+        enc.bool(declared_valid).expect("infallible");
+        match failures {
+            None => {
+                // TagMismatchDescription::PassedUnexpectedly = array(1) [0]
+                enc.array(1).expect("infallible");
+                enc.u8(0).expect("infallible");
+            }
+            Some(msgs) => {
+                debug_assert!(
+                    !msgs.is_empty(),
+                    "FailedUnexpectedly carries a Haskell NonEmpty; callers must \
+                     route the empty case to partial_fallback"
+                );
+                // TagMismatchDescription::FailedUnexpectedly = array(2) [1, NonEmpty]
+                enc.array(2).expect("infallible");
+                enc.u8(1).expect("infallible");
+                list_open(enc, msgs.len());
+                for msg in msgs {
+                    // FailureDescription::PlutusFailure = array(3) [1, text, bytes]
+                    enc.array(3).expect("infallible");
+                    enc.u8(1).expect("infallible");
+                    enc.str(msg).expect("infallible");
+                    enc.bytes(&[]).expect("infallible");
+                }
+                list_close(enc, msgs.len());
+            }
+        }
+    });
 }
 
 /// The three UTXOW arms whose payload is exactly `Set ScriptHash`.
@@ -3609,6 +3730,177 @@ mod tests {
         let hash_bytes = dec.bytes().unwrap();
         assert_eq!(hash_bytes, &[0xABu8; 32][..]);
         assert_eq!(dec.u32().unwrap(), 3);
+    }
+
+    /// #1053: a phase-2 script failure must reach the client as the TYPED
+    /// `ValidationTagMismatch … FailedUnexpectedly`, walking every nested tag:
+    ///   Ledger(1) → Utxow(0) → Utxo(0=UtxosFailure) →
+    ///   Utxos(0=ValidationTagMismatch) → [IsPhase2Valid bool,
+    ///   TagMismatchDescription(1=FailedUnexpectedly) →
+    ///   NonEmpty[ FailureDescription(1=PlutusFailure) → text, bytes ]].
+    ///
+    /// Before the fix this whole class encoded as the generic
+    /// `ConwayMempoolFailure "transaction validation failed"` (Ledger tag 7), so
+    /// disarming the arm turns the very first assertion RED on the Ledger tag.
+    #[test]
+    fn test_encode_phase2_scripts_failed_unexpectedly_typed() {
+        let err = TxValidationError::Phase2ScriptsFailedUnexpectedly {
+            messages: vec!["script returned Error term".to_string()],
+        };
+        let bytes = encode_apply_tx_err(&err, 6);
+
+        let mut dec = Decoder::new(&bytes);
+        assert_eq!(dec.array().unwrap(), Some(1)); // HFC wrapper
+        assert_eq!(dec.array().unwrap(), Some(2)); // [era_id, failures]
+        let _era = dec.u16().unwrap();
+        assert_eq!(dec.array().unwrap(), Some(1)); // one failure
+        assert_eq!(dec.array().unwrap(), Some(2));
+        assert_eq!(dec.u8().unwrap(), 1, "Ledger tag = ConwayUtxowFailure");
+        assert_eq!(dec.array().unwrap(), Some(2));
+        assert_eq!(dec.u8().unwrap(), 0, "Utxow tag = UtxoFailure");
+        assert_eq!(dec.array().unwrap(), Some(2));
+        assert_eq!(dec.u8().unwrap(), 0, "Utxo tag = UtxosFailure");
+        // ConwayUtxosPredFailure: array(3) [0, IsPhase2Valid, descr]
+        assert_eq!(dec.array().unwrap(), Some(3));
+        assert_eq!(dec.u8().unwrap(), 0, "Utxos tag = ValidationTagMismatch");
+        // `IsPhase2Valid` is a BARE bool — not an array, not an int.
+        assert!(
+            dec.bool().unwrap(),
+            "the tx declared is_valid = true, so IsPhase2Valid = Phase2Valid"
+        );
+        // TagMismatchDescription: array(2) [1=FailedUnexpectedly, NonEmpty]
+        assert_eq!(dec.array().unwrap(), Some(2));
+        assert_eq!(dec.u8().unwrap(), 1, "descr tag = FailedUnexpectedly");
+        // NonEmpty FailureDescription — a bare list, NEVER a Set (no tag 258).
+        assert_eq!(dec.array().unwrap(), Some(1));
+        // FailureDescription: array(3) [1=PlutusFailure, text, bytes]
+        assert_eq!(dec.array().unwrap(), Some(3));
+        assert_eq!(
+            dec.u8().unwrap(),
+            1,
+            "FailureDescription tag = PlutusFailure — tag 0 belonged to the \
+             removed OnePhaseFailure and the Haskell decoder rejects it"
+        );
+        assert_eq!(dec.str().unwrap(), "script returned Error term");
+        assert!(
+            dec.bytes().unwrap().is_empty(),
+            "the base64 PlutusWithContext blob is deliberately empty — dugite \
+             has no byte-exact PlutusWithContext encoder"
+        );
+    }
+
+    /// #1053 mirror case: `is_valid = false` while every script PASSED must
+    /// encode `PassedUnexpectedly`, which is `array(1) [0]` — a Sum with no
+    /// fields, not a bare integer.
+    #[test]
+    fn test_encode_is_valid_tag_mismatch_passed_unexpectedly() {
+        let err = TxValidationError::IsValidTagMismatch {
+            declared: false,
+            evaluated: true,
+        };
+        let bytes = encode_apply_tx_err(&err, 6);
+
+        let mut dec = Decoder::new(&bytes);
+        assert_eq!(dec.array().unwrap(), Some(1));
+        assert_eq!(dec.array().unwrap(), Some(2));
+        let _era = dec.u16().unwrap();
+        assert_eq!(dec.array().unwrap(), Some(1));
+        assert_eq!(dec.array().unwrap(), Some(2));
+        assert_eq!(dec.u8().unwrap(), 1, "Ledger tag = ConwayUtxowFailure");
+        assert_eq!(dec.array().unwrap(), Some(2));
+        assert_eq!(dec.u8().unwrap(), 0, "Utxow tag = UtxoFailure");
+        assert_eq!(dec.array().unwrap(), Some(2));
+        assert_eq!(dec.u8().unwrap(), 0, "Utxo tag = UtxosFailure");
+        assert_eq!(dec.array().unwrap(), Some(3));
+        assert_eq!(dec.u8().unwrap(), 0, "Utxos tag = ValidationTagMismatch");
+        assert!(
+            !dec.bool().unwrap(),
+            "the tx declared is_valid = false, so IsPhase2Valid = Phase2Invalid"
+        );
+        assert_eq!(
+            dec.array().unwrap(),
+            Some(1),
+            "PassedUnexpectedly is a no-field Sum: array(1), not a bare int"
+        );
+        assert_eq!(dec.u8().unwrap(), 0, "descr tag = PassedUnexpectedly");
+    }
+
+    /// #1053: the two frames must survive dugite's OWN decoder and surface the
+    /// script message, since the failure text is the whole diagnostic value.
+    ///
+    /// A same-process round-trip cannot catch a wrong shape shared by both
+    /// halves — the tag walk above is what pins the shape against Haskell.
+    #[test]
+    fn test_roundtrip_validation_tag_mismatch() {
+        let failed = TxValidationError::Phase2ScriptsFailedUnexpectedly {
+            messages: vec!["eval_phase_two_raw error: script returned Error term".to_string()],
+        };
+        let bytes = encode_apply_tx_err(&failed, 6);
+        let mut dec = Decoder::new(&bytes);
+        let reason = crate::n2c_client::decode_reject_reason(&mut dec)
+            .expect("dugite's own decoder must parse its own encoder's output");
+        assert!(
+            reason.contains("ValidationTagMismatch") && reason.contains("script returned Error"),
+            "the failure text must survive to the client; got: {reason}"
+        );
+
+        let passed = TxValidationError::IsValidTagMismatch {
+            declared: false,
+            evaluated: true,
+        };
+        let bytes = encode_apply_tx_err(&passed, 6);
+        let mut dec = Decoder::new(&bytes);
+        let reason = crate::n2c_client::decode_reject_reason(&mut dec)
+            .expect("dugite's own decoder must parse its own encoder's output");
+        assert!(reason.contains("PassedUnexpectedly"), "got: {reason}");
+    }
+
+    /// #1053: the SPLIT is the point. `TxValidationError::ScriptFailed` is the
+    /// free-text catch-all for ~20 unrelated rejections, so it must KEEP the
+    /// generic `ConwayMempoolFailure` (Ledger tag 7) — giving it the phase-2
+    /// typed class would mislabel most of what flows through it (#979).
+    ///
+    /// This test fails if someone later "completes" the fix by pointing the
+    /// catch-all at `encode_validation_tag_mismatch`.
+    #[test]
+    fn test_script_failed_catchall_stays_generic() {
+        let err = TxValidationError::ScriptFailed {
+            reason: "ConwayTxRefScriptsSizeTooBig: total ref-script size 300000 exceeds 204800"
+                .to_string(),
+        };
+        let bytes = encode_apply_tx_err(&err, 6);
+        let mut dec = Decoder::new(&bytes);
+        assert_eq!(dec.array().unwrap(), Some(1));
+        assert_eq!(dec.array().unwrap(), Some(2));
+        let _era = dec.u16().unwrap();
+        assert_eq!(dec.array().unwrap(), Some(1));
+        assert_eq!(dec.array().unwrap(), Some(2));
+        assert_eq!(
+            dec.u8().unwrap(),
+            7,
+            "the catch-all must stay ConwayMempoolFailure, NOT a typed phase-2 class"
+        );
+    }
+
+    /// #1053: an empty message list would produce an empty Haskell `NonEmpty`,
+    /// which is undecodable — so it must fall back to the generic rejection
+    /// rather than emit a typed frame cardano-cli would reject with
+    /// `DeserialiseFailure`.
+    #[test]
+    fn test_phase2_empty_messages_falls_back_to_generic() {
+        let err = TxValidationError::Phase2ScriptsFailedUnexpectedly { messages: vec![] };
+        let bytes = encode_apply_tx_err(&err, 6);
+        let mut dec = Decoder::new(&bytes);
+        assert_eq!(dec.array().unwrap(), Some(1));
+        assert_eq!(dec.array().unwrap(), Some(2));
+        let _era = dec.u16().unwrap();
+        assert_eq!(dec.array().unwrap(), Some(1));
+        assert_eq!(dec.array().unwrap(), Some(2));
+        assert_eq!(
+            dec.u8().unwrap(),
+            7,
+            "empty NonEmpty must degrade to ConwayMempoolFailure"
+        );
     }
 
     /// dugite #470: encoder↔decoder round-trip — the produced bytes must

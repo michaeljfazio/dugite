@@ -1857,10 +1857,66 @@ fn decode_conway_utxos_pred_failure(decoder: &mut minicbor::Decoder<'_>) -> Opti
     let _ = decoder.array().ok()?;
     let tag = decoder.u8().ok()?;
     match tag {
+        // ValidationTagMismatch IsPhase2Valid TagMismatchDescription (#1053).
+        //
+        // `IsPhase2Valid` is a BARE bool (`encCBOR = encCBOR . isPhase2Valid`),
+        // and `TagMismatchDescription` is `[0]` = PassedUnexpectedly or
+        // `[1, NonEmpty FailureDescription]` = FailedUnexpectedly, where each
+        // `FailureDescription` is `[1, text, bytes]` (Sum tag 1 — tag 0 belonged
+        // to a removed `OnePhaseFailure`).
+        //
+        // The failure TEXT is the whole diagnostic value of this frame, so it is
+        // surfaced rather than skipped.
         0 => {
-            let _ = decoder.skip();
-            let _ = decoder.skip();
-            Some("ValidationTagMismatch: script validity tag mismatch".to_string())
+            let declared_valid = decoder.bool().ok()?;
+            let _ = decoder.array().ok()?;
+            let descr = decoder.u8().ok()?;
+            match descr {
+                0 => Some(format!(
+                    "ValidationTagMismatch: transaction declared is_valid = {declared_valid} \
+                     but every script PASSED (PassedUnexpectedly)"
+                )),
+                1 => {
+                    let n = decoder.array().ok().flatten().unwrap_or(0);
+                    let mut msgs: Vec<String> = Vec::new();
+                    for _ in 0..n {
+                        // FailureDescription = [1, text, bytes]
+                        if decoder.array().ok().is_none() {
+                            break;
+                        }
+                        match decoder.u8() {
+                            Ok(1) => {}
+                            _ => {
+                                let _ = decoder.skip();
+                                continue;
+                            }
+                        }
+                        let text = decoder.str().ok().map(str::to_string);
+                        // The base64 `PlutusWithContext` blob: consumed, not
+                        // rendered — it is diagnostic input for `plutus debug`,
+                        // not a human-readable reason.
+                        let _ = decoder.skip();
+                        if let Some(t) = text {
+                            msgs.push(t);
+                        }
+                    }
+                    if msgs.is_empty() {
+                        Some(format!(
+                            "ValidationTagMismatch: transaction declared is_valid = \
+                             {declared_valid} but scripts FAILED (FailedUnexpectedly)"
+                        ))
+                    } else {
+                        Some(format!(
+                            "ValidationTagMismatch: transaction declared is_valid = \
+                             {declared_valid} but scripts FAILED: {}",
+                            msgs.join("; ")
+                        ))
+                    }
+                }
+                other => Some(format!(
+                    "ValidationTagMismatch: unknown TagMismatchDescription tag {other}"
+                )),
+            }
         }
         1 => {
             // CollectErrors NonEmpty(CollectError)

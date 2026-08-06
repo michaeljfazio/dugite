@@ -191,42 +191,74 @@ const _: () = assert!(GENESIS_PARKED_DYNAMO_MARGIN_SLOTS < 25_920);
 /// parent itself and the apply pipeline has not stored it yet (channel lag). The
 /// contiguous chain is in flight, not missing.
 ///
-/// **#1057 (OPEN)**: a range rooted at GENESIS is currently NOT accepted here
-/// unless the ChainDB is completely empty (see
-/// [`fetch_range_connects_via_chain_db`]). Genesis is never a *stored* block, so
-/// a node holding any block of its own declines the canonical chain's block 0
-/// forever and never rejoins a chain that diverges at Origin.
-///
-/// Accepting `prev == Hash32::ZERO` here is necessary but NOT sufficient to fix
-/// that, and must not be done alone: the storage layer would then emit a
-/// genesis-rooted `SwitchPlan`, and the ledger cannot roll back to Origin
-/// (`sync.rs` aborts with "Rollback target outside LedgerSeq volatile window AND
-/// no canonical snapshot available"), so the wedge moves from BlockFetch to the
-/// ledger rollback instead of going away. Verified live on a two-forger devnet.
-/// The complete fix needs the ledger to re-initialise from genesis on a
-/// rollback-to-Origin — tracked in #1057.
-///
-/// `prev` is retained in the signature for that fix and is deliberately unused
-/// today.
-pub(crate) fn fetch_range_connects_fast(
-    prev: &dugite_primitives::hash::Hash32,
-    already_fetched: bool,
-) -> bool {
-    let _ = prev;
+/// `prev` is deliberately absent: the genesis case needs the ledger tip, which
+/// needs a lock, so it lives in [`fetch_range_connects_via_chain_db`] where a lock
+/// is being taken anyway. This half stays allocation- and lock-free.
+pub(crate) fn fetch_range_connects_fast(already_fetched: bool) -> bool {
     already_fetched
 }
 
-/// #735 gross-request invariant, ChainDB half: consulted only when
+/// Should the rate-limited #1057 genesis-decline WARN be emitted now?
+///
+/// Extracted so the throttle is unit-testable rather than only observable by
+/// counting log lines after a 20-minute devnet round — which is how the
+/// unthrottled first version got as far as 29,435 lines before anyone noticed.
+pub(crate) fn genesis_warn_due(last_warn_ms: Option<u64>, now_ms: u64, interval_ms: u64) -> bool {
+    last_warn_ms.is_none_or(|last| now_ms.saturating_sub(last) >= interval_ms)
+}
+
+/// #735 gross-request invariant, locked half: consulted only when
 /// [`fetch_range_connects_fast`] returned `false`.
 ///
 /// `chain_db_empty` keeps the original from-origin bootstrap exemption as
 /// defence-in-depth for any era whose header decode does not surface a genesis
 /// `prev_hash`; `chain_db_has_prev` is the ordinary frontier-extension case.
+///
+/// **#1057, half A** — `prev_is_genesis && ledger_at_origin` is the new clause.
+///
+/// Genesis is never a *stored* block, so `chain_db_has_prev` is always false for
+/// the canonical chain's block 0, and `chain_db_empty` exempts only a COMPLETELY
+/// empty ChainDB. A node holding any block of its own therefore declined that
+/// block forever and never rejoined a chain diverging at Origin: the ledger never
+/// advanced, ChainSync's forecast-horizon park timed out, and every peer was
+/// dropped and re-dialled in a loop with no self-healing. It strands a block
+/// producer.
+///
+/// THE `ledger_at_origin` CONJUNCT IS THE WHOLE REASON THIS IS SAFE, and it is
+/// there because the unconditional version was tried and REVERTED. Accepting
+/// genesis regardless of the ledger makes the storage layer emit a genesis-rooted
+/// `SwitchPlan`; chain selection then asks the ledger to roll back to Origin and
+/// `sync.rs` aborts —
+///
+/// ```text
+/// ERROR Rollback target outside LedgerSeq volatile window AND no canonical
+///   snapshot available. Aborting rollback
+/// WARN  Fork rollback failed; skipping fork replay
+/// ```
+///
+/// — which MOVES the wedge from BlockFetch to the ledger rather than removing it.
+/// Measured live: the node sat at block 4 while the network was at 84, i.e. WORSE
+/// than unfixed. When the ledger is already at Origin there is no rollback to
+/// perform, so that failure cannot arise.
+///
+/// Reaching Origin from a NON-Origin ledger is the other half of #1057 and is not
+/// solved here. This clause repairs exactly the case where the ledger is already at
+/// genesis — which a live devnet run proved is a real and SEPARATE wedge: a node
+/// restarted with a genesis ledger over a ChainDB still holding its own 18-block
+/// fork did not adopt the peer's 208-block chain. The ChainDB fork blocks adoption
+/// independently of ledger state, so this half is required either way.
+///
+/// `Hash32::ZERO` IS dugite's canonical Origin parent — the encoder maps it to
+/// CBOR `null`, i.e. Haskell `PrevHash = GenesisHash`. Upstream needs no clause at
+/// all here because `AnchorGenesis` is a first-class constructor of `Anchor blk`,
+/// matched by `Paths.hs::isReachable`.
 pub(crate) fn fetch_range_connects_via_chain_db(
     chain_db_empty: bool,
     chain_db_has_prev: bool,
+    prev_is_genesis: bool,
+    ledger_at_origin: bool,
 ) -> bool {
-    chain_db_empty || chain_db_has_prev
+    chain_db_empty || chain_db_has_prev || (prev_is_genesis && ledger_at_origin)
 }
 
 /// Should an unproductive dynamo that has starved ChainSel past the watchdog
@@ -990,6 +1022,13 @@ pub struct ConnectionLifecycleManager {
     /// Shared ChainDB — protocol tasks read chain state for intersection finding.
     chain_db: Arc<RwLock<ChainDB>>,
 
+    /// #1057: can the ledger be rolled back to Origin? THE SAME CELL chain
+    /// selection reads, not a second predicate computed here — the two disagreed
+    /// once (storage on this flag, BlockFetch on `ledger tip == Origin`) and the
+    /// result was a node that would have accepted the fork switch but never
+    /// received the blocks to switch to.
+    ledger_can_reach_origin: Arc<std::sync::atomic::AtomicBool>,
+
     /// Shared LedgerState — protocol tasks read ledger tip for intersection.
     ledger_state: Arc<RwLock<LedgerState>>,
 
@@ -1298,6 +1337,7 @@ impl ConnectionLifecycleManager {
         fetched_blocks_tx: mpsc::Sender<FetchedBlock>,
         block_announcement_tx: broadcast::Sender<BlockAnnouncement>,
         chain_db: Arc<RwLock<ChainDB>>,
+        ledger_can_reach_origin: Arc<std::sync::atomic::AtomicBool>,
         ledger_state: Arc<RwLock<LedgerState>>,
         ledger_view: Arc<arc_swap::ArcSwap<super::ledger_view::LedgerView>>,
         ledger_tip_slot_tx: tokio::sync::watch::Sender<u64>,
@@ -1335,6 +1375,7 @@ impl ConnectionLifecycleManager {
             fetched_blocks_tx,
             block_announcement_tx,
             chain_db,
+            ledger_can_reach_origin,
             ledger_state,
             ledger_view,
             ledger_tip_slot_tx,
@@ -2628,6 +2669,11 @@ impl ConnectionLifecycleManager {
         let fetched_blocks_tx = self.fetched_blocks_tx.clone();
         let candidate_chains = self.candidate_chains.clone();
         let chain_db = self.chain_db.clone();
+        // #1057: the gross-request invariant's genesis clause is conditional on the
+        // ledger being able to ROLL BACK to Origin. Read from the SAME cell chain
+        // selection uses, so the two layers cannot gate one decision on two
+        // different predicates — see `fetch_range_connects_via_chain_db`.
+        let ledger_can_reach_origin = self.ledger_can_reach_origin.clone();
         let bel = self.byron_epoch_length;
         // Shared flag: only ONE BlockFetch worker is active at a time.
         // Matches Haskell's bfcMaxConcurrencyBulkSync = 1.
@@ -2747,6 +2793,15 @@ impl ConnectionLifecycleManager {
                 // Haskell starvation path cannot reach (it requires a current
                 // fetch peer with an outstanding request).
                 let mut unproductive_since_ms: Option<u64> = None;
+                // #1057: latch so the actionable "cannot rejoin" ERROR is emitted ONCE
+                // per worker rather than on every declined range. Repeating the remedy
+                // every few seconds would bury it.
+                let mut genesis_wedge_reported = false;
+                // #1057: rate-limit state for the per-decline WARN. BlockFetch re-claims
+                // the declined range continuously — measured at ~100 declines/second, so
+                // an unthrottled WARN produced 29,435 lines / 17 MB in ten minutes.
+                let mut last_genesis_warn_ms: Option<u64> = None;
+                let mut genesis_declines_since_warn: u64 = 0;
 
                 info!(%addr, "blockfetch worker started (waiting for turn)");
 
@@ -3099,6 +3154,13 @@ impl ConnectionLifecycleManager {
                                     )
                                 {
                                     let prev = hdr.prev_hash;
+                                    // Hoisted out of the `else` below because the
+                                    // decline branch needs it too: a range rooted at
+                                    // genesis is the #1057 wedge and gets its own
+                                    // diagnostic, distinct from the ordinary
+                                    // far-ahead decline.
+                                    let prev_is_genesis =
+                                        prev == dugite_primitives::hash::Hash32::ZERO;
                                     // The decision itself lives in the pure
                                     // `fetch_range_connects` (unit-tested);
                                     // here we only supply its inputs, taking
@@ -3106,26 +3168,79 @@ impl ConnectionLifecycleManager {
                                     // already-fetched / genesis cases stay
                                     // lock-free.
                                     let connects = if fetch_range_connects_fast(
-                                        &prev,
                                         fetched_hashes.contains(prev.as_bytes()),
                                     ) {
                                         true
                                     } else {
+                                        // #1057: an atomic load, no lock — and the
+                                        // SAME cell chain selection reads. The
+                                        // previous version tested `ledger tip ==
+                                        // Origin` here while storage tested
+                                        // "can reach Origin", so BlockFetch declined
+                                        // the very blocks storage was prepared to
+                                        // switch to.
+                                        let ledger_at_origin = prev_is_genesis
+                                            && ledger_can_reach_origin
+                                                .load(std::sync::atomic::Ordering::Relaxed);
                                         let cdb = chain_db.read().await;
                                         fetch_range_connects_via_chain_db(
                                             cdb.get_tip_info().is_none(),
                                             cdb.has_block(&prev),
+                                            prev_is_genesis,
+                                            ledger_at_origin,
                                         )
                                     };
                                     if !connects {
-                                        debug!(
-                                            %addr,
-                                            first_slot = first.slot,
-                                            prev = %prev.to_hex(),
-                                            "BlockFetch: declining far-ahead range — \
-                                             first block does not extend a stored block \
-                                             (gross-request invariant, #735)"
-                                        );
+                                        if prev_is_genesis {
+                                            // RATE-LIMITED, and the first version was not.
+                                            //
+                                            // BlockFetch re-claims the range continuously, so
+                                            // an unconditional per-decline WARN emitted 29,435
+                                            // lines and 17 MB of log in ten minutes on the
+                                            // devnet round — roughly 100/second. A diagnostic
+                                            // that buries every other line, and can fill a
+                                            // disk, is not an improvement on silence; it just
+                                            // moves the operator's problem.
+                                            //
+                                            // One line per 30s per worker, carrying the count
+                                            // suppressed since the last one so the recurrence
+                                            // is still visible without the volume.
+                                            const GENESIS_WARN_INTERVAL_MS: u64 = 30_000;
+                                            let now_ms = std::time::SystemTime::now()
+                                                .duration_since(std::time::UNIX_EPOCH)
+                                                .map(|d| d.as_millis() as u64)
+                                                .unwrap_or(0);
+                                            genesis_declines_since_warn += 1;
+                                            if genesis_warn_due(
+                                                last_genesis_warn_ms,
+                                                now_ms,
+                                                GENESIS_WARN_INTERVAL_MS,
+                                            ) {
+                                                last_genesis_warn_ms = Some(now_ms);
+                                                let suppressed =
+                                                    genesis_declines_since_warn.saturating_sub(1);
+                                                genesis_declines_since_warn = 0;
+                                                warn!(
+                                                    %addr,
+                                                    first_slot = first.slot,
+                                                    suppressed_since_last = suppressed,
+                                                    "BlockFetch: declining a range rooted at \
+                                                     GENESIS — this node holds a chain that \
+                                                     diverges from the peer's at genesis and \
+                                                     cannot adopt it in place (#1057). The \
+                                                     ledger will not advance from this peer."
+                                                );
+                                            }
+                                        } else {
+                                            debug!(
+                                                %addr,
+                                                first_slot = first.slot,
+                                                prev = %prev.to_hex(),
+                                                "BlockFetch: declining far-ahead range — \
+                                                 first block does not extend a stored block \
+                                                 (gross-request invariant, #735)"
+                                            );
+                                        }
                                         // #742 watchdog: a perpetual decline is the
                                         // exact #735 far-ahead wedge — same treatment
                                         // as the empty-runs case above: rotate the
@@ -3138,6 +3253,88 @@ impl ConnectionLifecycleManager {
                                         if unproductive_since_ms.is_none() {
                                             unproductive_since_ms = Some(now_ms);
                                         }
+
+                                        // #1057: escalate ONCE to an actionable ERROR when
+                                        // the genesis decline has persisted past the
+                                        // watchdog window, and PERSIST A MARKER so the
+                                        // next start recovers.
+                                        //
+                                        // By this point it is not a transient or hostile
+                                        // peer: the same condition has held for 3x the
+                                        // BlockFetch grace period.
+                                        //
+                                        // The node does NOT exit itself. The trigger is a
+                                        // peer's claim, so turning it into an automatic
+                                        // discard-my-chain-and-resync would be a
+                                        // remotely-triggerable forced resync — and
+                                        // dugite-node is adversarial-deployment software.
+                                        // The marker makes "restart the node" sufficient
+                                        // (which today it is NOT — measured); WHEN to
+                                        // restart stays with the operator or supervisor.
+                                        //
+                                        // `genesis_divergence::decide` then applies two
+                                        // bounds at startup: refuse if anything is flushed
+                                        // to the ImmutableDB (a rollback past the immutable
+                                        // tip is protocol-impossible), and refuse after
+                                        // MAX_RESET_ATTEMPTS, since a divergence that
+                                        // survives a full re-sync is a genesis-config error.
+                                        if prev_is_genesis && !genesis_wedge_reported {
+                                            if let Some(since) = unproductive_since_ms {
+                                                let wedge_ms = 3 * block_fetch_grace_period
+                                                    .as_millis()
+                                                    as u64;
+                                                if now_ms.saturating_sub(since) >= wedge_ms {
+                                                    genesis_wedge_reported = true;
+                                                    let db_path = {
+                                                        let cdb = chain_db.read().await;
+                                                        cdb.db_path().to_path_buf()
+                                                    };
+                                                    let attempt =
+                                                        crate::node::genesis_divergence::record(
+                                                            &db_path,
+                                                            &addr.to_string(),
+                                                            first.slot,
+                                                        );
+                                                    match attempt {
+                                                        Ok(n) => tracing::error!(
+                                                            %addr,
+                                                            wedged_secs = now_ms
+                                                                .saturating_sub(since)
+                                                                / 1000,
+                                                            attempt = n,
+                                                            "#1057: this node cannot rejoin the \
+                                                             network. Its chain diverges from \
+                                                             the peers' at GENESIS, so every \
+                                                             block range they offer is rooted \
+                                                             at genesis and is declined; the \
+                                                             ledger cannot advance and peers \
+                                                             will churn indefinitely. This does \
+                                                             NOT recover on its own. RESTART \
+                                                             THE NODE: a marker has been \
+                                                             written, and on the next start \
+                                                             dugite discards the local \
+                                                             dead-end chain and re-syncs from \
+                                                             genesis (only while the \
+                                                             ImmutableDB is empty — otherwise \
+                                                             it refuses and the operator must \
+                                                             decide)."
+                                                        ),
+                                                        Err(e) => tracing::error!(
+                                                            %addr,
+                                                            "#1057: this node cannot rejoin the \
+                                                             network (its chain diverges from \
+                                                             the peers' at GENESIS) AND the \
+                                                             recovery marker could not be \
+                                                             written: {e}. REMEDY: stop the \
+                                                             node, delete its database \
+                                                             directory, and re-sync or restore \
+                                                             a Mithril snapshot."
+                                                        ),
+                                                    }
+                                                }
+                                            }
+                                        }
+
                                         if let (Some(ref cs), Some(since)) =
                                             (&csj, unproductive_since_ms)
                                         {
@@ -4489,6 +4686,9 @@ impl ConnectionLifecycleManager {
             fetched_blocks_tx,
             block_announcement_tx,
             Arc::new(RwLock::new(chain_db2)),
+            // #1057: tests default the shared flag OFF — the conservative direction,
+            // matching a node that has not published yet.
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
             ledger_arc,
             ledger_view,
             ledger_tip_slot_tx,
@@ -4567,6 +4767,9 @@ impl ConnectionLifecycleManager {
             fetched_blocks_tx,
             block_announcement_tx,
             Arc::new(RwLock::new(chain_db2)),
+            // #1057: tests default the shared flag OFF — the conservative direction,
+            // matching a node that has not published yet.
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
             ledger_arc,
             ledger_view,
             ledger_tip_slot_tx,
@@ -7478,20 +7681,63 @@ mod range_byte_abort_751_tests {
     /// why a node holding any block of its own never rejoins a chain diverging
     /// at Origin.
     ///
-    /// Deliberately asserts the bug rather than hiding it, so the day #1057 is
-    /// fixed this test fails and forces the update. Accepting genesis here alone
-    /// is NOT the fix — it relocates the wedge to the ledger rollback path; see
-    /// `fetch_range_connects_fast`'s doc comment.
+    /// #1057 half A: a genesis-rooted range is now ACCEPTED against a non-empty
+    /// ChainDB — but only when the ledger is at Origin. Both conjuncts are
+    /// asserted separately, because the version WITHOUT the ledger condition was
+    /// implemented, measured live at block 4 against a network at 84, and reverted.
     #[test]
-    fn fetch_range_rooted_at_genesis_is_declined_with_non_empty_chain_db() {
-        let genesis = dugite_primitives::hash::Hash32::ZERO;
+    fn fetch_range_rooted_at_genesis_is_accepted_only_when_ledger_at_origin() {
+        // The case the wedge was: non-empty ChainDB, parent not stored, genesis
+        // root, ledger at Origin → must connect.
         assert!(
-            !fetch_range_connects_fast(&genesis, false),
-            "current behaviour: the lock-free half does not recognise genesis"
+            fetch_range_connects_via_chain_db(false, false, true, true),
+            "a genesis-rooted range must be fetchable when the ledger is at Origin, \
+             otherwise a node holding any block of its own never rejoins a chain \
+             diverging at genesis (#1057)"
         );
+
+        // Same range, ledger NOT at Origin → must still be declined. Accepting it
+        // here makes storage emit a genesis-rooted SwitchPlan the ledger cannot
+        // execute, relocating the wedge instead of removing it.
         assert!(
-            !fetch_range_connects_via_chain_db(false, false),
-            "and the ChainDB half cannot either — genesis is never a stored block (#1057)"
+            !fetch_range_connects_via_chain_db(false, false, true, false),
+            "with a non-Origin ledger the genesis clause MUST NOT fire — that is \
+             the reverted two-layer fix, which left the node at block 4 while the \
+             network was at 84"
+        );
+    }
+
+    /// #1057: the genesis-decline WARN must be THROTTLED.
+    ///
+    /// This exists because the first version was not. BlockFetch re-claims the
+    /// declined range continuously — measured at roughly 100 declines/second — so
+    /// an unconditional per-decline WARN wrote **29,435 lines and 17 MB** of log
+    /// in a ten-minute devnet round. A diagnostic that buries every other line and
+    /// can fill a disk is not an improvement on silence.
+    ///
+    /// Caught only by looking at the log volume after the round, which is why the
+    /// decision is now a pure function with a test rather than an inline
+    /// comparison.
+    #[test]
+    fn genesis_warn_is_throttled_to_one_per_interval() {
+        const IVL: u64 = 30_000;
+
+        // First ever decline always warns — the operator must learn immediately.
+        assert!(genesis_warn_due(None, 1_000, IVL));
+
+        // Inside the window: suppressed, including at the boundary-1.
+        assert!(!genesis_warn_due(Some(1_000), 1_000, IVL));
+        assert!(!genesis_warn_due(Some(1_000), 1_000 + IVL - 1, IVL));
+
+        // Exactly at the interval: due (`>=`).
+        assert!(genesis_warn_due(Some(1_000), 1_000 + IVL, IVL));
+        assert!(genesis_warn_due(Some(1_000), 10_000_000, IVL));
+
+        // A clock that goes BACKWARDS must not produce a warn storm: the
+        // saturating subtraction yields 0, which is inside the window.
+        assert!(
+            !genesis_warn_due(Some(10_000), 5_000, IVL),
+            "a backwards clock must suppress, not spam — SystemTime is not monotonic"
         );
     }
 
@@ -7500,22 +7746,26 @@ mod range_byte_abort_751_tests {
     /// ChainDB still does NOT (the far-ahead range the guard exists to decline).
     #[test]
     fn fetch_range_ordinary_cases_unchanged() {
-        let other = dugite_primitives::hash::Hash32::from_bytes([7u8; 32]);
-
         // Already fetched by this worker → in flight, not missing.
-        assert!(fetch_range_connects_fast(&other, true));
-        // Not fetched, not genesis → must fall through to the ChainDB.
-        assert!(!fetch_range_connects_fast(&other, false));
+        assert!(fetch_range_connects_fast(true));
+        // Not fetched → must fall through to the locked half.
+        assert!(!fetch_range_connects_fast(false));
 
         // Frontier extension: the parent is stored → connects.
-        assert!(fetch_range_connects_via_chain_db(false, true));
+        assert!(fetch_range_connects_via_chain_db(false, true, false, false));
         // From-origin bootstrap exemption retained.
-        assert!(fetch_range_connects_via_chain_db(true, false));
-        // The #735 far-ahead range: unknown parent, non-empty DB → decline.
+        assert!(fetch_range_connects_via_chain_db(true, false, false, false));
+        // The #735 far-ahead range: unknown NON-genesis parent, non-empty DB →
+        // decline, regardless of where the ledger is. The genesis clause must not
+        // become a general-purpose escape hatch.
         assert!(
-            !fetch_range_connects_via_chain_db(false, false),
+            !fetch_range_connects_via_chain_db(false, false, false, false),
             "an unknown non-genesis parent against a non-empty ChainDB must \
              still be declined — the #735 invariant is preserved"
+        );
+        assert!(
+            !fetch_range_connects_via_chain_db(false, false, false, true),
+            "and a ledger at Origin must NOT excuse a non-genesis unknown parent"
         );
     }
 }
