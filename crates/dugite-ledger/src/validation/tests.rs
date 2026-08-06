@@ -13386,6 +13386,55 @@ mod tests {
         tx
     }
 
+    /// #1030 item 1: Phase-1 failures must ACCUMULATE, not short-circuit.
+    ///
+    /// Haskell's STS `?!` never short-circuits within a rule body, so every
+    /// applicable predicate failure reaches `MsgRejectTx`. dugite gated Rule 3
+    /// (ADA conservation) on `errors.is_empty()`, so an unrelated
+    /// `ProposalDepositIncorrect` raised immediately above it SUPPRESSED the
+    /// conservation failure — a client saw one cause where cardano-node reports
+    /// two. The verdict never diverged; the reported reason list was short.
+    ///
+    /// This drives a tx that violates BOTH at once and requires both to surface.
+    #[test]
+    fn phase1_failures_accumulate_proposal_deposit_and_value_conservation() {
+        let mut params = ProtocolParameters::mainnet_defaults();
+        params.protocol_version_major = 9;
+        let wrong_deposit = params.gov_action_deposit.0 - 1;
+
+        let mut utxo_set = UtxoSet::new();
+        // Correctly-balanced proposal tx with a WRONG proposal deposit...
+        let mut tx = make_proposal_tx(&mut utxo_set, wrong_deposit, &params);
+        // ...then break ADA conservation too, by inflating the output.
+        if let Some(out) = tx.body.outputs.first_mut() {
+            out.value.coin = Lovelace(out.value.coin.0 + 1_000_000);
+        }
+
+        let errors = validate_transaction_with_pools(
+            &tx, &utxo_set, &params, 100, 300, None, None, None, None, None, None, None, None,
+            None, None, None, None, None,
+        )
+        .expect_err("both predicates are violated, so the tx must be rejected");
+
+        let has_deposit = errors
+            .iter()
+            .any(|e| matches!(e, ValidationError::ProposalDepositIncorrect { .. }));
+        let has_conservation = errors
+            .iter()
+            .any(|e| matches!(e, ValidationError::ValueNotConserved { .. }));
+
+        assert!(
+            has_deposit,
+            "ProposalDepositIncorrect must be reported; got: {errors:?}"
+        );
+        assert!(
+            has_conservation,
+            "ValueNotConserved must ALSO be reported — an `errors.is_empty()` gate \
+             on Rule 3 suppressed it, shortening the failure list vs cardano-node \
+             (#1030 item 1); got: {errors:?}"
+        );
+    }
+
     #[test]
     fn test_proposal_incorrect_deposit_rejected() {
         // A proposal with a deposit that doesn't match gov_action_deposit must

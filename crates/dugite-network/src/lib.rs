@@ -834,6 +834,45 @@ pub enum TxValidationError {
         /// `(typed-hash32 hex, expiry epoch)` per offending member.
         members: Vec<(String, u64)>,
     },
+    /// `ScriptIntegrityHashMismatch` (UTXOW tag 18) — the **PV>=11** form of a
+    /// script-integrity-hash mismatch (#1058).
+    ///
+    /// `checkScriptIntegrityHash` (cardano-ledger
+    /// `eras/alonzo/impl/src/Cardano/Ledger/Alonzo/Rules/Utxow.hs`) picks the
+    /// constructor by protocol version:
+    ///
+    /// ```haskell
+    /// $ if pvMajor (pp ^. ppProtocolVersionL) < natVersion @11
+    ///   then PPViewHashesDontMatch mismatch
+    ///   else ScriptIntegrityHashMismatch mismatch expectedScriptIntegrity
+    /// ```
+    ///
+    /// The two differ in BOTH tag and payload shape
+    /// (`Conway/Rules/Utxow.hs`):
+    ///
+    /// ```haskell
+    /// PPViewHashesDontMatch       mm  -> Sum … 13 !> ToGroup mm
+    /// ScriptIntegrityHashMismatch x y -> Sum … 18 !> To x !> To y
+    /// ```
+    ///
+    /// so tag 13 FLATTENS the `Mismatch` into the constructor array while tag 18
+    /// carries it as a self-contained `array(2)` plus a SECOND field. dugite
+    /// emitted tag 13 at every PV, which is wrong on preview/PV11 — the #978
+    /// inversion (there, only the unreachable PV>=11 arms existed).
+    ///
+    /// `expected_bytes` is Haskell's `originalBytes <$> scriptIntegrity`: the
+    /// script-integrity **preimage**, not a hash. dugite's Phase-1 error carries
+    /// only hashes, so this is `None` (`SNothing`) — structurally valid and
+    /// decodable, omitting a diagnostic. Plumbing the preimage span out of
+    /// Phase-1 is a larger change and deliberately does not gate the tag fix.
+    ScriptIntegrityHashMismatchUTXOW {
+        /// Hex-encoded hash the transaction body declared, if any.
+        supplied: Option<String>,
+        /// Hex-encoded hash recomputed from the script context, if any.
+        expected: Option<String>,
+        /// Hex-encoded script-integrity preimage bytes, if known.
+        expected_bytes: Option<String>,
+    },
     /// `HardForkApplyTxErrWrongEra` — the submitted transaction's era does not
     /// match the ledger's current era (#1047).
     ///
