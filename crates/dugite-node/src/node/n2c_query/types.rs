@@ -1042,8 +1042,11 @@ pub struct NodeStateSnapshot {
     /// only ever change AT a boundary and `setFreshDRepPulsingState` seals
     /// them there. It differs exactly once: before the first boundary there is
     /// no pulser, and upstream's initial `EnactState` carries the
-    /// genesis-translated params — which on a Conway-genesis chain lack the
-    /// injected `defaultV2CostModel`.
+    /// genesis-translated params — which lack the cost models
+    /// `alonzoInjectCostModels` writes into `curPParams` from
+    /// `agExtraConfig.aecCostModels` (#1046). On a `create-testnet-data` devnet
+    /// that is PlutusV1+PlutusV2; on mainnet/preview/preprod there is no
+    /// `extraConfig` at all, so there is nothing to lack.
     pub ratify_cur_protocol_params: ProtocolParamsSnapshot,
     /// Stake pool distribution data, built from LIVE ledger state. Feeds
     /// `GetStakePools` (tag 16) and `GetStakeDistribution2` (tag 37), both of

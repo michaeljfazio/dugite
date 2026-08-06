@@ -9,6 +9,7 @@
 //! chain" tool ISSUE-4 was missing.
 //!
 //! Usage:  replay_phase2 <dump.json>
+//!         replay_phase2 --flat <term.flat> [<dump.json>] [v1|v2|v3|v4]
 
 use std::fs;
 
@@ -37,23 +38,74 @@ fn main() {
             cpu: i64::MAX / 4,
             mem: i64::MAX / 4,
         };
-        // Optional 3rd arg: a dump JSON whose on-chain V2 cost model is used
-        // (so CPU costs match the live node). Without it, default costs.
+        // #1030 item 2: the Plutus language is SELECTABLE, not pinned.
+        //
+        // This mode used to hardcode `PlutusV2` for both the cost model and the
+        // `SemanticsVariant`. That silently mis-costs a V1 or V3 term — and
+        // `ScriptLanguage::PlutusV4` now exists (#1000), so the arm it could not
+        // previously select is available. Diagnostic tooling only (the main
+        // dump-replay path resolves the language correctly via
+        // `eval_phase_two_raw`), but a diagnostic that reports the wrong numbers
+        // is worse than none when it is being used to localise a cost divergence.
+        //
+        // Usage: replay_phase2 --flat <term.flat> [<dump.json>] [v1|v2|v3|v4]
+        let lang = match args.get(4).map(|s| s.as_str()).unwrap_or("v2") {
+            "v1" => dugite_uplc::redeemer_resolve::ScriptLanguage::PlutusV1,
+            "v2" => dugite_uplc::redeemer_resolve::ScriptLanguage::PlutusV2,
+            "v3" => dugite_uplc::redeemer_resolve::ScriptLanguage::PlutusV3,
+            "v4" => dugite_uplc::redeemer_resolve::ScriptLanguage::PlutusV4,
+            other => panic!(
+                "unknown Plutus language '{other}' — expected one of v1|v2|v3|v4 \
+                 (usage: replay_phase2 --flat <term.flat> [<dump.json>] [v1|v2|v3|v4])"
+            ),
+        };
+
+        // Optional 3rd arg: a dump JSON whose on-chain cost model for the
+        // selected language is used (so CPU costs match the live node). Without
+        // it, default costs.
         let mut tracker = if let Some(dump) = args.get(3) {
             let v: serde_json::Value =
                 serde_json::from_str(&fs::read_to_string(dump).unwrap()).unwrap();
             let cm_cbor = hexd(v["cost_models_cbor"].as_str().unwrap());
             let cm = dugite_uplc::cost_models::decode_cost_models_cbor(&cm_cbor).unwrap();
-            let params = cm.plutus_v2.as_deref().unwrap();
-            let applied = dugite_uplc::cost_apply::apply_v2(params, 11).unwrap();
+            let applied = match lang {
+                dugite_uplc::redeemer_resolve::ScriptLanguage::PlutusV1 => {
+                    let p = cm
+                        .plutus_v1
+                        .as_deref()
+                        .expect("dump has no PlutusV1 cost model");
+                    dugite_uplc::cost_apply::apply_v1(p, 11).unwrap()
+                }
+                dugite_uplc::redeemer_resolve::ScriptLanguage::PlutusV2 => {
+                    let p = cm
+                        .plutus_v2
+                        .as_deref()
+                        .expect("dump has no PlutusV2 cost model");
+                    dugite_uplc::cost_apply::apply_v2(p, 11).unwrap()
+                }
+                dugite_uplc::redeemer_resolve::ScriptLanguage::PlutusV3 => {
+                    let p = cm
+                        .plutus_v3
+                        .as_deref()
+                        .expect("dump has no PlutusV3 cost model");
+                    dugite_uplc::cost_apply::apply_v3(p, 11).unwrap()
+                }
+                // `cost_apply` has no `apply_v4` yet, so an on-chain V4 cost
+                // model cannot be applied. Say so rather than silently
+                // substituting V3's application and reporting numbers that are
+                // not what the node would charge — the whole purpose of this mode
+                // is to settle a cost divergence.
+                dugite_uplc::redeemer_resolve::ScriptLanguage::PlutusV4 => panic!(
+                    "PlutusV4 on-chain cost application is not implemented \
+                     (dugite_uplc::cost_apply has no apply_v4); re-run without the \
+                     dump argument to evaluate V4 under default costs"
+                ),
+            };
             dugite_uplc::machine::cost::BudgetTracker::with_applied(huge, applied)
         } else {
             dugite_uplc::machine::cost::BudgetTracker::new(huge)
         };
-        let variant = dugite_uplc::builtin::semantics::SemanticsVariant::for_script(
-            dugite_uplc::redeemer_resolve::ScriptLanguage::PlutusV2,
-            11,
-        );
+        let variant = dugite_uplc::builtin::semantics::SemanticsVariant::for_script(lang, 11);
         let res = dugite_uplc::machine::step::evaluate_with_budget(
             prog.term,
             &mut tracker,

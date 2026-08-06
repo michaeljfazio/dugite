@@ -313,6 +313,54 @@ pub(crate) struct LedgerTxValidator {
 
 impl TxValidator for LedgerTxValidator {
     fn validate_tx(&self, era_id: u16, tx_bytes: &[u8]) -> Result<(), TxValidationError> {
+        // #1047: WIRE-ERA CHECK, before decoding.
+        //
+        // Upstream cannot even represent applying a tx from era X to a ledger in
+        // era Y: `ApplyTxErr` for the HFC is
+        // `Either (MismatchEraInfo xs) (OneEraApplyTxErr xs)`, and the HFC's
+        // mempool returns `HardForkApplyTxErrWrongEra` before any era's rules
+        // run. dugite had no such check — a legacy-era submission was rejected
+        // only as an ACCIDENTAL CBOR decode error (the standalone Shelley decoder
+        // expects a different array length than a real Shelley tx has).
+        //
+        // That accident is load-bearing today and must not be relied on: correct
+        // any one of those decoders without adding this check, and MIR /
+        // GenesisKeyDelegation / other legacy-era artifacts become ACCEPTABLE on a
+        // Conway chain where cardano-node answers
+        // `HardForkApplyTxErrWrongEra` — the accept-where-Haskell-rejects wedge
+        // class (#996/#997/#985/#1023). MIR Phase-1 validation is a documented
+        // no-op at PV>=9 and GenesisKeyDelegation has era-unconditional
+        // apply-time support, so the ledger layer would NOT catch it.
+        //
+        // The ledger's era comes from `EraHistory::current_era()`, not from
+        // ledger pparams: #985's lesson is that a stale/corrupt protocol version
+        // must never drive an era decision.
+        let ledger_era = match self.era_history.try_read() {
+            Ok(h) => Some(h.current_era()),
+            // Lock contention must not manufacture a spurious era rejection;
+            // fall through to the decoder, which is the pre-#1047 behaviour.
+            Err(_) => None,
+        };
+        if let Some(ledger_era) = ledger_era {
+            let ledger_era_index = ledger_era.to_era_index();
+            if u32::from(era_id) != ledger_era_index {
+                let tx_era = dugite_primitives::era::Era::from_era_index(era_id);
+                tracing::warn!(
+                    era_id,
+                    ledger_era = %ledger_era,
+                    "N2C tx rejected: wrong era (HardForkApplyTxErrWrongEra)"
+                );
+                return Err(TxValidationError::HardForkApplyTxErrWrongEra {
+                    tx_era_index: era_id as u8,
+                    tx_era_name: tx_era
+                        .map(|e| e.to_string())
+                        .unwrap_or_else(|| format!("UnknownEra{era_id}")),
+                    ledger_era_index: ledger_era_index as u8,
+                    ledger_era_name: ledger_era.to_string(),
+                });
+            }
+        }
+
         let tx = dugite_serialization::decode_transaction(era_id, tx_bytes).map_err(|e| {
             TxValidationError::DecodeFailed {
                 reason: e.to_string(),
@@ -902,6 +950,22 @@ pub(crate) fn convert_validation_error_at_pv(
             other => return convert_validation_error(other),
         }
     }
+    // #1058: the script-integrity-hash mismatch also splits at PV 11.
+    // `checkScriptIntegrityHash` chooses
+    //   pv < 11  -> PPViewHashesDontMatch mismatch                    (UTXOW 13)
+    //   pv >= 11 -> ScriptIntegrityHashMismatch mismatch preimage      (UTXOW 18)
+    // and the two differ in tag AND payload shape (13 flattens the Mismatch via
+    // ToGroup; 18 nests it and adds a third field). dugite emitted 13 at every
+    // PV, which is wrong on preview/PV11 — the #978 inversion.
+    if let VE::ScriptDataHashMismatch { expected, actual } = &e {
+        return TxValidationError::ScriptIntegrityHashMismatchUTXOW {
+            supplied: Some(actual.clone()),
+            expected: Some(expected.clone()),
+            // Haskell's `originalBytes <$> scriptIntegrity` — the preimage, not a
+            // hash. dugite's Phase-1 error carries only hashes, so SNothing.
+            expected_bytes: None,
+        };
+    }
     convert_validation_error(e)
 }
 
@@ -1265,14 +1329,15 @@ pub(crate) fn convert_validation_error(
             expected: network_id_to_wire(expected),
             accounts,
         },
-        VE::ConstitutionPolicyMismatch { expected, actual } => {
+        // #1028: both sides are now typed `Option<Hash28>` end to end, so the
+        // `StrictMaybe` distinction survives from the predicate to the wire.
+        // Previously the ledger carried hex STRINGS and used the empty string as
+        // an absence sentinel, which this arm had to re-interpret — and which
+        // could not express "the constitution has no guardrail" at all.
+        VE::InvalidGuardrailsScriptHash { got, expected } => {
             TxValidationError::InvalidGuardrailsScriptHash {
-                got: if actual.is_empty() { None } else { Some(actual) },
-                expected: if expected.is_empty() {
-                    None
-                } else {
-                    Some(expected)
-                },
+                got: got.map(|h| h.to_hex()),
+                expected: expected.map(|h| h.to_hex()),
             }
         }
         VE::UnspendableUTxONoDatumHash { input, .. } => {
@@ -1318,6 +1383,18 @@ pub(crate) fn convert_validation_error(
             action_index,
             action_type: action_type.to_string(),
             prev_action_id: prev_action_id.as_ref().map(gov_action_id_to_string),
+            proposal,
+        },
+        // #1026: PV9 bootstrap proposal-submission restriction, GOV tag 12.
+        // Typed from the start — see the encoder arm's note on why a new
+        // predicate must not join the #979/#1050 generic-fallback backlog.
+        VE::DisallowedProposalDuringBootstrap {
+            action_index,
+            action_type,
+            proposal,
+        } => TxValidationError::DisallowedProposalDuringBootstrap {
+            action_index,
+            action_type: action_type.to_string(),
             proposal,
         },
         // No dedicated wire variant yet (dugite issue #1021, tracked
@@ -2724,9 +2801,9 @@ mod tests {
                 expected: 0,
                 mismatched: vec![(format!("e0{}", "55".repeat(28)), 1)],
             },
-            VE::ConstitutionPolicyMismatch {
-                expected: "66".repeat(28),
-                actual: String::new(),
+            VE::InvalidGuardrailsScriptHash {
+                got: None,
+                expected: Some(dugite_primitives::hash::Hash28::from_bytes([0x66; 28])),
             },
             VE::WdrlNotDelegatedToDRep {
                 credential_hash: "77".repeat(28),
