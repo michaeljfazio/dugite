@@ -4,7 +4,15 @@
 # Upstream: cardano-node-tests test_tx_many_utxos.py::test_mini_transactions
 # (#1032, cardano-node-tests adoption P0.1).
 #
-# Assertion contract: fan out 300+ tiny UTxOs at a fresh script-local address,
+# Rerunnable (#1048): FAN_ADDR is a PERSISTENT per-script address (its keys are
+# cached under $ZOO_KEYS/$NAME), and this script returns its consume-tx change
+# there, so a second run in the same devnet finds an irregular-value leftover.
+# Step 2 therefore selects only ada-only UTxOs worth EXACTLY PER_UTXO, which
+# keeps `SUM = N * PER_UTXO` true by construction; step 3 looks its output up by
+# txid prefix and was already rerun-safe. The funder input is ada-only-selected
+# so multi-asset debris in the shared wallet cannot be silently dropped.
+#
+# Assertion contract: fan out 300+ tiny UTxOs at a script-local address,
 # then build ONE tx that consumes as many of them as fit under
 # maxTxSize=16384 (devnet). We assert the packed input count is >=300 (the
 # upstream test's own floor), that the tx is ACCEPTED, and that the
@@ -84,7 +92,14 @@ FANOUT_TXS=3
 PER_TX_OUTPUTS=120
 TOTAL_FANNED=$((FANOUT_TXS * PER_TX_OUTPUTS))
 
-UTXO=$(zoo_largest_utxo "$FUND_ADDR") || { zoo_record "$NAME" FAIL "" "no-utxo"; exit 1; }
+# #1048: ADA-ONLY funder input. `zoo_largest_utxo` ranks by lovelace alone and
+# on a wallet carrying multi-asset debris can hand back a UTxO with tokens; the
+# bare-ADA `--tx-out`s in `build_fanout` would silently drop the asset and the tx
+# would be rejected `ValueNotConservedUTxO`.
+UTXO=$(zoo_largest_ada_only_utxo "$FUND_ADDR") || {
+    zoo_record "$NAME" FAIL "" "no-ada-only-utxo"
+    exit 1
+}
 CUR_IN=${UTXO%% *}
 CUR_AMT=${UTXO##* }
 LAST_TXID=""
@@ -108,12 +123,31 @@ zoo_wait_inclusion "$LAST_TXID" 90 || {
 }
 
 # ── Step 2: build ONE tx consuming as many FAN_ADDR utxos as fit ───────────
+#
+# #1048: select ONLY ada-only UTxOs worth EXACTLY PER_UTXO.
+#
+# `SUM=$((N * PER_UTXO))` below is what makes the exact post-balance assertion in
+# step 3 possible, and it is only true if every selected input really is
+# PER_UTXO. FAN_ADDR is a persistent per-script address, and this script's own
+# consume tx returns its change THERE — so on a second run in the same devnet
+# FAN_ADDR holds an irregular-value leftover. Selecting it made SUM wrong, which
+# made CHANGE wrong, which got the tx rejected for `ValueNotConservedUTxO`: a
+# harness-hygiene failure that reads as a ledger bug.
+#
+# Filtering by exact value (rather than, say, skipping the newest UTxO) keeps the
+# invariant true by CONSTRUCTION and needs no bookkeeping across runs. Leftovers
+# simply accumulate, ignored.
 mapfile -t FAN_INS < <(cardano-cli conway query utxo \
         --testnet-magic "$LD_MAGIC" --socket-path "$ZOO_SOCKET" \
-        --address "$FAN_ADDR" --output-json 2>/dev/null | jq -r 'keys[]')
+        --address "$FAN_ADDR" --output-json 2>/dev/null \
+    | jq -r --argjson per "$PER_UTXO" '
+        to_entries
+        | map(select((.value.value | keys) == ["lovelace"]))
+        | map(select(.value.value.lovelace == $per))
+        | .[].key')
 TOTAL_AVAIL=${#FAN_INS[@]}
 if [ "$TOTAL_AVAIL" -lt 300 ]; then
-    zoo_record_env_skip "$NAME" "only-$TOTAL_AVAIL-utxos-fanned-out (wanted >=300)"
+    zoo_record_env_skip "$NAME" "only-$TOTAL_AVAIL-exact-${PER_UTXO}-lovelace-utxos-at-FAN_ADDR (wanted >=300)"
     exit 0
 fi
 
