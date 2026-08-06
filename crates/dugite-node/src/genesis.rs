@@ -618,6 +618,25 @@ pub struct AlonzoGenesis {
     pub max_collateral_inputs: u64,
     #[serde(default)]
     pub cost_models: HashMap<String, serde_json::Value>,
+    /// Haskell `agExtraConfig :: StrictMaybe AlonzoExtraConfig` (#1046).
+    ///
+    /// Written by `cardano-cli ... create-testnet-data`, absent from
+    /// mainnet/preview/preprod. See
+    /// [`AlonzoGenesis::apply_extra_config_cost_models`] for the semantics —
+    /// it is a `curPParams`-only, per-language override and the ONLY way a node
+    /// gets a cost model it was not handed by a genesis field or an on-chain
+    /// PPU.
+    #[serde(default)]
+    pub extra_config: Option<AlonzoExtraConfig>,
+}
+
+/// Haskell `AlonzoExtraConfig { aecCostModels :: Maybe CostModels }`
+/// (`eras/alonzo/impl/src/Cardano/Ledger/Alonzo/Genesis.hs`).
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AlonzoExtraConfig {
+    #[serde(default)]
+    pub cost_models: HashMap<String, serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -777,6 +796,88 @@ impl AlonzoGenesis {
                 );
                 params.cost_models.plutus_v3 = Some(costs);
             }
+        }
+    }
+
+    /// Apply `extraConfig.costModels` — Haskell `alonzoInjectCostModels` /
+    /// `overrideCostModels` (#1046).
+    ///
+    /// `cardano-ledger`'s `AlonzoGenesis` carries an optional
+    /// `agExtraConfig :: StrictMaybe AlonzoExtraConfig` whose sole field is
+    /// `aecCostModels :: Maybe CostModels`
+    /// (`eras/alonzo/impl/src/Cardano/Ledger/Alonzo/Genesis.hs`). The transition
+    /// config applies it in
+    /// `eras/alonzo/impl/src/Cardano/Ledger/Alonzo/Transition.hs`:
+    ///
+    /// ```haskell
+    /// alonzoInjectCostModels cfg =
+    ///   case agExtraConfig $ cfg ^. tcTranslationContextL of
+    ///     SNothing -> id
+    ///     SJust aec -> overrideCostModels (aecCostModels aec)
+    ///
+    /// overrideCostModels = \case
+    ///   Nothing -> id
+    ///   -- Injected cost models override the era-translated ones (the
+    ///   -- fixed-length PlutusV1/PlutusV3 genesis fields), so a testnet can
+    ///   -- carry full cost models without an on-chain parameter update.
+    ///   Just cms ->
+    ///     nesEsL . curPParamsEpochStateL . ppCostModelsL
+    ///       %~ flip updateCostModels (CostModelsUpdate cms)
+    /// ```
+    ///
+    /// Two properties are load-bearing and are why this is a SEPARATE method
+    /// rather than part of [`Self::apply_to_protocol_params`]:
+    ///
+    /// 1. **`curPParamsEpochStateL` only.** The override never touches
+    ///    `prevPParams`. That is exactly why cardano-node reports
+    ///    `cur = [V1, V2, V3]` but `prev = [V1, V3]` on a `create-testnet-data`
+    ///    devnet — the shape #994 observed and could not explain.
+    /// 2. **`updateCostModels` is a per-language update**, not a wholesale
+    ///    replacement: languages named in `extraConfig` override, others are
+    ///    retained.
+    ///
+    /// This is the ONLY mechanism by which a node acquires a cost model it was
+    /// not given by a genesis field or an on-chain PPU. cardano-ledger has no
+    /// "default PlutusV2" anywhere — `defaultV2CostModel` lives in **cardano-api**
+    /// (`Cardano.Api.Genesis.Internal`) and is a value written INTO a generated
+    /// genesis file, not a runtime injection. dugite used to hardcode that
+    /// constant and inject it unconditionally, which happened to match on the
+    /// devnet (where `create-testnet-data` writes the identical values into
+    /// `extraConfig`) while being wrong on mainnet/preview/preprod, whose
+    /// alonzo-genesis files carry no `extraConfig` at all and whose
+    /// cardano-node therefore has NO PlutusV2 until a real PPU installs one.
+    pub fn apply_extra_config_cost_models(&self, params: &mut ProtocolParameters) {
+        let Some(extra) = self.extra_config.as_ref() else {
+            return;
+        };
+        for (lang, value) in extra.cost_models.iter() {
+            let Some(costs) = parse_cost_model(value) else {
+                warn!(
+                    lang = %lang,
+                    "Alonzo genesis extraConfig.costModels entry could not be parsed — ignoring"
+                );
+                continue;
+            };
+            let count = costs.len();
+            match lang.as_str() {
+                "PlutusV1" => params.cost_models.plutus_v1 = Some(costs),
+                "PlutusV2" => params.cost_models.plutus_v2 = Some(costs),
+                "PlutusV3" => params.cost_models.plutus_v3 = Some(costs),
+                other => {
+                    warn!(
+                        lang = %other,
+                        "Alonzo genesis extraConfig.costModels names an unknown Plutus \
+                         language — ignoring"
+                    );
+                    continue;
+                }
+            }
+            debug!(
+                lang = %lang,
+                count,
+                "Applied cost model from Alonzo genesis extraConfig (Haskell \
+                 alonzoInjectCostModels — curPParams only)"
+            );
         }
     }
 }
@@ -987,45 +1088,26 @@ impl ConwayGenesis {
             params.cost_models.plutus_v3 = Some(v3.clone());
         }
 
-        // PlutusV2 cost model: if not already set from Alonzo genesis or
-        // on-chain protocol parameter updates, fall back to the initial V2
-        // values cardano-node uses when no V2 is present in genesis files.
+        // #1046: NO default PlutusV2 injection.
         //
-        // These are the pre-Babbage `defaultV2CostModel` values from
-        // `cardano-api/src/Cardano/Api/Genesis/Internal.hs` — the V2 cost
-        // model as introduced at the Alonzo→Babbage HFC. They share the
-        // first ~133 entries with V1 (V2 inherited V1's pricing for
-        // pre-existing builtins and added new ones on top), then diverge
-        // with `serialiseData`, `keccak256`, `blake2b224`, etc.
+        // dugite used to hardcode cardano-api's `defaultV2CostModel` here and
+        // inject it whenever V2 was absent. cardano-ledger has no such default:
+        // a node's cost models come from the genesis FIELDS, from
+        // `agExtraConfig.aecCostModels` (see
+        // `AlonzoGenesis::apply_extra_config_cost_models`), or from an on-chain
+        // PPU — and nowhere else. `defaultV2CostModel` lives in cardano-api's
+        // `Cardano.Api.Genesis.Internal` as a value written INTO a generated
+        // genesis file, not as a runtime fallback.
         //
-        // On mainnet/preview/preprod, a Babbage-era ParameterChange action
-        // updated V2 to the values starting `[100788, 420, ...]` —
-        // dugite's on-chain `apply_protocol_param_update` applies that
-        // automatically during sync, so we converge with public networks
-        // after that epoch.
-        //
-        // On a Conway-direct devnet (cardano-testnet), no such
-        // ParameterChange has ever run, so these initial values remain
-        // authoritative. Using the post-Babbage values here would break
-        // script integrity hash validation against cardano-node, which
-        // computes `LangDepView` from these initial values.
-        if params.cost_models.plutus_v2.is_none() {
-            debug!("PlutusV2 cost model not set — loading pre-Babbage defaultV2CostModel");
-            params.cost_models.plutus_v2 = Some(vec![
-                205665, 812, 1, 1, 1000, 571, 0, 1, 1000, 24177, 4, 1, 1000, 32, 117366, 10475, 4,
-                23000, 100, 23000, 100, 23000, 100, 23000, 100, 23000, 100, 23000, 100, 100, 100,
-                23000, 100, 19537, 32, 175354, 32, 46417, 4, 221973, 511, 0, 1, 89141, 32, 497525,
-                14068, 4, 2, 196500, 453240, 220, 0, 1, 1, 1000, 28662, 4, 2, 245000, 216773, 62,
-                1, 1060367, 12586, 1, 208512, 421, 1, 187000, 1000, 52998, 1, 80436, 32, 43249, 32,
-                1000, 32, 80556, 1, 57667, 4, 1000, 10, 197145, 156, 1, 197145, 156, 1, 204924,
-                473, 1, 208896, 511, 1, 52467, 32, 64832, 32, 65493, 32, 22558, 32, 16563, 32,
-                76511, 32, 196500, 453240, 220, 0, 1, 1, 69522, 11687, 0, 1, 60091, 32, 196500,
-                453240, 220, 0, 1, 1, 196500, 453240, 220, 0, 1, 1, 1159724, 392670, 0, 2, 806990,
-                30482, 4, 1927926, 82523, 4, 265318, 0, 4, 0, 85931, 32, 205665, 812, 1, 1, 41182,
-                32, 212342, 32, 31220, 32, 32696, 32, 43357, 32, 32247, 32, 38314, 32, 35892428,
-                10, 9462713, 1021, 10, 38887044, 32947, 10,
-            ]);
-        }
+        // The injection was invisible on the devnet only because
+        // `create-testnet-data` writes those exact 175 values into
+        // `extraConfig.costModels.PlutusV2`, so the wrong mechanism produced the
+        // right numbers there. On mainnet/preview/preprod there is no
+        // `extraConfig` at all, so cardano-node has NO PlutusV2 until a real PPU
+        // installs one, and dugite reported one it should not have had — a
+        // `costModels` wire divergence, and a latent
+        // accept-where-Haskell-rejects (a V2 script would EXECUTE on dugite and
+        // fail on cardano-node with `CollectErrors [NoCostModel PlutusV2]`).
 
         // Pool voting thresholds
         let pvt = &self.pool_voting_thresholds;
@@ -2343,5 +2425,137 @@ mod tests {
             "Preprod: zero_time must be 2022-06-21 00:00:00 UTC in ms"
         );
         assert_eq!(sc.slot_length, 1_000);
+    }
+
+    // ── #1046: cost models come from genesis fields / extraConfig / PPU ─────
+    //
+    // cardano-ledger has NO default PlutusV2. `alonzoInjectCostModels`
+    // (eras/alonzo/impl/src/Cardano/Ledger/Alonzo/Transition.hs) applies
+    // `agExtraConfig.aecCostModels` and nothing else:
+    //
+    //   alonzoInjectCostModels cfg =
+    //     case agExtraConfig $ cfg ^. tcTranslationContextL of
+    //       SNothing -> id
+    //       SJust aec -> overrideCostModels (aecCostModels aec)
+    //
+    //   overrideCostModels (Just cms) =
+    //     nesEsL . curPParamsEpochStateL . ppCostModelsL
+    //       %~ flip updateCostModels (CostModelsUpdate cms)
+    //
+    // Two properties under test: cur-only, and per-language update.
+
+    fn alonzo_genesis_json(extra_config: Option<&str>) -> String {
+        let extra = match extra_config {
+            Some(e) => format!(", \"extraConfig\": {e}"),
+            None => String::new(),
+        };
+        format!(
+            r#"{{
+              "lovelacePerUTxOWord": 34482,
+              "executionPrices": {{ "prSteps": {{"numerator":721,"denominator":10000000}},
+                                    "prMem": {{"numerator":577,"denominator":10000}} }},
+              "maxTxExUnits": {{ "exUnitsMem": 10000000, "exUnitsSteps": 10000000000 }},
+              "maxBlockExUnits": {{ "exUnitsMem": 50000000, "exUnitsSteps": 40000000000 }},
+              "maxValueSize": 5000,
+              "collateralPercentage": 150,
+              "maxCollateralInputs": 3,
+              "costModels": {{ "PlutusV1": [1, 2, 3] }}
+              {extra}
+            }}"#
+        )
+    }
+
+    /// A real-network shape (no `extraConfig`): PlutusV2 must stay ABSENT.
+    /// This is the #1046 regression — dugite used to inject a hardcoded
+    /// `defaultV2CostModel` here, giving it a cost model cardano-node does not
+    /// have. Reachable consequence: a V2 script would EXECUTE on dugite and fail
+    /// on cardano-node with `CollectErrors [NoCostModel PlutusV2]`.
+    #[test]
+    fn alonzo_genesis_without_extra_config_yields_no_plutus_v2() {
+        let g: AlonzoGenesis = serde_json::from_str(&alonzo_genesis_json(None)).unwrap();
+        assert!(
+            g.extra_config.is_none(),
+            "mainnet/preview/preprod alonzo-genesis has no extraConfig"
+        );
+
+        let mut params = ProtocolParameters::mainnet_defaults();
+        params.cost_models.plutus_v1 = None;
+        params.cost_models.plutus_v2 = None;
+        params.cost_models.plutus_v3 = None;
+
+        g.apply_to_protocol_params(&mut params);
+        g.apply_extra_config_cost_models(&mut params);
+
+        assert_eq!(params.cost_models.plutus_v1, Some(vec![1, 2, 3]));
+        assert_eq!(
+            params.cost_models.plutus_v2, None,
+            "no extraConfig ⇒ NO PlutusV2 cost model (#1046); cardano-ledger has \
+             no default and dugite must not invent one"
+        );
+    }
+
+    /// A `create-testnet-data` devnet shape: `extraConfig` supplies V1+V2, so
+    /// PlutusV2 IS present — and V1 is OVERRIDDEN, since `updateCostModels` is a
+    /// per-language update. This is what keeps devnet parity intact without the
+    /// hardcoded default (#994's stated fear).
+    #[test]
+    fn alonzo_genesis_extra_config_overrides_per_language() {
+        let g: AlonzoGenesis = serde_json::from_str(&alonzo_genesis_json(Some(
+            r#"{ "costModels": { "PlutusV1": [10, 20, 30], "PlutusV2": [40, 50] } }"#,
+        )))
+        .unwrap();
+
+        let mut params = ProtocolParameters::mainnet_defaults();
+        params.cost_models.plutus_v1 = None;
+        params.cost_models.plutus_v2 = None;
+        params.cost_models.plutus_v3 = None;
+
+        g.apply_to_protocol_params(&mut params);
+        // Stand in for the Conway genesis contributing its V3 field before the
+        // override runs — the override must not disturb it.
+        params.cost_models.plutus_v3 = Some(vec![7, 8, 9]);
+        g.apply_extra_config_cost_models(&mut params);
+
+        assert_eq!(
+            params.cost_models.plutus_v1,
+            Some(vec![10, 20, 30]),
+            "extraConfig OVERRIDES the era-translated V1"
+        );
+        assert_eq!(
+            params.cost_models.plutus_v2,
+            Some(vec![40, 50]),
+            "extraConfig supplies V2 — this is where the devnet's V2 comes from"
+        );
+        assert_eq!(
+            params.cost_models.plutus_v3,
+            Some(vec![7, 8, 9]),
+            "a language NOT named in extraConfig is retained (per-language update, \
+             not a wholesale replacement)"
+        );
+    }
+
+    /// The devnet's real generated genesis carries V2 in `extraConfig`, NOT in
+    /// the top-level `costModels`. Pinning the shape, because reading only the
+    /// top-level field is what made #994 conclude no genesis file supplied V2.
+    #[test]
+    fn devnet_style_extra_config_is_where_v2_actually_lives() {
+        let g: AlonzoGenesis = serde_json::from_str(&alonzo_genesis_json(Some(
+            r#"{ "costModels": { "PlutusV2": [99] } }"#,
+        )))
+        .unwrap();
+
+        assert!(
+            !g.cost_models.contains_key("PlutusV2"),
+            "top-level costModels has no V2 — that field is V1-only on every \
+             real alonzo-genesis"
+        );
+        assert_eq!(
+            g.extra_config
+                .as_ref()
+                .and_then(|e| e.cost_models.get("PlutusV2"))
+                .and_then(parse_cost_model),
+            Some(vec![99]),
+            "V2 lives in extraConfig.costModels"
+        );
     }
 }
