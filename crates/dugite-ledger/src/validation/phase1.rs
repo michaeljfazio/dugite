@@ -727,6 +727,28 @@ pub(super) fn run_phase1_rules(
 ) {
     let body = &tx.body;
 
+    // Did every input resolve to a UTxO?
+    //
+    // #1030 item 1: the precondition for the checks that need input VALUES
+    // (Rule 3 conservation) or input ADDRESSES (Rule 9b witness completeness).
+    // Those two used to be gated on `errors.is_empty()`, which conflated "this
+    // check cannot be computed" with "something else already went wrong" and so
+    // shortened the reported failure list on any multi-failure transaction.
+    // Haskell's `?!` never short-circuits, so all applicable failures reach
+    // MsgRejectTx.
+    //
+    // Deliberately NARROW: only the variants that mean a UTxO lookup did not
+    // produce an entry. `ValueNotConserved` is not here — it is a RESULT of this
+    // check, not a precondition for it.
+    fn inputs_resolved(errors: &[ValidationError]) -> bool {
+        !errors.iter().any(|e| {
+            matches!(
+                e,
+                ValidationError::NoInputs | ValidationError::InputNotFound(_)
+            )
+        })
+    }
+
     // ------------------------------------------------------------------
     // Rule 1: Must have at least one input
     // ------------------------------------------------------------------
@@ -1171,8 +1193,22 @@ pub(super) fn run_phase1_rules(
     // Rule 3: ADA value conservation
     // consumed = Σ(inputs) + Σ(withdrawals) + Σ(refunds)
     // produced = Σ(outputs) + fee + Σ(deposits) + proposal_deposits + donation
+    //
+    // #1030 item 1: gated on INPUT RESOLUTION, not on `errors.is_empty()`.
+    //
+    // Haskell's STS `?!` never short-circuits within a rule body, so every
+    // applicable predicate failure accumulates and all of them reach
+    // `MsgRejectTx`. An `errors.is_empty()` gate silently shortens that list:
+    // a `ProposalDepositIncorrect` raised immediately above — which has nothing
+    // to do with whether ADA conservation can be computed — used to suppress the
+    // conservation failure entirely. The verdict never diverged (both
+    // implementations reject), but a client parsing the reason saw fewer causes
+    // than cardano-node reports.
+    //
+    // What this check genuinely CANNOT be computed without is resolved inputs,
+    // so that — and only that — is the precondition now.
     // ------------------------------------------------------------------
-    if errors.is_empty() {
+    if inputs_resolved(errors) {
         let output_value: u128 = body.outputs.iter().map(|o| o.value.coin.0 as u128).sum();
         let withdrawal_value: u128 = body.withdrawals.values().map(|l| l.0 as u128).sum();
 
@@ -1704,8 +1740,13 @@ pub(super) fn run_phase1_rules(
 
     // ------------------------------------------------------------------
     // Rule 9b: Witness completeness
+    //
+    // #1030 item 1: gated on INPUT RESOLUTION, not `errors.is_empty()` — see
+    // Rule 3's note. Witness completeness needs each input's ADDRESS to know
+    // which key or script must have signed, so unresolved inputs genuinely make
+    // it uncomputable; an unrelated earlier failure does not.
     // ------------------------------------------------------------------
-    if errors.is_empty() {
+    if inputs_resolved(errors) {
         // Build the set of VKey witness key hashes (blake2b-224 of each vkey).
         //
         // D9 / audit #544: Only hash vkeys that are exactly 32 bytes.

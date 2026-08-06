@@ -950,6 +950,22 @@ pub(crate) fn convert_validation_error_at_pv(
             other => return convert_validation_error(other),
         }
     }
+    // #1058: the script-integrity-hash mismatch also splits at PV 11.
+    // `checkScriptIntegrityHash` chooses
+    //   pv < 11  -> PPViewHashesDontMatch mismatch                    (UTXOW 13)
+    //   pv >= 11 -> ScriptIntegrityHashMismatch mismatch preimage      (UTXOW 18)
+    // and the two differ in tag AND payload shape (13 flattens the Mismatch via
+    // ToGroup; 18 nests it and adds a third field). dugite emitted 13 at every
+    // PV, which is wrong on preview/PV11 — the #978 inversion.
+    if let VE::ScriptDataHashMismatch { expected, actual } = &e {
+        return TxValidationError::ScriptIntegrityHashMismatchUTXOW {
+            supplied: Some(actual.clone()),
+            expected: Some(expected.clone()),
+            // Haskell's `originalBytes <$> scriptIntegrity` — the preimage, not a
+            // hash. dugite's Phase-1 error carries only hashes, so SNothing.
+            expected_bytes: None,
+        };
+    }
     convert_validation_error(e)
 }
 

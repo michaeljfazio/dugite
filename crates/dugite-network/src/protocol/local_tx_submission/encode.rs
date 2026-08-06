@@ -414,23 +414,47 @@ fn encode_conway_ledger_pred_failure(enc: &mut Encoder<&mut Vec<u8>>, err: &TxVa
             );
         }
 
-        // Utxow tag 13: ScriptIntegrityHashMismatch (formerly PPViewHashesDontMatch pre-PV11) — [supplied_hash_or_null, expected_hash_or_null]
+        // Utxow tag 13: PPViewHashesDontMatch — the PV<=10 form (#1058).
+        //
+        //   PPViewHashesDontMatch mm -> Sum … 13 !> ToGroup mm
+        //
+        // `ToGroup` FLATTENS the Mismatch into the constructor array, so the two
+        // StrictMaybe values sit directly in it. The PV>=11 form is a different
+        // constructor with a different tag AND a third field — see
+        // `ScriptIntegrityHashMismatchUTXOW` above. `convert_validation_error_at_pv`
+        // chooses between them.
         TxValidationError::ScriptDataHashMismatch { expected, actual } => {
             encode_utxow_failure(enc, 13, |enc| {
-                // supplied (actual from tx) — StrictMaybe encoding
-                if let Some(hash_bytes) = parse_hex_bytes(actual) {
-                    enc.array(1).expect("infallible");
-                    enc.bytes(&hash_bytes).expect("infallible");
-                } else {
-                    enc.array(0).expect("infallible");
-                }
-                // expected (computed from script context) — StrictMaybe encoding
-                if let Some(hash_bytes) = parse_hex_bytes(expected) {
-                    enc.array(1).expect("infallible");
-                    enc.bytes(&hash_bytes).expect("infallible");
-                } else {
-                    enc.array(0).expect("infallible");
-                }
+                // supplied (declared in the tx body), then expected (recomputed).
+                encode_strict_maybe_bytes(enc, Some(actual.as_str()));
+                encode_strict_maybe_bytes(enc, Some(expected.as_str()));
+            });
+        }
+
+        // Utxow tag 18: ScriptIntegrityHashMismatch — the PV>=11 form (#1058).
+        //
+        //   ScriptIntegrityHashMismatch x y -> Sum … 18 !> To x !> To y
+        //
+        // `To x` puts the `Mismatch` in a NON-group position, so it uses its own
+        // `EncCBOR` and is a self-contained array(2) — the opposite of tag 13's
+        // `ToGroup mm`, which flattens the same Mismatch into the constructor
+        // array. Getting that distinction backwards is #1050's
+        // ProposalDepositIncorrect trap (a nested Mismatch where a flattened one
+        // was wanted produced `DeserialiseFailure … "expected word"`).
+        //
+        // `y :: StrictMaybe ByteString` is the script-integrity PREIMAGE.
+        TxValidationError::ScriptIntegrityHashMismatchUTXOW {
+            supplied,
+            expected,
+            expected_bytes,
+        } => {
+            encode_utxow_failure(enc, 18, |enc| {
+                // x: the Mismatch as a self-contained array(2).
+                enc.array(2).expect("infallible");
+                encode_strict_maybe_bytes(enc, supplied.as_deref());
+                encode_strict_maybe_bytes(enc, expected.as_deref());
+                // y: StrictMaybe ByteString.
+                encode_strict_maybe_bytes(enc, expected_bytes.as_deref());
             });
         }
 
@@ -1814,6 +1838,25 @@ fn parse_hex_bytes(s: &str) -> Option<Vec<u8>> {
         .step_by(2)
         .map(|i| u8::from_str_radix(&s[i..i + 2], 16).ok())
         .collect()
+}
+
+/// Encode a `StrictMaybe ByteString` from an optional hex string.
+///
+/// Haskell's `StrictMaybe` encodes as `array(0)` for `SNothing` and
+/// `array(1)[value]` for `SJust` — the shape used by every script-integrity and
+/// metadata-hash field. Unparseable hex is treated as `SNothing` rather than
+/// silently emitting a truncated byte string, so a malformed input cannot
+/// produce a frame that decodes to the wrong value (#1058).
+fn encode_strict_maybe_bytes(enc: &mut Encoder<&mut Vec<u8>>, hex: Option<&str>) {
+    match hex.and_then(parse_hex_bytes) {
+        Some(bytes) => {
+            enc.array(1).expect("infallible");
+            enc.bytes(&bytes).expect("infallible");
+        }
+        None => {
+            enc.array(0).expect("infallible");
+        }
+    }
 }
 
 /// Parse a hex string into exactly 28 raw bytes.
@@ -4312,6 +4355,107 @@ mod tests {
             "the GOV tag-1 payload must be byte-identical to the body encoder's output"
         );
         assert_eq!(&buf[..4], &[0x82, 0x03, 0x82, 0x01]);
+    }
+
+    // ── #1058: script-integrity-hash mismatch splits at PV 11 ──────────────
+    //
+    //   pv < 11  -> PPViewHashesDontMatch mismatch                 (UTXOW 13)
+    //   pv >= 11 -> ScriptIntegrityHashMismatch mismatch preimage   (UTXOW 18)
+    //
+    // and the encodings differ in shape, not just tag:
+    //   PPViewHashesDontMatch       mm  -> Sum … 13 !> ToGroup mm   (FLATTENED)
+    //   ScriptIntegrityHashMismatch x y -> Sum … 18 !> To x !> To y (NESTED + 3rd)
+    //
+    // dugite emitted 13 at every PV. preview runs PV11, so the reachable case was
+    // the wrong one — the #978 inversion.
+
+    /// PV<=10 form: tag 13 with the Mismatch FLATTENED into the constructor.
+    #[test]
+    fn script_integrity_pv10_is_tag_13_flattened() {
+        let err = TxValidationError::ScriptDataHashMismatch {
+            expected: "aa".repeat(32),
+            actual: "bb".repeat(32),
+        };
+        let mut buf = Vec::new();
+        let mut enc = Encoder::new(&mut buf);
+        encode_conway_ledger_pred_failure(&mut enc, &err);
+
+        // ConwayLedgerPredFailure array(2)[1, ConwayUtxowPredFailure]
+        assert_eq!(buf[0], 0x82);
+        assert_eq!(buf[1], 0x01, "Ledger tag 1 = ConwayUtxowFailure");
+        // UTXOW array(3)[13, supplied, expected] — flattened, so THREE elements.
+        assert_eq!(buf[2], 0x83, "ToGroup flattens the Mismatch: array(3)");
+        assert_eq!(buf[3], 0x0d, "UTXOW tag 13 (PPViewHashesDontMatch)");
+        // supplied = SJust bstr(32)
+        assert_eq!(buf[4], 0x81, "StrictMaybe SJust = array(1)");
+        assert_eq!(buf[5], 0x58);
+        assert_eq!(buf[6], 0x20, "bstr(32)");
+        assert_eq!(&buf[7..39], [0xbbu8; 32], "supplied comes FIRST");
+    }
+
+    /// PV>=11 form: tag 18, Mismatch NESTED as array(2), plus a third field.
+    #[test]
+    fn script_integrity_pv11_is_tag_18_nested_with_preimage_field() {
+        let err = TxValidationError::ScriptIntegrityHashMismatchUTXOW {
+            supplied: Some("bb".repeat(32)),
+            expected: Some("aa".repeat(32)),
+            expected_bytes: None,
+        };
+        let mut buf = Vec::new();
+        let mut enc = Encoder::new(&mut buf);
+        encode_conway_ledger_pred_failure(&mut enc, &err);
+
+        assert_eq!(buf[0], 0x82);
+        assert_eq!(buf[1], 0x01, "Ledger tag 1 = ConwayUtxowFailure");
+        assert_eq!(buf[2], 0x83, "UTXOW array(3)[18, mismatch, preimage]");
+        assert_eq!(buf[3], 0x12, "UTXOW tag 18 (ScriptIntegrityHashMismatch)");
+        assert_eq!(
+            buf[4], 0x82,
+            "`To x` NESTS the Mismatch as a self-contained array(2) — the opposite \
+             of tag 13's ToGroup flattening"
+        );
+        // supplied then expected inside the nested Mismatch.
+        assert_eq!(buf[5], 0x81);
+        assert_eq!(buf[6], 0x58);
+        assert_eq!(buf[7], 0x20);
+        assert_eq!(
+            &buf[8..40],
+            [0xbbu8; 32],
+            "supplied first inside the Mismatch"
+        );
+        // ... expected ...
+        assert_eq!(buf[40], 0x81);
+        assert_eq!(&buf[43..75], [0xaau8; 32], "expected second");
+        // third field: SNothing, since dugite has no preimage.
+        assert_eq!(buf[75], 0x80, "StrictMaybe ByteString SNothing = array(0)");
+    }
+
+    /// The two forms must be DISTINGUISHABLE on the wire. If they ever encode
+    /// identically the PV gate is pointless and #1058 has regressed.
+    #[test]
+    fn script_integrity_pv10_and_pv11_forms_differ() {
+        let pv10 = TxValidationError::ScriptDataHashMismatch {
+            expected: "aa".repeat(32),
+            actual: "bb".repeat(32),
+        };
+        let pv11 = TxValidationError::ScriptIntegrityHashMismatchUTXOW {
+            supplied: Some("bb".repeat(32)),
+            expected: Some("aa".repeat(32)),
+            expected_bytes: None,
+        };
+
+        let enc_one = |e: &TxValidationError| {
+            let mut b = Vec::new();
+            let mut x = Encoder::new(&mut b);
+            encode_conway_ledger_pred_failure(&mut x, e);
+            b
+        };
+
+        assert_ne!(
+            enc_one(&pv10),
+            enc_one(&pv11),
+            "the PV<=10 and PV>=11 script-integrity forms must differ on the wire"
+        );
     }
 
     // ── #1047: HardForkApplyTxErrWrongEra ─────────────────────────────────
