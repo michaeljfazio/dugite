@@ -136,6 +136,8 @@ pub enum QueryResult {
         committee: Box<CommitteeSnapshot>,
         /// `DState.dsGenDelegs` — real genesis delegations (#1027).
         gen_delegs: Vec<(Vec<u8>, Vec<u8>, Vec<u8>)>,
+        /// `EpochState.esNonMyopic` — real per-pool likelihoods + reward pot (#1067).
+        non_myopic: Box<NonMyopicSnapshot>,
     },
     /// DebugNewEpochState (tag 12): full Haskell-compatible NewEpochState.
     ///
@@ -176,6 +178,8 @@ pub enum QueryResult {
         committee: Box<CommitteeSnapshot>,
         /// See [`QueryResult::DebugEpochState::gen_delegs`].
         gen_delegs: Vec<(Vec<u8>, Vec<u8>, Vec<u8>)>,
+        /// See [`QueryResult::DebugEpochState::non_myopic`].
+        non_myopic: Box<NonMyopicSnapshot>,
     },
     /// DebugChainDepState (tag 13): consensus chain-dependent state.
     ///
@@ -434,6 +438,33 @@ pub struct SnapshotStakeData {
     pub stake_entries: Vec<(u8, Vec<u8>, u64, Vec<u8>)>,
     /// One `stakePoolsSnapShot` entry per pool in the snapshot.
     pub pool_entries: Vec<PoolSnapshotEntry>,
+}
+
+/// `EpochState.esNonMyopic` — the fourth field of `EpochState` (#1067).
+///
+/// ```haskell
+/// data NonMyopic = NonMyopic
+///   { likelihoodsNM :: !(VMap.VMap VMap.VB VMap.VB (KeyHash StakePool) Likelihood)
+///   , rewardPotNM :: !Coin }
+/// ```
+///
+/// Both fields were hardcoded (`array(2) [map(0), 0]`) until #1067. An empty
+/// `likelihoodsNM` is CORRECT until the go snapshot first carries pools — around
+/// epoch 3 on a fresh chain, and cardano-node itself reports `{}` before that —
+/// but `rewardPotNM` is non-zero from the very first RUPD, so the zero was
+/// unconditionally wrong and live-visible.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct NonMyopicSnapshot {
+    /// `likelihoodsNM`: (pool_id 28B, 100 `LogWeight`s).
+    ///
+    /// Held **sorted by pool id**. Upstream's `VMap` is key-ordered and its
+    /// CBOR map follows that order, so an unsorted vector here would encode a
+    /// map cardano-node never emits — and, because the source is a `HashMap`,
+    /// would differ between two runs of the same node on the same state.
+    pub likelihoods: Vec<(Vec<u8>, Vec<f32>)>,
+    /// `rewardPotNM` in lovelace: `_R = rPot - deltaT1`, the pot AFTER the
+    /// treasury cut.
+    pub reward_pot: u64,
 }
 
 /// One `stakePoolsSnapShot` entry — the per-pool aggregate a snapshot carries.
@@ -1155,6 +1186,14 @@ pub struct NodeStateSnapshot {
     /// content divergence — unlike `utxosUtxo`, which is empty upstream too
     /// because those queries are tagged `QFNoTables` (#1027).
     pub gen_delegs: Vec<(Vec<u8>, Vec<u8>, Vec<u8>)>,
+    /// `EpochState.esNonMyopic` — per-pool `Likelihood` history and the frozen
+    /// reward pot, read from the ledger's own persisted record (#1067).
+    ///
+    /// Cannot be derived here: the likelihoods are a decayed accumulator over
+    /// every past epoch and the pot is `_R` from a boundary whose inputs have
+    /// moved, so this snapshot copies what the ledger stored rather than
+    /// recomputing anything.
+    pub non_myopic: NonMyopicSnapshot,
     /// Constitution anchor URL
     pub constitution_url: String,
     /// Constitution anchor data hash
@@ -1287,6 +1326,7 @@ impl Default for NodeStateSnapshot {
             enacted_constitution: None,
             committee: CommitteeSnapshot::default(),
             gen_delegs: Vec::new(),
+            non_myopic: NonMyopicSnapshot::default(),
             constitution_url: String::new(),
             constitution_hash: vec![0u8; 32],
             constitution_script: None,

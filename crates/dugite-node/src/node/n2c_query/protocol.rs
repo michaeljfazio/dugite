@@ -398,7 +398,7 @@ pub(crate) fn handle_account_state(state: &NodeStateSnapshot) -> QueryResult {
 ///                       not independently track is structurally-correct
 ///                       but empty (see [`QueryResult::DebugEpochState`]).
 /// `SnapShots`         = `array(4)[mark, set, go, fee]` with real data
-/// `NonMyopic`         = `array(2)[likelihoods_map, reward_pot]`
+/// `NonMyopic`         = `array(2)[likelihoods_map, reward_pot]` with real data (#1067)
 ///
 /// Tools like db-analyser expect the EpochState structure at the top level of
 /// the result; the SnapShots field at position [2] is typically what callers
@@ -417,6 +417,7 @@ pub(crate) fn handle_debug_epoch_state(state: &NodeStateSnapshot) -> QueryResult
         dreps: state.drep_entries.clone(),
         committee: Box::new(state.committee.clone()),
         gen_delegs: state.gen_delegs.clone(),
+        non_myopic: Box::new(state.non_myopic.clone()),
     }
 }
 
@@ -463,6 +464,7 @@ pub(crate) fn handle_debug_new_epoch_state(state: &NodeStateSnapshot) -> QueryRe
         dreps: state.drep_entries.clone(),
         committee: Box::new(state.committee.clone()),
         gen_delegs: state.gen_delegs.clone(),
+        non_myopic: Box::new(state.non_myopic.clone()),
     }
 }
 
