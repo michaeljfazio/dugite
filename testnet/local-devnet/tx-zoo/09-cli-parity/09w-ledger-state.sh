@@ -34,20 +34,13 @@ QUERY_NAME="ledger-state"
 # Depth-limited key-path set. Full-depth paths include per-pool / per-credential
 # hashes, which differ between nodes by design; depth 4 keeps the record
 # structure (esLState/utxoState/ppups/currentPParams …) and drops the data.
-# The `.[-2] != "likelihoodsNM"` clause drops the CHILDREN of
-# `esNonMyopic.likelihoodsNM` — see #1067. dugite hardcodes that map empty because it does
-# not track per-pool `Likelihood` at all, so a real node lists one entry per pool and this
-# comparison fails on data dugite has no state for.
 #
-# DELIBERATELY NARROW, and it must stay that way:
-#   * the PARENT path is still required to exist and to be a map, so dropping the field
-#     entirely still fails;
-#   * every other path in `NewEpochState` is still compared strictly;
-#   * `ledger-state` is NOT in KNOWN_DIVERGENCES, which would have suppressed the whole
-#     query and masked any future unrelated regression in it.
-# Remove this clause the moment #1067 lands — it is scaffolding around a known gap, not a
-# statement that the field does not matter.
-PATHS_JQ='[paths | select(length <= 4) | select(all(.[]; type == "string")) | select((.[-2] // "") != "likelihoodsNM") | join(".")] | unique'
+# #1067 LANDED, so the `likelihoodsNM` exclusion that used to sit here is GONE.
+# dugite now tracks per-pool `Likelihood` and the frozen `rewardPotNM`, so
+# `esNonMyopic` is compared on the same strict footing as every other subtree —
+# which is the whole point of having removed the scaffolding rather than
+# widening it.
+PATHS_JQ='[paths | select(length <= 4) | select(all(.[]; type == "string")) | join(".")] | unique'
 
 if [ "${PARITY_MODE:-exact}" = "skip" ]; then
     parity_record "$QUERY_NAME" "SKIP" "skip" "skip" "skip-mode"
