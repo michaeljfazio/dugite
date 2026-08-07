@@ -416,15 +416,67 @@ pub struct PoolStakeSnapshotEntry {
 ///   - `stake_map`       — credential(29B) → lovelace
 ///   - `delegation_map`  — credential(29B) → pool_id(28B)
 ///   - `pool_params_map` — pool_id(28B)    → pool registration params
+///
+/// There is deliberately NO delegation map. `SnapShot` upstream is `array(2)`
+/// (stake, poolParams); the per-credential delegation map moved into `Accounts`.
+/// dugite used to carry one here and encode it as a third element, which made
+/// `query ledger-state` undecodable in its entirety — see `encode_snap_shot`.
 #[derive(Debug, Clone, Default)]
 pub struct SnapshotStakeData {
-    /// (credential_type_byte, credential_hash_28B, lovelace)
-    /// credential_type_byte: 0x00=KeyHash, 0x01=ScriptHash
-    pub stake_entries: Vec<(u8, Vec<u8>, u64)>,
-    /// (credential_type_byte, credential_hash_28B, pool_id_28B)
-    pub delegation_entries: Vec<(u8, Vec<u8>, Vec<u8>)>,
-    /// Pool params at snapshot time
-    pub pool_params: Vec<PoolParamsSnapshot>,
+    /// One `activeStake` entry per delegated credential:
+    /// (credential_type_byte, credential_hash_28B, stake_lovelace, delegated_pool_id_28B)
+    ///
+    /// credential_type_byte: 0x00=KeyHash, 0x01=ScriptHash.
+    ///
+    /// The delegated pool travels WITH the stake because upstream merged the two:
+    /// an entry is `[swdStake, swdDelegation]`, not a stake map plus a separate
+    /// delegation map. See `encode_snap_shot`.
+    pub stake_entries: Vec<(u8, Vec<u8>, u64, Vec<u8>)>,
+    /// One `stakePoolsSnapShot` entry per pool in the snapshot.
+    pub pool_entries: Vec<PoolSnapshotEntry>,
+}
+
+/// One `stakePoolsSnapShot` entry — the per-pool aggregate a snapshot carries.
+///
+/// This is NOT `PoolParams`. Upstream's snapshot stores a pre-aggregated record that
+/// combines the pool's registration with its snapshot-time stake, and dugite emitted
+/// `PoolParams` here instead, which is what made `query ledger-state` undecodable.
+///
+/// Field order and types were established by proxying the running cardano-node's own
+/// N2C socket and matching each CBOR position against the field NAMES in the JSON
+/// cardano-cli renders from the same reply — see `encode_snap_shot` for the table.
+#[derive(Debug, Clone, Default)]
+pub struct PoolSnapshotEntry {
+    /// Pool id (28B) — the map key.
+    pub pool_id: Vec<u8>,
+    /// `stake` — the pool's absolute delegated stake in this snapshot.
+    pub stake: u64,
+    /// `stakeRatio` numerator / denominator, in LOWEST TERMS.
+    ///
+    /// Haskell `Rational` is always normalised, so `pool_stake / total_active_stake`
+    /// must be reduced by their gcd: a live pool at 60% of 27001412116144820 encodes
+    /// as 4050148044961077/6750353029036205, not as the unreduced pair.
+    pub ratio_num: u64,
+    pub ratio_den: u64,
+    /// `selfDelegatedOwners` — pool owners that delegate to this very pool.
+    pub self_delegated_owners: Vec<Vec<u8>>,
+    /// `selfDelegatedOwnersStake` — their combined stake.
+    pub self_delegated_owners_stake: u64,
+    /// `vrf` (32B).
+    pub vrf_keyhash: Vec<u8>,
+    /// `pledge`.
+    pub pledge: u64,
+    /// `cost`.
+    pub cost: u64,
+    /// `margin` numerator / denominator, in LOWEST TERMS (a 0 margin is `0/1`).
+    pub margin_num: u64,
+    pub margin_den: u64,
+    /// `numDelegators` — how many credentials delegate to this pool.
+    pub num_delegators: u64,
+    /// `accountId`: whether the reward account's credential is a script hash.
+    pub account_is_script: bool,
+    /// `accountId`: the reward account's credential hash (28B).
+    pub account_hash28: Vec<u8>,
 }
 
 /// Pool relay snapshot for CBOR encoding
@@ -1123,6 +1175,10 @@ pub struct NodeStateSnapshot {
     pub snap_fee: u64,
     /// Per-pool block counts for the current epoch (pool_id → count)
     pub epoch_blocks_by_pool: Vec<(Vec<u8>, u64)>,
+    /// Per-pool blocks made in the PREVIOUS epoch (`nesBprev`, rendered by
+    /// cardano-cli as `blocksBefore`). Sourced from the mark snapshot, which is
+    /// captured at the boundary from the epoch that just ended.
+    pub prev_epoch_blocks_by_pool: Vec<(Vec<u8>, u64)>,
     /// Pool parameters for pool-params queries
     pub pool_params_entries: Vec<PoolParamsSnapshot>,
     /// Pending pool retirements: Map<pool_hash, EpochNo> (matching Haskell's psRetiring)
@@ -1241,6 +1297,7 @@ impl Default for NodeStateSnapshot {
             snap_go: SnapshotStakeData::default(),
             snap_fee: 0,
             epoch_blocks_by_pool: Vec::new(),
+            prev_epoch_blocks_by_pool: Vec::new(),
             pool_params_entries: Vec::new(),
             pending_retirements: Vec::new(),
             pool_deposit: 500_000_000,
@@ -1417,8 +1474,7 @@ mod tests {
 
         let ssd = SnapshotStakeData::default();
         assert!(ssd.stake_entries.is_empty());
-        assert!(ssd.delegation_entries.is_empty());
-        assert!(ssd.pool_params.is_empty());
+        assert!(ssd.pool_entries.is_empty());
 
         let gs = GovStateSnapshot::default();
         assert!(gs.proposals.is_empty());

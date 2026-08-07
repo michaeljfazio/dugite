@@ -51,7 +51,31 @@ xv_submit_dugite() {
             --socket-path   "$SUBMIT_SOCK" \
             --tx-file       "$signed" 2>&1) && rc=0 || rc=$?
     if [ "$rc" -ne 0 ]; then
+        # ASK THE ORACLE THE SAME QUESTION before blaming dugite.
+        #
+        # A rejection here is ambiguous on its own: the tx may be genuinely invalid
+        # (cardano-cli's `transaction build` estimates the fee, and an estimate that
+        # comes up short is the HARNESS underpaying, not a node defect), or dugite may
+        # be rejecting something valid. The only thing that separates those is whether
+        # cardano-node rejects the identical bytes — the same "both-sides failure is a
+        # harness bug" rule the cli-parity suite already enforces, which four phantom
+        # dugite gaps in #900 were filed for want of.
+        #
+        # Submitting to a second node is safe: a tx accepted by one propagates to the
+        # other anyway, and one that is invalid is inert everywhere.
+        local cn_out cn_rc verdict
+        cn_out=$(cardano-cli conway transaction submit \
+                    --testnet-magic "$LD_MAGIC" \
+                    --socket-path   "$OBSERVE_SOCK" \
+                    --tx-file       "$signed" 2>&1) && cn_rc=0 || cn_rc=$?
+        if [ "$cn_rc" -ne 0 ]; then
+            verdict="HARNESS: cardano-node rejected the SAME bytes too — the tx is invalid as built, not a dugite defect. cardano-node said: $(printf '%s' "$cn_out" | tr '\n' ' ' | cut -c1-240)"
+        else
+            verdict="DUGITE DEFECT: cardano-node ACCEPTED the same bytes that dugite rejected"
+        fi
         zoo_fail "dugite-cli submit failed ($txid): $out"
+        zoo_info "cross-check -> $verdict"
+        printf '%s\n' "$verdict" > "$XV_LOGS/$(basename "$signed" .signed)-submit-crosscheck.txt" 2>/dev/null
         return 1
     fi
     echo "$txid"
