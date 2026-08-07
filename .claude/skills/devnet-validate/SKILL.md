@@ -265,10 +265,16 @@ Goal: catch bugs that only manifest at epoch transitions — RUPD, snapshot rota
 
 ```bash
 cd testnet/local-devnet
+. ./lib/common.sh                   # exports LD_EVIDENCE, sockets, LD_MAGIC
 ./setup.sh
 ./run.sh
 sleep 30
 ./tx-zoo/run-all.sh --setup
+
+# PIN ONE EVIDENCE DIRECTORY FOR THE ROUND, for the same reason Round 1 does — and
+# here it is load-bearing rather than tidy: the two parity samplers and `soak.sh`
+# must land in the SAME directory or the preset manifest cannot see them together.
+EVD="$LD_EVIDENCE/round2-$(date -u +%Y%m%dT%H%M%SZ)"; mkdir -p "$EVD"
 
 # Submit a constant tx trickle so the boundaries fire under load (and produce fees)
 ( while true; do
@@ -283,8 +289,18 @@ TRICKLE=$!
 # be sampled continuously. A one-shot `09k-gov-state` lands in that window ~1%
 # of the time and `NoPParamsUpdate` is correct for the rest, which is why the
 # hardcoded value in #977 survived every previous release gate.
+#
+# PIN THE ROUND'S OWN EVIDENCE DIRECTORY. These two samplers previously wrote to
+# `$LD_EVIDENCE/current/`, which is not where anything reads them from: the standard
+# preset manifest requires `futurepparams-parity.csv` / `ratify-state-parity.csv`
+# inside a ROUND's evidence directory, and `setup.sh` archives `evidence/*` away
+# before the next round. So both suites ran, passed, and reported real numbers while
+# `generate-release-report.sh` said "absent in EVERY round" — a strict report is then
+# impossible and the only way forward looks like `--no-strict`, which marks the whole
+# gate inadmissible. Evidence produced where the gate does not look is the #953
+# family: it reads identically to a suite that never ran.
 ../../.claude/skills/devnet-validate/scripts/futurepparams-boundary-parity.sh \
-    --seconds 900 --out "$LD_EVIDENCE/current/futurepparams-parity.csv" &
+    --seconds 900 --out "$EVD/futurepparams-parity.csv" &
 FPP=$!
 
 # Frozen-DRep-pulser parity (#988/#990/#991/#992), same reasoning and same
@@ -295,7 +311,7 @@ FPP=$!
 # has NO other external symptom, because `GetDRepStakeDistr` serves the
 # distribution itself, which was never doubled.
 ../../.claude/skills/devnet-validate/scripts/ratify-state-parity.sh \
-    --seconds 900 --out "$LD_EVIDENCE/current/ratify-state-parity.csv" &
+    --seconds 900 --out "$EVD/ratify-state-parity.csv" &
 RSP=$!
 
 # The gov lifecycle must run DURING this round, or the sampler above sees an
@@ -318,7 +334,7 @@ RSP=$!
 ( ./tx-zoo/run-all.sh 04-stake 05-governance-certs 10-gov-lifecycle >/dev/null 2>&1 ) &
 GOV=$!
 
-./soak.sh 900                       # 15 min — covers boundaries 0→1 AND 1→2 (first RUPD)
+EVIDENCE_DIR="$EVD" ./soak.sh 900   # 15 min — covers boundaries 0→1 AND 1→2 (first RUPD)
 kill $TRICKLE 2>/dev/null
 wait $GOV 2>/dev/null
 wait $FPP; FPP_RC=$?
