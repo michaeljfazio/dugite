@@ -101,7 +101,170 @@ dugite-lsm (LSM-tree on-disk storage for UTxO-HD)
 - 28-byte hash types (DRep keys, pool voter keys, required signers) must be padded to 32 bytes via `Hash28::to_hash32_padded()` — do not use `Hash<32>::from()` directly on 28-byte hashes
 
 ## Current Focus
-**v2.7.1 (2026-08-07) — the #1057 P0, plus four `query ledger-state` wire defects.**
+**v2.8.0 (2026-08-08) — the NonMyopic record becomes real.**
+**RE-SYNC RELEASE: SNAPSHOT_VERSION 37 -> 38**, so existing DBs replay chunks on
+first restart. Closes **#1067**. Open: #1068, **#1070**, **#1071** (both found by
+this release's own gate), #1008, and the Dijkstra set.
+
+### #1067 — both halves of `NonMyopic` were invented, not just the named one
+
+dugite emitted `array(2) [map(0), 0]` and tracked per-pool `Likelihood` nowhere.
+The issue title names `likelihoodsNM`, but an EMPTY map is CORRECT until the go
+snapshot first carries pools — cardano-node itself reports `{}` at epoch 2. The
+unconditionally-wrong field was the other one: **`rewardPotNM`**, non-zero from
+the first RUPD onward and live-visible the whole time.
+
+`newLikelihoods` is now built inside `compute_reward_update` (mirroring Haskell
+building it inside `startStep`) and folded through `updateNonMyopic` on the way
+out as `RewardUpdate.nonMyopic`, which `applyRUpd` installs as the new
+`esNonMyopic`.
+
+**Five things decide byte-exactness, and only three were written down before.**
+
+1. `l x = n * log x + m * log (1 - t*x)`, `m = slotsPerEpoch - blocks`. NOT
+   `n * log (x*t)` — which is what dugite's own notes said.
+2. Precision is mixed on purpose: `l x` in f64, `realToFrac` narrows ONCE to
+   f32, then decay-multiply / zip-add / min-subtract all stay f32.
+3. `<>` normalises, so `mempty <> newPerf` min-subtracts even a pool's FIRST
+   epoch. The raw likelihood is never what gets stored.
+4. `sigma` is the UNCAPPED relative stake over `totalStake` (circulating
+   supply) — not `min sigma z0`, and not over `totalActiveStake`, which is
+   `sigmaA` and belongs to `mkApparentPerformance` alone.
+5. **`realToFrac` on a `Rational` rounds the exact ratio ONCE.** mainnet
+   `totalStake` (~3.7e16) exceeds 2^53, so `num as f64 / den as f64` rounds
+   twice and lands a ulp out. This one was not on anybody's list.
+
+**The trap that cannot be tested end-to-end.** The wrong `n*log(x*t)` differs
+from the correct formula by `n*log t` — a CONSTANT in `x`. `normalizeLikelihood`
+subtracts the minimum, so a constant offset cancels at every step, including
+across decayed history. Measured end-to-end the two formulas agree to within one
+f32 ulp (3.8e-06 after one epoch, 1.5e-05 after two). **A tolerance-based test on
+the stored value passes under the bug.** The assertion has to sit on the RAW
+likelihood, where they differ by ~30. This is the mirror image of
+[[feedback_red_proven_unit_test_bounds_the_function_not_the_system]]: sometimes
+the unit test is the only thing that CAN go red.
+
+`allPoolInfo` covers EVERY pool in the go snapshot's pool set. The
+reward-distribution loop `continue`s past zero-block and pledge-unmet pools, so
+the likelihood set is built by its own iteration — piggy-backing it onto that
+loop would silently drop exactly the pools the `Left` branch exists to serve.
+And `updateNonMyopic` maps over `newLikelihoods`, so a pool absent this epoch is
+DROPPED, not carried forward decayed.
+
+**Scope was wider than the issue twice over.** There were **two** hardcoded
+encoder sites — `encode_debug_epoch_state` (tag 8) as well as tag 12 — so fixing
+the named one would have left the other lying. And the Mithril ancillary import
+`skip_cbor_value`'d the record entirely, so every mainnet/preview/preprod
+bootstrap started with no history and converged over ~20 epochs while looking
+authoritative. Both fixed.
+
+**The wire shape is pinned to a capture, and the capture is reproducible.**
+`cargo run -p dugite-network --example capture_non_myopic -- <sock> <magic>`,
+run at epoch 3 or later — capturing earlier returns `a0` and would "confirm" the
+hardcoded empty map by accident. Two of the three framing decisions are what
+reading `deriving EncCBOR` gets wrong: the map is DEFINITE (2 <= 23) while each
+100-element `Likelihood` is INDEFINITE (100 > 23, #938), and every `LogWeight`
+is `0xfa` float32 at every magnitude. `likelihoods` is held sorted by pool id
+because upstream's `VMap` is key-ordered and dugite's source is a `HashMap` —
+without the sort the same node emits different bytes for the same state on
+consecutive runs.
+
+**cardano-cli's JSON renders `exp(LogWeight)`** — it shows `1`, `1.4e305` and
+`+inf` for an f32 field. Use it to decide WHEN to capture, never to check WHAT
+was captured.
+
+Live proof, epoch 3 devnet: the whole `esNonMyopic` record — all 100 log-weights
+for both pools plus `rewardPotNM` — is byte-identical to cardano-node's, and
+`09w-ledger-state` compares 48 key paths identical with the `likelihoodsNM`
+exclusion REMOVED.
+
+### #1071 — `nesRu` is hardcoded SNothing, and every prior gate passed by luck
+
+Found BY this release's gate. `NewEpochState[4]` is `enc.array(0)`, while
+cardano-node populates the pending `RewardUpdate` from `4k/f` into each epoch
+until the boundary — **80 of 400 slots on the devnet, 20% of the time**. A
+one-shot `09w-ledger-state` therefore diverges ~1 run in 5; v2.7.1 recorded
+`ledger-state` as `23 equal / 0 divergent` because it sampled outside the
+window.
+
+**This is #977's `futurePParams` shape**: the interesting state is an epoch
+PHASE, so a point sample almost always observes the boring value and reports
+agreement. The root cause is architectural, not a missing encoder arm — dugite
+has **no RUPD pulser**; it computes the reward update inline at the boundary, and
+`pending_reward_update` is `take()`n at two sites while nothing ever writes it.
+So `array(0)` faithfully renders dugite's state; the state is what differs.
+
+Not attempted here: a pulser means deciding byte-exactly WHEN reward inputs
+freeze, which is the surface #966/#988/#949/#991 kept finding consensus bugs in,
+plus another SNAPSHOT bump. `09w` carries a narrow `possibleRewardUpdate`
+children exclusion citing it — parent still required, everything else strict,
+`ledger-state` still OUT of `KNOWN_DIVERGENCES`.
+
+### #1070 — `dugite-cli query ledger-state` queries the wrong tag
+
+`N2CClient::query_ledger_state()` sends Shelley tag 4, which is
+`GetProposedPParamsUpdates`. Against a real cardano-node it returns four bytes,
+`82 04 81 a0`. The query carrying `NewEpochState` is tag 12, added as
+`query_debug_new_epoch_state` for the capture tool. Node-side dispatch was
+always correct, and `09-cli-parity` runs `cardano-cli` against both sockets so
+it structurally cannot see this. Not fixed in-release: it changes a user-visible
+CLI surface and wants its own round.
+
+### QA — v2.8.0 (SHIPPED)
+
+devnet-validate standard preset, **4/4 rounds PASS**
+(`reports/devnet-validate/v2.8.0.json`) vs cardano-node 11.0.1, strict,
+`gate_integrity.admissible = true`, zero missing evidence.
+
+- 623 canonical blocks, 0 invalid forges, 0 critical anomalies, **0 ERROR lines
+  on any node in any round**
+- tx-zoo 154 scripts: 151 pass / **0 fail** / 3 state-skip / 0 ENV-SKIP
+- bidirectional parity **99/99, 0 OFFDIAG, 0 CLASSDIFF**
+- cli-parity 23 EQUAL / **0 DIVERGENT** / 26-26; adversarial N2N 26/26;
+  UTxO RPC 27/27; chaos 5 rows / 0 FAIL / 0 ENV_SKIP
+- tip-parity **100% in all four rounds** (24/24, 24/24, 176/176, 12/12)
+- treasury+reserves **byte-exact** vs cardano-node after the RUPD boundary
+- futurePParams 489 compared / 0 diffs; ratify-state 489 compared / 0 diffs /
+  1 `PLAN_APPLIED` — both reached their non-vacuous condition
+
+**The two tx-zoo failures were VERIFIED, not pattern-matched.** Both are
+`01a-simple-pay` from Round 2's 20-second trickle racing itself on one address —
+the same count and script as previous releases, which is exactly what makes it
+easy to wave a real one through. The two have DIFFERENT reasons (`Input
+conflict: input already claimed by mempool tx` and `InputNotFound`), one cause
+seen at two moments: a competitor still in the mempool versus one already in a
+block. The decisive evidence is p3 — **29 txs, 24 accepted / 5 rejected, all
+three nodes agreeing**. A dugite defect appears as disagreement, never as a
+shared verdict.
+
+**Preprod soak, 60 min.** The 37 -> 38 re-sync quarantined the existing
+snapshot as `.v37-unreadable` and rebuilt the ledger by chunk replay at
+65-81k blk/s, reaching tip at `delta=0` vs Koios. `esNonMyopic` at real scale:
+**546 pools, every Likelihood exactly 100 long**, `rewardPotNM`
+28118802294396. The 8-pool gap against the *post-rotation* `go` snapshot is the
+rotation itself — `compute_reward_update` runs BEFORE SNAP (`conway.rs:630` vs
+`:729`), so the stored likelihoods come from the pre-rotation `go`, which held
+exactly 546. Zero pools appear in `likelihoodsNM` that are absent from `go`.
+
+**Two harness defects, both mine, both the family the gate exists to catch.**
+Round scripts relaxed `errexit` BEFORE sourcing `lib/common.sh`, which
+re-enables it (#1044's trap), so a round aborted at its first non-zero exit
+instead of running its remaining suites. And the Round 2 samplers wrote to
+`evidence/current/` rather than the round's pinned directory — making their
+CSVs indistinguishable from suites that never ran. **The generator caught that
+one and refused to report a PASS (exit 3)**, which is the check working; the
+artifacts were relocated into the round that produced them rather than waved
+through with `--no-strict`.
+
+**Coverage gap named rather than papered over**: the devnet gate never
+round-trips a NON-EMPTY `non_myopic` through a snapshot save/load, because the
+rounds with real likelihoods (1, 2) never restart and the restart round (3) is
+pre-RUPD. Layout is covered by `snapshot_format_hash_stability` +
+`fixture_populates_every_snapshot_field`; the live path is covered by the
+preprod restart check.
+
+### Superseded: v2.7.1 (2026-08-07) — the #1057 P0, plus four `query ledger-state` wire defects.
+
 Drop-in from v2.7.0, **SNAPSHOT unchanged at 37**, so no re-sync.
 
 **#1057 is CLOSED** — the P0 that stranded a block producer. It needed **THREE**
@@ -129,7 +292,7 @@ socket and is now pinned to those bytes —
 `snap_shot_bytes_match_a_cardano_node_11_0_1_capture`. See
 [[reference_running_node_is_the_wire_oracle]] for the method and its two traps.
 
-**Open, and one of them is `reachable:live`:**
+**Open at the time (superseded — see Current Focus above):**
 - **#1067** (`reachable:live`) — `NonMyopic.likelihoodsNM` is hardcoded EMPTY and
   dugite tracks per-pool `Likelihood` nowhere (8 mentions in the tree, all
   comments or the two hardcoded encoder lines). NOT consensus: it feeds the
