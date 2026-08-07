@@ -39,6 +39,34 @@ pub struct HaskellNewEpochState {
     pub gov_state: HaskellGovState,
     /// Instant stake: credential → lovelace (reconstructed from DState + PState).
     pub instant_stake: HashMap<(u8, Hash28), u64>,
+    /// `EpochState.esNonMyopic` — per-pool `Likelihood` history and the frozen
+    /// reward pot.
+    ///
+    /// Decoded rather than skipped because `mithril-import` is the bootstrap
+    /// path for mainnet/preview/preprod, and the likelihoods are a 0.9-decayed
+    /// accumulator over every past epoch: a node that discards them starts from
+    /// nothing and reports converging-but-wrong values for ~20 epochs, with no
+    /// way to tell that it is wrong.
+    pub non_myopic: HaskellNonMyopic,
+}
+
+/// `NonMyopic` as it appears in a Haskell ledger snapshot.
+///
+/// ```haskell
+/// data NonMyopic = NonMyopic
+///   { likelihoodsNM :: !(VMap.VMap VMap.VB VMap.VB (KeyHash StakePool) Likelihood)
+///   , rewardPotNM :: !Coin }
+/// ```
+///
+/// The log-weights stay as raw `f32` here — this crate decodes the wire shape
+/// and does not own the `Likelihood` semantics (decay, combine, normalise),
+/// which live in `dugite-ledger`.
+#[derive(Debug, Default, Clone, PartialEq)]
+pub struct HaskellNonMyopic {
+    /// pool id → 100 `LogWeight`s.
+    pub likelihoods: HashMap<Hash28, Vec<f32>>,
+    /// `rewardPotNM` in lovelace.
+    pub reward_pot: u64,
 }
 
 /// PraosState from the HeaderState telescope.

@@ -1192,3 +1192,110 @@ fn decode_state_file_preprod_haskell_snapshot_regression_504() {
          (regression for #504: PoolParams ≠ StakePoolState)",
     );
 }
+
+// ── NonMyopic (#1067) ──────────────────────────────────────────────────────────
+
+/// The same cardano-node 11.0.1 capture the encoder fixture pins, decoded from
+/// the other direction.
+///
+/// The Mithril ancillary import used to `skip_cbor_value` this field, so a
+/// mithril-bootstrapped node started with no likelihood history at all and took
+/// ~20 epochs of 0.9-decay to converge — reporting plausible-but-wrong rankings
+/// the whole time with nothing to signal it.
+const NON_MYOPIC_CAPTURE: &str = concat!(
+    "82a2581c55cf8ff54601445d6cfde29af421492606909808d27f7fa2907b7b399ffa00000000fa43",
+    "548690fa439b826cfa43bbd7cafa43d3ea4afa43e712f8fa43f6f8a6fa440245a5fa44083022fa44",
+    "0d6d73fa4412204ffa441661eafa441a452afa441dd892fa4421278afa44243b31fa44271aeffa44",
+    "29ccdcfa442c560efa442ebacafa4430feb4fa443324e9fa4435301afa4437229cfa4438fe7cfa44",
+    "3ac587fa443c7954fa443e1b4efa443facb8fa44412eb4fa4442a246fa4444085bfa444561c8fa44",
+    "46af4ffa4447f1a1fa4449295ffa444a571efa444b7b66fa444c96b5fa444da97efa444eb42cfa44",
+    "4fb722fa4450b2bdfa4451a752fa44529530fa44537ca2fa44545deffa44553956fa44560f16fa44",
+    "56df66fa4457aa7dfa4458708efa445931c8fa4459ee58fa445aa669fa445b5a22fa445c09aafa44",
+    "5cb525fa445d5cb4fa445e0078fa445ea090fa445f3d19fa445fd62efa44606beafa4460fe66fa44",
+    "618dbafa446219fcfa4462a343fa446329a3fa4463ad31fa44642dfefa4464ac1ffa446527a3fa44",
+    "65a09bfa44661719fa44668b2afa4466fcdefa44676c42fa4467d965fa44684453fa4468ad19fa44",
+    "6913c3fa4469785cfa4469daf0fa446a3b8afa446a9a33fa446af6f6fa446b51dcfa446baaeefa44",
+    "6c0236fa446c57bcfa446cab88fa446cfda2fa446d4e13fa446d9ce1fa446dea13fa446e35b2fa44",
+    "6e7fc2fa446ec84cfa446f0f55ff581caf8ada6478a95a98d2e4329b93d1d3905bfd4eab9a28834c",
+    "51e833659ffa00000000fa00000000fa00000000fa00000000fa00000000fa00000000fa00000000",
+    "fa00000000fa00000000fa00000000fa00000000fa00000000fa00000000fa00000000fa00000000",
+    "fa00000000fa00000000fa00000000fa00000000fa00000000fa00000000fa00000000fa00000000",
+    "fa00000000fa00000000fa00000000fa00000000fa00000000fa00000000fa00000000fa00000000",
+    "fa00000000fa00000000fa00000000fa00000000fa00000000fa00000000fa00000000fa00000000",
+    "fa00000000fa00000000fa00000000fa00000000fa00000000fa00000000fa00000000fa00000000",
+    "fa00000000fa00000000fa00000000fa00000000fa00000000fa00000000fa00000000fa00000000",
+    "fa00000000fa00000000fa00000000fa00000000fa00000000fa00000000fa00000000fa00000000",
+    "fa00000000fa00000000fa00000000fa00000000fa00000000fa00000000fa00000000fa00000000",
+    "fa00000000fa00000000fa00000000fa00000000fa00000000fa00000000fa00000000fa00000000",
+    "fa00000000fa00000000fa00000000fa00000000fa00000000fa00000000fa00000000fa00000000",
+    "fa00000000fa00000000fa00000000fa00000000fa00000000fa00000000fa00000000fa00000000",
+    "fa00000000fa00000000fa00000000fa00000000fa00000000ff1b00000cb24d4afced",
+);
+
+#[test]
+fn decode_nonmyopic_matches_the_cardano_node_capture() {
+    let data = hex::decode(NON_MYOPIC_CAPTURE).unwrap();
+    let (nm, consumed) = super::decode_nonmyopic(&data).unwrap();
+
+    assert_eq!(consumed, data.len(), "must consume the whole record");
+    assert_eq!(nm.likelihoods.len(), 2);
+    assert_eq!(nm.reward_pot, 13_959_940_472_045);
+
+    let pool_a = dugite_primitives::hash::Hash28::from_bytes(
+        hex::decode("55cf8ff54601445d6cfde29af421492606909808d27f7fa2907b7b39")
+            .unwrap()
+            .try_into()
+            .unwrap(),
+    );
+    let pool_b = dugite_primitives::hash::Hash28::from_bytes(
+        hex::decode("af8ada6478a95a98d2e4329b93d1d3905bfd4eab9a28834c51e83365")
+            .unwrap()
+            .try_into()
+            .unwrap(),
+    );
+
+    let a = &nm.likelihoods[&pool_a];
+    assert_eq!(a.len(), super::LIKELIHOOD_SAMPLE_SIZE);
+    // Normalised: the minimum log-weight is exactly 0.
+    assert_eq!(a[0], 0.0f32);
+    assert_eq!(a[1], 212.525_63f32);
+    assert_eq!(a[99], 956.239_56f32);
+
+    // A zero-stake pool: t = 0 ⇒ every log-weight is exactly 0.
+    let b = &nm.likelihoods[&pool_b];
+    assert_eq!(b.len(), super::LIKELIHOOD_SAMPLE_SIZE);
+    assert!(b.iter().all(|&w| w == 0.0));
+}
+
+/// A `Likelihood` of the wrong length is REJECTED, not padded or truncated.
+///
+/// It is a decayed accumulator no later computation can repair, so a
+/// wrong-length one means the upstream format moved — and silently accepting it
+/// would hand the ledger a record cardano-node could never have produced.
+#[test]
+fn decode_nonmyopic_rejects_a_short_likelihood() {
+    // array(2) [ map(1) { bstr(28) => 9f fa.. fa.. ff }, 0 ]
+    let mut v = vec![0x82, 0xa1, 0x58, 0x1c];
+    v.extend_from_slice(&[0xAAu8; 28]);
+    v.push(0x9f);
+    for _ in 0..3 {
+        v.extend_from_slice(&[0xfa, 0, 0, 0, 0]);
+    }
+    v.push(0xff);
+    v.push(0x00);
+
+    let err = super::decode_nonmyopic(&v).unwrap_err().to_string();
+    assert!(err.contains("100"), "unexpected error: {err}");
+}
+
+/// Half (`0xf9`) and double (`0xfb`) floats are rejected — `EncCBOR Float` is
+/// `encodeFloat`, which emits `0xfa` unconditionally, so anything else means
+/// the format changed rather than that a value happened to be small.
+#[test]
+fn decode_float32_is_strict_about_the_major_type() {
+    assert!(decode_float32(&[0xfa, 0x00, 0x00, 0x00, 0x00]).is_ok());
+    assert!(decode_float32(&[0xf9, 0x00, 0x00]).is_err());
+    assert!(decode_float32(&[0xfb, 0, 0, 0, 0, 0, 0, 0, 0]).is_err());
+    // truncated
+    assert!(decode_float32(&[0xfa, 0x00]).is_err());
+}
