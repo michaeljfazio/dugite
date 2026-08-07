@@ -22,11 +22,48 @@ for sock in "$LD_RELAY_SOCK" "$LD_DUGITE_BP_SOCK" "$LD_CARDANO_BP_SOCK"; do
         || die "Tip query failed on $sock"
 done
 
+# ── PRE-SOAK CONVERGENCE GATE (p4 depends on it) ─────────────────────────────
+#
+# p4 scores EXACT tip parity across relay, dugite-bp and cardano-bp on >=95% of ticks.
+# Starting a soak straight after a deliberate disruption — the chaos suite's SIGKILL, or a
+# restart round's outage — therefore measures RECONVERGENCE, and the early ticks fail the
+# predicate on noise rather than on any node defect. Measured on two consecutive gate runs:
+# 19/24 = 79% and 20/24 = 83%, with every tick from the fifth on in parity and recovery
+# taking about twenty seconds.
+#
+# THIS LIVES HERE, NOT IN THE CALLER. It was first added only to an out-of-tree gate
+# driver, which meant the assertion existed and never executed for anyone else — the
+# `ALL_CATEGORIES` failure mode (#969) that this project keeps re-documenting. A discipline
+# that depends on remembering to invoke it is not a gate.
+#
+# It is an ADDED ASSERTION, NOT A RELAXED PREDICATE: the 95% floor is untouched, and a
+# devnet that cannot converge now fails HERE, loudly, quoting the values it last saw,
+# instead of producing a soak whose result says nothing about steady state. The elapsed
+# wait is recorded as evidence so a slow creep in convergence time stays visible rather
+# than being absorbed silently.
+#
+# SOAK_SKIP_PARITY_GATE=1 opts out for a deliberate divergence experiment (e.g. the
+# genesis-fork round, where non-parity IS the subject). Any such run is marked in the
+# metadata below so a report cannot silently claim a gated soak.
+PARITY_GATE_WAITED="skipped"
+if [ "${SOAK_SKIP_PARITY_GATE:-0}" != "1" ]; then
+    _pg_start=$(date +%s)
+    if ! "$SCRIPT_DIR/wait-tip-parity.sh" --label "pre-soak" \
+            --timeout-seconds "${SOAK_PARITY_TIMEOUT:-180}"; then
+        die "observers are not in tip parity — refusing to soak, because p4 would score \
+reconvergence rather than steady state. Investigate the disagreement above first, or set \
+SOAK_SKIP_PARITY_GATE=1 if non-parity is deliberately the subject of this run."
+    fi
+    PARITY_GATE_WAITED=$(( $(date +%s) - _pg_start ))
+    log_info "pre-soak parity reached after ${PARITY_GATE_WAITED}s"
+fi
+
 # Metadata snapshot
 cat > "$EVD/metadata.json" <<EOF
 {
   "timestamp": "$TS",
   "duration_seconds": $DURATION,
+  "pre_soak_parity_gate": "$PARITY_GATE_WAITED",
   "magic": $LD_MAGIC,
   "ports": { "relay": $LD_RELAY_PORT, "dugite_bp": $LD_DUGITE_BP_PORT, "cardano_bp": $LD_CARDANO_BP_PORT },
   "cardano_node_version": "$(cardano-node --version | awk 'NR==1 {print $2}')",

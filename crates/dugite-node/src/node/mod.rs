@@ -1084,10 +1084,27 @@ impl Node {
     ///
     /// Kept as a free-standing predicate so both bounds are unit-testable without a
     /// ChainDB, a snapshot file, or a running node.
-    fn snapshot_is_a_valid_anchor(immutable_db_is_empty: bool, snapshot_slot: u64) -> bool {
-        // A genesis-slot snapshot IS the genesis anchor, so it is always fine; the
-        // non-empty case keeps dugite's existing behaviour untouched.
-        !immutable_db_is_empty || snapshot_slot == 0
+    fn snapshot_is_a_valid_anchor(immutable_db_is_empty: bool, snapshot_slot: Option<u64>) -> bool {
+        if !immutable_db_is_empty {
+            // Anything flushed: dugite's existing behaviour is untouched.
+            return true;
+        }
+        match snapshot_slot {
+            // FAIL CLOSED on an unreadable slot. This took `u64` with
+            // `peek_snapshot_slot(..).unwrap_or(0)` at the call site, so a snapshot whose
+            // slot could not be read was treated as slot 0 — i.e. as a valid GENESIS
+            // anchor — which is the one answer that skips the replay this guard exists to
+            // force. Rejecting costs a replay bounded by k; accepting risks coming up
+            // unable to roll back at all.
+            None => false,
+            // NOT `slot == 0`. A snapshot taken AFTER applying a real block in slot 0 also
+            // reports slot 0, and accepting it as "the genesis anchor" is the very wedge
+            // this guard prevents, in miniature: the anchor would sit one block above
+            // Origin with an empty window. Only a snapshot that has applied NOTHING is the
+            // genesis anchor, and on this path a fresh ledger has no snapshot file at all —
+            // so with an empty ImmutableDB there is no slot value that qualifies.
+            Some(_) => false,
+        }
     }
 
     fn load_snapshot_with_backend_guard(
@@ -1475,7 +1492,7 @@ impl Node {
         let snapshot_usable = if snapshot_path.exists()
             && !Self::snapshot_is_a_valid_anchor(
                 immutable_db_is_empty,
-                Self::peek_snapshot_slot(&snapshot_path).unwrap_or(0),
+                Self::peek_snapshot_slot(&snapshot_path),
             ) {
             // #1057 — THE RESTART HALF, and it is a snapshot-policy bug.
             //
@@ -10823,32 +10840,44 @@ mod tests {
     fn tip_snapshot_is_not_a_valid_anchor_when_immutable_db_is_empty() {
         use super::Node;
 
-        // Anything flushed ⇒ dugite's existing behaviour is untouched, at any slot.
+        // Anything flushed ⇒ dugite's existing behaviour is untouched, at any slot,
+        // including an unreadable one.
         assert!(
-            Node::snapshot_is_a_valid_anchor(false, 0),
+            Node::snapshot_is_a_valid_anchor(false, Some(0)),
             "a non-empty ImmutableDB must keep accepting snapshots"
         );
         assert!(
-            Node::snapshot_is_a_valid_anchor(false, 119_084_816),
+            Node::snapshot_is_a_valid_anchor(false, Some(119_084_816)),
             "a non-empty ImmutableDB must keep accepting a deep snapshot"
         );
-
-        // Nothing flushed + a genesis-slot snapshot: that snapshot IS the genesis
-        // anchor, so it is accepted and no replay is forced.
         assert!(
-            Node::snapshot_is_a_valid_anchor(true, 0),
-            "a genesis snapshot is the genesis anchor and must be accepted"
+            Node::snapshot_is_a_valid_anchor(false, None),
+            "a non-empty ImmutableDB is unaffected by an unreadable slot"
         );
 
-        // Nothing flushed + a non-genesis snapshot: it describes a still-volatile
-        // block, i.e. a tip snapshot. REJECT.
+        // Nothing flushed: NO snapshot slot qualifies as the genesis anchor.
+        //
+        // Slot 0 is deliberately rejected too. A snapshot taken AFTER applying a real
+        // block in slot 0 also reports slot 0, so accepting it would reinstate the wedge
+        // in miniature — an anchor one block above Origin with an empty window. A
+        // genuinely fresh ledger has no snapshot file at all and never reaches here.
         assert!(
-            !Node::snapshot_is_a_valid_anchor(true, 1),
+            !Node::snapshot_is_a_valid_anchor(true, Some(0)),
+            "slot 0 may be the state AFTER a real slot-0 block, so it is not provably \
+             the genesis anchor"
+        );
+        assert!(
+            !Node::snapshot_is_a_valid_anchor(true, Some(1)),
             "with an empty ImmutableDB even a slot-1 snapshot is a volatile tip"
         );
         assert!(
-            !Node::snapshot_is_a_valid_anchor(true, 80),
+            !Node::snapshot_is_a_valid_anchor(true, Some(80)),
             "the devnet reproduction: 6 blocks, nothing flushed, snapshot at slot 80"
+        );
+        // FAIL CLOSED: an unreadable slot must not be read as "genesis anchor".
+        assert!(
+            !Node::snapshot_is_a_valid_anchor(true, None),
+            "an unreadable snapshot slot must force the replay, not skip it"
         );
     }
 
