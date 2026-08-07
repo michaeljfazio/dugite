@@ -2195,46 +2195,101 @@ fn encode_relay_cbor(enc: &mut minicbor::Encoder<&mut Vec<u8>>, relay: &RelaySna
 
 // ─── SnapShot encoding ────────────────────────────────────────────────────────
 
-/// Encode a single Cardano `SnapShot` as `array(3)` per Haskell wire format.
+/// Encode a single Cardano `SnapShot`.
 ///
-/// SnapShot = array(3):
-///   [0] stake_map       — `Map<Credential(29B), Lovelace>`
-///   [1] delegation_map  — `Map<Credential(29B), pool_id(28B)>`
-///   [2] pool_params_map — `Map<pool_id(28B), PoolParams(array(9))>`
+/// ```text
+/// SnapShot = array(2)
+///   [0] activeStake        Map< array(2)[cred_tag, hash28] , array(2)[swdStake, swdDelegation] >
+///   [1] stakePoolsSnapShot Map< pool_id28 , array(10) >
+/// ```
 ///
-/// Credential (29 bytes) = 1-byte type prefix (0x00=KeyHash, 0x01=ScriptHash)
-/// followed by 28 bytes of the hash.
+/// and each `stakePoolsSnapShot` value is
 ///
-/// cncli reads these maps to compute the leader schedule for a pool operator.
+/// ```text
+///   [0] stake                     Coin
+///   [1] stakeRatio                tag(30) array(2)[num, den]   -- lowest terms
+///   [2] selfDelegatedOwners       tag(258) array of hash28
+///   [3] selfDelegatedOwnersStake  Coin
+///   [4] vrf                       bytes(32)
+///   [5] pledge                    Coin
+///   [6] cost                      Coin
+///   [7] margin                    tag(30) array(2)[num, den]   -- lowest terms
+///   [8] numDelegators             uint
+///   [9] accountId                 array(2)[0|1, hash28]
+/// ```
+///
+/// **HOW THIS SHAPE WAS ESTABLISHED, because it cannot be read off cardano-ledger.**
+/// dugite previously emitted `array(3)[stake_map, delegation_map, pool_params_map]` with
+/// `PoolParams(9)` values, which made `query ledger-state` undecodable IN ITS ENTIRETY —
+/// `SnapShots` is `array(4)[mark, set, go, fee]`, so one wrong element in the first
+/// snapshot desynchronises everything after it, and cardano-cli then exits 0 while
+/// printing a raw-CBOR diagnostic dump instead of JSON.
+///
+/// cardano-ledger master is NOT the oracle: cardano-node 11.0.1 pins CHaP at 2026-05-02,
+/// and master's `StakePoolState` has ELEVEN fields (it gained `spsBlsKey`) in a different
+/// order, so aligning to it would have produced a second wrong answer. Instead the
+/// running node's own N2C socket was proxied to capture its reply bytes, and each CBOR
+/// position was matched against the field NAMES that cardano-cli renders from the SAME
+/// reply — values pinning the mapping unambiguously:
+///
+/// ```text
+///   stake 16200592179844308   stakeRatio 4050148044961077/6750353029036205 (= 0.6)
+///   numDelegators 12          margin 0/1        pledge 0    cost 0
+///   vrf 7e07d1b3…             accountId keyHash d7cab9a6…
+/// ```
+///
+/// Two consequences worth keeping: the per-credential delegation map did not disappear,
+/// it MERGED into each stake entry (`swdStake` + `swdDelegation`); and the ratio is
+/// reduced, because Haskell `Rational` is always normalised.
 pub(crate) fn encode_snap_shot(
     enc: &mut minicbor::Encoder<&mut Vec<u8>>,
     snap: &SnapshotStakeData,
 ) {
-    enc.array(3).ok();
+    enc.array(2).ok();
 
-    // [0] stake_map: Map<Credential(29B), Lovelace>
+    // [0] activeStake: Map<Credential, [stake, pool]>
     enc.map(snap.stake_entries.len() as u64).ok();
-    for (cred_type, cred_hash, lovelace) in &snap.stake_entries {
-        // Credential key: 1-byte type prefix || 28-byte hash
-        let mut key = Vec::with_capacity(29);
-        key.push(*cred_type);
-        key.extend_from_slice(cred_hash);
-        enc.bytes(&key).ok();
+    for (cred_type, cred_hash, lovelace, pool_id) in &snap.stake_entries {
+        // Credential is a RECORD, not a 29-byte blob: array(2)[tag, hash28].
+        enc.array(2).ok();
+        enc.u8(*cred_type).ok();
+        enc.bytes(cred_hash).ok();
+        // Value: array(2)[swdStake, swdDelegation]
+        enc.array(2).ok();
         enc.u64(*lovelace).ok();
-    }
-
-    // [1] delegation_map: Map<Credential(29B), pool_id(28B)>
-    enc.map(snap.delegation_entries.len() as u64).ok();
-    for (cred_type, cred_hash, pool_id) in &snap.delegation_entries {
-        let mut key = Vec::with_capacity(29);
-        key.push(*cred_type);
-        key.extend_from_slice(cred_hash);
-        enc.bytes(&key).ok();
         enc.bytes(pool_id).ok();
     }
 
-    // [2] pool_params_map: Map<pool_id(28B), PoolParams>
-    encode_pool_params_map(enc, &snap.pool_params);
+    // [1] stakePoolsSnapShot: Map<pool_id, array(10)>
+    enc.map(snap.pool_entries.len() as u64).ok();
+    for pe in &snap.pool_entries {
+        enc.bytes(&pe.pool_id).ok();
+        enc.array(10).ok();
+        enc.u64(pe.stake).ok();
+        encode_rational(enc, pe.ratio_num, pe.ratio_den);
+        enc.tag(minicbor::data::Tag::new(258)).ok();
+        enc.array(pe.self_delegated_owners.len() as u64).ok();
+        for o in &pe.self_delegated_owners {
+            enc.bytes(o).ok();
+        }
+        enc.u64(pe.self_delegated_owners_stake).ok();
+        enc.bytes(&pe.vrf_keyhash).ok();
+        enc.u64(pe.pledge).ok();
+        enc.u64(pe.cost).ok();
+        encode_rational(enc, pe.margin_num, pe.margin_den);
+        enc.u64(pe.num_delegators).ok();
+        enc.array(2).ok();
+        enc.u8(u8::from(pe.account_is_script)).ok();
+        enc.bytes(&pe.account_hash28).ok();
+    }
+}
+
+/// `Rational` / `UnitInterval` = tag(30) array(2)[numerator, denominator].
+fn encode_rational(enc: &mut minicbor::Encoder<&mut Vec<u8>>, num: u64, den: u64) {
+    enc.tag(minicbor::data::Tag::new(30)).ok();
+    enc.array(2).ok();
+    enc.u64(num).ok();
+    enc.u64(if den == 0 { 1 } else { den }).ok();
 }
 
 // ─── Debug query encoding ─────────────────────────────────────────────────────

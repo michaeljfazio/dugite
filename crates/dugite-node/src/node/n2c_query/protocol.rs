@@ -428,11 +428,11 @@ pub(crate) fn handle_debug_epoch_state(state: &NodeStateSnapshot) -> QueryResult
 pub(crate) fn handle_debug_new_epoch_state(state: &NodeStateSnapshot) -> QueryResult {
     debug!("Query: DebugNewEpochState");
 
-    // Build block-count maps from the per-pool epoch block counts.
-    // cncli doesn't use these for snapshot purposes, but the Haskell structure
-    // places them at [0] and [1] of NewEpochState, so we include them.
-    let blocks_made_prev: Vec<(Vec<u8>, u64)> = state.epoch_blocks_by_pool.clone();
-    let blocks_made_cur: Vec<(Vec<u8>, u64)> = Vec::new();
+    // NewEpochState [1] = nesBprev (`blocksBefore`), [2] = nesBcur (`blocksCurrent`).
+    // These were the wrong way round: the CURRENT epoch's counts were reported as the
+    // previous epoch's and `blocksCurrent` was always empty.
+    let blocks_made_prev: Vec<(Vec<u8>, u64)> = state.prev_epoch_blocks_by_pool.clone();
+    let blocks_made_cur: Vec<(Vec<u8>, u64)> = state.epoch_blocks_by_pool.clone();
 
     QueryResult::DebugNewEpochState {
         epoch: state.epoch.0,
