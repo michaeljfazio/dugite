@@ -2996,6 +2996,15 @@ impl Node {
     /// Nothing is inferred about the ledger TIP here: a node 10 blocks in with an
     /// Origin anchor can roll all 10 back, which is precisely the case that has to
     /// work.
+    ///
+    /// A DERIVED EQUIVALENT OF UPSTREAM'S CONDITION, NOT THE LITERAL PREDICATE — do not
+    /// "simplify" it to match `isReachable` textually. Upstream guards on the CURRENT
+    /// CHAIN FRAGMENT's anchor (`AF.anchorIsGenesis (AF.anchor chain)`), which is the
+    /// ImmutableDB tip; that coincides with the LedgerDB anchor only because upstream
+    /// prunes the LedgerDB to the immutable tip by construction. dugite has to state the
+    /// condition over its own LedgerSeq anchor instead, and it is equivalent only because
+    /// the startup path now restores anchor == immutable tip (reject a volatile-tip
+    /// snapshot when nothing is flushed, then replay the volatile chain as deltas).
     pub(crate) async fn publish_ledger_can_reach_origin(&self) {
         let Some(ref cs) = self.chain_sel_handle else {
             return;

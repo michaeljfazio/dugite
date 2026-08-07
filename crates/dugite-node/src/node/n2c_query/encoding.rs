@@ -3507,6 +3507,94 @@ mod tests {
     /// snapshot value: the `.max(1)` clamp already existed for the ratio
     /// denominator and simply never reached the encoded field, so a test that
     /// only checked the clamp's input would have passed against the bug.
+    /// BYTE FIXTURE captured from cardano-node 11.0.1's OWN N2C socket.
+    ///
+    /// `SnapShot` is not a type I could read off cardano-ledger: cardano-node 11.0.1 pins
+    /// CHaP at index-state 2026-05-02, and `master`'s nearest equivalent record has an
+    /// extra field in a different order, so aligning to master would replace one wrong
+    /// answer with another. The shape below was established empirically — proxy the
+    /// running node's socket, reassemble mini-protocol 7, take the `MsgResult
+    /// [4, [tag24(bstr)]]` payload, and read `NewEpochState[3][2][0]` — and each CBOR
+    /// position was then named by matching it to the field names cardano-cli renders from
+    /// the SAME reply (`stateBefore.esSnapshots.pstakeMark`):
+    ///
+    /// ```text
+    ///   activeStake         key  array(2)[cred_tag, hash28]
+    ///                       val  array(2)[swdStake, swdDelegation]
+    ///   stakePoolsSnapShot  key  pool_id28
+    ///                       val  array(10)[ stake, stakeRatio, selfDelegatedOwners,
+    ///                                       selfDelegatedOwnersStake, vrf, pledge, cost,
+    ///                                       margin, numDelegators, accountId ]
+    /// ```
+    ///
+    /// THIS TEST EXISTS TO FAIL LOUDLY ON A NODE BUMP. The field names beyond what
+    /// cardano-cli renders are inferred labels for a pinned-revision record, not a
+    /// documented upstream type — so if a future cardano-node changes this shape, the
+    /// right response is to RE-CAPTURE from the new node and update these bytes
+    /// deliberately, never to adjust the encoder until the test passes again. Silent
+    /// re-fitting is how a wire encoder ends up matching nothing.
+    ///
+    /// Values are cardano-node's own, so the assertion is byte equality against the
+    /// reference implementation rather than against dugite's own output shape — the
+    /// distinction #951 turned on (encoder and decoder agreeing on a WRONG order still
+    /// round-trips; only an upstream-derived fixture catches it).
+    #[test]
+    fn snap_shot_bytes_match_a_cardano_node_11_0_1_capture() {
+        use crate::node::n2c_query::types::{PoolSnapshotEntry, SnapshotStakeData};
+
+        let hx = |h: &str| hex::decode(h).expect("fixture hex");
+        let cred = hx("0521e95cf8dad704f7b55fbc929cd94bbebe1e175d775a3ad9eb77de");
+        let deleg = hx("d520c60eb7c1b62bbd8f2ad5ac1e36a1d3efb5ded9e42a8c22dfea3f");
+        let pool = hx("6745303dc0604949ae78d7ee48aff63a4af0d39420ba92f5b4e386a1");
+        let vrf = hx("7e07d1b302caefa4494d8b6bf82ae4b8bf87fc9abfbb514119fc604d5ff46ad3");
+        let account = hx("d7cab9a64de7c2338fa4b7c160ebb21a703b2773c6c056f27c4105bc");
+
+        let snap = SnapshotStakeData {
+            stake_entries: vec![(0u8, cred, 1_350_000_000_000_000u64, deleg)],
+            pool_entries: vec![PoolSnapshotEntry {
+                pool_id: pool,
+                stake: 16_200_000_000_000_000,
+                // 3/5 — already in lowest terms, as a Haskell `Rational` always is.
+                ratio_num: 3,
+                ratio_den: 5,
+                self_delegated_owners: vec![],
+                self_delegated_owners_stake: 0,
+                vrf_keyhash: vrf,
+                pledge: 0,
+                cost: 0,
+                margin_num: 0,
+                margin_den: 1,
+                num_delegators: 12,
+                account_is_script: false,
+                account_hash28: account,
+            }],
+        };
+
+        let mut buf = Vec::new();
+        let mut enc = minicbor::Encoder::new(&mut buf);
+        encode_snap_shot(&mut enc, &snap);
+
+        // Captured bytes, verbatim. `d81e` = tag(30) rational, `d90102` = tag(258) set.
+        let expected = concat!(
+            "82",
+            "a1",
+            "8200581c0521e95cf8dad704f7b55fbc929cd94bbebe1e175d775a3ad9eb77de",
+            "821b0004cbd15e726000581cd520c60eb7c1b62bbd8f2ad5ac1e36a1d3efb5ded9e42a8c22dfea3f",
+            "a1",
+            "581c6745303dc0604949ae78d7ee48aff63a4af0d39420ba92f5b4e386a1",
+            "8a1b00398dd06d5c8000d81e820305d901028000",
+            "58207e07d1b302caefa4494d8b6bf82ae4b8bf87fc9abfbb514119fc604d5ff46ad3",
+            "0000d81e8200010c8200581cd7cab9a64de7c2338fa4b7c160ebb21a703b2773c6c056f27c4105bc",
+        );
+        assert_eq!(
+            hex::encode(&buf),
+            expected,
+            "SnapShot bytes must equal cardano-node 11.0.1's own reply for the same values \
+             — if a node bump changed this, RE-CAPTURE and update the fixture deliberately \
+             rather than adjusting the encoder to match"
+        );
+    }
+
     #[test]
     fn pool_distr_total_active_stake_is_never_encoded_as_zero() {
         use crate::node::n2c_query::types::GovStateSnapshot;

@@ -693,6 +693,13 @@ impl EraRules for ShelleyRules {
             stake_distribution: Arc::new(snapshot_stake),
             epoch_fees: utxo.epoch_fees,
             epoch_block_count: consensus.epoch_block_count,
+            // SECOND CONSUMER: this frozen map is also `nesBprev` (`blocksBefore`) for
+            // the whole of the epoch that is about to start — the MARK snapshot is
+            // captured at the boundary from the epoch that just ended, which is exactly
+            // Haskell's `nesBprev := nesBcur` in NEWEPOCH. `query.rs` reads it for
+            // `DebugNewEpochState`. It stays frozen because this `Arc::clone` makes the
+            // later `Arc::make_mut(..).clear()` copy-on-write rather than mutating the
+            // map the snapshot holds — do not "optimise" that clone away.
             epoch_blocks_by_pool: Arc::clone(&consensus.epoch_blocks_by_pool),
         });
 
