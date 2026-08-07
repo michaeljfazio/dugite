@@ -119,10 +119,36 @@ if [ -f "$EVD/tip-samples.csv" ] && [ -f "$EVD/blocks.csv" ]; then
     if [ -n "$SLOT_FIRST" ] && [ -n "$SLOT_LAST" ] && [ "$SLOT_LAST" -gt "$SLOT_FIRST" ]; then
         SLOTS=$((SLOT_LAST - SLOT_FIRST))
         DENSITY=$(awk -v b="$CANONICAL" -v s="$SLOTS" 'BEGIN{printf "%.3f", b/s}')
-        LOW=$(awk -v f="$ACTIVE_SLOT_COEFF" -v t="$DENSITY_TOLERANCE" 'BEGIN{printf "%.3f", f*(1-t)}')
-        HIGH=$(awk -v f="$ACTIVE_SLOT_COEFF" -v t="$DENSITY_TOLERANCE" 'BEGIN{printf "%.3f", f*(1+t)}')
+
+        # SCALE THE TOLERANCE TO THE SAMPLE SIZE. Block production here is Bernoulli per
+        # slot with p = activeSlotsCoeff (the forger holds ~all the stake, so the Praos
+        # leader probability 1-(1-f)^sigma tends to f), which makes the block count
+        # binomial. A FIXED +/-20% band therefore means completely different confidence
+        # at different window sizes:
+        #
+        #   n=1812 slots (Round 2)   1 sd = 0.012 density   =>  +/-0.1 is ~8 sd, far too loose
+        #   n=54    slots (Round 3)  1 sd = 0.068 density   =>  +/-0.1 is ~1.5 sd, too tight
+        #
+        # At ~1.5 sd a perfectly healthy run fails roughly one time in eight. Measured:
+        # Round 3 reported density 0.630 from 34 canonical blocks in 54 slots — 1.9 sd,
+        # ordinary noise — with 0 orphans, every block triple-observed, and 0 ERROR on
+        # all three nodes. That is the #917 forge-stall defect exactly: a per-sample coin
+        # flip presented as a threshold, and the same remedy applies — derive the budget
+        # from the distribution instead of guessing a percentage.
+        #
+        # z = 3.29 is the two-sided p99.9 quantile, the same confidence #917 chose, so a
+        # healthy run fails about one time in a thousand. Note this makes the check
+        # STRICTER where the sample supports it: Round 2's band tightens from
+        # [0.400,0.600] to about [0.461,0.539].
+        DENSITY_Z=${DENSITY_Z:-3.29}
+        read LOW HIGH < <(awk -v f="$ACTIVE_SLOT_COEFF" -v n="$SLOTS" -v z="$DENSITY_Z" 'BEGIN{
+            sd = sqrt(n * f * (1 - f)) / n      # sd of the DENSITY estimate
+            lo = f - z * sd; hi = f + z * sd
+            if (lo < 0) lo = 0; if (hi > 1) hi = 1
+            printf "%.3f %.3f\n", lo, hi
+        }')
         awk -v d="$DENSITY" -v l="$LOW" -v h="$HIGH" 'BEGIN{exit !(d < l || d > h)}' \
-            && ANOMALIES+=("chain_density=$DENSITY outside [${LOW},${HIGH}]") || true
+            && ANOMALIES+=("chain_density=$DENSITY outside [${LOW},${HIGH}] (n=${SLOTS} slots, p99.9 binomial)") || true
     fi
 fi
 
@@ -180,7 +206,7 @@ Blocks
   total forges            : $TOTAL_FORGES
   canonical               : $CANONICAL
   orphans                 : $ORPHANS  (rate=$ORPHAN_RATE, threshold≤$ORPHAN_RATE_MAX)
-  chain_density           : $DENSITY  (target ≈ $ACTIVE_SLOT_COEFF ± ${DENSITY_TOLERANCE})
+  chain_density           : $DENSITY  (p99.9 binomial band [${LOW:-?},${HIGH:-?}] over n=${SLOTS:-?} slots, p=$ACTIVE_SLOT_COEFF)
 
 Tip-age
   avg                     : ${TIP_AGE_AVG}s
