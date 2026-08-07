@@ -428,11 +428,11 @@ pub(crate) fn handle_debug_epoch_state(state: &NodeStateSnapshot) -> QueryResult
 pub(crate) fn handle_debug_new_epoch_state(state: &NodeStateSnapshot) -> QueryResult {
     debug!("Query: DebugNewEpochState");
 
-    // Build block-count maps from the per-pool epoch block counts.
-    // cncli doesn't use these for snapshot purposes, but the Haskell structure
-    // places them at [0] and [1] of NewEpochState, so we include them.
-    let blocks_made_prev: Vec<(Vec<u8>, u64)> = state.epoch_blocks_by_pool.clone();
-    let blocks_made_cur: Vec<(Vec<u8>, u64)> = Vec::new();
+    // NewEpochState [1] = nesBprev (`blocksBefore`), [2] = nesBcur (`blocksCurrent`).
+    // These were the wrong way round: the CURRENT epoch's counts were reported as the
+    // previous epoch's and `blocksCurrent` was always empty.
+    let blocks_made_prev: Vec<(Vec<u8>, u64)> = state.prev_epoch_blocks_by_pool.clone();
+    let blocks_made_cur: Vec<(Vec<u8>, u64)> = state.epoch_blocks_by_pool.clone();
 
     QueryResult::DebugNewEpochState {
         epoch: state.epoch.0,
@@ -444,8 +444,20 @@ pub(crate) fn handle_debug_new_epoch_state(state: &NodeStateSnapshot) -> QueryRe
         snap_set: Box::new(state.snap_set.clone()),
         snap_go: Box::new(state.snap_go.clone()),
         snap_fee: state.snap_fee,
-        total_active_stake: state.total_active_stake,
-        pool_distr: state.stake_pools.clone(),
+        // nesPd is the FROZEN distribution, not the live pool set.
+        //
+        // This passed `stake_pools` — `certs.pool_params` joined with live stake — so
+        // `stakeDistrib` reported whichever pools are registered RIGHT NOW. A real
+        // cardano-node reports the `set` snapshot: measured on the devnet it listed a
+        // pool that is no longer registered and omitted one registered since, because
+        // the distribution is two boundaries old by construction. Same class as
+        // #922/#950 — answering a frozen query from live state — and this one feeds the
+        // leader schedule, so it is not cosmetic.
+        //
+        // `pool_distr` is the distribution #964 already derived from
+        // `snapshots.set`, with its own `ssTotalActiveStake` as the denominator.
+        total_active_stake: state.pool_distr_total_active_stake,
+        pool_distr: state.pool_distr.clone(),
         gov: Box::new(super::governance::gov_state_snapshot(state)),
         retiring: state.pending_retirements.clone(),
         dreps: state.drep_entries.clone(),

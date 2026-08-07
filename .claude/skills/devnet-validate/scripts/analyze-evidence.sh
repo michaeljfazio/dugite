@@ -3,7 +3,22 @@
 # human-readable report block. Exits non-zero if any anomaly threshold is
 # breached — usable as a CI gate.
 #
-# Usage: analyze-evidence.sh <evidence_dir>
+# Usage: analyze-evidence.sh <evidence_dir> [--allowed-errors <file>]
+#
+# --allowed-errors declares ERROR lines that a round CAUSED ON PURPOSE. It exists for
+# one situation: Round 1 runs the chaos suite, which SIGKILLs the sole forger mid-forge,
+# and a forger killed between forging and adopting can legitimately come back to find
+# its block beaten — `TraceDidntAdoptBlock`, which is the SAFE outcome and the same
+# severity cardano-node uses. Without this the baseline round fails whenever the kill
+# lands at an unlucky moment, which is a coin-flip, not a signal.
+#
+# Three properties keep it from becoming the over-broad allowlist that makes a round
+# report success while measuring nothing (#916/#923/#945/#953/#959):
+#   1. It is OPT-IN per invocation. No round gets it unless its caller passes it.
+#   2. It NEVER applies to the invalid-block check. A Haskell-rejected dugite block
+#      stays CRITICAL and unconditional — that check is the point of the round.
+#   3. Both numbers are always printed ("N ERROR, M unexplained"), so an allowance is
+#      visible in the output rather than silently subtracted.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -12,10 +27,24 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=lib/log-level-counts.sh
 source "$SCRIPT_DIR/lib/log-level-counts.sh"
 
-EVD="${1:-}"
+EVD=""
+ALLOWED_ERRORS=""
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --allowed-errors) ALLOWED_ERRORS="${2:-}"; shift 2 ;;
+        -*) echo "unknown option: $1" >&2; exit 2 ;;
+        *)  EVD="$1"; shift ;;
+    esac
+done
 if [ -z "$EVD" ] || ! [ -d "$EVD" ]; then
-    echo "Usage: $0 <evidence_dir>" >&2
+    echo "Usage: $0 <evidence_dir> [--allowed-errors <file>]" >&2
     echo "  e.g. $0 testnet/local-devnet/evidence/20260521T120000Z" >&2
+    exit 2
+fi
+# A named-but-missing allowlist is a hard error, never a silent "allow nothing":
+# that is how a caller ends up believing a suppression is active when it is not.
+if [ -n "$ALLOWED_ERRORS" ] && [ ! -f "$ALLOWED_ERRORS" ]; then
+    echo "--allowed-errors: no such file: $ALLOWED_ERRORS" >&2
     exit 2
 fi
 
@@ -90,15 +119,46 @@ if [ -f "$EVD/tip-samples.csv" ] && [ -f "$EVD/blocks.csv" ]; then
     if [ -n "$SLOT_FIRST" ] && [ -n "$SLOT_LAST" ] && [ "$SLOT_LAST" -gt "$SLOT_FIRST" ]; then
         SLOTS=$((SLOT_LAST - SLOT_FIRST))
         DENSITY=$(awk -v b="$CANONICAL" -v s="$SLOTS" 'BEGIN{printf "%.3f", b/s}')
-        LOW=$(awk -v f="$ACTIVE_SLOT_COEFF" -v t="$DENSITY_TOLERANCE" 'BEGIN{printf "%.3f", f*(1-t)}')
-        HIGH=$(awk -v f="$ACTIVE_SLOT_COEFF" -v t="$DENSITY_TOLERANCE" 'BEGIN{printf "%.3f", f*(1+t)}')
+
+        # SCALE THE TOLERANCE TO THE SAMPLE SIZE. Block production here is Bernoulli per
+        # slot with p = activeSlotsCoeff (the forger holds ~all the stake, so the Praos
+        # leader probability 1-(1-f)^sigma tends to f), which makes the block count
+        # binomial. A FIXED +/-20% band therefore means completely different confidence
+        # at different window sizes:
+        #
+        #   n=1812 slots (Round 2)   1 sd = 0.012 density   =>  +/-0.1 is ~8 sd, far too loose
+        #   n=54    slots (Round 3)  1 sd = 0.068 density   =>  +/-0.1 is ~1.5 sd, too tight
+        #
+        # At ~1.5 sd a perfectly healthy run fails roughly one time in eight. Measured:
+        # Round 3 reported density 0.630 from 34 canonical blocks in 54 slots — 1.9 sd,
+        # ordinary noise — with 0 orphans, every block triple-observed, and 0 ERROR on
+        # all three nodes. That is the #917 forge-stall defect exactly: a per-sample coin
+        # flip presented as a threshold, and the same remedy applies — derive the budget
+        # from the distribution instead of guessing a percentage.
+        #
+        # z = 3.29 is the two-sided p99.9 quantile, the same confidence #917 chose, so a
+        # healthy run fails about one time in a thousand. Note this makes the check
+        # STRICTER where the sample supports it: Round 2's band tightens from
+        # [0.400,0.600] to about [0.461,0.539].
+        DENSITY_Z=${DENSITY_Z:-3.29}
+        read LOW HIGH < <(awk -v f="$ACTIVE_SLOT_COEFF" -v n="$SLOTS" -v z="$DENSITY_Z" 'BEGIN{
+            sd = sqrt(n * f * (1 - f)) / n      # sd of the DENSITY estimate
+            lo = f - z * sd; hi = f + z * sd
+            if (lo < 0) lo = 0; if (hi > 1) hi = 1
+            printf "%.3f %.3f\n", lo, hi
+        }')
         awk -v d="$DENSITY" -v l="$LOW" -v h="$HIGH" 'BEGIN{exit !(d < l || d > h)}' \
-            && ANOMALIES+=("chain_density=$DENSITY outside [${LOW},${HIGH}]") || true
+            && ANOMALIES+=("chain_density=$DENSITY outside [${LOW},${HIGH}] (n=${SLOTS} slots, p99.9 binomial)") || true
     fi
 fi
 
 # --- Log error histogram -----------------------------------------------------
-declare -A ERR_COUNT WARN_COUNT
+declare -A ERR_COUNT WARN_COUNT UNEXPLAINED_COUNT
+# Build one alternation from the allowlist, ignoring comments and blank lines.
+ALLOW_RE=""
+if [ -n "$ALLOWED_ERRORS" ]; then
+    ALLOW_RE=$(grep -vE '^[[:space:]]*(#|$)' "$ALLOWED_ERRORS" | paste -sd'|' - || true)
+fi
 for node in dugite-bp dugite-relay cardano-bp; do
     log="$LOG_DIR/$node.log"
     [ -f "$log" ] || continue
@@ -106,12 +166,24 @@ for node in dugite-bp dugite-relay cardano-bp; do
     wc=$(count_log_warns "$log")
     ERR_COUNT[$node]=$ec
     WARN_COUNT[$node]=$wc
-    if [ "$ec" -gt 0 ]; then
-        # Forged-invalid is always fatal-class — flag whichever name appears.
-        if grep -qE 'TraceForgedInvalidBlock|AddBlockValidation\.InvalidBlock|Forge\.Loop\.ForgedInvalidBlock' "$log"; then
-            ANOMALIES+=("CRITICAL: invalid-block event in $node.log — Haskell rejected a dugite-forged block")
-        fi
-        ANOMALIES+=("$node: $ec ERROR/invalid-block lines")
+
+    # Unexplained = ERROR lines that no allowlist pattern accounts for. With no
+    # allowlist this equals the raw count, so behaviour is unchanged by default.
+    unexplained=$ec
+    if [ "$ec" -gt 0 ] && [ -n "$ALLOW_RE" ]; then
+        unexplained=$(grep -E ' ERROR ' "$log" | grep -cvE "$ALLOW_RE" || true)
+        unexplained=${unexplained:-0}
+    fi
+    UNEXPLAINED_COUNT[$node]=$unexplained
+
+    # The invalid-block check is deliberately OUTSIDE the allowlist and outside the
+    # `unexplained` gate: a dugite-forged block that Haskell rejected is the failure
+    # this whole harness exists to detect, and no allowlist may suppress it.
+    if grep -qE 'TraceForgedInvalidBlock|AddBlockValidation\.InvalidBlock|Forge\.Loop\.ForgedInvalidBlock' "$log"; then
+        ANOMALIES+=("CRITICAL: invalid-block event in $node.log — Haskell rejected a dugite-forged block")
+    fi
+    if [ "$unexplained" -gt 0 ]; then
+        ANOMALIES+=("$node: $unexplained unexplained ERROR line(s) (of $ec total)")
     fi
 done
 
@@ -134,16 +206,17 @@ Blocks
   total forges            : $TOTAL_FORGES
   canonical               : $CANONICAL
   orphans                 : $ORPHANS  (rate=$ORPHAN_RATE, threshold≤$ORPHAN_RATE_MAX)
-  chain_density           : $DENSITY  (target ≈ $ACTIVE_SLOT_COEFF ± ${DENSITY_TOLERANCE})
+  chain_density           : $DENSITY  (p99.9 binomial band [${LOW:-?},${HIGH:-?}] over n=${SLOTS:-?} slots, p=$ACTIVE_SLOT_COEFF)
 
 Tip-age
   avg                     : ${TIP_AGE_AVG}s
   p99                     : ${TIP_AGE_P99}s  (threshold ≤ ${TIP_AGE_P99_MAX}s)
 
 Log errors / warns
-  dugite-bp               : ${ERR_COUNT[dugite-bp]:-?} ERROR / ${WARN_COUNT[dugite-bp]:-?} WARN
-  dugite-relay            : ${ERR_COUNT[dugite-relay]:-?} ERROR / ${WARN_COUNT[dugite-relay]:-?} WARN
-  cardano-bp              : ${ERR_COUNT[cardano-bp]:-?} ERROR / ${WARN_COUNT[cardano-bp]:-?} WARN
+  dugite-bp               : ${ERR_COUNT[dugite-bp]:-?} ERROR (${UNEXPLAINED_COUNT[dugite-bp]:-?} unexplained) / ${WARN_COUNT[dugite-bp]:-?} WARN
+  dugite-relay            : ${ERR_COUNT[dugite-relay]:-?} ERROR (${UNEXPLAINED_COUNT[dugite-relay]:-?} unexplained) / ${WARN_COUNT[dugite-relay]:-?} WARN
+  cardano-bp              : ${ERR_COUNT[cardano-bp]:-?} ERROR (${UNEXPLAINED_COUNT[cardano-bp]:-?} unexplained) / ${WARN_COUNT[cardano-bp]:-?} WARN
+  allowlist               : ${ALLOWED_ERRORS:-none}
 
 EOF
 

@@ -101,72 +101,223 @@ dugite-lsm (LSM-tree on-disk storage for UTxO-HD)
 - 28-byte hash types (DRep keys, pool voter keys, required signers) must be padded to 32 bytes via `Hash28::to_hash32_padded()` — do not use `Hash<32>::from()` directly on 28-byte hashes
 
 ## Current Focus
-**v2.7.0 (2026-08-06) — eras are checked at the wire.**
-Drop-in from v2.6.0, **SNAPSHOT unchanged at 37**. Closes #1015, #1026, #1028,
-#1046, #1047, #1048, #1050, #1051, #1054, #1055, #1031, #1044, plus **#1058**
-found during the sweep. Open: **#1057** (P0, fully diagnosed below — the
-two-layer storage fix was attempted, verified WRONG live, and reverted), #1008
-(CLI surface backlog), #1053 (typed phase-2 wire class), #1030 items 4-6.
+**v2.7.1 (2026-08-07) — the #1057 P0, plus four `query ledger-state` wire defects.**
+Drop-in from v2.7.0, **SNAPSHOT unchanged at 37**, so no re-sync.
 
-### #1057 — a node with any block of its own never rejoins (P0, OPEN)
+**#1057 is CLOSED** — the P0 that stranded a block producer. It needed **THREE**
+fixes, not one, and each was only visible once the one above it was fixed; a
+fourth guard came out of an adversarial review. The second and third were found
+by asking what cardano-node does rather than what would make the symptom go
+away, and the long-standing written prediction that this required
+`init_fresh_ledger` was WRONG (see below).
 
-**Diagnosed in detail, NOT fixed — do not re-diagnose from scratch.** A node whose
-local chain must be replaced from Origin never adopts the canonical chain:
-BlockFetch declines the peer's block 0 forever, the ledger never advances,
-ChainSync's forecast-horizon park times out, and **every** peer is disconnected in
-an endless reconnect loop with no self-healing. It strands a block producer.
+**`query ledger-state` was undecodable in its entirety** and cardano-cli hides
+that — it exits 0 and prints a raw-CBOR dump instead of JSON, so the query had
+been broken for every operator while looking merely verbose. Four defects:
+`SnapShot` arity 3 -> 2; its contents (the delegation map MERGED into each stake
+entry, and the pool map's values are a 10-field snapshot aggregate, not
+`PoolParams(9)`); `blocksBefore`/`blocksCurrent` swapped; and `nesPd` answered
+from the LIVE pool set instead of the frozen `set` snapshot. Consolidating the
+last one onto the shared encoder then exposed a fifth: `pdTotalActiveStake` was
+written unclamped, and it is a `NonZero Coin` upstream — so tag 36, the only arm
+a V21+ client can reach, could emit a value that fails to decode.
 
-Live evidence: dugite-bp forged blocks 0..8 (slots 4-21) on Origin, then froze at
-its own tip while the Haskell chain reached block 240+, dying at the *same* header
-slot on every peer and every reconnect. Controlled comparison, same binary and
-devnet: **dugite-relay reached epoch 2, dugite-bp stayed at epoch 0** — the only
-difference being whether the ChainDB was non-empty when the Origin adoption was
-required.
+The shape could NOT be read off cardano-ledger: 11.0.1 pins CHaP at
+index-state 2026-05-02 and master's nearest record has an extra field in a
+different order. It was established by proxying the running node's own N2C
+socket and is now pinned to those bytes —
+`snap_shot_bytes_match_a_cardano_node_11_0_1_capture`. See
+[[reference_running_node_is_the_wire_oracle]] for the method and its two traps.
 
-Two layers both refuse a genesis anchor, recognising only a stored block or the
-ImmutableDB tip:
-- `connection_lifecycle.rs` — the #735 gross-request invariant exempts only a
-  COMPLETELY EMPTY ChainDB. Genesis is never a stored block, so
-  `has_block(&genesis)` is always false. **This is the branch that fires.**
-- `volatile_db.rs::switch_chain` — accepts a non-intersecting fork only when its
-  root anchors at the ImmutableDB tip; with nothing flushed yet that anchor is
-  `None`.
+**Open, and one of them is `reachable:live`:**
+- **#1067** (`reachable:live`) — `NonMyopic.likelihoodsNM` is hardcoded EMPTY and
+  dugite tracks per-pool `Likelihood` nowhere (8 mentions in the tree, all
+  comments or the two hardcoded encoder lines). NOT consensus: it feeds the
+  non-myopic reward ESTIMATE and pool ranking, not block validity. Deliberately
+  NOT rushed into v2.7.1 — it is a float-encoded per-epoch accumulator needing
+  byte-exactness and a SNAPSHOT_VERSION bump, which turns a drop-in patch into a
+  re-sync, and a half-right typed arm is worse than an honest gap (#979).
+  `09w-ledger-state` excludes only that subtree's CHILDREN, citing the issue;
+  the parent is still required and everything else is compared strictly.
+- **#1008** — 82 cardano-cli commands, a backlog by design, referenced by
+  `cli-surface-known-gaps.txt` so the gate stays honest.
+- Dijkstra: #1011/#1014/#1029/#607, pre-activation by definition.
 
-**Why the obvious two-line fix is WRONG, verified live.** Teaching both layers to
-accept `prev_hash == Hash32::ZERO` was attempted and REVERTED: storage then emits a
-genesis-rooted `SwitchPlan` (`intersection = ZERO, slot 0`), chain selection asks
-the ledger to roll back to Origin, and `sync.rs` aborts —
+**Harness defects fixed this wave, all of the same family** — a check that
+reports success while measuring nothing, or an assertion that never runs:
+`wait-tip-parity.sh` existed and was called by nothing (the `ALL_CATEGORIES`
+shape, #969) and now lives inside `soak.sh`; `XV_RC` was captured and never
+checked, so a cross-validate failure could not fail the gate; three of six
+11-mempool scripts selected a shared UTxO with no `zoo_wait_mempool_quiet`,
+which is #918's mechanism left unfixed; and cross-validate now submits a
+rejected tx to cardano-node before blaming dugite. Two of those were mine, added
+in this same wave.
+
+### #1057 — a node holding its own chain now adopts one diverging at genesis (CLOSED)
+
+**THREE independent defects, one symptom** — and each was only visible once the one
+above it was fixed, which is why this took four attempts. A node whose local chain must be replaced
+from Origin never adopted the canonical chain: BlockFetch declined the peer's block 0
+forever, the ledger never advanced, ChainSync's forecast-horizon park timed out, and
+every peer was disconnected in an endless reconnect loop. It stranded a block producer
+(dugite-bp forged blocks 0..8 on Origin, then froze at its own tip while the Haskell
+chain reached 240+, dying at the *same* header slot on every peer and every reconnect).
+
+Both halves are now aligned with cardano-node, and the alignment is what made the fix
+tractable — every earlier attempt guessed at the mechanism instead.
+
+**Half 1 — the live path. Upstream's condition is on the ANCHOR, not the tip.**
+`Paths.hs::isReachable`:
+
+```haskell
+(_, StoppedAtGenesis)
+  | AF.anchorIsGenesis (AF.anchor chain) -> Just (ChainDiff rollback' …AnchorGenesis…)
+  | otherwise                            -> Nothing
+```
+
+with `rollback' = rollback + length chain` — a full rollback of the whole current
+chain. dugite's gate is `ledger_can_reach_origin` (the LedgerSeq anchor IS Origin and
+the window is coherent), which is that condition derived rather than invented. An
+earlier version tested "the ledger is at Origin" and was measured too narrow: a node
+that had just recovered re-adopted a stale 10-block chain from its sibling and was
+wedged again 30 seconds later against the canonical 155-block chain.
+
+BlockFetch and chain selection read the SAME `Arc<AtomicBool>`. They briefly disagreed
+— storage on `ledger_can_reach_origin`, BlockFetch still on `ledger tip == Origin` — so
+the node accepted the fork switch and was never given the blocks to switch to.
+`find_rollback_n`'s `target == anchor` case is what makes the rollback executable.
+
+**Half 2 — the restart path. dugite snapshotted the wrong state.** cardano-node
+snapshots the LedgerDB *anchor* (`LedgerDB/V2.hs`):
+
+```haskell
+let pruneStrat = LedgerDbPruneBeforeSlot (slot + 1)
+(slot,) <$> (duplicateStateRef $ anchorHandle $ snd $ prune pruneStrat lseq)
+```
+
+then `pruneToImmTipOnly`s on init and re-pushes the volatile chain as individually
+rollback-able states. So with nothing flushed, upstream's anchor IS genesis and
+`anchorIsGenesis` still holds after a restart.
+
+dugite snapshotted the LIVE TIP and then `reset_anchor`ed onto the replayed tip, so a
+restart came up unable to roll back *anywhere* and the wedge outlived the process. Two
+changes, both scoped to "nothing flushed to the ImmutableDB" — the regime in which the
+whole chain is inside k of genesis, so genesis is the only correct anchor:
+
+- `snapshot_is_a_valid_anchor` rejects a volatile-tip snapshot in that regime, so the
+  ledger starts at genesis. Bounded: under k blocks to replay.
+- replay pushes every block through the LedgerSeq delta path instead of bulk-advancing,
+  and the post-replay `reanchor_ledger_seq` is SKIPPED when it did (`reset_anchor`
+  clears the window, which would discard exactly what the delta replay just built).
+
+**Half 3 — the ledger declined the rollback because Origin has TWO spellings.**
+Found only by running the round with halves 1 and 2 in place: storage switched the
+chain, chain selection asked for a rollback to Origin, and the ledger refused —
 
 ```
-Chain selection: fork switch at live tip — rolling back ledger to intersection
-  intersection=00000000000000000000000000000000
-ERROR Rollback target outside LedgerSeq volatile window AND no canonical
-  snapshot available. Aborting rollback
+INFO  Chain selection: fork switch at live tip — rolling back ledger to intersection
+        intersection=0000…0000 intersection_slot=0 rollback_count=6 apply_count=7
+ERROR Rollback target outside LedgerSeq volatile window AND no canonical snapshot
+        available. Aborting rollback; ledger state preserved.  rollback_slot=0 ledger_slot=48
 WARN  Fork rollback failed; skipping fork replay
 ```
 
-— leaving dugite-bp at block 4 while the network was at 84. The wedge MOVES from
-BlockFetch to the ledger rollback; it does not go away. Unit tests on
-`switch_chain` in isolation all passed, because nothing drove the storage plan
-through the ledger.
+`find_rollback_n` compared points with `==`. The LedgerSeq anchor is `Point::Origin`;
+chain selection builds `Point::Specific(intersection_slot, intersection_hash)`, so a
+genesis intersection arrives as `Specific(0, ZERO)`. Same chain position, different
+enum variant, unequal — so it fell through to the snapshot slow path, found nothing at
+or before genesis, and aborted, leaving the node on its dead fork with storage already
+switched. That is the EXACT fingerprint recorded for the reverted unconditional fix,
+which is why that attempt looked like a storage/ledger design problem: it was this
+one-line comparison all along.
 
-The complete fix needs the ledger to **re-initialise from genesis** on a
-rollback-to-Origin (a full `init_fresh_ledger`, not an in-place rewind — #989
-deleted `reset_to_origin` precisely because a partial reset cannot be correct),
-plus a LedgerSeq re-anchor (#985) and a query-state reset. That touches the code
-path that produced #985's chimera, so it needs its own focused pass with
-byte-exact validation.
+Fixed with `Point::denotes_origin()` (in dugite-primitives, documented with both
+spellings and why `Specific(0, ZERO)` is unambiguous — a real block at slot 0 carries a
+real hash), used in `find_rollback_n`.
 
-`Hash32::ZERO` IS dugite's canonical Origin parent (encoder → CBOR `null` ==
-Haskell `PrevHash = GenesisHash`), and upstream needs no guard at all because
-`AnchorGenesis` is a first-class constructor of `Anchor blk`, matched by
-`Paths.hs::isReachable`. Those facts are settled; the blocker is the ledger.
+**This is why the earlier four RED-proven unit tests were worthless.** They all drove
+`Point::Origin` — the form the LEDGER uses and the form production never sends on this
+path. The new test drives BOTH spellings, plus two negatives (a real hash at slot 0, a
+ZERO hash above slot 0) so the predicate cannot start swallowing unrelated targets.
 
-**An existing test PINNED the storage half**:
-`test_switch_chain_reachable_via_immutable_anchor` used `h(0)` as its "immutable
-tip", and `h(0)` is `[0u8; 32]` — the genesis sentinel. Re-pointed at a non-ZERO
-anchor so it covers the path it is named for; its `is_none()` assertion now
-documents the open wedge explicitly.
+**And the fix needs no ledger re-initialisation at all.** The prediction carried in the
+issue, in CLAUDE.md and in the round's own header for three attempts — that this needed
+a full `init_fresh_ledger` on rollback-to-Origin — was WRONG. The live log shows the
+real mechanism:
+
+```
+LedgerSeq rollback: restored ledger via in-memory volatile window
+  rollback_slot=0 rolled_back_blocks=6 new_tip_slot=0
+```
+
+No snapshot reload, no re-initialisation. The volatile window merely had to be
+REACHABLE: anchor at Origin (halves 1 and 2) and the comparison able to see it (half 3).
+
+**The marker mechanism was DELETED, not kept.** An earlier mitigation persisted
+`<db>/genesis-divergence-detected` and the next start discarded the node's own chain.
+Upstream does no such thing: `isReachable` returns `Nothing`, chain selection keeps
+what it has, and no marker, operator restart or re-sync is involved. It was a
+dugite-only invention presented as a fix. What remains is a throttled WARN per declined
+genesis range plus one latched ERROR naming the remedy — reaching it now means the fork
+really is deeper than k, which upstream cannot switch across either.
+
+**Traps worth keeping.**
+
+- **A gate can read a value nobody sets.** `set_ledger_can_reach_origin` is only called
+  from `reanchor_ledger_seq` — the exact call half 2 skips. Without an explicit publish
+  the flag keeps its initial `false`, BlockFetch declines every genesis range, and the
+  restart path is dead while looking implemented.
+- **Why the UNCONDITIONAL two-line fix was wrong.** Teaching both layers to accept
+  `prev_hash == Hash32::ZERO` with no ledger precondition was attempted and REVERTED:
+  storage emitted a genesis-rooted `SwitchPlan`, chain selection asked the ledger to
+  roll back to Origin, and `sync.rs` aborted with *"Rollback target outside LedgerSeq
+  volatile window AND no canonical snapshot available"*, leaving dugite-bp at block 4
+  while the network was at 84. The wedge MOVED to the ledger rollback. Unit tests on
+  `switch_chain` in isolation all passed, because nothing drove the storage plan through
+  the ledger — a RED-proven unit test bounds the FUNCTION, not the SYSTEM.
+- **Two published findings had to be RETRACTED**: "a dugite BP cannot mint the first
+  block of a chain" (the harness omitted the forging keys — a keyless BP is
+  indistinguishable from a gate-blocked one) and a PASS on tip-hash equality (dugite's
+  fork had WON; cardano adopted it). `relay=?` from an unreadable tip was also read as
+  "did not converge" for three runs — **unmeasured is not failed**.
+- `Hash32::ZERO` IS dugite's canonical Origin parent (encoder → CBOR `null` == Haskell
+  `PrevHash = GenesisHash`), and upstream needs no guard at all because `AnchorGenesis`
+  is a first-class constructor of `Anchor blk`.
+- **An existing test PINNED the storage half**:
+  `test_switch_chain_reachable_via_immutable_anchor` used `h(0)` as its "immutable tip",
+  and `h(0)` is `[0u8; 32]` — the genesis sentinel. Re-pointed at a non-ZERO anchor.
+
+**The reproduction is `testnet/local-devnet/genesis-fork-round.sh`, and four of its own
+defects are the reason it took so long to trust:**
+
+1. **Depth asymmetry is REQUIRED.** With both islands running up symmetrically dugite's
+   fork wins chain selection and the path under test is never entered (measured: 4-vs-5
+   and 9-vs-9 both converged with 0 switches). `LD_POOL2_STAKE_PCT=85` makes cardano's
+   chain longer by construction (~0.45 vs ~0.10 leader probability per slot) instead of
+   fighting the race.
+2. **A slot gap between two LIVE islands cannot grow.** A slot number is wall-clock, so
+   each live tip tracks the current slot and their difference stays near zero. Four runs
+   chased that impossible target. The gap accrues only against a genuinely frozen node.
+3. **It measured the wrong node.** The wedged node is dugite-**relay** — it peers with
+   cardano-bp and must replace its chain. An earlier gate compared cardano-bp's slot
+   against dugite-**bp**'s and reported INCONCLUSIVE "slot gap 17" on a run whose relay
+   was frozen 302 slots back. Step 4 once read the wrong node's log for the same reason.
+4. **A topology reload does NOT close an established connection.** SIGHUP-ing
+   `localRoots = []` stops future dials only; the hot session survived and dugite-bp fed
+   the relay from block 6 to 32 while the round believed it was frozen. The freeze is
+   `SIGSTOP` on the producer — reversible, and no restart, so the relay's anchor stays
+   at Origin.
+
+Also: the horizon breach is the SECONDARY condition, downstream of the defect. The
+primary one is just that chain selection prefers a chain sharing only genesis
+(`GF_MIN_BLOCK_LEAD`). A round demanding the breach up front skips the step it exists to
+exercise. And cardano's chain must out-length **dugite-bp's**, not just the relay's: the
+relay's chain is a PREFIX of dugite-bp's, so adopting that one is a plain roll-forward.
+
+**The allowlist SHRANK when the fix landed**, which is the direction that matters. While
+the node could not adopt, `genesis-fork-round.allowed-errors` excused the wedge's own
+diagnostics as "the round's evidence"; left in place, the round would pass whether the
+node adopted or wedged — a check that cannot fail.
 
 ### #1015 — Babbage folded extraEntropy; Praos has 2 terms, not 3
 
@@ -1159,6 +1310,29 @@ Network magic: Mainnet=764824073, Preview=2, Preprod=1
 - `config/bp-pair/` — Sandstone preview BP-pair soak rig (dugite-bp + dugite-relay + haskell-relay).
 - `config/monitoring/` — Grafana dashboard, Prometheus scrape + alert rules.
 - `scripts/run/`, `scripts/soak/`, `scripts/monitoring/`, `scripts/validation/`, `scripts/mithril/`, `scripts/dev/` — see `just --list` for the entry points.
+- `scripts/soak/preprod-steady-state-soak.sh [MINUTES]` — pre-release soak on the
+  REAL preprod network. REUSES an existing synced DB and never wipes, which is what
+  distinguishes it from `goal-soak.sh` (that one wipes and re-imports to answer "can
+  a fresh node reach tip in 30 min"). Gated on catch-up before anything is sampled —
+  sampling during reconvergence measures reconvergence, not steady state. Every
+  predicate records the compared VALUE: tip delta vs Koios, minimum peers, ERROR
+  lines, `LedgerSeq was incoherent` (absence = positive evidence #985's re-anchor
+  fired), #1057 genesis declines, RSS drift. Fewer than 3 usable samples FAILS
+  rather than passing vacuously.
+- `testnet/local-devnet/wait-tip-parity.sh` — waits until relay, dugite-bp AND cardano-bp
+  report the SAME tip block, for N consecutive samples. Run it before any `soak.sh`: p4
+  scores exact parity across all three observers, so a soak started right after a
+  disruption measures RECONVERGENCE and fails on noise (measured twice: 79% then 83%).
+  `wait-catchup.sh` is NOT a substitute — it allows a 5-block gap by default and compares
+  only cardano-bp against dugite-bp, never the relay. Both its queries are bounded,
+  because a SIGSTOPped node's socket still listens and an unbounded query hangs the gate
+  on the very condition it exists to catch.
+- `testnet/local-devnet/genesis-fork-round.sh` — the #1057 reproduction (Round 12), now
+  a regression gate: it REQUIRES live in-place adoption of a genesis-divergent chain,
+  across a restart. Needs depth asymmetry (`LD_POOL2_STAKE_PCT=85`), freezes the
+  producer with SIGSTOP rather than a topology reload, and measures the RELAY. Four
+  separate constructions failed silently first — see the #1057 section before changing
+  any precondition.
 
 ## Fuzzing
 

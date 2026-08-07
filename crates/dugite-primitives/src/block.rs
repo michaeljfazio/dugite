@@ -14,6 +14,33 @@ pub enum Point {
 }
 
 impl Point {
+    /// Whether this point denotes the ORIGIN of the chain.
+    ///
+    /// Origin has TWO representations in dugite, both legitimate and both in use:
+    ///
+    /// * `Point::Origin` — what the ledger and `LedgerSeq` use for the genesis anchor.
+    /// * `Point::Specific(SlotNo(0), Hash32::ZERO)` — what the storage and chain-
+    ///   selection layers produce, because `Hash32::ZERO` is dugite's canonical Origin
+    ///   parent: the encoder maps it to CBOR `null`, i.e. Haskell's
+    ///   `PrevHash = GenesisHash`.
+    ///
+    /// A real block at slot 0 carries a real header hash, never all-zero, so the
+    /// sentinel is unambiguous.
+    ///
+    /// Comparing the two forms with `==` silently answers "different chain positions".
+    /// That is what declined the genesis-rooted ledger rollback in #1057: chain
+    /// selection asked to roll back to `Specific(0, ZERO)` while the anchor was
+    /// `Origin`, so `find_rollback_n` fell through to its snapshot slow path, found no
+    /// snapshot at or before genesis, and aborted — leaving the node on its dead fork
+    /// with the storage layer already switched. Use this predicate for any comparison
+    /// that can see a genesis point from more than one layer.
+    pub fn denotes_origin(&self) -> bool {
+        match self {
+            Point::Origin => true,
+            Point::Specific(slot, hash) => slot.0 == 0 && *hash == crate::hash::Hash32::ZERO,
+        }
+    }
+
     pub fn slot(&self) -> Option<SlotNo> {
         match self {
             Point::Origin => None,
