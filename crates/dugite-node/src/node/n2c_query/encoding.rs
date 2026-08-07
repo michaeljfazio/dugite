@@ -1011,8 +1011,20 @@ fn encode_pool_distr2(
         // `individualPoolStakeVrf`.
         enc.bytes(&pool.vrf_keyhash).ok();
     }
-    // `pdTotalActiveStake`.
-    enc.u64(total_active_stake).ok();
+    // `pdTotalActiveStake` — CLAMPED, because it is a `NonZero Coin` upstream:
+    //
+    //   data PoolDistr = PoolDistr
+    //     { unPoolDistr        :: !(Map (KeyHash StakePool) IndividualPoolStake)
+    //     , pdTotalActiveStake :: !(NonZero Coin) }
+    //
+    // A literal 0 does not merely look odd, it fails to DECODE — `NonZero`'s reader
+    // rejects it — so on a chain with no active stake (origin, or any pre-delegation
+    // epoch) the whole reply is undecodable. This encoder clamped the ratio DENOMINATOR
+    // on the line above and then wrote the unclamped value here, so tag 36 — the only
+    // arm a V21+ client can reach — carried the defect while the debug path that had
+    // its own copy of this logic did not. The #978 inversion: the reachable arm broken,
+    // the one with a local fix correct. A real cardano-node emits 1 here.
+    enc.u64(total_active_stake.max(1)).ok();
 }
 
 // ─── Stake encoding ───────────────────────────────────────────────────────────
@@ -2512,7 +2524,7 @@ fn encode_debug_new_epoch_state(
     snap_go: &SnapshotStakeData,
     snap_fee: u64,
     total_active_stake: u64,
-    pool_distr: &[crate::node::n2c_query::types::StakePoolSnapshot],
+    pool_distr: &[crate::node::n2c_query::types::PoolDistrEntry],
     gov: &crate::node::n2c_query::types::GovStateSnapshot,
     retiring: &[(Vec<u8>, u64)],
     dreps: &[crate::node::n2c_query::types::DRepSnapshot],
@@ -2583,42 +2595,19 @@ fn encode_debug_new_epoch_state(
     // [4] StrictMaybe RewardUpdate = Nothing = array(0)
     enc.array(0).ok();
 
-    // [5] PoolDistr = array(2)[Map<pool_id(28B), IndividualPoolStake>, total_active_stake]
+    // [5] PoolDistr — via the SHARED encoder, not a private copy.
     //
-    // IndividualPoolStake = array(3)[individualPoolStake :: Rational,
-    // individualTotalPoolStake :: CompactForm Coin, individualPoolStakeVrf].
-    // Was previously a BARE map (no `total_active_stake` wrapper) whose
-    // `IndividualPoolStake` was `array(2)` — missing the middle Coin field
-    // entirely. `individualTotalPoolStake` is the pool's own absolute stake
-    // in lovelace, which is already `pool.stake` (the same value used as the
-    // ratio's numerator) — no new data needed, just the missing field.
-    // `pdTotalActiveStake` is a `NonZero Coin` upstream, NOT a plain Coin:
+    // This used to be a fourth hand-rolled PoolDistr encoder, and it differed from the
+    // other three in two ways that both reached the wire: no `spssNumDelegators > 0`
+    // filter (upstream's `calculatePoolDistr'` guards on it), and an UNREDUCED rational
+    // where every other rational here is in lowest terms, a Haskell `Rational` being
+    // normalised by construction.
     //
-    //   data PoolDistr = PoolDistr
-    //     { unPoolDistr        :: !(Map (KeyHash StakePool) IndividualPoolStake)
-    //     , pdTotalActiveStake :: !(NonZero Coin) }
-    //
-    // (cardano-ledger `libs/cardano-ledger-core/.../State/PoolDistr.hs`.)
-    // A literal `0` therefore fails to DECODE — `NonZero`'s reader rejects it
-    // — so on a chain with no active stake (origin, or any pre-delegation
-    // epoch) the whole `NewEpochState` reply became undecodable. The `.max(1)`
-    // clamp was already applied to the ratio DENOMINATOR on the line below and
-    // simply never reached the encoded field; a real cardano-node at the same
-    // point emits `1` here for exactly this reason.
-    //
-    // The same clamp is applied by `encode_stake_snapshots` (tag 20) — see
-    // `test_stake_snapshots_zero_totals_encode_as_one`.
-    let total = total_active_stake.max(1);
-    enc.array(2).ok();
-    enc.map(pool_distr.len() as u64).ok();
-    for pool in pool_distr {
-        enc.bytes(&pool.pool_id).ok();
-        enc.array(3).ok();
-        encode_tagged_rational(enc, pool.stake, total);
-        enc.u64(pool.stake).ok();
-        enc.bytes(&pool.vrf_keyhash).ok();
-    }
-    enc.u64(total).ok();
+    // `encode_pool_distr2` is the arm #964 verified against `calculatePoolDistr'`,
+    // including the `NonZero` clamp on `pdTotalActiveStake` — a literal 0 there fails to
+    // DECODE, which made the whole reply undecodable on a chain with no active stake.
+    // Sharing it also keeps the N-copies drift behind #932/#938/#985 from recurring.
+    encode_pool_distr2(enc, pool_distr, total_active_stake);
 
     // [6] StashedAVVMAddresses = () = CBOR null. See the doc comment above.
     enc.null().ok();
@@ -3293,11 +3282,14 @@ mod tests {
             delegator_hashes: vec![],
         }];
         let retiring = vec![(vec![0xDDu8; 28], 30u64)];
-        let pool_distr = vec![StakePoolSnapshot {
+        // nesPd carries the FROZEN `set`-snapshot distribution, so this is a
+        // PoolDistrEntry — and `delegator_count` must be > 0 or the shared encoder
+        // correctly filters the pool out (`calculatePoolDistr'`'s guard).
+        let pool_distr = vec![PoolDistrEntry {
             pool_id: vec![0xEEu8; 28],
             stake: 1_000_000,
             vrf_keyhash: vec![0xFFu8; 32],
-            total_circulation: 45_000_000_000_000_000,
+            delegator_count: 3,
         }];
 
         let result = QueryResult::DebugNewEpochState {
