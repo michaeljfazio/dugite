@@ -145,6 +145,19 @@ pub struct EpochSubState {
     pub treasury: Lovelace,
     pub reserves: Lovelace,
     pub pending_reward_update: Option<PendingRewardUpdate>,
+    /// Haskell `EpochState.esNonMyopic` — per-pool `Likelihood` history plus the
+    /// reward pot frozen at the boundary that produced it.
+    ///
+    /// A sibling of `snapshots` here for the same reason it is a sibling of
+    /// `esSnapshots` upstream: it is epoch-boundary state, but it is NOT part of
+    /// `SnapShots` and does not rotate mark/set/go. It is replaced wholesale at
+    /// each boundary by `updateNonMyopic`, whose output is carried in
+    /// [`PendingRewardUpdate::non_myopic`].
+    ///
+    /// Cannot be reconstructed from current state — the likelihoods are a
+    /// 0.9-decayed accumulator over every past epoch — which is why adding it
+    /// forces a `SNAPSHOT_VERSION` bump rather than a lazy backfill.
+    pub non_myopic: super::non_myopic::NonMyopic,
     /// Reward update that was consumed by the most recent epoch-boundary
     /// handler.  Populated by the boundary handler immediately AFTER it
     /// `take()`s `pending_reward_update`, so debug dumpers (run AFTER

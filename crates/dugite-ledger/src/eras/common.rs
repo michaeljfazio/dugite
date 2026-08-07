@@ -1281,6 +1281,7 @@ mod tests {
             treasury: Lovelace(0),
             reserves: Lovelace(0),
             pending_reward_update: None,
+            non_myopic: Default::default(),
             last_applied_rupd: None,
             pending_pp_updates: BTreeMap::new(),
             future_pp_updates: BTreeMap::new(),

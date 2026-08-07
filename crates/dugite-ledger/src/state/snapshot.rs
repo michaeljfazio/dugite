@@ -502,7 +502,16 @@ impl LedgerState {
     //     cannot distinguish "no account delegates to AlwaysAbstain" from
     //     "accounts delegate zero stake", and upstream's `psDRepDistr` is one
     //     map whose keys exist only for the former. Positional bincode change.
-    pub(crate) const SNAPSHOT_VERSION: u8 = 37;
+    // 38: #1067 added `EpochSubState.non_myopic` (`EpochState.esNonMyopic`) and
+    //     `PendingRewardUpdate.non_myopic` (`RewardUpdate.nonMyopic`). Two
+    //     positional bincode additions, so a v37 snapshot cannot supply them.
+    //     Neither field is reconstructible after the fact: `likelihoodsNM` is a
+    //     0.9-decayed accumulator folded over every past epoch, and
+    //     `rewardPotNM` is `_R` from a boundary whose inputs (reserves, fees,
+    //     eta) have since moved. A lazy backfill would therefore not converge
+    //     for ~20 epochs while looking authoritative the whole time — the #979
+    //     failure mode — so existing DBs replay chunks instead.
+    pub(crate) const SNAPSHOT_VERSION: u8 = 38;
 
     /// Save ledger state snapshot to disk using bincode serialization.
     ///

@@ -174,6 +174,16 @@ pub struct LedgerStateSnapshot {
     pub ptr_stake_excluded: bool,
     /// Pending reward update (drained at the next epoch boundary).
     pub pending_reward_update: Option<PendingRewardUpdate>,
+    /// `EpochState.esNonMyopic` — per-pool `Likelihood` history plus the frozen
+    /// reward pot (#1067).
+    ///
+    /// Persisted because it CANNOT be reconstructed: the likelihoods are a
+    /// 0.9-decayed accumulator folded over every past epoch, and the reward pot
+    /// is `_R` from a boundary whose inputs (reserves, fees, eta) have since
+    /// moved. A node resuming without it would report values that only converge
+    /// over ~20 epochs — which is precisely why adding it forces
+    /// `SNAPSHOT_VERSION` 37 → 38 rather than a lazy backfill.
+    pub non_myopic: super::non_myopic::NonMyopic,
     /// Running total of all stake key deposits locked in the ledger (lovelace).
     pub total_stake_key_deposits: u64,
     /// Script-type stake credentials.
@@ -302,6 +312,7 @@ impl From<&super::LedgerState> for LedgerStateSnapshot {
             treasury: s.epochs.treasury,
             reserves: s.epochs.reserves,
             pending_reward_update: s.epochs.pending_reward_update.clone(),
+            non_myopic: s.epochs.non_myopic.clone(),
             pending_pp_updates: s.epochs.pending_pp_updates.clone(),
             future_pp_updates: s.epochs.future_pp_updates.clone(),
             needs_stake_rebuild: s.epochs.needs_stake_rebuild,
@@ -393,6 +404,7 @@ impl From<LedgerStateSnapshot> for super::LedgerState {
                 treasury: s.treasury,
                 reserves: s.reserves,
                 pending_reward_update: s.pending_reward_update,
+                non_myopic: s.non_myopic,
                 // Not persisted to ledger snapshots — this is a
                 // post-boundary debug-dump aid only.  Recomputed on the
                 // next epoch boundary.
@@ -515,6 +527,7 @@ mod tests {
             ptr_stake,
             ptr_stake_excluded,
             pending_reward_update,
+            non_myopic,
             total_stake_key_deposits,
             script_stake_credentials,
             pending_mir_reserves,
@@ -574,6 +587,27 @@ mod tests {
             opcert_counters, "opcert_counters";
             stake_key_deposits, "stake_key_deposits";
             pool_deposits, "pool_deposits";
+        );
+        // #1067: both halves must be non-trivial. An empty `likelihoods` map
+        // writes no element bytes at all, so a layout change inside
+        // `Likelihood` would be invisible — the exact blindness this test
+        // exists to remove.
+        assert!(
+            !non_myopic.likelihoods.is_empty(),
+            "non_myopic.likelihoods is empty — the layout of a Likelihood \
+             contributes no bytes and is invisible to the hash"
+        );
+        assert!(
+            non_myopic
+                .likelihoods
+                .values()
+                .all(|l| l.0.len() == crate::state::non_myopic::SAMPLE_SIZE),
+            "non_myopic.likelihoods holds a short Likelihood — a truncated \
+             sequence writes fewer bytes and weakens the hash"
+        );
+        assert_ne!(
+            non_myopic.reward_pot.0, 0,
+            "non_myopic.reward_pot is 0 — indistinguishable from its default"
         );
         assert!(
             !stake_distribution.stake_map.is_empty(),

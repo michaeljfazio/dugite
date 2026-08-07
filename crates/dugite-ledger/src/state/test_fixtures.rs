@@ -60,6 +60,24 @@ fn h32(b: u8) -> Hash32 {
     Hash32::from_bytes([b; 32])
 }
 
+/// A non-trivial `NonMyopic`: one pool, a full-length `Likelihood` whose
+/// log-weights are all DIFFERENT, and a non-zero reward pot.
+///
+/// The weights vary across the sample positions on purpose. A constant-filled
+/// `Likelihood` would serialize identically under a bincode layout change that
+/// reordered or resized the sequence, which is the exact blindness #967 exists
+/// to remove.
+fn sample_non_myopic(pool_byte: u8, reward_pot: u64) -> super::non_myopic::NonMyopic {
+    use super::non_myopic::{Likelihood, NonMyopic, SAMPLE_SIZE};
+    let weights: Vec<f32> = (0..SAMPLE_SIZE).map(|i| -(i as f32) * 0.25).collect();
+    let mut likelihoods = HashMap::new();
+    likelihoods.insert(h28(pool_byte), Likelihood(weights));
+    NonMyopic {
+        likelihoods,
+        reward_pot: Lovelace(reward_pot),
+    }
+}
+
 /// A `LedgerState` in which every field the snapshot serializes is non-trivial:
 /// every `Option` is `Some`, every collection has at least one entry, and every
 /// scalar is distinguishable from its default.
@@ -183,7 +201,12 @@ pub fn populated_ledger_state() -> LedgerState {
         },
         delta_treasury: 42_000,
         delta_reserves: -17,
+        non_myopic: sample_non_myopic(0x30, 7_777_777),
     });
+    // `esNonMyopic` itself, distinct from the copy riding on the pending reward
+    // update — different pool id and pot so a From impl that wires one field to
+    // the other cannot pass.
+    state.epochs.non_myopic = sample_non_myopic(0x31, 8_888_888);
     state.epochs.rupd_addrs_rew = Some(Arc::new({
         let mut s = HashSet::new();
         s.insert(h32(0x10));
