@@ -165,7 +165,7 @@ pub enum QueryResult {
         /// Total active stake for GetStakeDistribution (used in PoolDistr)
         total_active_stake: u64,
         /// Current pool stake distribution (pool_id_28B → (stake_rational_num, stake_rational_den, vrf_hash_32B))
-        pool_distr: Vec<StakePoolSnapshot>,
+        pool_distr: Vec<PoolDistrEntry>,
         /// See [`QueryResult::DebugEpochState::gov`].
         gov: Box<GovStateSnapshot>,
         /// See [`QueryResult::DebugEpochState::retiring`].
