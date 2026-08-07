@@ -218,6 +218,19 @@ xv_03_plutus_spend() {
     # Step 2: spend it back to wallet-a with empty redeemer + collateral
     # (picked from the genesis collateral pool).
     local genesis_addr; genesis_addr=$(cat "$ZOO_PAY_ADDR_FILE")
+    # COLLATERAL MUST BE ADA-ONLY, and the `keys == ["lovelace"]` filter below is the
+    # whole reason. A collateral input carrying native assets forces `build` to emit a
+    # collateral-RETURN output that carries them all back, and after the zoo's minting
+    # categories the genesis address holds dozens of assets. Measured: the return
+    # collateral field alone was 9445 characters of the tx view — about 2100 CBOR bytes
+    # the fee estimate did not cover, i.e. ~94k lovelace at minFeeA=44, which is the bulk
+    # of the FeeTooSmallUTxO shortfall (the rest was the witness count, handled above).
+    #
+    # That is also why it only failed AFTER a full zoo run: on a fresh devnet the genesis
+    # address is ada-only, so any candidate passed.
+    #
+    # Pure-ADA collateral is what a real operator uses anyway — the return output then
+    # holds only lovelace and stays small.
     local coll
     coll=$(cardano-cli conway query utxo \
         --testnet-magic "$LD_MAGIC" --socket-path "$ZOO_SOCKET" \
@@ -225,6 +238,7 @@ xv_03_plutus_spend() {
         | jq -r 'to_entries[] | select(.value.value.lovelace >= 10000000 and .value.value.lovelace <= 100000000)
                               | select((.value.inlineDatum // null) == null and (.value.datumhash // null) == null
                                      and (.value.referenceScript // null) == null)
+                              | select((.value.value | keys) == ["lovelace"])
                               | .key' | head -n 1)
     [ -n "$coll" ] || { xv_record "$name" FAIL "" "no-collateral"; return 1; }
 
