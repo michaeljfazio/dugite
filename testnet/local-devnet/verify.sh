@@ -39,12 +39,15 @@ p1_forge_cross_check() {
     # blocks are by definition NOT on the canonical chain, so neither the
     # other BP nor (often) the relay ever adopts them.
     #
-    # A block is canonical at end-of-soak iff BOTH BPs have an event for
-    # it: the forger logs a `forge` event, and the OTHER BP logs a `recv`
-    # event when its chain adopts that block.  Orphans only ever have the
-    # forger's event.  This filter excludes orphans before counting
-    # observers — matching the predicate's intent ("every canonical block
-    # must be observed by all three nodes").
+    # A block counts here iff BOTH BPs have an event for it: the forger logs a
+    # `forge` event, and the OTHER BP logs a `recv` event when its chain adopts
+    # that block.  A slot-battle loser only ever has the forger's event, so this
+    # filter excludes it before counting observers — matching the predicate's
+    # intent ("every adopted block must be observed by all three nodes").
+    #
+    # Note the filter cannot distinguish "lost a slot battle" from "has not
+    # propagated yet", because both look like a missing peer event. See the
+    # comment on `unadopted` below before reporting the excluded count as orphans.
     local canonical_only=""
     while IFS=, read -r slot hash; do
         [ -z "$slot" ] && continue
@@ -73,9 +76,23 @@ p1_forge_cross_check() {
         fi
     done <<< "$canonical_only"
 
-    local orphans=$((total - total_canonical))
+    # DO NOT call this "orphans". The filter above excludes any block the forger logged
+    # that the OTHER BP has no event for, and that has two very different causes:
+    #
+    #   two-forger round : a genuine slot-battle loser, i.e. a real orphan
+    #   single-forger    : nothing competes, so it is a block that simply had not
+    #                      propagated yet when the check ran (typically the newest one
+    #                      or two), or one forged before cardano-bp connected
+    #
+    # Reporting "10 orphan(s) excluded" on a topology that structurally cannot orphan
+    # sends the reader looking for forks that do not exist — and it disagrees with
+    # analyze-evidence.sh, which computes orphans from the CHAIN and correctly says 0
+    # over the same forges. Two counters describing one population with opposite answers
+    # is worse than either number alone. Measured 2026-08-07: p1 said "10 orphan(s)"
+    # while analyze said "orphans: 0 (rate=0.0000)" for the identical 52 forges.
+    local unadopted=$((total - total_canonical))
     if [ "$fails" -eq 0 ]; then
-        PREDICATE_PASS+=("p1:forge-cross-check ($total_canonical canonical blocks, >=3 observers each; $orphans orphan(s) excluded)")
+        PREDICATE_PASS+=("p1:forge-cross-check ($total_canonical blocks adopted by both BPs, >=3 observers each; $unadopted forged-but-not-yet-adopted excluded)")
     else
         PREDICATE_FAIL+=("p1:forge-cross-check ($fails/$total_canonical canonical blocks missing observers; example: $fail_examples)")
     fi
