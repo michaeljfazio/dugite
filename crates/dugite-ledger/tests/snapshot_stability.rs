@@ -112,7 +112,14 @@ fn snapshot_format_hash_stability() {
     //     layout change and this test stayed GREEN through it, because
     //     `ratification_snapshot` was `None` in the fixture — which is what
     //     #967 is about.)
-    const EXPECTED_HASH: &str = "474c7869c31088f4310932825ca44657df5be7bfebd1da93abf57732b1f72f2e";
+    //   474c7869c31088f4310932825ca44657df5be7bfebd1da93abf57732b1f72f2e
+    //     SNAPSHOT 37 (#994, PulsingSnapshot presence flags)
+    //
+    // Current: SNAPSHOT 37 -> 38 (#1067). This IS a layout change — two
+    // positional bincode additions, `EpochSubState.non_myopic` and
+    // `PendingRewardUpdate.non_myopic` — so it is the first of the two rules
+    // above and SNAPSHOT_VERSION was bumped with it.
+    const EXPECTED_HASH: &str = "0b78b7f6df8e66b194d3578d74a9c53624742eda20fb8a7aa4685d4fa03f0089";
 
     if EXPECTED_HASH == "COMPUTE_ON_FIRST_RUN" {
         panic!(

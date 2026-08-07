@@ -643,6 +643,7 @@ impl EraRules for ConwayRules {
                 ctx.epoch_length,
                 ctx.shelley_transition_epoch,
                 ctx.max_lovelace_supply,
+                &epochs.non_myopic,
             );
 
             // Issue #438/#471: per-boundary reward-debug dump.  No-op
@@ -700,6 +701,11 @@ impl EraRules for ConwayRules {
                     }
                 }
             }
+
+            // `applyRUpd` installs the reward update's `nonMyopic` as the new
+            // `esNonMyopic`. It is a wholesale replacement, not a merge — the
+            // decay-and-combine already happened in `updateNonMyopic`.
+            epochs.non_myopic = rupd.non_myopic.clone();
 
             // #615d: expose the freshly-applied RUPD to the epoch-state dumper.
             // Without this, `epoch_state_debug::rewards_summary` sees `None` and
@@ -2068,6 +2074,7 @@ fn make_empty_epoch_sub() -> EpochSubState {
         treasury: Lovelace(0),
         reserves: Lovelace(0),
         pending_reward_update: None,
+        non_myopic: Default::default(),
         last_applied_rupd: None,
         pending_pp_updates: std::collections::BTreeMap::new(),
         future_pp_updates: std::collections::BTreeMap::new(),
@@ -2186,6 +2193,7 @@ mod tests {
             treasury: Lovelace(0),
             reserves: Lovelace(0),
             pending_reward_update: None,
+            non_myopic: Default::default(),
             last_applied_rupd: None,
             pending_pp_updates: BTreeMap::new(),
             future_pp_updates: BTreeMap::new(),

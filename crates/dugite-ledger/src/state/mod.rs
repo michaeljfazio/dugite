@@ -4,6 +4,7 @@ mod epoch;
 #[cfg(feature = "epoch-state-debug")]
 pub mod epoch_state_debug;
 pub(crate) mod governance;
+pub mod non_myopic;
 mod protocol_params;
 #[cfg(feature = "reward-debug-dump")]
 pub mod reward_debug;
@@ -26,6 +27,7 @@ pub(crate) use governance::{
     modified_pp_groups, pp_change_drep_all_groups_met, pp_change_drep_threshold,
     pp_change_spo_threshold, prev_action_as_expected, DRepPPGroup, StakePoolPPGroup,
 };
+pub use non_myopic::{leader_probability, Likelihood, NonMyopic, DECAY_FACTOR, SAMPLE_SIZE};
 pub use rewards::compute_reward_update;
 // Re-export for the RUPD-apply sites in `eras::shelley` / `eras::conway`,
 // which are not descendants of `state` and cannot otherwise reach the
@@ -259,6 +261,24 @@ pub struct PendingRewardUpdate {
     /// issue #796. `i128` (not `u64`) so the sign can be represented; the
     /// magnitude never exceeds the max lovelace supply, well within range.
     pub delta_reserves: i128,
+    /// Haskell `RewardUpdate.nonMyopic` — the `NonMyopic` record this boundary
+    /// produces, already folded through `updateNonMyopic` (decay the previous
+    /// epoch's history, combine with this epoch's likelihoods, re-key to this
+    /// epoch's pool set, and stamp the frozen reward pot).
+    ///
+    /// ```haskell
+    /// data RewardUpdate = RewardUpdate
+    ///   { deltaT :: !DeltaCoin, deltaR :: !DeltaCoin
+    ///   , rs :: !(Map (Credential 'Staking) (Set Reward))
+    ///   , deltaF :: !DeltaCoin, nonMyopic :: !NonMyopic }
+    /// ```
+    ///
+    /// Carried on the reward update rather than written directly to the epoch
+    /// state because upstream does the same: `startStep` computes
+    /// `newLikelihoods` and stashes the OLD `nonMyopic` in the `RewardSnapShot`,
+    /// and `completeRupd` produces the merged record. Both halves travel
+    /// together to the point of application.
+    pub non_myopic: non_myopic::NonMyopic,
 }
 
 // ── Governance proposal priority forest types ─────────────────────────
@@ -1199,6 +1219,9 @@ impl LedgerState {
                 treasury: Lovelace(0),
                 reserves: Lovelace(MAX_LOVELACE_SUPPLY),
                 pending_reward_update: None,
+                // Haskell `emptyNonMyopic` at genesis — no pool has any history
+                // yet and no RUPD has frozen a pot.
+                non_myopic: non_myopic::NonMyopic::default(),
                 last_applied_rupd: None,
                 pending_pp_updates: BTreeMap::new(),
                 future_pp_updates: BTreeMap::new(),
@@ -1744,6 +1767,14 @@ impl LedgerState {
                 treasury: Lovelace(hs.new_epoch_state.treasury),
                 reserves: Lovelace(hs.new_epoch_state.reserves),
                 pending_reward_update: None,
+                // Carried across from the imported snapshot rather than reset.
+                // The likelihoods are a 0.9-decayed accumulator over every past
+                // epoch, so a fresh node that drops them needs ~20 epochs to
+                // converge and reports plausible-but-wrong rankings the whole
+                // time, with nothing to signal that it is wrong.
+                non_myopic: non_myopic::NonMyopic::from_haskell_snapshot(
+                    &hs.new_epoch_state.non_myopic,
+                ),
                 last_applied_rupd: None,
                 pending_pp_updates: BTreeMap::new(),
                 future_pp_updates: BTreeMap::new(),

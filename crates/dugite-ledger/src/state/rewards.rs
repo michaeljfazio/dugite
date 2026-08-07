@@ -1,3 +1,4 @@
+use super::non_myopic::{leader_probability, Likelihood, NonMyopic};
 use super::{LedgerState, PendingRewardUpdate, StakeSnapshot};
 use dugite_primitives::hash::{Hash28, Hash32};
 use dugite_primitives::protocol_params::ProtocolParameters;
@@ -107,6 +108,70 @@ impl Rat {
     }
 }
 
+/// Build this epoch's `newLikelihoods` — one `Likelihood` per pool in the GO
+/// snapshot's pool set.
+///
+/// ```haskell
+/// -- startStep, Cardano.Ledger.Shelley.LedgerState.PulsingReward
+/// let SnapShot activeStake totalActiveStake stakePoolSnapShots = ssStakeGo ss
+///     mkPoolRewardInfoCurry =
+///       mkPoolRewardInfo pr _R b (fromIntegral blocksMade) totalStake totalActiveStake
+///     allPoolInfo = VMap.mapWithKey mkPoolRewardInfoCurry stakePoolSnapShots
+///
+/// makeLikelihoods = \case
+///   Left (StakeShare sigma) ->
+///     likelihood 0 (leaderProbability asc sigma $ pr ^. ppDG) slotsPerEpoch
+///   Right info ->
+///     likelihood (poolBlocks info) (leaderProbability asc (getSigma info) $ pr ^. ppDG) slotsPerEpoch
+/// newLikelihoods = VMap.map makeLikelihoods allPoolInfo
+/// ```
+///
+/// # This is NOT the reward-distribution loop's pool set
+///
+/// The key set is **every** pool in `stakePoolSnapShots`, unconditionally — no
+/// filter on stake and no filter on blocks produced. The reward loop below
+/// deliberately `continue`s past pools that made zero blocks and past pools
+/// whose pledge is unmet; both of those still get a likelihood entry here.
+/// Piggy-backing this onto that loop would silently drop exactly the pools the
+/// `Left` branch exists to serve.
+///
+/// The `Left`/`Right` split needs no branch in Rust: it is decided by
+/// `Map.lookup stakePoolId (unBlocksMade blocks)`, and `BlocksMade` is
+/// increment-only, so "absent" ⟺ "zero blocks". Reading the count with
+/// `unwrap_or(0)` reproduces both arms — `Left` passes a literal `0`, `Right`
+/// passes `poolBlocks info`, and both compute `t` from the same `sigma`.
+fn build_new_likelihoods(
+    go_snapshot: Option<&StakeSnapshot>,
+    bprev_blocks_by_pool: &HashMap<Hash28, u64>,
+    active_slot_coeff: (u64, u64),
+    prev_d: &dugite_primitives::transaction::Rational,
+    total_stake: u64,
+    epoch_length: u64,
+) -> HashMap<Hash28, Likelihood> {
+    let go = match go_snapshot {
+        Some(g) => g,
+        None => return HashMap::new(),
+    };
+
+    let d = (prev_d.numerator, prev_d.denominator.max(1));
+
+    go.pool_params
+        .keys()
+        .map(|pool_id| {
+            let pool_stake = go.pool_stake.get(pool_id).map(|l| l.0).unwrap_or(0);
+            let blocks = bprev_blocks_by_pool.get(pool_id).copied().unwrap_or(0);
+
+            // `sigma = poolTotalStake %? totalStake` — the UNCAPPED relative
+            // stake over circulating supply. NOT `min sigma z0` (that capping
+            // belongs to `maxPool'`), and NOT over `totalActiveStake` (that is
+            // `sigmaA`, used only by `mkApparentPerformance`).
+            let t = leader_probability(active_slot_coeff, (pool_stake, total_stake), d);
+
+            (*pool_id, Likelihood::new(blocks, t, epoch_length))
+        })
+        .collect()
+}
+
 /// Compute a reward update from explicit parameters, without requiring a `LedgerState`.
 ///
 /// This is the standalone version of the reward calculation that was previously
@@ -146,7 +211,27 @@ pub fn compute_reward_update(
     epoch_length: u64,
     _shelley_transition_epoch: u64,
     max_lovelace_supply: u64,
+    prev_non_myopic: &NonMyopic,
 ) -> PendingRewardUpdate {
+    // `totalStake` = `circulation es maxSupply = maxSupply <-> casReserves acnt`,
+    // the current circulating supply. Hoisted above every early return because
+    // it is `sigma`'s denominator and so is needed to build `newLikelihoods`,
+    // which Haskell produces unconditionally in `startStep`.
+    let total_stake = max_lovelace_supply.saturating_sub(reserves.0);
+
+    // Haskell has no early return here: `startStep` always computes
+    // `newLikelihoods`, and `completeRupd` always folds it through
+    // `updateNonMyopic`. Every `return` below therefore has to carry a real
+    // `NonMyopic`, not a default one — an empty `likelihoodsNM` is only correct
+    // when the GO snapshot genuinely has no pools.
+    let new_likelihoods = build_new_likelihoods(
+        go_snapshot,
+        bprev_blocks_by_pool,
+        params.active_slot_coeff_rational(),
+        prev_d,
+        total_stake,
+        epoch_length,
+    );
     // pv≤6 reward prefilter source set (`fvAddrsRew`). Haskell freezes
     // `Map.keysSet(accounts)` at `startStep` (mid-epoch, before that block's
     // certs); both the per-member (`rewardOnePoolMember`) and leader
@@ -233,7 +318,14 @@ pub fn compute_reward_update(
     let total_rewards_available = expansion + epoch_fees;
 
     if total_rewards_available == 0 {
-        return PendingRewardUpdate::default();
+        // `rPot = ssFee <> deltaR1 = 0`, so `deltaT1 = floor(tau * 0) = 0` and
+        // `_R = rPot - deltaT1 = 0`. The deltas are all zero, but the
+        // likelihoods are not: upstream still ranks pools in an epoch that
+        // minted nothing.
+        return PendingRewardUpdate {
+            non_myopic: prev_non_myopic.update(Lovelace(0), new_likelihoods),
+            ..Default::default()
+        };
     }
 
     let tau = Rat::from_i128(tau_num, tau_den);
@@ -243,7 +335,6 @@ pub fn compute_reward_update(
 
     let reward_pot = total_rewards_available - treasury_cut;
 
-    let total_stake = max_lovelace_supply.saturating_sub(reserves.0);
     if total_stake == 0 {
         // #615b: Haskell's RewardUpdate carries only treasury_cut in deltaT;
         // the undistributed portion of reward_pot is refunded to reserves via
@@ -258,6 +349,7 @@ pub fn compute_reward_update(
             delta_reserves,
             delta_treasury,
             rewards: HashMap::new(),
+            non_myopic: prev_non_myopic.update(Lovelace(reward_pot), new_likelihoods),
         };
     }
 
@@ -279,6 +371,11 @@ pub fn compute_reward_update(
                 delta_reserves,
                 delta_treasury,
                 rewards: HashMap::new(),
+                // `new_likelihoods` is empty on this path by construction
+                // (`build_new_likelihoods` returns empty for `None`), so this
+                // drops any prior history — which is what `mapWithKey` over an
+                // empty `newLikelihoods` does upstream.
+                non_myopic: prev_non_myopic.update(Lovelace(reward_pot), new_likelihoods),
             };
         }
     };
@@ -363,6 +460,11 @@ pub fn compute_reward_update(
             delta_reserves,
             delta_treasury,
             rewards: HashMap::new(),
+            // Non-empty whenever the GO snapshot has pools: zero ACTIVE stake
+            // does not mean zero pools, and every pool in `stakePoolSnapShots`
+            // still gets a `likelihood 0 …` entry (all-zero after
+            // normalisation, since sigma = 0 makes t = 0).
+            non_myopic: prev_non_myopic.update(Lovelace(reward_pot), new_likelihoods),
         };
     }
 
@@ -698,6 +800,11 @@ pub fn compute_reward_update(
         rewards: reward_map,
         delta_treasury,
         delta_reserves,
+        // `nonMyopic = updateNonMyopic nm oldr newLikelihoods`, where `oldr` is
+        // `rewR` = `_R` = `rPot - deltaT1` — the pot AFTER the treasury cut,
+        // which is exactly `reward_pot` here. Not `total_rewards_available`,
+        // and not `expansion`.
+        non_myopic: prev_non_myopic.update(Lovelace(reward_pot), new_likelihoods),
     }
 }
 
@@ -858,6 +965,7 @@ impl LedgerState {
             self.epoch_length,
             self.shelley_transition_epoch,
             self.max_lovelace_supply,
+            &self.epochs.non_myopic,
         )
     }
 
@@ -1335,6 +1443,7 @@ mod tests {
             86400, // epoch_length
             0,     // shelley_transition_epoch
             super::super::MAX_LOVELACE_SUPPLY,
+            &Default::default(),
         );
 
         assert!(
@@ -1389,6 +1498,7 @@ mod tests {
             86_400,
             0,
             MAX_SUPPLY,
+            &Default::default(),
         );
 
         // expansion = floor(rho * reserves) = floor(0.1 * 1_000_000) = 100_000
@@ -2008,6 +2118,7 @@ mod tests {
             86_400, // preview epoch length
             0,
             super::super::MAX_LOVELACE_SUPPLY,
+            &Default::default(),
         );
 
         // The account whose on-chain withdrawal wedged the chain.
@@ -2153,6 +2264,7 @@ mod tests {
                 86_400,
                 0,
                 super::super::MAX_LOVELACE_SUPPLY,
+                &Default::default(),
             )
             .rewards
             .get(&member)

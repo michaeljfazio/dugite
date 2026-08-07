@@ -339,6 +339,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             state.epoch_length,
             state.shelley_transition_epoch,
             state.max_lovelace_supply,
+            &Default::default(),
         );
 
         let total: u64 = rupd.rewards.values().map(|l| l.0).sum();
