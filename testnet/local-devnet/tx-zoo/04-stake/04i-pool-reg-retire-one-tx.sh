@@ -101,17 +101,60 @@ POOL_ID_HEX=$(cardano-cli conway stake-pool id \
 # i.e. the retirement epoch is a plain integer keyed by pool id at the TOP
 # level of that pool's object — not nested under a `poolRetiring`/`retiring`
 # map as originally guessed.
-# RED-PROOF: loosen the `grep -q "$POOL_ID_HEX"` (or drop the epoch check) to
-# hide a retirement that never got scheduled, or got scheduled for the wrong
-# epoch.
+# RED-PROOF: relax the `has($id)` test (or drop the epoch equality below) to hide
+# a retirement that never got scheduled, or got scheduled for the wrong epoch.
+# THREE outcomes, not two. The previous version ran the query with `2>/dev/null`
+# and tested the result with `grep -q "$POOL_ID_HEX"`, so a query that never
+# produced an answer was reported as `pool-not-found` — identical to the verdict
+# for a pool the ledger genuinely never registered. That is the wrong shape for a
+# diagnostic: an UNREADABLE answer is not a failed assertion, and reporting it as
+# one sends the reader looking for a ledger bug that is not there.
+#
+# Measured 2026-08-07: 04i reported `pool-not-found` on the dugite relay while
+# cardano-node reported the pool with the correct retirement epoch one second
+# later. Everything needed to attribute that had been discarded — the exit code
+# and stderr both went to /dev/null. The node was subsequently shown correct
+# (12/12 stable queries, byte-identical JSON to cardano-node), so the run had
+# thrown away the only evidence that mattered.
+#
+# Note what is deliberately NOT retried: ABSENCE. A new pool registration lands in
+# `psStakePoolParams` immediately (cardano-ledger `Shelley.Rules.Pool`, the
+# `hk ∉ dom poolParams` branch), so once the tx is in an applied block the pool
+# MUST be visible on the next successful query. Retrying until it appears would
+# convert a real staleness bug into a pass — fitting the gate instead of the node.
+# Only an unanswered query is retried.
 FAIL_SOCKS=""
 for sock in "$ZOO_SOCKET" "$LD_CARDANO_BP_SOCK"; do
     [ -S "$sock" ] || continue
-    OUT=$(cardano-cli conway query pool-state \
-            --testnet-magic "$LD_MAGIC" --socket-path "$sock" \
-            --stake-pool-id "$POOL_ID_HEX" --output-json 2>/dev/null)
-    if ! printf '%s' "$OUT" | grep -q "$POOL_ID_HEX"; then
-        FAIL_SOCKS="$FAIL_SOCKS $sock(pool-not-found)"
+    OUT=""; QRC=1; QERR=""
+    for attempt in 1 2 3; do
+        QERR_FILE="$ZOO_LOGS/$NAME.pool-state.$(basename "$sock").$attempt.err"
+        if OUT=$(cardano-cli conway query pool-state \
+                    --testnet-magic "$LD_MAGIC" --socket-path "$sock" \
+                    --stake-pool-id "$POOL_ID_HEX" --output-json 2>"$QERR_FILE"); then
+            QRC=0
+            break
+        fi
+        # `|| true`: this file is created by the 2> redirection above so it should
+        # always exist, but the whole point of this block is to survive the case
+        # where something unexpected happened — `set -euo pipefail` would turn a
+        # failed read of the diagnostic into an exit that discards the diagnostic.
+        QERR=$( { tail -2 "$QERR_FILE" 2>/dev/null || true; } | tr -d '\r' | tr '\n' ' ')
+        sleep 2
+    done
+    if [ "$QRC" -ne 0 ]; then
+        FAIL_SOCKS="$FAIL_SOCKS $sock(query-failed-3x:${QERR:-no-stderr})"
+        continue
+    fi
+    # cardano-cli exits 0 on a reply it cannot decode, printing a raw CBOR dump
+    # instead of JSON — so a zero exit is not proof of a usable answer. Require
+    # the output to parse as a JSON object before drawing any conclusion from it.
+    if ! printf '%s' "$OUT" | jq -e 'type == "object"' >/dev/null 2>&1; then
+        FAIL_SOCKS="$FAIL_SOCKS $sock(undecodable-reply)"
+        continue
+    fi
+    if ! printf '%s' "$OUT" | jq -e --arg id "$POOL_ID_HEX" 'has($id)' >/dev/null 2>&1; then
+        FAIL_SOCKS="$FAIL_SOCKS $sock(pool-absent-from-decoded-reply)"
         continue
     fi
     RETIRING_EPOCH=$(printf '%s' "$OUT" | jq -r --arg id "$POOL_ID_HEX" \

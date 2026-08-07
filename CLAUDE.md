@@ -101,22 +101,57 @@ dugite-lsm (LSM-tree on-disk storage for UTxO-HD)
 - 28-byte hash types (DRep keys, pool voter keys, required signers) must be padded to 32 bytes via `Hash28::to_hash32_padded()` — do not use `Hash<32>::from()` directly on 28-byte hashes
 
 ## Current Focus
-**Post-v2.7.0 sweep (2026-08-07) — every `reachable:live` issue is closed.**
-v2.7.0 was drop-in from v2.6.0, **SNAPSHOT unchanged at 37**, closing #1015,
-#1026, #1028, #1046, #1047, #1048, #1050, #1051, #1054, #1055, #1031, #1044 and
-#1058. PR #1065 then closed **#1053** (typed phase-2 wire class), **#1030** (all
-six items — item 5's audit found tag 14 `GetRewardProvenance` replying `array(4)`
-where Haskell has a 16-field `Rec`, undecodable, with THREE tests pinning it) and
-**#1060** (tx-zoo 16a: two fixture defects, the node was right both times).
+**v2.7.1 (2026-08-07) — the #1057 P0, plus four `query ledger-state` wire defects.**
+Drop-in from v2.7.0, **SNAPSHOT unchanged at 37**, so no re-sync.
 
-**#1057 is CLOSED** — the P0 that stranded a block producer. It needed TWO fixes,
-not one, and the second was only found by asking what cardano-node does rather
-than what would make the symptom go away (see below).
+**#1057 is CLOSED** — the P0 that stranded a block producer. It needed **THREE**
+fixes, not one, and each was only visible once the one above it was fixed; a
+fourth guard came out of an adversarial review. The second and third were found
+by asking what cardano-node does rather than what would make the symptom go
+away, and the long-standing written prediction that this required
+`init_fresh_ledger` was WRONG (see below).
 
-**Open: #1008 only** (82 cardano-cli commands — a backlog by design, referenced by
-`cli-surface-known-gaps.txt` so the gate stays honest), plus the Dijkstra items
-#1011/#1014/#1029/#607, which are pre-activation by definition. Nothing carries
-`reachable:live`.
+**`query ledger-state` was undecodable in its entirety** and cardano-cli hides
+that — it exits 0 and prints a raw-CBOR dump instead of JSON, so the query had
+been broken for every operator while looking merely verbose. Four defects:
+`SnapShot` arity 3 -> 2; its contents (the delegation map MERGED into each stake
+entry, and the pool map's values are a 10-field snapshot aggregate, not
+`PoolParams(9)`); `blocksBefore`/`blocksCurrent` swapped; and `nesPd` answered
+from the LIVE pool set instead of the frozen `set` snapshot. Consolidating the
+last one onto the shared encoder then exposed a fifth: `pdTotalActiveStake` was
+written unclamped, and it is a `NonZero Coin` upstream — so tag 36, the only arm
+a V21+ client can reach, could emit a value that fails to decode.
+
+The shape could NOT be read off cardano-ledger: 11.0.1 pins CHaP at
+index-state 2026-05-02 and master's nearest record has an extra field in a
+different order. It was established by proxying the running node's own N2C
+socket and is now pinned to those bytes —
+`snap_shot_bytes_match_a_cardano_node_11_0_1_capture`. See
+[[reference_running_node_is_the_wire_oracle]] for the method and its two traps.
+
+**Open, and one of them is `reachable:live`:**
+- **#1067** (`reachable:live`) — `NonMyopic.likelihoodsNM` is hardcoded EMPTY and
+  dugite tracks per-pool `Likelihood` nowhere (8 mentions in the tree, all
+  comments or the two hardcoded encoder lines). NOT consensus: it feeds the
+  non-myopic reward ESTIMATE and pool ranking, not block validity. Deliberately
+  NOT rushed into v2.7.1 — it is a float-encoded per-epoch accumulator needing
+  byte-exactness and a SNAPSHOT_VERSION bump, which turns a drop-in patch into a
+  re-sync, and a half-right typed arm is worse than an honest gap (#979).
+  `09w-ledger-state` excludes only that subtree's CHILDREN, citing the issue;
+  the parent is still required and everything else is compared strictly.
+- **#1008** — 82 cardano-cli commands, a backlog by design, referenced by
+  `cli-surface-known-gaps.txt` so the gate stays honest.
+- Dijkstra: #1011/#1014/#1029/#607, pre-activation by definition.
+
+**Harness defects fixed this wave, all of the same family** — a check that
+reports success while measuring nothing, or an assertion that never runs:
+`wait-tip-parity.sh` existed and was called by nothing (the `ALL_CATEGORIES`
+shape, #969) and now lives inside `soak.sh`; `XV_RC` was captured and never
+checked, so a cross-validate failure could not fail the gate; three of six
+11-mempool scripts selected a shared UTxO with no `zoo_wait_mempool_quiet`,
+which is #918's mechanism left unfixed; and cross-validate now submits a
+rejected tx to cardano-node before blaming dugite. Two of those were mine, added
+in this same wave.
 
 ### #1057 — a node holding its own chain now adopts one diverging at genesis (CLOSED)
 
