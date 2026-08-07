@@ -139,6 +139,14 @@ socket and is now pinned to those bytes —
   re-sync, and a half-right typed arm is worse than an honest gap (#979).
   `09w-ledger-state` excludes only that subtree's CHILDREN, citing the issue;
   the parent is still required and everything else is compared strictly.
+- **#1068** — UTxO queries read the LIVE ledger while every other query reads the
+  pinned LSQ acquisition snapshot, so one `MsgAcquire..MsgRelease` session can answer
+  from two ledger points. Upstream cannot express this: `answerQuery` runs against one
+  acquired `ExtLedgerState`. Window is one refresh interval (~1 s) at tip, non-consensus,
+  query-only. Not fixed here because `QueryHandler::acquire` is a SYNCHRONOUS trait
+  method in dugite-network, so the fix is a cross-crate change, and pinning a UTxO view
+  is not a cheap `Arc` clone under UTxO-HD. Found by reading the query path while
+  attributing a tx-zoo failure — it was NOT the cause of that failure.
 - **#1008** — 82 cardano-cli commands, a backlog by design, referenced by
   `cli-surface-known-gaps.txt` so the gate stays honest.
 - Dijkstra: #1011/#1014/#1029/#607, pre-activation by definition.
@@ -152,6 +160,57 @@ checked, so a cross-validate failure could not fail the gate; three of six
 which is #918's mechanism left unfixed; and cross-validate now submits a
 rejected tx to cardano-node before blaming dugite. Two of those were mine, added
 in this same wave.
+
+### QA — v2.7.1 (SHIPPED)
+
+devnet-validate **standard** preset, **4/4 rounds PASS**, strict,
+`gate_integrity.admissible = true`, `missing = []`
+(`reports/devnet-validate/v2.7.1.json`) vs cardano-node 11.0.1.
+
+- 1055 canonical blocks, **0 invalid forges**, 0 critical anomalies
+- bidirectional parity **96/99 classified identically, 0 OFFDIAG**, 0 class-diff
+  (1 tracked known-diff, 2 stateful-excluded)
+- tx-zoo Round 1 **151/154 pass, 0 fail**, 0 ENV-SKIP; cli-parity **23 EQUAL /
+  0 divergent / 0 ENV-SKIP**; cross-validate 7/7; adversarial N2N, UTxO RPC, chaos clean
+- Round 2 pots **byte-exact** vs Haskell: treasury `7173850901297`,
+  reserves `5992798100783733`
+- **both epoch-boundary samplers reached NON-VACUITY** — 264 non-empty
+  `nextRatifyState` samples, 146 `PotentialPParamsUpdate` samples, 0 diffs each. That is
+  the condition that matters; #992's hardcoded empty pulser satisfied the vacuous
+  version of it in every previous gate
+- restart round rejoined 27 -> 57, 0 ERROR on any node
+
+The 3 tx-zoo failures are all `01a-simple-pay` from the Round 2 trickle racing itself.
+**Verify the REASON, do not carry it forward** — confirmed for this run from Round 2's
+logs: 5x `Input conflict: input already claimed by mempool tx` and zero
+fee/value/input errors.
+
+**Preprod steady-state soak, 60 min at tip on the same binary — PASS on all seven
+predicates.** 12 usable samples, worst tip delta vs Koios **8 slots**, min peers 8,
+**0 ERROR**, RSS 3873 -> 4107 MB (6%, flat). Two are positive evidence rather than
+absent noise: **0 `LedgerSeq was incoherent`** means #985's startup re-anchor fired (the
+devnet is structurally blind to that defect, so preprod is the only place to see it), and
+**0 genesis-range declines** confirms #1057's wedge does not arise on a synced node.
+Catch-up was exact — tip at slot 130419082, delta 0 vs Koios.
+
+**Five harness defects surfaced during this release, and THREE were introduced in this
+same wave.** All of one family: a check reporting success while measuring nothing.
+- both epoch-boundary samplers wrote to `$LD_EVIDENCE/current/`, which nothing reads, so
+  they ran, passed and printed real numbers while a STRICT report called them "absent in
+  EVERY round" — and the apparent escape is `--no-strict`, which voids the whole gate
+- `10e-assert-enactment`'s timeout was a constant encoding `epochLength=400`, so it gave
+  up ~3 min before the enactment it awaited once Round 2's overlay changed that parameter
+- the gate driver discarded the governance zoo's exit code, so the suite carrying
+  Round 2's headline capability could not fail the round (the `XV_RC` hole again)
+- `04i` reported an unanswered query as a missing pool, having discarded exit code AND
+  stderr, so a correct node looked like a ledger bug
+- the chain-density predicate was a flat +/-20% band, i.e. a ~1-in-8 coin flip at a
+  54-slot window; now the p99.9 binomial interval, which is STRICTER where the sample
+  supports it (Round 2: [0.461,0.539] vs [0.400,0.600])
+
+**Two of those were caught only by the strict report generator**, and only because
+`--no-strict` was refused. A gate whose evidence manifest is not enforced cannot tell a
+suite that passed from one that never ran.
 
 ### #1057 — a node holding its own chain now adopts one diverging at genesis (CLOSED)
 
