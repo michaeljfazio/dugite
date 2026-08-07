@@ -3,7 +3,22 @@
 # human-readable report block. Exits non-zero if any anomaly threshold is
 # breached — usable as a CI gate.
 #
-# Usage: analyze-evidence.sh <evidence_dir>
+# Usage: analyze-evidence.sh <evidence_dir> [--allowed-errors <file>]
+#
+# --allowed-errors declares ERROR lines that a round CAUSED ON PURPOSE. It exists for
+# one situation: Round 1 runs the chaos suite, which SIGKILLs the sole forger mid-forge,
+# and a forger killed between forging and adopting can legitimately come back to find
+# its block beaten — `TraceDidntAdoptBlock`, which is the SAFE outcome and the same
+# severity cardano-node uses. Without this the baseline round fails whenever the kill
+# lands at an unlucky moment, which is a coin-flip, not a signal.
+#
+# Three properties keep it from becoming the over-broad allowlist that makes a round
+# report success while measuring nothing (#916/#923/#945/#953/#959):
+#   1. It is OPT-IN per invocation. No round gets it unless its caller passes it.
+#   2. It NEVER applies to the invalid-block check. A Haskell-rejected dugite block
+#      stays CRITICAL and unconditional — that check is the point of the round.
+#   3. Both numbers are always printed ("N ERROR, M unexplained"), so an allowance is
+#      visible in the output rather than silently subtracted.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -12,10 +27,24 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=lib/log-level-counts.sh
 source "$SCRIPT_DIR/lib/log-level-counts.sh"
 
-EVD="${1:-}"
+EVD=""
+ALLOWED_ERRORS=""
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --allowed-errors) ALLOWED_ERRORS="${2:-}"; shift 2 ;;
+        -*) echo "unknown option: $1" >&2; exit 2 ;;
+        *)  EVD="$1"; shift ;;
+    esac
+done
 if [ -z "$EVD" ] || ! [ -d "$EVD" ]; then
-    echo "Usage: $0 <evidence_dir>" >&2
+    echo "Usage: $0 <evidence_dir> [--allowed-errors <file>]" >&2
     echo "  e.g. $0 testnet/local-devnet/evidence/20260521T120000Z" >&2
+    exit 2
+fi
+# A named-but-missing allowlist is a hard error, never a silent "allow nothing":
+# that is how a caller ends up believing a suppression is active when it is not.
+if [ -n "$ALLOWED_ERRORS" ] && [ ! -f "$ALLOWED_ERRORS" ]; then
+    echo "--allowed-errors: no such file: $ALLOWED_ERRORS" >&2
     exit 2
 fi
 
@@ -98,7 +127,12 @@ if [ -f "$EVD/tip-samples.csv" ] && [ -f "$EVD/blocks.csv" ]; then
 fi
 
 # --- Log error histogram -----------------------------------------------------
-declare -A ERR_COUNT WARN_COUNT
+declare -A ERR_COUNT WARN_COUNT UNEXPLAINED_COUNT
+# Build one alternation from the allowlist, ignoring comments and blank lines.
+ALLOW_RE=""
+if [ -n "$ALLOWED_ERRORS" ]; then
+    ALLOW_RE=$(grep -vE '^[[:space:]]*(#|$)' "$ALLOWED_ERRORS" | paste -sd'|' - || true)
+fi
 for node in dugite-bp dugite-relay cardano-bp; do
     log="$LOG_DIR/$node.log"
     [ -f "$log" ] || continue
@@ -106,12 +140,24 @@ for node in dugite-bp dugite-relay cardano-bp; do
     wc=$(count_log_warns "$log")
     ERR_COUNT[$node]=$ec
     WARN_COUNT[$node]=$wc
-    if [ "$ec" -gt 0 ]; then
-        # Forged-invalid is always fatal-class — flag whichever name appears.
-        if grep -qE 'TraceForgedInvalidBlock|AddBlockValidation\.InvalidBlock|Forge\.Loop\.ForgedInvalidBlock' "$log"; then
-            ANOMALIES+=("CRITICAL: invalid-block event in $node.log — Haskell rejected a dugite-forged block")
-        fi
-        ANOMALIES+=("$node: $ec ERROR/invalid-block lines")
+
+    # Unexplained = ERROR lines that no allowlist pattern accounts for. With no
+    # allowlist this equals the raw count, so behaviour is unchanged by default.
+    unexplained=$ec
+    if [ "$ec" -gt 0 ] && [ -n "$ALLOW_RE" ]; then
+        unexplained=$(grep -E ' ERROR ' "$log" | grep -cvE "$ALLOW_RE" || true)
+        unexplained=${unexplained:-0}
+    fi
+    UNEXPLAINED_COUNT[$node]=$unexplained
+
+    # The invalid-block check is deliberately OUTSIDE the allowlist and outside the
+    # `unexplained` gate: a dugite-forged block that Haskell rejected is the failure
+    # this whole harness exists to detect, and no allowlist may suppress it.
+    if grep -qE 'TraceForgedInvalidBlock|AddBlockValidation\.InvalidBlock|Forge\.Loop\.ForgedInvalidBlock' "$log"; then
+        ANOMALIES+=("CRITICAL: invalid-block event in $node.log — Haskell rejected a dugite-forged block")
+    fi
+    if [ "$unexplained" -gt 0 ]; then
+        ANOMALIES+=("$node: $unexplained unexplained ERROR line(s) (of $ec total)")
     fi
 done
 
@@ -141,9 +187,10 @@ Tip-age
   p99                     : ${TIP_AGE_P99}s  (threshold ≤ ${TIP_AGE_P99_MAX}s)
 
 Log errors / warns
-  dugite-bp               : ${ERR_COUNT[dugite-bp]:-?} ERROR / ${WARN_COUNT[dugite-bp]:-?} WARN
-  dugite-relay            : ${ERR_COUNT[dugite-relay]:-?} ERROR / ${WARN_COUNT[dugite-relay]:-?} WARN
-  cardano-bp              : ${ERR_COUNT[cardano-bp]:-?} ERROR / ${WARN_COUNT[cardano-bp]:-?} WARN
+  dugite-bp               : ${ERR_COUNT[dugite-bp]:-?} ERROR (${UNEXPLAINED_COUNT[dugite-bp]:-?} unexplained) / ${WARN_COUNT[dugite-bp]:-?} WARN
+  dugite-relay            : ${ERR_COUNT[dugite-relay]:-?} ERROR (${UNEXPLAINED_COUNT[dugite-relay]:-?} unexplained) / ${WARN_COUNT[dugite-relay]:-?} WARN
+  cardano-bp              : ${ERR_COUNT[cardano-bp]:-?} ERROR (${UNEXPLAINED_COUNT[cardano-bp]:-?} unexplained) / ${WARN_COUNT[cardano-bp]:-?} WARN
+  allowlist               : ${ALLOWED_ERRORS:-none}
 
 EOF
 

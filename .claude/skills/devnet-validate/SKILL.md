@@ -173,7 +173,23 @@ EVIDENCE_DIR="$EVD" ./tx-zoo/run-all.sh   # ~22 min — all 154 tx scripts (via 
                                        #          LAST of the three: it SIGKILLs on purpose.
 EVIDENCE_DIR="$EVD" ./soak.sh 120      # 2 min idle evidence
 ./verify.sh "$EVD"
-../../.claude/skills/devnet-validate/scripts/analyze-evidence.sh "$EVD"
+# `--allowed-errors` because THIS round SIGKILLs the sole forger on purpose (see the
+# chaos step above). A forger killed between forging and adopting can restart and find
+# its block beaten, logging `TraceDidntAdoptBlock` at ERROR — the SAFE outcome, and the
+# same severity cardano-node uses. Whether the kill lands in that window is a coin
+# flip: measured 0 such lines on one gate run and 1 on the next from the identical
+# suite, so without this the baseline round fails at random.
+#
+# Pass it ONLY when chaos actually injected the fault — check `chaos-events.csv` for a
+# `sigkill` row first — so this cannot drift into a blanket exemption. The file holds
+# exactly one pattern, and `analyze-evidence.sh` never applies any allowlist to the
+# invalid-block check: `TraceForgedInvalidBlock` /
+# `AddBlockValidation.InvalidBlock` / `Forge.Loop.ForgedInvalidBlock` stay CRITICAL and
+# unconditional, which is asserted by a test that allowlists every ERROR line in a log
+# and still requires the CRITICAL verdict.
+grep -q ',sigkill,' "$EVD/chaos-events.csv" \
+  && ALLOW=(--allowed-errors "$PWD/chaos/chaos.allowed-errors") || ALLOW=()
+../../.claude/skills/devnet-validate/scripts/analyze-evidence.sh "$EVD" "${ALLOW[@]}"
 ./stop.sh
 ```
 
@@ -205,7 +221,10 @@ tail -F logs/cardano-bp.log   | grep -E 'AddedToCurrentChain|AddBlockValidation\
 - `dugite_tip_age_seconds` stays <5 throughout the soak
 - `health-probe.sh` returns HEALTHY at end-of-round AND at every ≤60s sample during the soak (network throughput + Haskell-tip parity included)
 - `metric-audit.sh` exits 0 at end-of-round (all ~30 metric assertions pass: completeness, arithmetic invariants, counter monotonicity, BP↔relay parity, Haskell parity, range checks)
-- `analyze-evidence.sh` reports no anomalies
+- `analyze-evidence.sh` reports no anomalies. It now prints ERROR counts as
+  `N ERROR (M unexplained)` plus the allowlist path in use, so a suppression is visible
+  in the output rather than subtracted silently; only `M > 0` is an anomaly, and the
+  invalid-block check is never subject to any allowlist
 - `evidence/<ts>/cli-parity.csv` has zero DIVERGENT rows that are not filed as known-divergence issues, **and zero ERROR rows** (`09-cli-parity/run.sh` now exits 1 on either). An ERROR row noted `HARNESS both-sides-failed` means the suite passed cardano-cli arguments it does not accept — fix the `09*.sh` script, do not add it to `KNOWN_DIVERGENCES`
 - `evidence/<ts>/n2n-trace.csv` has zero PANIC or SILENT_SKIP rows
 - `evidence/<ts>/chaos-events.csv` has zero FAIL rows, and any `ENV_SKIP` row is
