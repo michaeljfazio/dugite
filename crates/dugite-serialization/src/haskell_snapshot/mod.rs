@@ -321,8 +321,9 @@ fn decode_new_epoch_state(
     let (snapshots, n) = decode_snapshots(&data[off..])?;
     off += n;
 
-    // [3][3] NonMyopic — skip (array(2) [map, uint])
-    off += skip_cbor_value(&data[off..])?;
+    // [3][3] NonMyopic = array(2) [likelihoodsNM, rewardPotNM]
+    let (non_myopic, n) = decode_nonmyopic(&data[off..])?;
+    off += n;
 
     // [4] rewardUpdate: StrictMaybe — [] for none, [content] for some
     off += skip_cbor_value(&data[off..])?;
@@ -355,6 +356,7 @@ fn decode_new_epoch_state(
         pool_distr_total_stake,
         gov_state,
         instant_stake,
+        non_myopic,
     };
 
     Ok((epoch, new_epoch_state, off))
@@ -474,6 +476,124 @@ fn decode_instant_stake_map(data: &[u8]) -> Result<(CredentialCoinMap, usize), S
 /// Decode `PoolDistr = array(2) [map(bytes(28) → IndividualPoolStake), total_stake]`.
 ///
 /// IndividualPoolStake = `array(3) [rational, compact_coin, vrf_hash]`.
+/// Number of `LogWeight`s in a `Likelihood`.
+///
+/// ```haskell
+/// samplePositions = (\x -> (x + 0.5) / 100.0) <$> StrictSeq.fromList [0.0 .. 99.0]
+/// ```
+///
+/// A compile-time constant upstream, so any other count means the format
+/// changed. Duplicated here rather than imported because `dugite-serialization`
+/// sits BELOW `dugite-ledger` in the dependency flow; the ledger's
+/// `state::non_myopic::SAMPLE_SIZE` is the same number and
+/// `nonmyopic_sample_size_agrees_with_the_ledger` pins them together.
+pub const LIKELIHOOD_SAMPLE_SIZE: usize = 100;
+
+/// Decode one `Likelihood` — an array of [`LIKELIHOOD_SAMPLE_SIZE`] CBOR
+/// float32 `LogWeight`s.
+///
+/// Accepts both framings. cardano-ledger-binary's `variableListLenEncoding`
+/// emits INDEFINITE (`0x9f … 0xff`) above 23 elements, so a real node always
+/// sends indefinite here (#938) — but a definite `0x98 0x64` is still
+/// well-formed CBOR for the same value and there is no reason to refuse it on
+/// the way IN. The encoder side is strict; the decoder is liberal, in that
+/// order.
+fn decode_likelihood(data: &[u8]) -> Result<(Vec<f32>, usize), SerializationError> {
+    let mut off = 0;
+    let (declared, n) = cbor_utils::decode_array_len_or_indef(&data[off..])?;
+    off += n;
+
+    if let Some(len) = declared {
+        // Bound the allocation before reserving — audit #548 pattern #5.
+        cbor_utils::bounded_alloc_capacity(len, LIKELIHOOD_SAMPLE_SIZE, data.len() - off)?;
+    }
+
+    let mut weights: Vec<f32> = Vec::with_capacity(LIKELIHOOD_SAMPLE_SIZE);
+    match declared {
+        Some(len) => {
+            for _ in 0..len {
+                let (w, n) = cbor_utils::decode_float32(&data[off..])?;
+                off += n;
+                weights.push(w);
+            }
+        }
+        None => loop {
+            if off >= data.len() {
+                return Err(SerializationError::CborDecode(
+                    "Likelihood: unterminated indefinite array".into(),
+                ));
+            }
+            if data[off] == 0xff {
+                off += 1;
+                break;
+            }
+            if weights.len() == LIKELIHOOD_SAMPLE_SIZE {
+                return Err(SerializationError::CborDecode(format!(
+                    "Likelihood: more than {LIKELIHOOD_SAMPLE_SIZE} log-weights"
+                )));
+            }
+            let (w, n) = cbor_utils::decode_float32(&data[off..])?;
+            off += n;
+            weights.push(w);
+        },
+    }
+
+    // Reject rather than pad or truncate. This value is a decayed accumulator
+    // that no later computation can repair, and a wrong-length Likelihood means
+    // the upstream format moved — in which case silently accepting it would
+    // hand the ledger a record cardano-node could never have produced.
+    if weights.len() != LIKELIHOOD_SAMPLE_SIZE {
+        return Err(SerializationError::CborDecode(format!(
+            "Likelihood: expected {LIKELIHOOD_SAMPLE_SIZE} log-weights, got {}",
+            weights.len()
+        )));
+    }
+
+    Ok((weights, off))
+}
+
+/// Decode `NonMyopic = array(2) [likelihoodsNM, rewardPotNM]`.
+///
+/// ```haskell
+/// instance EncCBOR NonMyopic where
+///   encCBOR nm@(NonMyopic _ _) =
+///     let NonMyopic {likelihoodsNM, rewardPotNM} = nm
+///      in encodeListLen 2 <> encCBOR likelihoodsNM <> encCBOR rewardPotNM
+/// ```
+fn decode_nonmyopic(data: &[u8]) -> Result<(HaskellNonMyopic, usize), SerializationError> {
+    let mut off = 0;
+    let (len, n) = decode_array_len(&data[off..])?;
+    off += n;
+    if len != 2 {
+        return Err(SerializationError::CborDecode(format!(
+            "NonMyopic: expected array(2), got array({len})"
+        )));
+    }
+
+    let (mut reader, n) = MapReader::new(&data[off..])?;
+    off += n;
+    let mut likelihoods = HashMap::new();
+    while reader.has_next(&data[off..])? {
+        let (pool_id, n) = decode_hash28(&data[off..])?;
+        off += n;
+        let (weights, n) = decode_likelihood(&data[off..])?;
+        off += n;
+        likelihoods.insert(pool_id, weights);
+    }
+    off += reader.finish(&data[off..])?;
+
+    let (reward_pot, n) = decode_uint(&data[off..])?;
+    off += n;
+
+    Ok((
+        HaskellNonMyopic {
+            likelihoods,
+            reward_pot,
+        },
+        off,
+    ))
+}
+
 fn decode_pool_distr(
     data: &[u8],
 ) -> Result<(HashMap<Hash28, HaskellPoolDistrEntry>, u64, usize), SerializationError> {
@@ -607,6 +727,7 @@ pub fn minimal_haskell_state_for_test(
         pool_distr_total_stake: 0,
         gov_state,
         instant_stake: HashMap::new(),
+        non_myopic: HaskellNonMyopic::default(),
     };
     let praos_state = HaskellPraosState {
         last_slot: None,

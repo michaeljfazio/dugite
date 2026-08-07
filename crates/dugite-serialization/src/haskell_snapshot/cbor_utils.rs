@@ -726,6 +726,32 @@ pub fn bounded_alloc_capacity(
     Ok(declared_len)
 }
 
+/// Decode a CBOR single-precision float (`0xfa` + 4 bytes, IEEE-754 big-endian).
+///
+/// Deliberately STRICT — half (`0xf9`) and double (`0xfb`) are rejected rather
+/// than widened. Haskell `EncCBOR Float` is `Codec.CBOR.Encoding.encodeFloat`,
+/// a distinct primitive from `encodeFloat16` with no value-dependent branching
+/// and no shortest-form selection, so a `LogWeight` is `0xfa` at every
+/// magnitude. Accepting `0xfb` here would silently absorb a
+/// `Double`-encoded field from some future format change and hand the ledger a
+/// value it could never have produced itself.
+pub fn decode_float32(data: &[u8]) -> Result<(f32, usize), SerializationError> {
+    if data.is_empty() {
+        return Err(eof());
+    }
+    if data[0] != 0xfa {
+        return Err(SerializationError::CborDecode(format!(
+            "expected CBOR float32 (0xfa), got {:#04x}",
+            data[0]
+        )));
+    }
+    if data.len() < 5 {
+        return Err(eof());
+    }
+    let bits = u32::from_be_bytes([data[1], data[2], data[3], data[4]]);
+    Ok((f32::from_bits(bits), 5))
+}
+
 /// Construct an "unexpected end of input" error.
 fn eof() -> SerializationError {
     SerializationError::CborDecode("unexpected end of input".into())
