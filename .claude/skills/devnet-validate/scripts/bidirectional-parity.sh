@@ -307,6 +307,7 @@ awk -F, '
     BEGIN {
         stateful["05g-cc-hot-key-authorization"] = "constitutional committee is seated at genesis and is devnet-global: batch 1 resigns cc-1, so batch 2 correctly gets ConwayCommitteeHasPreviouslyResigned. Giving batch 2 its own committee needs an UpdateCommittee governance action (2+ epoch boundaries)."
         stateful["05h-cc-resign"] = "same: a cold-key resignation is one-shot per member, and only cc-1/cc-2 are seated."
+        stateful["11d-replay-resubmit"] = "funds from the SHARED genesis address via zoo_largest_utxo, so both batches select the SAME largest UTxO and one invalidates the other. Measured: cardano-bp logged Mempool.AddedTx for the loser then Mempool.RemoveTxs dropping it with four other txs 4s later, and the tx reached 0/3 observers in 120s. The PARITY ASSERTION ITSELF HELD — in the batch that completed, both sockets rejected the replay identically — so this is an inclusion race on a global resource, not an accept/reject divergence. 11d still runs, and passes, in Round 1s full zoo, so nothing is uncovered."
         # Deliberate, documented protocol difference (#925): a Conway duplicate
         # input fails at the CBOR set layer. Haskell drops the connection
         # ("mux: bearer closed"); dugite answers a structured MsgRejectTx naming
