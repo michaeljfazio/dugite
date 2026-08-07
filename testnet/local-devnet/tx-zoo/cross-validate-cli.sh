@@ -238,7 +238,25 @@ xv_03_plutus_spend() {
 
     local spend_raw="$ZOO_BUILT/$name-spend.raw"
     local spend_signed="$ZOO_BUILT/$name-spend.signed"
+    # --witness-override: DECLARE the witness count instead of letting it be inferred.
+    #
+    # `transaction build` costs the body it emits, budgeting for the witnesses it can
+    # infer from the inputs. These cases then sign with more keys than that, so the
+    # finished tx is bigger than the one that was costed and the fee falls short.
+    # Measured in a gate run: supplied 185387, required 290417 — and cardano-node
+    # rejected the identical bytes with the same numbers, so the tx really was underpaid
+    # and dugite was right to reject it. (The cross-check in `xv_submit_dugite`
+    # established that, rather than leaving it to inference.)
+    #
+    # It bit intermittently because it depends on which UTxOs `build` selects: on a fresh
+    # devnet these pass, and xv-03 failed only after the full 154-script zoo had
+    # fragmented the wallet. An intermittent harness failure that looks like a node
+    # defect is worse than a consistent one.
+    #
+    # Over-declaring is safe — it only raises the fee — so the number matches the signing
+    # keys used below rather than predicting what `build` infers.
     cardano-cli conway transaction build \
+        --witness-override 2 \
         --testnet-magic "$LD_MAGIC" --socket-path "$ZOO_SOCKET" \
         --tx-in "$spend_in" \
         --tx-in-script-file "$plutus" \
@@ -293,7 +311,25 @@ xv_04_stake_register() {
     local txin=${utxo%% *}
     local raw="$ZOO_BUILT/$name.raw"
     local signed="$ZOO_BUILT/$name.signed"
+    # --witness-override: DECLARE the witness count instead of letting it be inferred.
+    #
+    # `transaction build` costs the body it emits, budgeting for the witnesses it can
+    # infer from the inputs. These cases then sign with more keys than that, so the
+    # finished tx is bigger than the one that was costed and the fee falls short.
+    # Measured in a gate run: supplied 185387, required 290417 — and cardano-node
+    # rejected the identical bytes with the same numbers, so the tx really was underpaid
+    # and dugite was right to reject it. (The cross-check in `xv_submit_dugite`
+    # established that, rather than leaving it to inference.)
+    #
+    # It bit intermittently because it depends on which UTxOs `build` selects: on a fresh
+    # devnet these pass, and xv-03 failed only after the full 154-script zoo had
+    # fragmented the wallet. An intermittent harness failure that looks like a node
+    # defect is worse than a consistent one.
+    #
+    # Over-declaring is safe — it only raises the fee — so the number matches the signing
+    # keys used below rather than predicting what `build` infers.
     cardano-cli conway transaction build \
+        --witness-override 3 \
         --testnet-magic "$LD_MAGIC" --socket-path "$ZOO_SOCKET" \
         --tx-in "$txin" --change-address "$from_addr" \
         --certificate-file "$cert" \
@@ -340,7 +376,25 @@ xv_05_drep_register() {
     local txin=${utxo%% *}
     local raw="$ZOO_BUILT/$name.raw"
     local signed="$ZOO_BUILT/$name.signed"
+    # --witness-override: DECLARE the witness count instead of letting it be inferred.
+    #
+    # `transaction build` costs the body it emits, budgeting for the witnesses it can
+    # infer from the inputs. These cases then sign with more keys than that, so the
+    # finished tx is bigger than the one that was costed and the fee falls short.
+    # Measured in a gate run: supplied 185387, required 290417 — and cardano-node
+    # rejected the identical bytes with the same numbers, so the tx really was underpaid
+    # and dugite was right to reject it. (The cross-check in `xv_submit_dugite`
+    # established that, rather than leaving it to inference.)
+    #
+    # It bit intermittently because it depends on which UTxOs `build` selects: on a fresh
+    # devnet these pass, and xv-03 failed only after the full 154-script zoo had
+    # fragmented the wallet. An intermittent harness failure that looks like a node
+    # defect is worse than a consistent one.
+    #
+    # Over-declaring is safe — it only raises the fee — so the number matches the signing
+    # keys used below rather than predicting what `build` infers.
     cardano-cli conway transaction build \
+        --witness-override 2 \
         --testnet-magic "$LD_MAGIC" --socket-path "$ZOO_SOCKET" \
         --tx-in "$txin" --change-address "$from_addr" \
         --certificate-file "$cert" \
@@ -480,7 +534,25 @@ xv_07_drep_vote() {
     local txin=${utxo%% *}
     local raw="$ZOO_BUILT/$name.raw"
     local signed="$ZOO_BUILT/$name.signed"
+    # --witness-override: DECLARE the witness count instead of letting it be inferred.
+    #
+    # `transaction build` costs the body it emits, budgeting for the witnesses it can
+    # infer from the inputs. These cases then sign with more keys than that, so the
+    # finished tx is bigger than the one that was costed and the fee falls short.
+    # Measured in a gate run: supplied 185387, required 290417 — and cardano-node
+    # rejected the identical bytes with the same numbers, so the tx really was underpaid
+    # and dugite was right to reject it. (The cross-check in `xv_submit_dugite`
+    # established that, rather than leaving it to inference.)
+    #
+    # It bit intermittently because it depends on which UTxOs `build` selects: on a fresh
+    # devnet these pass, and xv-03 failed only after the full 154-script zoo had
+    # fragmented the wallet. An intermittent harness failure that looks like a node
+    # defect is worse than a consistent one.
+    #
+    # Over-declaring is safe — it only raises the fee — so the number matches the signing
+    # keys used below rather than predicting what `build` infers.
     cardano-cli conway transaction build \
+        --witness-override 2 \
         --testnet-magic "$LD_MAGIC" --socket-path "$ZOO_SOCKET" \
         --tx-in "$txin" --change-address "$from_addr" \
         --vote-file "$vote" \
