@@ -257,8 +257,16 @@ struct WalEntry {
     block_no: u64,
     hash: Hash32,
     /// The hash of the parent block. Set to `Hash32::ZERO` when recovered
-    /// from a legacy 56-byte WAL entry that predates this field.
+    /// from a legacy 56-byte WAL entry that predates this field — in which case
+    /// `prev_hash_known` is false and the value means "unknown", NOT genesis.
     prev_hash: Hash32,
+    /// Whether `prev_hash` is the block's real parent.
+    ///
+    /// False only for legacy 56-byte WAL entries, which carried no parent field.
+    /// This distinction is load-bearing: `Hash32::ZERO` is ALSO dugite's canonical
+    /// Origin parent, so without it "recovered from a legacy entry" and "roots at
+    /// genesis" are indistinguishable — see `switch_chain`'s genesis arm.
+    prev_hash_known: bool,
     cbor: Vec<u8>,
 }
 
@@ -430,7 +438,8 @@ fn replay_wal(path: &Path) -> io::Result<Vec<WalEntry>> {
         hash_bytes.copy_from_slice(&data[pos + 20..pos + 52]);
 
         let (prev_hash, cbor_len) = if legacy {
-            // Legacy layout: cbor_len at offset 52, no prev_hash field.
+            // Legacy layout: cbor_len at offset 52, no prev_hash field. ZERO here is a
+            // PLACEHOLDER for an unknown parent, not a claim of genesis-rootedness.
             let cl = u32::from_be_bytes(data[pos + 52..pos + 56].try_into().unwrap()) as usize;
             (Hash32::ZERO, cl)
         } else {
@@ -485,6 +494,7 @@ fn replay_wal(path: &Path) -> io::Result<Vec<WalEntry>> {
             block_no,
             hash: Hash32::from_bytes(hash_bytes),
             prev_hash,
+            prev_hash_known: !legacy,
             cbor: data[cbor_start..cbor_end].to_vec(),
         });
     }
@@ -562,6 +572,15 @@ pub struct VolatileDB {
     /// Invariant: `leaves == { h ∈ blocks : successors[h] is empty/absent }`,
     /// verified by `debug_assert` in `get_all_fork_tips` and a proptest.
     leaves: HashSet<Hash32>,
+    /// Blocks whose recorded `prev_hash` is a PLACEHOLDER, not their real parent.
+    ///
+    /// Populated only by legacy 56-byte WAL entries, which predate the parent field
+    /// and are recovered with `Hash32::ZERO`. That value is ALSO dugite's canonical
+    /// Origin parent, so without this set "recovered from a legacy entry" and "roots
+    /// at genesis" are the same bit pattern — and `switch_chain`'s genesis arm would
+    /// authorise a full-volatile rollback for a fork that does not root at genesis.
+    /// Empty on any database written by this version.
+    unknown_prev: HashSet<Hash32>,
     /// Tip of the selected chain: (slot, hash, block_no).
     tip: Option<(u64, Hash32, u64)>,
     wal: Option<WalWriter>,
@@ -595,6 +614,7 @@ impl VolatileDB {
             block_no_index: BTreeMap::new(),
             successors: HashMap::new(),
             leaves: HashSet::new(),
+            unknown_prev: HashSet::new(),
             tip: None,
             wal: None,
             wal_size_floor: 0,
@@ -625,6 +645,7 @@ impl VolatileDB {
             block_no_index: BTreeMap::new(),
             successors: HashMap::new(),
             leaves: HashSet::new(),
+            unknown_prev: HashSet::new(),
             tip: None,
             wal: None,
             wal_size_floor: 0,
@@ -638,7 +659,15 @@ impl VolatileDB {
         // will still be consistent with itself (all point to ZERO parent)
         // and will be corrected over time as blocks are re-added via
         // normal sync after the first node startup post-upgrade.
+        //
+        // Those entries are ALSO recorded in `unknown_prev`, because ZERO is
+        // indistinguishable from a genuine genesis parent and `switch_chain`'s
+        // genesis arm must not treat "we do not know the parent" as "roots at
+        // genesis".
         for entry in entries {
+            if !entry.prev_hash_known {
+                db.unknown_prev.insert(entry.hash);
+            }
             // WAL replay: extension gating does not apply here —
             // `rebuild_selected_chain` below re-derives the selection, and
             // the genesis-mode startup k-cap is applied by the node after
@@ -1856,7 +1885,19 @@ impl VolatileDB {
                 // deeper than k is protocol-impossible, and it matches ChainSync's
                 // own "local chain is within k blocks of genesis" condition for
                 // accepting the Origin intersection in the first place.
-                if allow_genesis_anchor && new_root_prev == Some(Hash32::ZERO) {
+                // `unknown_prev` guard: `Hash32::ZERO` is overloaded inside this very
+                // module — a legacy 56-byte WAL entry is recovered with ZERO as a
+                // stand-in for a parent it never stored. Without this check, a
+                // pre-upgrade WAL plus an empty ImmutableDB plus an anchor at Origin
+                // (all three co-occur on a young upgraded node, and the last two are
+                // exactly the regime this arm exists to serve) would let the backward
+                // walk stop at a legacy entry and be read as "roots at genesis",
+                // authorising a full-volatile rollback for a fork that does not.
+                let root_prev_is_known_genesis = new_chain
+                    .first()
+                    .is_some_and(|h| !self.unknown_prev.contains(h))
+                    && new_root_prev == Some(Hash32::ZERO);
+                if allow_genesis_anchor && root_prev_is_known_genesis {
                     let rollback: Vec<Hash32> = self.selected_chain.iter().rev().copied().collect();
                     let apply: Vec<Hash32> = new_chain.clone();
                     debug!(
@@ -3337,6 +3378,52 @@ mod tests {
             "apply is entire new chain, oldest first"
         );
         assert_eq!(db.get_tip(), Some((350, h(12), 22)));
+    }
+
+    /// A fork whose root came from a LEGACY WAL entry must NOT be treated as
+    /// genesis-rooted, even though its recorded `prev_hash` is `Hash32::ZERO`.
+    ///
+    /// `Hash32::ZERO` carries two meanings inside this module: dugite's canonical Origin
+    /// parent, AND the placeholder for a parent a legacy 56-byte WAL entry never stored.
+    /// The #1057 genesis arm keys off the first meaning, so without `unknown_prev` it
+    /// would read "we do not know this block's parent" as "this block roots at genesis"
+    /// and authorise a full-volatile rollback for a fork that does not.
+    ///
+    /// The preconditions co-occur naturally on a young upgraded node — a pre-upgrade WAL,
+    /// an empty ImmutableDB, and a ledger anchored at Origin — and the last two are
+    /// precisely the regime the genesis arm exists to serve.
+    #[test]
+    fn switch_chain_refuses_genesis_anchor_for_a_legacy_recovered_root() {
+        let mut db = VolatileDB::new();
+        db.add_block(h(1), 100, 10, Hash32::ZERO, b"mine1".to_vec());
+        db.add_block(h(2), 200, 20, h(1), b"mine2".to_vec());
+
+        // A competing, longer fork sharing no block with ours. Its root's prev_hash reads
+        // ZERO, but only because the entry was recovered from a legacy WAL — the parent
+        // is genuinely unknown, so this fork's rootedness is NOT established.
+        db.add_block(h(10), 150, 11, Hash32::ZERO, b"theirs1".to_vec());
+        db.add_block(h(11), 250, 21, h(10), b"theirs2".to_vec());
+        db.add_block(h(12), 350, 22, h(11), b"theirs3".to_vec());
+        db.unknown_prev.insert(h(10));
+
+        // Even with the ledger able to reach Origin, the switch must be declined.
+        let plan = db.switch_chain(&h(12), None, u64::MAX, true);
+        assert!(
+            plan.is_none(),
+            "a legacy-recovered root must not be accepted as genesis-rooted — ZERO there \
+             means UNKNOWN parent, and acting on it authorises a rollback of a fork whose \
+             root is not genesis"
+        );
+
+        // Control: the SAME topology with a genuinely known genesis parent IS accepted,
+        // so the guard rejects the placeholder rather than the whole genesis arm.
+        db.unknown_prev.remove(&h(10));
+        let plan = db.switch_chain(&h(12), None, u64::MAX, true);
+        assert!(
+            plan.is_some(),
+            "with a KNOWN genesis parent the same fork must still switch — otherwise the \
+             guard has disabled #1057's fix rather than narrowing it"
+        );
     }
 
     /// #1057 half A: a fork rooted at GENESIS is reachable with an EMPTY

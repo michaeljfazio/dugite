@@ -30,34 +30,41 @@
 # so cutting the relay's 3003 edge and cardano-bp's 3002 edge splits the network
 # into two islands that share only genesis.
 #
-#   1. setup.sh (two-forger genesis, so both islands have a real forging pool).
-#   2. Cut the bridge. Start the DUGITE island (bp + relay, peered with each
-#      other) and the CARDANO island (cardano-bp + arbiter) separately. Each
-#      builds its own chain from the same genesis.
+#   1.  setup.sh with a two-forger genesis, stake split 15/85 AGAINST dugite (see
+#       LD_POOL2_STAKE_PCT below) so cardano's chain outgrows dugite's by construction.
+#   2.  Cut the bridge. Both islands build their own chain from the same genesis.
+#       dugite-bp is peered with the relay ON PURPOSE — it cannot forge without a hot
+#       peer plus a ChainSync intersection.
+#   2b. SIGSTOP dugite-bp. The relay is now stranded holding a genesis-rooted chain it
+#       cannot extend, while cardano runs >= 300 slots ahead.
+#   2c. RESTART the relay. It must come back still able to roll back to Origin.
+#   3.  Restore the bridge by SIGHUP (no restarts) and SIGCONT dugite-bp. The relay
+#       must adopt cardano's chain IN PLACE.
+#   4.  Assert no wedge signatures and no undeclared error-class lines.
+#   5.  Restart the relay again; the adopted chain must survive it.
 #
-#      dugite-bp is peered with the relay ON PURPOSE — it cannot forge without a
-#      hot peer plus a ChainSync intersection.
+# THE SUBJECT IS THE RELAY, not dugite-bp. The relay is the node that peers with
+# cardano-bp and therefore the one that must replace its own chain from Origin;
+# dugite-bp is one hop downstream and can adopt nothing the relay has not adopted
+# first. Step 3 asserts the relay's tip HASH matches cardano-bp's AND that the relay
+# logged a chain switch — hash equality alone does not establish DIRECTION, and on the
+# first working run of this round the hashes matched with ZERO switches because
+# cardano-bp had adopted DUGITE's chain instead.
 #
-#   3. Wait until both islands hold >= MIN_FORK_BLOCKS blocks.
-#   4. Restore the bridge and restart the two nodes whose topology changed.
-#   5. ASSERT dugite-bp converges on the Haskell chain's tip HASH.
+# WHAT A PASS MEANS NOW. Until 2026-08-07 this script was a reproduction and a PASS was
+# impossible: the round's own summary said so. It is now a REGRESSION GATE — it requires
+# live, in-place adoption with no marker file, no operator action and no discarded
+# chain, which is what cardano-node does via `Paths.hs::isReachable`'s `anchorIsGenesis`
+# case. A run that "recovers" by any other route must FAIL.
 #
-# Step 5 asserts the tip HASH, not merely "advanced": a node that rebuilt its own
-# fork also advances. Hash equality against cardano-bp is the only thing that
-# distinguishes "rejoined the network" from "kept extending itself" — the same
-# reasoning as two-forger-round step 8.
-#
-# EXPECTED RESULT ON AN UNFIXED NODE: FAIL. That is the point — this script is
-# the reproduction. It should only pass once #1057 is genuinely fixed, which
-# requires the ledger to re-initialise from genesis on a rollback-to-Origin (a
-# full `init_fresh_ledger`; #989 deleted `reset_to_origin` because a partial
-# in-place reset cannot be correct), plus a LedgerSeq re-anchor (#985).
-#
-# Usage:
-#   ./genesis-fork-round.sh
-#   GF_MIN_FORK_BLOCKS=3 ./genesis-fork-round.sh
-#
-# Terminal: tears the devnet down at the end.
+# The prediction this header used to carry was also wrong and is worth recording: it
+# said the fix would require the ledger to re-initialise from genesis on a
+# rollback-to-Origin. It did not. The live half needed only the gate to key off the
+# LedgerSeq ANCHOR (`ledger_can_reach_origin`) rather than the ledger tip, so
+# `find_rollback_n`'s `target == anchor` case makes the rollback executable with no
+# re-initialisation at all. The genuinely missing piece was elsewhere entirely — a
+# SNAPSHOT-POLICY bug: dugite snapshotted the live tip where cardano-node snapshots the
+# LedgerDB anchor, so a restart came up unable to roll back anywhere.
 #
 # EARLIER FALSE NEGATIVE, recorded so it is not repeated: the first version of
 # this round reported dugite-bp forging 0 blocks with 0 leadership checks — both
@@ -83,19 +90,35 @@
 #
 # Both INCONCLUSIVE, and both would have read as PASS on tip-hash equality alone.
 #
-# So the dugite island is FROZEN at a shallow tip while the cardano island runs
-# far ahead (step 2b): stop dugite-relay and dugite-bp loses its only peer, which
-# makes the peer-connectivity forge gate stop it extending its own chain — the
-# gate working FOR the construction. dugite-bp itself is never restarted.
+# So the RELAY is frozen at a shallow tip while the cardano island runs far ahead
+# (step 2b), by SIGSTOPping the PRODUCER. Topologies are left alone: see step 2b for
+# the three freeze shapes that failed before this one, each silently.
 #
-# The gap is measured in SLOTS, not blocks, because the target is the forecast
-# horizon: devnet is k=40, f=0.5, slotLength=1s, so 3k/f = 240 slots. A default
-# GF_HEAD_START_SLOTS=300 puts the peer's headers definitively beyond it. That
-# mirrors the original occurrence — dugite frozen at slot 21 while the network ran
-# to slot 1004 — and the horizon park is what turns a declined BlockFetch range
-# into the endless peer-churn loop.
+# TWO THINGS THIS GATE GOT WRONG, both worth keeping written down.
 #
-# MEASURED — #1057 REPRODUCED (2026-08-06, main with the reverted fix):
+# 1. IT MEASURED THE WRONG NODE. The wedged node is dugite-relay — it is the one
+#    that peers with cardano-bp and must replace its chain from Origin. dugite-bp
+#    is one hop downstream. An earlier gate compared cardano-bp's slot against
+#    dugite-bp's and reported INCONCLUSIVE "slot gap 17" on a run whose relay was
+#    frozen 302 slots back: the precondition held and the round refused to test it.
+#
+# 2. A SLOT GAP BETWEEN TWO LIVE ISLANDS CANNOT GROW. A slot number is wall-clock,
+#    so every live tip tracks the current slot and their difference stays near zero
+#    no matter how long you wait. Four runs chased that impossible target. The gap
+#    accrues only against a node that is genuinely stopped — hence the freeze, and
+#    hence measuring it at the frozen relay.
+#
+# The gap is measured in SLOTS because the target is the forecast horizon: devnet
+# is k=40, f=0.5, slotLength=1s, so 3k/f = 240 slots, and GF_HEAD_START_SLOTS=300
+# clears it. But note the horizon is the SECONDARY condition, downstream of the
+# defect: BlockFetch declines the genesis range, the ledger stops, and only then —
+# 240 slots later — does the park fire and strand the node. The PRIMARY condition
+# is just that chain selection prefers a chain sharing only genesis, which is what
+# GF_MIN_BLOCK_LEAD enforces. A round that demanded the horizon breach up front
+# would skip the very step it exists to exercise.
+#
+# MEASURED — #1057 AS IT WAS, on main with the fix reverted (2026-08-06). Kept as the
+# reference fingerprint of the unfixed node, NOT as the current expected result:
 #
 #   fork depths           dugite-bp=5 (6 forged), cardano-bp=7, chains differ
 #   after the freeze      dugite-bp slot=18 block=5 | cardano-bp slot=326 block=93
@@ -142,12 +165,23 @@ MIN_FORK_BLOCKS="${GF_MIN_FORK_BLOCKS:-5}"
 CONVERGE_TIMEOUT="${GF_CONVERGE_TIMEOUT:-300}"
 FORK_BUILD_TIMEOUT="${GF_FORK_BUILD_TIMEOUT:-300}"
 # > 3k/f = 240 slots on this devnet (k=40, f=0.5), so the peer's headers land
-# beyond dugite-bp's forecast horizon — the condition the original #1057
+# beyond THE RELAY's forecast horizon — the condition the original #1057
 # occurrence had and the reason its park loop never self-healed.
+#
+# MEASURED AGAINST THE RELAY, NOT dugite-bp. The wedged node is dugite-relay: it
+# is the one that must replace its chain from Origin. Comparing cardano-bp's slot
+# against dugite-bp's reported INCONCLUSIVE "slot gap 17" on a run whose relay was
+# frozen 302 slots back — the gate measured a node that is not under test. Same
+# class as step 4 once reading the wrong node's log.
 HEAD_START_SLOTS="${GF_HEAD_START_SLOTS:-300}"
-# slotLength is 1s and only pool2 (40% stake) forges on the cardano island, so
-# 300 slots of lead is ~300s of wall clock. 900 leaves generous headroom.
+# slotLength is 1s and the relay is frozen outright once its edges are dropped, so
+# the lead accrues at ~1 slot/s of wall clock. 900 leaves generous headroom.
 HEAD_START_TIMEOUT="${GF_HEAD_START_TIMEOUT:-900}"
+# cardano's chain must out-length EVERY chain the relay can reach cheaply. Its own
+# 5 blocks are a PREFIX of dugite-bp's, so adopting dugite-bp is a plain forward
+# roll-forward and does not exercise the genesis-rooted path at all. Only a chain
+# that beats dugite-bp's too forces the switch under test.
+MIN_BLOCK_LEAD="${GF_MIN_BLOCK_LEAD:-20}"
 
 FAILURES=0
 INCONCLUSIVE=0
@@ -164,9 +198,52 @@ DUGITE_BIN="${DUGITE_BIN:-$(cd ../.. && pwd)/target/release/dugite-node}"
 [ -x "$DUGITE_BIN" ] || { echo "REFUSING TO RUN: dugite-node not found at $DUGITE_BIN"; exit 2; }
 command -v cardano-node >/dev/null 2>&1 || { echo "REFUSING TO RUN: cardano-node not on PATH"; exit 2; }
 
+# BOUNDED, because this round deliberately creates nodes that cannot answer.
+#
+# A SIGSTOPped node still has a LISTENING socket — the kernel completes the connect
+# from its backlog — so `cardano-cli query tip` neither fails nor returns: it blocks
+# forever. Unbounded, that turned a 15-minute wait loop into a 29-minute silent hang
+# with no output at all, and the round looked merely slow rather than stuck.
+#
+# macOS ships no `timeout(1)`, so the bound is hand-rolled. TWO REJECTED SHAPES,
+# recorded because both look correct:
+#
+#   out=$( cmd & ( sleep N; kill $! ) & wait ... )
+#     The watchdog subshell INHERITS the command-substitution pipe, and killing the
+#     subshell does not kill its `sleep` child. The orphan holds fd 1 open, so `$( )`
+#     cannot see EOF and EVERY call takes the full timeout — including successful ones.
+#     Its own test could not catch that, because it only exercised sockets that fail.
+#
+#   cmd | head -1
+#     `head` cannot bound a process that never writes.
+#
+# So: run the query to a temp file, poll for its exit with a bounded loop, and read the
+# file only if it finished. Nothing shares a pipe with the watchdog, and the happy path
+# costs one poll interval. An unreadable tip returns EMPTY, which the callers already
+# treat as "unmeasured" (see below) rather than as zero.
+TIP_QUERY_TIMEOUT="${GF_TIP_QUERY_TIMEOUT:-20}"
 tip_field() {
-    cardano-cli query tip --testnet-magic "$LD_MAGIC" --socket-path "$1" 2>/dev/null \
-        | jq -r "$2 // empty" 2>/dev/null
+    local sock="$1" filter="$2" tmp q i limit
+    tmp="$(mktemp "${TMPDIR:-/tmp}/gf-tipq.XXXXXX")" || return 0
+    cardano-cli query tip --testnet-magic "$LD_MAGIC" --socket-path "$sock" \
+        >"$tmp" 2>/dev/null &
+    q=$!
+    i=0
+    limit=$(( TIP_QUERY_TIMEOUT * 5 ))          # 200ms granularity
+    while [ "$i" -lt "$limit" ]; do
+        kill -0 "$q" 2>/dev/null || break
+        sleep 0.2
+        i=$(( i + 1 ))
+    done
+    if kill -0 "$q" 2>/dev/null; then
+        kill -9 "$q" 2>/dev/null
+        wait "$q" 2>/dev/null
+        rm -f "$tmp"
+        return 0                                # timed out -> unmeasured, not zero
+    fi
+    wait "$q" 2>/dev/null
+    jq -r "$filter // empty" <"$tmp" 2>/dev/null
+    rm -f "$tmp"
 }
 
 # Why `tip_field` returned nothing.
@@ -250,7 +327,26 @@ stop_pid_file() { # <pidfile>
 # ── setup ──────────────────────────────────────────────────────────────────
 step "setup (two-forger genesis)"
 ./stop.sh >/dev/null 2>&1
-LD_TWO_FORGERS=1 ./setup.sh >/dev/null 2>&1 || { echo "SETUP FAILED"; exit 2; }
+# INVERT THE STAKE SPLIT — this is what finally makes the precondition hold.
+#
+# `LD_TWO_FORGERS=1` defaults to pool1/pool2 = 60/40, i.e. DUGITE holds the majority.
+# Four separate attempts at freezing the dugite island failed on the same wall: with
+# 60% of the stake dugite-bp simply out-produces cardano-bp, so the cardano chain is
+# never strictly longer and the adoption under test is never entered. Measured across
+# those attempts:
+#
+#   dugite 4  vs cardano 5    converged, 0 switches   (equal depth, dugite won)
+#   dugite 9  vs cardano 9    converged, 0 switches
+#   dugite 111 vs cardano 86  slot gap 1              (freeze leaked: bidirectional link)
+#   dugite 129 vs cardano 84  slot gap -2             (both edges dropped, still ahead)
+#
+# The knob already exists — `LD_POOL2_STAKE_PCT` — and pointing it the other way is
+# the fix. At 85/15 the leader probabilities are P=1-(1-f)^sigma with f=0.5, so
+# cardano-bp ~0.45/slot against dugite-bp ~0.10/slot: roughly 4.5x, which makes
+# "cardano's chain is strictly longer" a property of the genesis rather than of the
+# timing. Deterministic beats fighting the race.
+LD_TWO_FORGERS=1 LD_POOL2_STAKE_PCT="${GF_POOL2_STAKE_PCT:-85}" \
+    ./setup.sh >/dev/null 2>&1 || { echo "SETUP FAILED"; exit 2; }
 ok "genesis regenerated (two-forger)"
 
 [ -f "$LD_GENESIS/.two-forgers" ] || {
@@ -261,12 +357,14 @@ ok "genesis regenerated (two-forger)"
 
 RELAY_TOPO="$LD_CONFIG/dugite-relay.topology.json"
 CBP_TOPO="$LD_CONFIG/cardano-bp.topology.json"
+BP_TOPO="$LD_CONFIG/dugite-bp.topology.json"
 cp "$RELAY_TOPO" "$LD_STATE/relay.topology.real.json" || exit 2
 cp "$CBP_TOPO"   "$LD_STATE/cbp.topology.real.json"   || exit 2
 
 cleanup() {
     [ -f "$LD_STATE/relay.topology.real.json" ] && cp "$LD_STATE/relay.topology.real.json" "$RELAY_TOPO" 2>/dev/null
     [ -f "$LD_STATE/cbp.topology.real.json" ]   && cp "$LD_STATE/cbp.topology.real.json"   "$CBP_TOPO"   2>/dev/null
+    [ -f "$LD_STATE/bp.topology.real.json" ]    && cp "$LD_STATE/bp.topology.real.json"    "$BP_TOPO"    2>/dev/null
     return 0
 }
 trap cleanup EXIT
@@ -355,44 +453,88 @@ fi
 # ── step 2b: freeze the dugite island, let cardano run far ahead ───────────
 # Equal-depth forks resolve in the WRONG direction (dugite's fork wins and cardano
 # adopts it), so the peer's chain must be strictly longer AND its headers must sit
-# beyond dugite-bp's forecast horizon.
-#
-# dugite-relay is dugite-bp's only peer, so stopping it leaves dugite-bp peerless
-# and the peer-connectivity forge gate stops it extending its own chain. dugite-bp
-# is NOT restarted — the adoption still has to happen on the live path.
+# beyond the RELAY's forecast horizon.
 step "2b. freeze the dugite island; cardano runs >= ${HEAD_START_SLOTS} slots ahead"
 
-stop_pid_file "$LD_STATE/dugite-relay.pid" || note "dugite-relay did not exit within 60s of SIGTERM"
-sleep 5
-DBP_FROZEN_SLOT=$(tip_field "$LD_DUGITE_BP_SOCK" .slot); DBP_FROZEN_SLOT=${DBP_FROZEN_SLOT:-0}
-DBP_FROZEN_BLK=$(tip_field "$LD_DUGITE_BP_SOCK" .block); DBP_FROZEN_BLK=${DBP_FROZEN_BLK:-0}
-note "dugite-bp frozen at slot=$DBP_FROZEN_SLOT block=$DBP_FROZEN_BLK (peerless)"
+# FREEZE THE PRODUCER, AND LEAVE THE TOPOLOGIES ALONE. Three earlier shapes failed,
+# each silently:
+#
+#   1. Stop dugite-relay.  Restarting it in step 3 re-anchored its LedgerSeq onto the
+#      replayed tip, destroying the `ledger_can_reach_origin` precondition before the
+#      peer's chain ever arrived. (The node no longer does that — but see 3.)
+#   2. SIGHUP both nodes' `localRoots` to [].  A topology reload does NOT close an
+#      ESTABLISHED connection, so the hot dugite-bp <-> relay session survived and
+#      dugite-bp fed the relay from block 6 to 32 while the round believed it frozen.
+#   3. Empty the relay's `localRoots` AND restart it.  dugite treats a peerless
+#      topology as nothing-to-do and EXITS:
+#          warn!("No peers configured in topology"); return Ok(());
+#      so the relay replayed, logged its genesis anchor, and terminated — after which
+#      `wait_for_socket` polled a STALE SOCKET FILE for 180s and the round looked
+#      merely slow.
+#
+# SIGSTOP on dugite-bp is the whole freeze: forging stops instantly, nothing restarts,
+# and the relay keeps a peer CONFIGURED (its step-1 cut topology, pointing at
+# dugite-bp) so it can still boot in step 2c. A configured-but-frozen peer is also what
+# a stranded node looks like in the field — it has peers, they just do not help.
+BP_PID=$(cat "$LD_STATE/dugite-bp.pid" 2>/dev/null)
 
+# dugite-bp's height is recorded BEFORE the stop: a stopped node does not answer its
+# N2C socket, and an unreadable tip must not be scored as 0.
+DBP_HELD_BLK=$(tip_field "$LD_DUGITE_BP_SOCK" .block); DBP_HELD_BLK=${DBP_HELD_BLK:-0}
+if [ -n "$BP_PID" ] && kill -STOP "$BP_PID" 2>/dev/null; then
+    note "SIGSTOP -> dugite-bp (pid $BP_PID): frozen holding a ${DBP_HELD_BLK}-block chain, so the relay has nothing new to adopt"
+else
+    bad "could not SIGSTOP dugite-bp (pid ${BP_PID:-none}) — it would keep feeding the relay and the relay would never be stranded"
+fi
+note "topologies untouched: the relay still has dugite-bp configured (frozen), so it stays stranded AND can boot when step 2c restarts it"
+sleep 30
+# THE SUBJECT IS THE RELAY. It is the node that has to replace its chain from
+# Origin, so every precondition below is measured at its socket. dugite-bp is
+# recorded only to prove its chain does not beat cardano's (see MIN_BLOCK_LEAD).
+REL_FROZEN_SLOT=$(tip_field "$LD_RELAY_SOCK" .slot);  REL_FROZEN_SLOT=${REL_FROZEN_SLOT:-0}
+REL_FROZEN_BLK=$(tip_field "$LD_RELAY_SOCK" .block);  REL_FROZEN_BLK=${REL_FROZEN_BLK:-0}
+# DO NOT QUERY dugite-bp FROM HERE UNTIL THE SIGCONT IN STEP 3. It is stopped, and a
+# stopped node's socket is still LISTENING, so the query blocks instead of failing —
+# it hung this round for 29 minutes with no output before `tip_field` was bounded.
+# Its height is `DBP_HELD_BLK`, captured before the stop and unable to move while it
+# is stopped.
+note "dugite-relay frozen at slot=$REL_FROZEN_SLOT block=$REL_FROZEN_BLK (no peers — THIS is the node under test)"
+note "dugite-bp holds $DBP_HELD_BLK block(s) and is stopped; its chain EXTENDS the relay's, so cardano's must out-length it"
+
+# Wait for cardano's headers to clear the RELAY's forecast horizon. The relay is
+# genuinely frozen, so this gap does accrue — unlike a gap measured between two
+# LIVE islands, which cannot grow at all: a slot number is wall-clock, so each
+# live tip tracks the current slot and their difference stays near zero. Four
+# earlier runs chased that impossible target.
 deadline=$(( $(date +%s) + HEAD_START_TIMEOUT ))
 CBP_SLOT=0
 while [ "$(date +%s)" -lt "$deadline" ]; do
     CBP_SLOT=$(tip_field "$LD_CARDANO_BP_SOCK" .slot); CBP_SLOT=${CBP_SLOT:-0}
-    [ "$CBP_SLOT" -ge $(( DBP_FROZEN_SLOT + HEAD_START_SLOTS )) ] && break
+    [ "$CBP_SLOT" -ge $(( REL_FROZEN_SLOT + HEAD_START_SLOTS )) ] && break
     sleep 10
 done
 
-# Re-read dugite-bp: if it kept forging while peerless, the gap must be recomputed
-# from where it ACTUALLY is, not from where it was when the relay died.
-DBP_NOW_SLOT=$(tip_field "$LD_DUGITE_BP_SOCK" .slot); DBP_NOW_SLOT=${DBP_NOW_SLOT:-0}
-DBP_NOW_BLK=$(tip_field "$LD_DUGITE_BP_SOCK" .block);  DBP_NOW_BLK=${DBP_NOW_BLK:-0}
+REL_NOW_SLOT=$(tip_field "$LD_RELAY_SOCK" .slot);      REL_NOW_SLOT=${REL_NOW_SLOT:-0}
+REL_NOW_BLK=$(tip_field "$LD_RELAY_SOCK" .block);      REL_NOW_BLK=${REL_NOW_BLK:-0}
+# dugite-bp is SIGSTOPped and cannot answer, so its chain is the length recorded
+# before the stop — it is frozen, so that value cannot have moved.
+DBP_NOW_BLK="$DBP_HELD_BLK"
 CBP_BLK2=$(tip_field "$LD_CARDANO_BP_SOCK" .block);    CBP_BLK2=${CBP_BLK2:-0}
-SLOT_GAP=$(( CBP_SLOT - DBP_NOW_SLOT ))
-note "dugite-bp slot=$DBP_NOW_SLOT block=$DBP_NOW_BLK | cardano-bp slot=$CBP_SLOT block=$CBP_BLK2 | slot gap=$SLOT_GAP"
+SLOT_GAP=$(( CBP_SLOT - REL_NOW_SLOT ))
+note "dugite-relay slot=$REL_NOW_SLOT block=$REL_NOW_BLK | dugite-bp block=$DBP_NOW_BLK | cardano-bp slot=$CBP_SLOT block=$CBP_BLK2 | slot gap=$SLOT_GAP"
 
-if [ "$DBP_NOW_BLK" -gt "$DBP_FROZEN_BLK" ]; then
-    note "dugite-bp advanced $DBP_FROZEN_BLK -> $DBP_NOW_BLK while peerless (the forge gate did not hold it); the gap below is what matters"
+if [ "$REL_NOW_BLK" -gt "$REL_FROZEN_BLK" ]; then
+    inconc "dugite-relay advanced $REL_FROZEN_BLK -> $REL_NOW_BLK while it was supposed to be frozen — an edge survived the SIGHUP, so it is not the stranded node this round needs."
 fi
 
-if [ "$CBP_BLK2" -le "$DBP_NOW_BLK" ]; then
-    inconc "cardano-bp's chain is NOT strictly longer (cardano=$CBP_BLK2 dugite=$DBP_NOW_BLK) — dugite's fork would win chain selection again. Raise GF_HEAD_START_SLOTS or GF_HEAD_START_TIMEOUT."
+# The relay must be unable to reach cardano's chain by any cheap route: not by
+# extending its own, and not by adopting dugite-bp's (of which its chain is a
+# prefix). Only then does chain selection have to root a switch at genesis.
+if [ "$CBP_BLK2" -lt $(( DBP_NOW_BLK + MIN_BLOCK_LEAD )) ]; then
+    inconc "cardano-bp's chain ($CBP_BLK2) does not lead dugite-bp's ($DBP_NOW_BLK) by $MIN_BLOCK_LEAD — the relay could satisfy chain selection by rolling FORWARD onto dugite-bp's chain, which shares its whole history, so the genesis-rooted switch would never be attempted."
 fi
 if [ "$SLOT_GAP" -lt 240 ]; then
-    inconc "slot gap $SLOT_GAP is inside the 240-slot forecast horizon — the horizon park that made #1057 unrecoverable would not be reached. Raise GF_HEAD_START_SLOTS or GF_HEAD_START_TIMEOUT."
+    inconc "slot gap $SLOT_GAP is inside the 240-slot forecast horizon — the horizon park that made #1057 unrecoverable would not be reached. Raise GF_HEAD_START_TIMEOUT."
 fi
 
 if [ "$INCONCLUSIVE" -gt 0 ]; then
@@ -400,54 +542,133 @@ if [ "$INCONCLUSIVE" -gt 0 ]; then
     ./stop.sh >/dev/null 2>&1
     exit 3
 fi
-ok "preconditions met: dugite-bp holds its own $DBP_NOW_BLK-block genesis-rooted chain, cardano-bp is $((CBP_BLK2 - DBP_NOW_BLK)) blocks / $SLOT_GAP slots ahead on an incompatible one"
+ok "preconditions met: dugite-relay holds a $REL_NOW_BLK-block genesis-rooted chain and is frozen; cardano-bp is $((CBP_BLK2 - REL_NOW_BLK)) blocks / $SLOT_GAP slots ahead on an incompatible one, and leads dugite-bp by $((CBP_BLK2 - DBP_NOW_BLK))"
+
+# ── step 2c: restart the stranded relay — the anchor must SURVIVE it ───────
+#
+# This used to be impossible to test, and the reason is the whole restart half of
+# the defect. dugite snapshotted the LIVE ledger tip and then `reset_anchor`ed onto
+# the replayed tip, so a restart came up with an anchor it could not roll back below
+# and the wedge outlived the process. That is why earlier versions of this round used
+# SIGHUP everywhere and treated a restart as something to avoid.
+#
+# cardano-node has no such problem: it snapshots the LedgerDB ANCHOR
+# (`LedgerDB/V2.hs` takes `anchorHandle` of the pruned sequence) and re-pushes the
+# volatile chain on init, so with nothing flushed its anchor is genesis and
+# `Paths.hs::isReachable`'s `anchorIsGenesis` case still applies after a restart.
+#
+# So the restart now goes FIRST, deliberately, and step 3 must still adopt. If the
+# startup evidence below is present but step 3 fails, the live half is broken; if the
+# evidence is absent, the startup half is.
+step "2c. restart the stranded dugite-relay; its genesis anchor must survive"
+
+# Mark BEFORE the restart, so the assertions below can only be satisfied by lines the
+# NEW process wrote. Scanning from 0 would also accept a line from the first boot.
+RELAY_BOOT_MARK=$(wc -l < "$LD_LOGS/dugite-relay.log" 2>/dev/null)
+RELAY_BOOT_MARK=${RELAY_BOOT_MARK:-0}
+stop_pid_file "$LD_STATE/dugite-relay.pid" || note "dugite-relay did not exit within 60s of SIGTERM"
+start_dugite dugite-relay "$LD_RELAY_PORT" "$LD_DUGITE_RELAY_METRICS_PORT" "$LD_RELAY_SOCK"
+wait_for_socket "$LD_RELAY_SOCK" 180 >/dev/null 2>&1
+
+# Its topology is still step 1's cut version — dugite-bp only, and dugite-bp is
+# SIGSTOPped. So it boots (a peerless topology would make it exit outright) and comes
+# up stranded on its own chain, now re-derived from disk rather than held in memory.
+sleep 5
+REL_BOOT_BLK=$(tip_field "$LD_RELAY_SOCK" .block); REL_BOOT_BLK=${REL_BOOT_BLK:-0}
+note "dugite-relay restarted; it re-derived a ${REL_BOOT_BLK}-block chain from its ChainDB"
+
+if awk -v m="$RELAY_BOOT_MARK" 'NR > m && /replaying it through the LedgerSeq delta path/ {f=1}
+        END{exit !f}' "$LD_LOGS/dugite-relay.log" 2>/dev/null; then
+    ok "dugite-relay replayed its volatile chain through the LedgerSeq delta path (blocks stay rollback-able)"
+else
+    bad "dugite-relay did NOT delta-replay its volatile chain at startup — its ImmutableDB is empty, so the whole chain is within k of genesis and every block should have been pushed as a delta. Without that the anchor lands on the replayed tip and the node cannot roll back at all."
+fi
+
+if awk -v m="$RELAY_BOOT_MARK" 'NR > m && /keeping its anchor rather than re-anchoring on the replayed tip/ {f=1}
+        END{exit !f}' "$LD_LOGS/dugite-relay.log" 2>/dev/null; then
+    ok "dugite-relay kept the replay-built anchor instead of re-anchoring on its tip"
+else
+    bad "dugite-relay re-anchored on the replayed tip after replay — reset_anchor clears the volatile window, so the rollback capability the delta replay just built was discarded"
+fi
+
+if awk -v m="$RELAY_BOOT_MARK" 'NR > m && /LedgerSeq was incoherent/ {c++} END{exit (c+0)>0}' \
+        "$LD_LOGS/dugite-relay.log" 2>/dev/null; then
+    ok "no LedgerSeq incoherence at startup (positive evidence the window chains onto its anchor)"
+else
+    bad "dugite-relay logged 'LedgerSeq was incoherent' after the restart — the replay-built window does not chain onto its anchor"
+fi
 
 # ── step 3: restore the bridge; dugite-bp must adopt ───────────────────────
 step "3. restore the bridge — dugite-bp must adopt a chain diverging at GENESIS"
 MARK=$(wc -l < "$LD_LOGS/dugite-bp.log" 2>/dev/null)
-# Both node logs are APPENDED across the restart, so step 4 must count only what
-# happens after the bridge is restored. The pre-restore relay never saw cardano-bp
-# at all, but relying on that is fragile — mark it explicitly.
+# Step 4 must count only what happens after the bridge is restored. Nothing is
+# restarted here any more (the bridge comes back via SIGHUP), but the relay's log
+# still spans the whole run, and the pre-restore relay never saw cardano-bp at all —
+# relying on that is fragile, so mark it explicitly.
 RELAY_MARK=$(wc -l < "$LD_LOGS/dugite-relay.log" 2>/dev/null)
 
-stop_pid_file "$LD_STATE/cardano-bp.pid"   || note "cardano-bp did not exit within 60s of SIGTERM"
-
+# RESTORED BY SIGHUP ON BOTH NODES — NO RESTARTS.
+#
+# Same reason as step 2b: restarting dugite-relay would move its LedgerSeq anchor off
+# Origin and close the gate before cardano-bp's chain ever arrives. Both dugite and
+# cardano-node reload `localRoots` from the topology file on SIGHUP, so the bridge can
+# be reconnected without touching either process.
 cp "$LD_STATE/relay.topology.real.json" "$RELAY_TOPO"
 cp "$LD_STATE/cbp.topology.real.json"   "$CBP_TOPO"
-note "bridge restored (relay -> dugite-bp + cardano-bp; cardano-bp -> relay)"
+[ -f "$LD_STATE/bp.topology.real.json" ] && cp "$LD_STATE/bp.topology.real.json" "$BP_TOPO"
 
-start_dugite dugite-relay "$LD_RELAY_PORT" "$LD_DUGITE_RELAY_METRICS_PORT" "$LD_RELAY_SOCK"
-cardano-node run \
-    --config        "$LD_CONFIG/cardano-bp.config.json" \
-    --topology      "$CBP_TOPO" \
-    --database-path "$LD_STATE/cardano-bp.db" \
-    --socket-path   "$LD_CARDANO_BP_SOCK" \
-    --host-addr     127.0.0.1 \
-    --port          "$LD_CARDANO_BP_PORT" \
-    --shelley-kes-key                 "$LD_KEYS/pool2/kes.skey" \
-    --shelley-vrf-key                 "$LD_KEYS/pool2/vrf.skey" \
-    --shelley-operational-certificate "$LD_KEYS/pool2/opcert.cert" \
-    >> "$LD_LOGS/cardano-bp.log" 2>&1 &
-echo $! > "$LD_STATE/cardano-bp.pid"
+BP_PID=$(cat "$LD_STATE/dugite-bp.pid" 2>/dev/null)
+# SIGCONT first: a SIGSTOPped process does not act on a queued SIGHUP, so reloading
+# its topology before resuming it would silently do nothing.
+if [ -n "$BP_PID" ] && kill -CONT "$BP_PID" 2>/dev/null; then
+    note "SIGCONT -> dugite-bp (pid $BP_PID): resumed after the freeze"
+else
+    note "could not SIGCONT dugite-bp (pid ${BP_PID:-none}) — the relay verdict below is unaffected, only the downstream hop is"
+fi
+if [ -n "$BP_PID" ] && kill -HUP "$BP_PID" 2>/dev/null; then
+    note "SIGHUP -> dugite-bp (pid $BP_PID): re-added its relay edge"
+else
+    bad "could not SIGHUP dugite-bp (pid ${BP_PID:-none}) — it would stay peerless and could not adopt anything"
+fi
+
+RELAY_PID=$(cat "$LD_STATE/dugite-relay.pid" 2>/dev/null)
+CBP_PID=$(cat "$LD_STATE/cardano-bp.pid" 2>/dev/null)
+if [ -n "$RELAY_PID" ] && kill -HUP "$RELAY_PID" 2>/dev/null; then
+    note "SIGHUP -> dugite-relay (pid $RELAY_PID): re-added dugite-bp + cardano-bp"
+else
+    bad "could not SIGHUP dugite-relay (pid ${RELAY_PID:-none}) — bridge not restored on the dugite side"
+fi
+if [ -n "$CBP_PID" ] && kill -HUP "$CBP_PID" 2>/dev/null; then
+    note "SIGHUP -> cardano-bp (pid $CBP_PID): re-added the relay"
+else
+    bad "could not SIGHUP cardano-bp (pid ${CBP_PID:-none}) — bridge not restored on the cardano side"
+fi
+note "bridge restored WITHOUT restarts, so dugite-relay's LedgerSeq anchor is still at Origin"
 
 # dugite-bp is deliberately NOT restarted: the adoption must happen on the LIVE
 # path, which is where #1057 bites. A restart would exercise startup replay
 # instead and could mask it.
+# CONVERGENCE IS MEASURED AT THE RELAY. It peers directly with cardano-bp and is
+# the node that must replace its chain from Origin. dugite-bp is one hop downstream
+# and can adopt nothing the relay has not adopted first, so it is reported as a
+# secondary (its own fork diverges from cardano's at genesis too, which makes its
+# adoption a second instance of the same path — useful, but not the subject).
 CONVERGED=0
 deadline=$(( $(date +%s) + CONVERGE_TIMEOUT ))
 while [ "$(date +%s)" -lt "$deadline" ]; do
     sleep 5
-    DBP_H=$(tip_field "$LD_DUGITE_BP_SOCK" .hash)
+    REL_H=$(tip_field "$LD_RELAY_SOCK" .hash)
     CBP_H=$(tip_field "$LD_CARDANO_BP_SOCK" .hash)
-    if [ -n "$DBP_H" ] && [ -n "$CBP_H" ] && [ "$DBP_H" = "$CBP_H" ]; then
+    if [ -n "$REL_H" ] && [ -n "$CBP_H" ] && [ "$REL_H" = "$CBP_H" ]; then
         CONVERGED=1
         break
     fi
 done
 
+REL_AFTER=$(tip_field "$LD_RELAY_SOCK" .block)
 DBP_AFTER=$(tip_field "$LD_DUGITE_BP_SOCK" .block)
 CBP_AFTER=$(tip_field "$LD_CARDANO_BP_SOCK" .block)
-note "after reconnect: dugite-bp block=${DBP_AFTER:-?} cardano-bp block=${CBP_AFTER:-?}"
+note "after reconnect: dugite-relay block=${REL_AFTER:-?} dugite-bp block=${DBP_AFTER:-?} cardano-bp block=${CBP_AFTER:-?}"
 
 # DIRECTION MATTERS, and tip-hash equality alone does NOT establish it.
 #
@@ -461,10 +682,13 @@ note "after reconnect: dugite-bp block=${DBP_AFTER:-?} cardano-bp block=${CBP_AF
 # So require BOTH: the tips agree, AND dugite-bp actually moved off its own fork.
 # A chain switch / ledger rollback in its log after the bridge was restored is the
 # only direct evidence it crossed the fork rather than winning it.
+REL_SWITCHED=$(awk -v m="${RELAY_MARK:-0}" '
+    NR > m && (/switching to longer fork/ || /chain switch/ || /rolling back ledger to intersection/) {c++}
+    END{print c+0}' "$LD_LOGS/dugite-relay.log" 2>/dev/null)
 DBP_SWITCHED=$(awk -v m="${MARK:-0}" '
     NR > m && (/switching to longer fork/ || /chain switch/ || /rolling back ledger to intersection/) {c++}
     END{print c+0}' "$LD_LOGS/dugite-bp.log" 2>/dev/null)
-note "dugite-bp chain-switch / ledger-rollback lines after reconnect: ${DBP_SWITCHED:-0}"
+note "chain-switch / ledger-rollback lines after reconnect: dugite-relay=${REL_SWITCHED:-0} dugite-bp=${DBP_SWITCHED:-0}"
 
 if [ "$CONVERGED" -ne 1 ]; then
     # NOT a failure by itself, and this is a deliberate change of semantics.
@@ -477,11 +701,16 @@ if [ "$CONVERGED" -ne 1 ]; then
     # So the verdict moved to step 5. Keeping a hard FAIL here would mean the round
     # could never pass however well recovery worked, and a check that can only ever
     # fail stops being read.
-    note "dugite-bp did NOT converge on the live path (stuck at block ${DBP_AFTER:-?}, cardano-bp at ${CBP_AFTER:-?}) — EXPECTED with #1057 half B, which recovers by restart rather than in place. Step 5 carries the verdict."
-elif [ "${DBP_SWITCHED:-0}" -eq 0 ]; then
-    inconc "tips agree at block ${DBP_AFTER:-?} but dugite-bp logged NO chain switch — its own fork WON chain selection and cardano-bp adopted it, so the genesis-rooted adoption under test never happened. Not a pass: the scenario resolved in the wrong direction. Raise GF_HEAD_START_SLOTS so the cardano island's chain is longer by a wider margin."
+    bad "dugite-relay did NOT adopt the genesis-divergent chain on the LIVE path (stuck at block ${REL_AFTER:-?}, cardano-bp at ${CBP_AFTER:-?}) — this is #1057 unfixed. cardano-node adopts here: Paths.hs::isReachable returns a genesis-rooted ChainDiff whenever the current chain's anchor is genesis, with rollback' = rollback + length chain, and it does so in place with no restart and no operator action."
+elif [ "${REL_SWITCHED:-0}" -eq 0 ]; then
+    inconc "tips agree at block ${REL_AFTER:-?} but dugite-relay logged NO chain switch — dugite's fork WON chain selection and cardano-bp adopted it, so the genesis-rooted adoption under test never happened. Not a pass: the scenario resolved in the wrong direction. Raise GF_MIN_BLOCK_LEAD so the cardano island's chain leads by a wider margin."
 else
-    ok "dugite-bp ADOPTED the genesis-divergent chain: crossed a fork it did not build (${DBP_SWITCHED} switch/rollback line(s)), tip hash matches cardano-bp at block ${DBP_AFTER:-?}"
+    ok "dugite-relay ADOPTED the genesis-divergent chain IN PLACE: crossed a fork it did not build (${REL_SWITCHED} switch/rollback line(s)), tip hash matches cardano-bp at block ${REL_AFTER:-?}"
+    if [ "${DBP_AFTER:-0}" -ge "${REL_AFTER:-0}" ] 2>/dev/null && [ "${DBP_SWITCHED:-0}" -gt 0 ]; then
+        ok "dugite-bp followed one hop downstream (${DBP_SWITCHED} switch/rollback line(s), block ${DBP_AFTER:-?}) — the same path a second time, through a node that had also forged its own fork"
+    else
+        note "dugite-bp at block ${DBP_AFTER:-?} with ${DBP_SWITCHED:-0} switch line(s) — it lags the relay; not fatal, the subject is the relay"
+    fi
 fi
 
 # ── step 4: name the wedge signatures ──────────────────────────────────────
@@ -553,21 +782,36 @@ note "Fork rollback FAILED (either node)    : ${ROLLBACK_FAIL:-0}"
 #                            #985's "LedgerSeq was incoherent", neither of which is
 #                            allowlisted on purpose.
 if [ "$CONVERGED" -ne 1 ]; then
-    # REQUIRE ONLY WHAT THE NODE UNDER TEST MUST SAY ABOUT ITSELF.
+    # REQUIRE A DIAGNOSTIC FOR THE WEDGE THAT ACTUALLY HAPPENED — not for one shape
+    # of it. There are two, at different layers, and demanding the wrong one produces
+    # a FALSE failure:
     #
-    # The genesis-decline WARN is dugite's own diagnostic for its own state, so its
-    # absence is unambiguously a defect. "beyond forecast horizon" was in this set on
-    # the first run and produced a FALSE FAILURE: it is a downstream CONSEQUENCE
-    # whose appearance depends on the 60s park timer landing inside the observation
-    # window and on the log being flushed by the time step 4 reads it — step 4's own
-    # counter saw it while `expect_log_errors` did not, in the same run. A
-    # timing-dependent side effect belongs in the reported NOTEs, not in a hard
-    # assertion.
-    if expect_log_errors "$LD_LOGS/dugite-relay.log" "${RELAY_MARK:-0}" \
-            "declining a range rooted at GENESIS"; then
-        ok "the wedge is self-announcing: dugite-relay logs the genesis-range decline at the DEFAULT log level (#1057)"
+    #   BlockFetch layer  "declining a range rooted at GENESIS"
+    #                     The peer's blocks never arrive at all.
+    #   Ledger layer      "Rollback target outside LedgerSeq volatile window"
+    #                     The blocks DID arrive, storage switched the chain, and the
+    #                     ledger then refused to roll back to Origin. This is the
+    #                     BAD-FIX shape, and it logs an ERROR of its own.
+    #
+    # An earlier version required the BlockFetch line unconditionally and reported
+    # "the node wedged SILENTLY" on a run where the ledger-layer ERROR was present and
+    # correct — the node was perfectly diagnosable, in the other layer's words.
+    #
+    # "beyond forecast horizon" is deliberately in NEITHER required set: it is a
+    # downstream CONSEQUENCE whose appearance depends on the 60s park timer landing
+    # inside the observation window, and step 4's own counter once saw it while
+    # `expect_log_errors` did not, in the same run.
+    if [ "${GENESIS_DECLINE:-0}" -gt 0 ]; then
+        if expect_log_errors "$LD_LOGS/dugite-relay.log" "${RELAY_MARK:-0}" \
+                "declining a range rooted at GENESIS"; then
+            ok "the BlockFetch wedge is self-announcing at the DEFAULT log level"
+        else
+            bad "dugite-relay declined genesis ranges but the diagnostic is not at the default log level — an unrecoverable state that logs nothing cannot be diagnosed in the field"
+        fi
+    elif [ "${ROLLBACK_FAIL:-0}" -gt 0 ]; then
+        ok "the LEDGER-layer wedge is self-announcing: the rollback refusal is logged as an ERROR (step 4's classification below names it)"
     else
-        bad "the node wedged SILENTLY: dugite-relay never logged 'declining a range rooted at GENESIS'. An unrecoverable state that logs nothing at the default level cannot be diagnosed in the field (#1057)"
+        bad "dugite-relay failed to adopt and logged NEITHER wedge diagnostic — neither a declined genesis range nor a rollback refusal. Read $LD_LOGS/dugite-relay.log directly; a wedge with no diagnostic at all is the worst outcome of the three."
     fi
 
     # The WARN is rate-limited to one per 30s per worker. A count in the hundreds
@@ -580,12 +824,18 @@ if [ "$CONVERGED" -ne 1 ]; then
         ok "genesis-decline WARN is throttled (${GENESIS_DECLINE} line(s) for the whole wedge window)"
     fi
 
-    if assert_no_other_errors "$LD_LOGS/dugite-relay.log" "${RELAY_MARK:-0}" \
-            ./genesis-fork-round.allowed-errors; then
-        ok "no UNDECLARED error-class line on dugite-relay after the reconnect"
-    else
-        bad "undeclared error-class line(s) on dugite-relay — listed above. If one of them is 'Fork rollback failed' or 'LedgerSeq was incoherent', that is the BAD-FIX / #985 shape, not something to allowlist."
-    fi
+fi
+
+# OUTSIDE the not-converged branch, deliberately. A successful adoption is exactly
+# where a bad fix leaves its trace — storage emitting a genesis-rooted plan the
+# ledger could not execute logs "Fork rollback failed" and then converges anyway
+# by some other route. Running this only on failure would skip the case worth
+# checking most.
+if assert_no_other_errors "$LD_LOGS/dugite-relay.log" "${RELAY_MARK:-0}" \
+        ./genesis-fork-round.allowed-errors; then
+    ok "no UNDECLARED error-class line on dugite-relay after the reconnect"
+else
+    bad "undeclared error-class line(s) on dugite-relay — listed above. If one of them is 'Fork rollback failed' or 'LedgerSeq was incoherent', that is the BAD-FIX / #985 shape, not something to allowlist."
 fi
 RELAY_TIP=$(tip_field "$LD_RELAY_SOCK" .block)
 note "dugite-relay block=${RELAY_TIP:-?} vs cardano-bp block=${CBP_AFTER:-?}"
@@ -597,61 +847,40 @@ note "dugite-relay block=${RELAY_TIP:-?} vs cardano-bp block=${CBP_AFTER:-?}"
 # fixed    -> converged, horizon drops 0
 if [ "${ROLLBACK_FAIL:-0}" -gt 0 ]; then
     bad "BAD-FIX SHAPE: the chain switch was ATTEMPTED but the ledger could not roll back to Origin. A genesis-rooted SwitchPlan from storage is necessary but NOT sufficient — the ledger must re-initialise from genesis (#1057)"
-elif [ "$CONVERGED" -eq 1 ] && [ "${DBP_SWITCHED:-0}" -gt 0 ]; then
+elif [ "$CONVERGED" -eq 1 ] && [ "${REL_SWITCHED:-0}" -gt 0 ]; then
     ok "no wedge signatures after a successful genesis-rooted adoption"
 elif [ "$CONVERGED" -eq 1 ]; then
-    note "no wedge signatures — but see the INCONCLUSIVE above: dugite-bp never crossed the fork, so their absence is not evidence about #1057"
+    note "no wedge signatures — but see the INCONCLUSIVE above: dugite-relay never crossed the fork, so their absence is not evidence either way"
 elif [ "${HORIZON:-0}" -gt 0 ] && [ "${ORIGIN_RB:-0}" -gt 0 ]; then
     note "UNFIXED SHAPE CONFIRMED on dugite-relay: it accepted the Origin intersection ${ORIGIN_ACCEPT} time(s), rolled ChainSync back to Origin ${ORIGIN_RB} time(s), made no ledger progress, and was dropped at the forecast horizon ${HORIZON} time(s) — the endless reconnect loop of #1057, with dugite-bp stranded behind it"
 else
     note "the round FAILED but neither the unfixed nor the bad-fix signature is present — read $LD_LOGS/dugite-relay.log directly before drawing any conclusion"
 fi
 
-# ── step 5: does a RESTART recover the node? (#1057 half B) ────────────────
+# ── step 5: the adoption must STICK across one more restart ────────────────
 #
-# ASSERTION now, not a diagnostic. Half B writes a marker when the wedge is
-# confirmed, and `Node::new` acts on it: discard the dead-end VolatileDB chain
-# (WAL truncated), treat the ledger snapshot as unusable, and wipe the on-disk UTxO
-# store — all on the already-validated from-genesis startup path. So a plain
-# restart MUST now recover, where before it demonstrably did not.
+# What used to be here was a marker-driven recovery probe: the node wrote a
+# "genesis-divergence-detected" file, the next start discarded its local chain, and
+# the round called that a PASS while recording that the wedge still happened.
 #
-# BOTH DUGITE NODES ARE RESTARTED, RELAY FIRST, and the order is the point.
+# That mechanism is gone, and its absence is the point. cardano-node never discards a
+# chain because a peer offered a longer one it cannot root — `isReachable` returns
+# `Nothing`, chain selection keeps what it has, and no marker, no operator restart and
+# no re-sync are involved. A dugite-only "restart to recover" path was a divergence
+# from the reference implementation dressed up as a fix, and step 3 now asserts the
+# behaviour upstream actually has: adoption, in place, live.
 #
-# dugite-relay is the node that peers with cardano-bp, so it is the one that
-# declines the genesis-rooted ranges and therefore the one that writes the marker.
-# dugite-bp never sees a genesis-rooted range from the relay while they share a
-# chain — it is stranded behind the relay, not independently wedged. Recovery is
-# therefore TWO HOP: the relay resets and adopts the canonical chain, and only then
-# does dugite-bp see a chain diverging from its own at genesis, wedge in turn, write
-# its own marker, and need its own restart.
-#
-# An operator restarting "the node" would hit exactly this, so the round models it:
-# restart the relay, let it converge, then restart dugite-bp. Anything less would
-# pass a fix that only works on a single-node topology.
-if [ "$CONVERGED" -ne 1 ] && [ "${GF_SKIP_RESTART_PROBE:-0}" -ne 1 ]; then
-    step "5. #1057 half B — a restart must recover both dugite nodes"
+# So the only restart worth probing here is whether the ADOPTED chain survives one.
+# The relay has just replaced its entire history; if that left its ledger, ChainDB or
+# LedgerSeq inconsistent, a restart is where it shows.
+if [ "$CONVERGED" -eq 1 ] && [ "${GF_SKIP_RESTART_PROBE:-0}" -ne 1 ]; then
+    step "5. the adopted chain must survive a restart"
 
-    # The marker is the mechanism; if it is absent the rest cannot work, and saying
-    # so here is more useful than a convergence timeout 300s later.
-    RELAY_MARKER="$LD_STATE/dugite-relay.db/genesis-divergence-detected"
-    if [ -f "$RELAY_MARKER" ]; then
-        ok "dugite-relay wrote the #1057 recovery marker: $(tr '\n' ' ' < "$RELAY_MARKER" | cut -c1-120)"
-    else
-        bad "dugite-relay did NOT write $RELAY_MARKER — half B's recovery cannot trigger, so a restart will not help (#1057)"
-    fi
-
-    # ── hop 1: the relay ──
+    PRE_RESTART_BLK=$(tip_field "$LD_RELAY_SOCK" .block); PRE_RESTART_BLK=${PRE_RESTART_BLK:-0}
     stop_pid_file "$LD_STATE/dugite-relay.pid" || note "dugite-relay did not exit within 60s of SIGTERM"
     RELAY_RESTART_MARK=$(wc -l < "$LD_LOGS/dugite-relay.log" 2>/dev/null)
     start_dugite dugite-relay "$LD_RELAY_PORT" "$LD_DUGITE_RELAY_METRICS_PORT" "$LD_RELAY_SOCK"
     wait_for_socket "$LD_RELAY_SOCK" 180 >/dev/null 2>&1
-
-    if expect_log_errors "$LD_LOGS/dugite-relay.log" "${RELAY_RESTART_MARK:-0}" \
-            "#1057 recovery"; then
-        ok "dugite-relay acted on the marker at startup (#1057 half B)"
-    else
-        bad "dugite-relay restarted but did NOT act on the #1057 marker — check the ImmutableDB-empty and attempt bounds in genesis_divergence::decide"
-    fi
 
     R_RELAY_CONVERGED=0
     deadline=$(( $(date +%s) + CONVERGE_TIMEOUT ))
@@ -666,60 +895,22 @@ if [ "$CONVERGED" -ne 1 ] && [ "${GF_SKIP_RESTART_PROBE:-0}" -ne 1 ]; then
     done
     R_RELAY_BLK=$(tip_field "$LD_RELAY_SOCK" .block)
     R_CBP=$(tip_field "$LD_CARDANO_BP_SOCK" .block)
+
     if [ "$R_RELAY_CONVERGED" -eq 1 ]; then
-        ok "hop 1: dugite-relay re-synced from genesis and now matches cardano-bp at block ${R_RELAY_BLK:-?}"
+        ok "the adopted chain survived a restart: dugite-relay came back on it and matches cardano-bp at block ${R_RELAY_BLK:-?} (was ${PRE_RESTART_BLK} before the stop)"
     elif [ -z "$R_RELAY_BLK" ]; then
         # UNMEASURED is not the same as FAILED, and conflating them cost three runs.
-        inconc "hop 1: dugite-relay's tip is UNREADABLE, so whether it recovered is unknown — not a failure, an unmeasured result"
+        inconc "dugite-relay's tip is UNREADABLE after the restart, so whether it held the adopted chain is unknown — not a failure, an unmeasured result"
         explain_tip_failure "dugite-relay" "$LD_RELAY_SOCK"
     else
-        bad "hop 1: dugite-relay did NOT converge with cardano-bp within ${CONVERGE_TIMEOUT}s after the marker restart (relay=${R_RELAY_BLK} cardano-bp=${R_CBP:-?}) — #1057 half B did not recover it"
+        bad "dugite-relay did NOT re-converge with cardano-bp within ${CONVERGE_TIMEOUT}s of restarting on the adopted chain (relay=${R_RELAY_BLK} cardano-bp=${R_CBP:-?}) — the adoption did not persist"
     fi
 
-    # ── hop 2: dugite-bp, now facing a relay on the canonical chain ──
-    #
-    # dugite-bp is NOT given any manual help: no snapshot deletion, no marker
-    # written by hand. It must detect the divergence itself, write its own marker,
-    # and recover on its own restart — which is what makes this a test of the
-    # mechanism rather than of the harness.
-    note "hop 2: dugite-bp still holds its own ${DBP_NOW_BLK:-?}-block chain; waiting for it to detect the divergence and write its own marker"
-    BP_MARKER="$LD_STATE/dugite-bp.db/genesis-divergence-detected"
-    deadline=$(( $(date +%s) + 240 ))
-    while [ "$(date +%s)" -lt "$deadline" ]; do
-        [ -f "$BP_MARKER" ] && break
-        sleep 5
-    done
-    if [ -f "$BP_MARKER" ]; then
-        ok "dugite-bp detected the divergence and wrote its own marker"
+    if awk -v m="${RELAY_RESTART_MARK:-0}" 'NR > m && /LedgerSeq was incoherent/ {c++} END{exit (c+0)>0}' \
+            "$LD_LOGS/dugite-relay.log" 2>/dev/null; then
+        ok "no LedgerSeq incoherence after restarting on the adopted chain"
     else
-        bad "dugite-bp never wrote $BP_MARKER — a node stranded behind a recovered relay must detect its own genesis divergence (#1057)"
-    fi
-
-    stop_pid_file "$LD_STATE/dugite-bp.pid" || note "dugite-bp did not exit within 60s of SIGTERM"
-    start_dugite dugite-bp "$LD_DUGITE_BP_PORT" "$LD_DUGITE_BP_METRICS_PORT" "$LD_DUGITE_BP_SOCK" pool1
-    wait_for_socket "$LD_DUGITE_BP_SOCK" 180 >/dev/null 2>&1
-
-    R_CONVERGED=0
-    deadline=$(( $(date +%s) + CONVERGE_TIMEOUT ))
-    while [ "$(date +%s)" -lt "$deadline" ]; do
-        sleep 5
-        DBP_H=$(tip_field "$LD_DUGITE_BP_SOCK" .hash)
-        CBP_H=$(tip_field "$LD_CARDANO_BP_SOCK" .hash)
-        if [ -n "$DBP_H" ] && [ -n "$CBP_H" ] && [ "$DBP_H" = "$CBP_H" ]; then
-            R_CONVERGED=1
-            break
-        fi
-    done
-    R_DBP=$(tip_field "$LD_DUGITE_BP_SOCK" .block)
-    R_CBP=$(tip_field "$LD_CARDANO_BP_SOCK" .block)
-    if [ "$R_CONVERGED" -eq 1 ]; then
-        ok "hop 2: dugite-bp recovered too — tip hash matches cardano-bp at block ${R_DBP:-?}. #1057 is RECOVERABLE BY RESTART."
-    elif [ -z "$R_DBP" ]; then
-        inconc "hop 2: dugite-bp's tip is UNREADABLE, so whether it recovered is unknown — not a failure, an unmeasured result"
-        explain_tip_failure "dugite-bp" "$LD_DUGITE_BP_SOCK"
-    else
-        bad "hop 2: dugite-bp did NOT converge within ${CONVERGE_TIMEOUT}s after its own marker restart (dugite-bp=${R_DBP} cardano-bp=${R_CBP:-?}) — #1057"
-        explain_tip_failure "dugite-bp" "$LD_DUGITE_BP_SOCK"
+        bad "dugite-relay logged 'LedgerSeq was incoherent' after restarting on the adopted chain"
     fi
 fi
 
@@ -734,7 +925,7 @@ elif [ "$INCONCLUSIVE" -gt 0 ]; then
     ./stop.sh >/dev/null 2>&1
     exit 3
 else
-    echo "GENESIS-FORK ROUND: PASS — the genesis divergence was detected, announced, and RECOVERED (see step 5). Note this is recovery-by-restart, not live self-healing: #1057's wedge still occurs, it is no longer permanent."
+    echo "GENESIS-FORK ROUND: PASS — a node holding its own genesis-rooted chain, restarted while stranded, ADOPTED the peer's chain IN PLACE on the live path and held it across a further restart. No marker, no operator action, no discarded chain: the behaviour cardano-node has via Paths.hs::isReachable's anchorIsGenesis case."
     ./stop.sh >/dev/null 2>&1
     exit 0
 fi

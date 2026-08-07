@@ -1,0 +1,36 @@
+# Expected ERROR-class log lines for a round that runs chaos/run.sh.
+#
+# Pass this to analyze-evidence.sh ONLY for a round that actually injected a fault,
+# and only after confirming chaos-events.csv recorded a sigkill. It is not a general
+# baseline allowlist.
+#
+# Format: one extended-regex per line; '#' comments and blank lines ignored.
+# Same format as the sibling <round>.allowed-errors files.
+#
+# ── The one entry, and why ──────────────────────────────────────────────────────
+#
+# `chaos/run.sh` scenario `kill-9-mid-forge` SIGKILLs the SOLE forger deliberately,
+# with no warning and no chance to finish what it was doing. A forger killed between
+# TraceForgedBlock and TraceAdoptedBlock can legitimately restart, replay, resume
+# forging, and find one of its blocks beaten to the tip — which it reports as
+# TraceDidntAdoptBlock and stores as a fork.
+#
+# That is the CORRECT and SAFE outcome: the node kept the better chain instead of
+# adopting its own late block. cardano-node logs the same trace at the same severity,
+# so dugite is not mis-levelling it. Measured 2026-08-07 in a release gate: SIGKILL at
+# 09:58:45 with tip block 633 (slot 1228), restart at 09:58:47 which correctly refused
+# the volatile-tip snapshot and replayed from genesis, then at slot 1259 block 641 was
+# forged and not adopted. Zero invalid-block events, cardano-bp 0 ERROR, and every
+# verify.sh predicate green including 24/24 tip parity.
+#
+# Whether the kill lands in that window is a coin flip — the immediately preceding
+# gate run produced 0 ERROR from the identical suite. Failing the baseline round on
+# that is not a signal, it is a dice roll, and it is why this entry exists.
+#
+# WHAT THIS DOES NOT COVER, deliberately: analyze-evidence.sh applies no allowlist to
+# the invalid-block check. TraceForgedInvalidBlock / AddBlockValidation.InvalidBlock /
+# Forge.Loop.ForgedInvalidBlock remain CRITICAL and unconditional, because a
+# Haskell-rejected dugite block is the failure this harness exists to catch. Do not
+# widen this file to a bare "forge" or "ERROR" pattern; that would swallow exactly
+# that class.
+TraceDidntAdoptBlock

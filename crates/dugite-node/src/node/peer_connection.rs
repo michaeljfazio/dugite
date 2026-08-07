@@ -481,7 +481,7 @@ impl PeerConnection {
             let result = mux.run().await;
             match &result {
                 Ok(()) => debug!(%mux_addr_for_log, "mux exited cleanly"),
-                Err(e) => warn!(%mux_addr_for_log, error = %e, "mux exited with error (#747)"),
+                Err(e) => warn!(%mux_addr_for_log, error = %e, "mux exited with error"),
             }
             result
         });
@@ -646,7 +646,7 @@ impl PeerConnection {
             let result = mux.run().await;
             match &result {
                 Ok(()) => debug!(%mux_addr_for_log, "mux exited cleanly"),
-                Err(e) => warn!(%mux_addr_for_log, error = %e, "mux exited with error (#747)"),
+                Err(e) => warn!(%mux_addr_for_log, error = %e, "mux exited with error"),
             }
             result
         });

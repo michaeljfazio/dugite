@@ -148,74 +148,118 @@ fn build_snapshot_stake_data(
     snap: &dugite_ledger::state::StakeSnapshot,
     script_creds: &std::collections::HashSet<dugite_primitives::hash::Hash32>,
 ) -> super::n2c_query::SnapshotStakeData {
-    use super::n2c_query::{PoolParamsSnapshot, RelaySnapshot, SnapshotStakeData};
+    use super::n2c_query::{PoolSnapshotEntry, SnapshotStakeData};
 
-    // stake_entries: one entry per delegated credential
+    /// Reduce a ratio to lowest terms, because Haskell `Rational` is always normalised
+    /// and the wire form carries the reduced pair.
+    fn reduce(mut n: u64, mut d: u64) -> (u64, u64) {
+        if d == 0 {
+            return (0, 1);
+        }
+        let (mut a, mut b) = (n, d);
+        while b != 0 {
+            let t = a % b;
+            a = b;
+            b = t;
+        }
+        if a > 1 {
+            n /= a;
+            d /= a;
+        }
+        (n, d)
+    }
+
+    // activeStake: credential -> (stake, delegated pool). Only DELEGATED credentials
+    // appear: an undelegated credential has no `swdDelegation` to carry.
     let mut stake_entries = Vec::with_capacity(snap.stake_distribution.len());
     for (cred_hash, lovelace) in snap.stake_distribution.iter() {
+        let Some(pool_id) = snap.delegations.get(cred_hash) else {
+            continue;
+        };
         let cred_type = script_creds.contains(cred_hash) as u8;
-        // Use the lower 28 bytes of the Hash32 key
+        // Lower 28 bytes: the snapshot keys credentials as Hash32 with zero padding.
         let hash28 = cred_hash.as_ref()[..28].to_vec();
-        stake_entries.push((cred_type, hash28, lovelace.0));
+        stake_entries.push((cred_type, hash28, lovelace.0, pool_id.as_ref().to_vec()));
     }
 
-    // delegation_entries: map credential → pool_id
-    let mut delegation_entries = Vec::with_capacity(snap.delegations.len());
-    for (cred_hash, pool_id) in snap.delegations.iter() {
-        let cred_type = script_creds.contains(cred_hash) as u8;
-        let hash28 = cred_hash.as_ref()[..28].to_vec();
-        delegation_entries.push((cred_type, hash28, pool_id.as_ref().to_vec()));
-    }
+    // The ratio denominator is the snapshot's TOTAL active stake, summed over pools —
+    // the same total `pdTotalActiveStake` reports.
+    let total_active: u64 = snap.pool_stake.values().map(|l| l.0).sum();
 
-    // pool_params: convert snapshot pool params to PoolParamsSnapshot
-    let pool_params: Vec<PoolParamsSnapshot> = snap
+    let pool_entries: Vec<PoolSnapshotEntry> = snap
         .pool_params
         .iter()
         .map(|(pool_id, reg)| {
-            let relays: Vec<RelaySnapshot> = reg
-                .relays
-                .iter()
-                .map(|r| match r {
-                    dugite_primitives::transaction::Relay::SingleHostAddr { port, ipv4, ipv6 } => {
-                        RelaySnapshot::SingleHostAddr {
-                            port: *port,
-                            ipv4: *ipv4,
-                            ipv6: *ipv6,
-                        }
-                    }
-                    dugite_primitives::transaction::Relay::SingleHostName { port, dns_name } => {
-                        RelaySnapshot::SingleHostName {
-                            port: *port,
-                            dns_name: dns_name.clone(),
-                        }
-                    }
-                    dugite_primitives::transaction::Relay::MultiHostName { dns_name } => {
-                        RelaySnapshot::MultiHostName {
-                            dns_name: dns_name.clone(),
-                        }
-                    }
-                })
-                .collect();
-            PoolParamsSnapshot {
+            let stake = snap.pool_stake.get(pool_id).map(|l| l.0).unwrap_or(0);
+            let (ratio_num, ratio_den) = reduce(stake, total_active);
+            let (margin_num, margin_den) = reduce(reg.margin_numerator, reg.margin_denominator);
+
+            // numDelegators / selfDelegatedOwners need the delegation set, so both are
+            // derived here rather than guessed: an owner counts as self-delegating only
+            // when it delegates to THIS pool.
+            let mut num_delegators = 0u64;
+            for (cred, delegated_to) in snap.delegations.iter() {
+                if delegated_to == pool_id {
+                    num_delegators += 1;
+                    let _ = cred;
+                }
+            }
+            let mut self_delegated_owners: Vec<Vec<u8>> = Vec::new();
+            let mut self_delegated_owners_stake = 0u64;
+            for owner in reg.owners.iter() {
+                let owner28 = owner.as_ref().to_vec();
+                let delegates_here = snap.delegations.iter().any(|(cred, delegated_to)| {
+                    delegated_to == pool_id && cred.as_ref()[..28] == owner28[..]
+                });
+                if delegates_here {
+                    let owner_stake = snap
+                        .stake_distribution
+                        .iter()
+                        .find(|(cred, _)| cred.as_ref()[..28] == owner28[..])
+                        .map(|(_, l)| l.0)
+                        .unwrap_or(0);
+                    self_delegated_owners_stake =
+                        self_delegated_owners_stake.saturating_add(owner_stake);
+                    self_delegated_owners.push(owner28);
+                }
+            }
+            // Sets are ordered on the wire.
+            self_delegated_owners.sort_unstable();
+
+            // accountId is the reward account's CREDENTIAL, not the address: a reward
+            // address is `header || hash28`, and bit 4 of the header distinguishes a
+            // script credential from a key credential.
+            let ra = &reg.reward_account;
+            let (account_is_script, account_hash28) = if ra.len() >= 29 {
+                ((ra[0] & 0x10) != 0, ra[1..29].to_vec())
+            } else if ra.len() == 28 {
+                (false, ra.clone())
+            } else {
+                (false, vec![0u8; 28])
+            };
+
+            PoolSnapshotEntry {
                 pool_id: pool_id.as_ref().to_vec(),
+                stake,
+                ratio_num,
+                ratio_den,
+                self_delegated_owners,
+                self_delegated_owners_stake,
                 vrf_keyhash: reg.vrf_keyhash.as_ref().to_vec(),
                 pledge: reg.pledge.0,
                 cost: reg.cost.0,
-                margin_num: reg.margin_numerator,
-                margin_den: reg.margin_denominator,
-                reward_account: reg.reward_account.clone(),
-                owners: reg.owners.iter().map(|o| o.as_ref().to_vec()).collect(),
-                relays,
-                metadata_url: reg.metadata_url.clone(),
-                metadata_hash: reg.metadata_hash.map(|h| h.as_ref().to_vec()),
+                margin_num,
+                margin_den,
+                num_delegators,
+                account_is_script,
+                account_hash28,
             }
         })
         .collect();
 
     SnapshotStakeData {
         stake_entries,
-        delegation_entries,
-        pool_params,
+        pool_entries,
     }
 }
 
@@ -299,9 +343,18 @@ impl Node {
         // leadership-schedule` computes the schedule CLIENT-side and takes σ
         // straight from this answer, so a denominator inflated from active
         // stake to circulation shrinks σ and drops leader slots.
+        // CLAMPED AT CONSTRUCTION, not at the encoder.
+        //
+        // `pdTotalActiveStake` is a `NonZero Coin` upstream, and `calculatePoolDistr'`
+        // applies its non-zero fallback when it BUILDS the distribution — so every Haskell
+        // consumer, including the leadership-schedule sigma denominator, sees the clamped
+        // value, never a raw 0. dugite clamped only in `encode_pool_distr2`, which is
+        // equivalent today (when the total is 0 the pool map is empty, so internal readers
+        // are vacuous) but stops being equivalent the moment any internal consumer reads
+        // the unclamped total. Clamping here keeps the invariant where the value is made.
         let (pool_distr, pool_distr_total_active_stake) = {
             match ls.epochs.snapshots.set.as_ref() {
-                None => (Vec::new(), 0u64),
+                None => (Vec::new(), 1u64),
                 Some(snap) => {
                     // `spssNumDelegators` — the count of credentials delegating
                     // to the pool IN THIS SNAPSHOT.
@@ -334,7 +387,8 @@ impl Node {
                     // `VMap.toMap` yields ascending key order; the response is a
                     // CBOR map, so a stable order keeps it byte-comparable.
                     entries.sort_by(|a, b| a.pool_id.cmp(&b.pool_id));
-                    (entries, total)
+                    // See the note above: NonZero at construction.
+                    (entries, total.max(1))
                 }
             }
         };
@@ -629,10 +683,31 @@ impl Node {
             .map(|s| build_snapshot_stake_data(s, &ls.certs.script_stake_credentials))
             .unwrap_or_default();
 
-        // Build per-pool epoch block count map for NewEpochState [1]/[2] fields.
-        // Haskell places the *previous* epoch's BlocksMade at [1] and the current
-        // at [2].  We expose the current epoch's counts as [1] (best approximation
-        // without a previous-epoch tracker), and leave [2] empty.
+        // Per-pool BlocksMade for NewEpochState [1] (nesBprev) and [2] (nesBcur).
+        //
+        // These were SWAPPED: the current epoch's counts were reported as [1] and [2]
+        // was hardcoded empty, on the reasoning that there was no previous-epoch
+        // tracker. cardano-node renders [1] as `blocksBefore` and [2] as
+        // `blocksCurrent`, so every consumer read this epoch's block production as last
+        // epoch's — and on a fresh chain, where `blocksBefore` must be EMPTY, dugite
+        // reported blocks there and nothing in `blocksCurrent`.
+        //
+        // There IS a previous-epoch source: the MARK snapshot is captured at the epoch
+        // boundary from the epoch that just ended, and carries that epoch's own
+        // per-pool block record. So mark's counts are exactly nesBprev, and no new
+        // tracking is needed.
+        let prev_epoch_blocks_by_pool: Vec<(Vec<u8>, u64)> = ls
+            .epochs
+            .snapshots
+            .mark
+            .as_ref()
+            .map(|snap| {
+                snap.epoch_blocks_by_pool
+                    .iter()
+                    .map(|(pool_id, count)| (pool_id.as_ref().to_vec(), *count))
+                    .collect()
+            })
+            .unwrap_or_default();
         let epoch_blocks_by_pool: Vec<(Vec<u8>, u64)> = ls
             .consensus
             .epoch_blocks_by_pool
@@ -1049,6 +1124,7 @@ impl Node {
             snap_go,
             snap_fee: ls.epochs.snapshots.ss_fee.0,
             epoch_blocks_by_pool,
+            prev_epoch_blocks_by_pool,
             pool_params_entries,
             pending_retirements: ls
                 .certs

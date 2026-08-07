@@ -34,10 +34,10 @@ pub use types::{
     CommitteeMemberSnapshot, CommitteeSnapshot, DRepDelegationGroup, DRepKey, DRepSnapshot,
     DRepStakeEntry, EraBound, EraSummary, GenesisConfigSnapshot, GovActionId, GovStateSnapshot,
     LedgerPeerEntry, MultiAssetSnapshot, NodeStateSnapshot, NonMyopicRewardEntry,
-    PoolParamsSnapshot, PoolRewardInfo, PoolStakeSnapshotEntry, ProposalSnapshot,
-    ProtocolParamsSnapshot, QueryResult, RelaySnapshot, ShelleyPParamsSnapshot, SnapshotStakeData,
-    StakeAddressSnapshot, StakeDelegDepositEntry, StakePoolSnapshot, StakeSnapshotsResult,
-    UtxoQueryProvider, UtxoSnapshot, VoteDelegateeEntry,
+    PoolParamsSnapshot, PoolRewardInfo, PoolSnapshotEntry, PoolStakeSnapshotEntry,
+    ProposalSnapshot, ProtocolParamsSnapshot, QueryResult, RelaySnapshot, ShelleyPParamsSnapshot,
+    SnapshotStakeData, StakeAddressSnapshot, StakeDelegDepositEntry, StakePoolSnapshot,
+    StakeSnapshotsResult, UtxoQueryProvider, UtxoSnapshot, VoteDelegateeEntry,
 };
 
 #[allow(unused_imports)]

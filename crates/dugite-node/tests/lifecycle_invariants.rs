@@ -226,7 +226,7 @@ async fn hundred_hot_warm_hot_cycles_no_channel_unavailable() {
             // Verify a second promotion succeeds (the invariant from #516).
             if let Err(e) = conn.start_hot_protocols(waiting_fn(), waiting_fn(), waiting_fn()) {
                 channel_unavailable_count += 1;
-                tracing::error!(cycle = i, error = %e, "re-promotion after recover failed (#516 regression)");
+                tracing::error!(cycle = i, error = %e, "re-promotion after recover failed");
             } else {
                 // Stop the re-promoted tasks cleanly.
                 conn.stop_hot_protocols().await;
