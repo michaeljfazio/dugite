@@ -309,10 +309,11 @@ pub(crate) fn encode_query_result_value(
             dreps,
             committee,
             gen_delegs,
+            non_myopic,
         } => {
             encode_debug_epoch_state(
                 enc, *treasury, *reserves, snap_mark, snap_set, snap_go, *snap_fee, gov, retiring,
-                dreps, committee, gen_delegs,
+                dreps, committee, gen_delegs, non_myopic,
             );
         }
         QueryResult::DebugNewEpochState {
@@ -332,6 +333,7 @@ pub(crate) fn encode_query_result_value(
             dreps,
             committee,
             gen_delegs,
+            non_myopic,
         } => {
             encode_debug_new_epoch_state(
                 enc,
@@ -351,6 +353,7 @@ pub(crate) fn encode_query_result_value(
                 dreps,
                 committee,
                 gen_delegs,
+                non_myopic,
             );
         }
         QueryResult::DebugChainDepState {
@@ -2253,6 +2256,52 @@ fn encode_relay_cbor(enc: &mut minicbor::Encoder<&mut Vec<u8>>, relay: &RelaySna
 /// Two consequences worth keeping: the per-credential delegation map did not disappear,
 /// it MERGED into each stake entry (`swdStake` + `swdDelegation`); and the ratio is
 /// reduced, because Haskell `Rational` is always normalised.
+/// Encode `NonMyopic = array(2) [likelihoodsNM, rewardPotNM]` (#1067).
+///
+/// ```haskell
+/// instance EncCBOR NonMyopic where
+///   encCBOR nm@(NonMyopic _ _) =
+///     let NonMyopic {likelihoodsNM, rewardPotNM} = nm
+///      in encodeListLen 2 <> encCBOR likelihoodsNM <> encCBOR rewardPotNM
+/// ```
+///
+/// Three shape decisions, all pinned to a cardano-node 11.0.1 wire capture
+/// rather than inferred from the derivation — see
+/// `non_myopic_bytes_match_a_cardano_node_11_0_1_capture`:
+///
+/// * `likelihoodsNM` is a **definite** `map(N)` for N <= 23 (`encodeMap`'s
+///   threshold, #930/#932), keys `bstr(28)`.
+/// * each `Likelihood` is an **INDEFINITE** `0x9f … 0xff` array.
+///   `variableListLenEncoding` switches above 23 elements and a `Likelihood`
+///   always has 100, so definite `0x98 0x64` — which is what
+///   `deriving EncCBOR` off `StrictSeq` looks like it should give — would be
+///   wrong (#938).
+/// * each `LogWeight` is CBOR `0xfa` float32, unconditionally.
+///   `EncCBOR Float = encodeFloat`, a distinct primitive from `encodeFloat16`
+///   with no shortest-form or half-precision branching, so this holds at every
+///   magnitude.
+pub(crate) fn encode_non_myopic(
+    enc: &mut minicbor::Encoder<&mut Vec<u8>>,
+    nm: &crate::node::n2c_query::types::NonMyopicSnapshot,
+) {
+    enc.array(2).ok();
+
+    // [0] likelihoodsNM — definite map, keys already sorted by the builder.
+    enc.map(nm.likelihoods.len() as u64).ok();
+    for (pool_id, weights) in &nm.likelihoods {
+        enc.bytes(pool_id).ok();
+        // Indefinite array of float32 — NOT definite. See the doc comment.
+        enc.begin_array().ok();
+        for w in weights {
+            enc.f32(*w).ok();
+        }
+        enc.end().ok();
+    }
+
+    // [1] rewardPotNM
+    enc.u64(nm.reward_pot).ok();
+}
+
 pub(crate) fn encode_snap_shot(
     enc: &mut minicbor::Encoder<&mut Vec<u8>>,
     snap: &SnapshotStakeData,
@@ -2482,6 +2531,7 @@ fn encode_debug_epoch_state(
     dreps: &[crate::node::n2c_query::types::DRepSnapshot],
     committee: &crate::node::n2c_query::types::CommitteeSnapshot,
     gen_delegs: &[(Vec<u8>, Vec<u8>, Vec<u8>)],
+    non_myopic: &crate::node::n2c_query::types::NonMyopicSnapshot,
 ) {
     // EpochState = array(4) [AccountState, LedgerState, SnapShots, NonMyopic]
     enc.array(4).ok();
@@ -2501,14 +2551,8 @@ fn encode_debug_epoch_state(
     encode_snap_shot(enc, snap_go);
     enc.u64(snap_fee).ok();
 
-    // [3] NonMyopic = array(2) [likelihoods_map, reward_pot_coin]
-    //
-    // `NonMyopic` stores per-pool likelihood histories used for non-myopic
-    // pool ranking.  We emit an empty likelihoods map and a zero reward pot.
-    // Reference: `Cardano.Ledger.Shelley.PoolRank` (encodeListLen 2)
-    enc.array(2).ok();
-    enc.map(0).ok(); // empty likelihoods map
-    enc.u64(0).ok(); // reward pot coin = 0
+    // [3] NonMyopic — real per-pool likelihoods and reward pot (#1067).
+    encode_non_myopic(enc, non_myopic);
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2530,6 +2574,7 @@ fn encode_debug_new_epoch_state(
     dreps: &[crate::node::n2c_query::types::DRepSnapshot],
     committee: &crate::node::n2c_query::types::CommitteeSnapshot,
     gen_delegs: &[(Vec<u8>, Vec<u8>, Vec<u8>)],
+    non_myopic: &crate::node::n2c_query::types::NonMyopicSnapshot,
 ) {
     // Full Haskell-compatible NewEpochState (array(7)):
     //
@@ -2585,12 +2630,10 @@ fn encode_debug_new_epoch_state(
     encode_snap_shot(enc, snap_go);
     enc.u64(snap_fee).ok();
 
-    // [3][3] NonMyopic = array(2) [likelihoods_map, reward_pot_coin]
-    // cncli does not inspect this field, but we encode it correctly for
-    // strict parsers.  Reference: Cardano.Ledger.Shelley.PoolRank (encodeListLen 2)
-    enc.array(2).ok();
-    enc.map(0).ok(); // empty likelihoods map
-    enc.u64(0).ok(); // reward pot coin = 0
+    // [3][3] NonMyopic — real per-pool likelihoods and reward pot (#1067).
+    // cncli does not inspect this field, but `cardano-cli query ledger-state`
+    // renders both halves and the devnet cli-parity gate compares them.
+    encode_non_myopic(enc, non_myopic);
 
     // [4] StrictMaybe RewardUpdate = Nothing = array(0)
     enc.array(0).ok();
@@ -3309,6 +3352,16 @@ mod tests {
             dreps,
             committee: Box::new(committee),
             gen_delegs: vec![(vec![0x11u8; 28], vec![0x22u8; 28], vec![0x33u8; 32])],
+            // Two pools, so the map header, the key ordering and the
+            // per-Likelihood framing are all exercised — an empty map would
+            // assert nothing about the shape this test is named for.
+            non_myopic: Box::new(crate::node::n2c_query::types::NonMyopicSnapshot {
+                likelihoods: vec![
+                    (vec![0x44u8; 28], vec![0.0f32; 100]),
+                    (vec![0x55u8; 28], vec![-2.25f32; 100]),
+                ],
+                reward_pot: 14_031_561_968_424,
+            }),
         };
 
         let encoded = encode_query_result(&result);
@@ -3459,10 +3512,41 @@ mod tests {
         for _ in 0..4 {
             dec.skip().unwrap();
         }
-        // [3][3] NonMyopic = array(2)
+        // [3][3] NonMyopic = array(2) [likelihoodsNM, rewardPotNM]
+        //
+        // Was two bare `skip()`s while both halves were hardcoded — which is
+        // precisely why the hardcoding survived this test (#1067).
         assert_eq!(dec.array().unwrap(), Some(2));
-        dec.skip().unwrap();
-        dec.skip().unwrap();
+        assert_eq!(
+            dec.map().unwrap(),
+            Some(2),
+            "likelihoodsNM must be a DEFINITE map (2 <= 23, encodeMap threshold)"
+        );
+        for expected_key in [0x44u8, 0x55u8] {
+            assert_eq!(
+                dec.bytes().unwrap(),
+                &[expected_key; 28],
+                "likelihoodsNM keys must be bstr(28) in ascending order"
+            );
+            assert_eq!(
+                dec.array().unwrap(),
+                None,
+                "a Likelihood must be an INDEFINITE array — 100 > 23, so \
+                 variableListLenEncoding applies (#938)"
+            );
+            let mut n = 0;
+            while dec.datatype().unwrap() != minicbor::data::Type::Break {
+                dec.f32().unwrap();
+                n += 1;
+            }
+            dec.skip().unwrap(); // the break byte
+            assert_eq!(n, 100, "a Likelihood carries exactly 100 LogWeights");
+        }
+        assert_eq!(
+            dec.u64().unwrap(),
+            14_031_561_968_424,
+            "rewardPotNM must be the real pot, not the hardcoded 0"
+        );
 
         // [4] StrictMaybe RewardUpdate = array(0)
         assert_eq!(dec.array().unwrap(), Some(0));
@@ -3507,6 +3591,141 @@ mod tests {
     /// snapshot value: the `.max(1)` clamp already existed for the ratio
     /// denominator and simply never reached the encoded field, so a test that
     /// only checked the clamp's input would have passed against the bug.
+    /// BYTE FIXTURE captured from cardano-node 11.0.1's OWN N2C socket.
+    ///
+    /// `NonMyopic` was `array(2) [map(0), 0]` in dugite until #1067 — both
+    /// halves hardcoded. Neither could be inferred safely from the Haskell
+    /// types, so the shape below is empirical: run
+    /// `cargo run -p dugite-network --example capture_non_myopic -- <sock> <magic>`
+    /// against a node whose `likelihoodsNM` is NON-EMPTY, which on a fresh
+    /// devnet means epoch 3 or later (slot ~1200 at `epochLength = 400`).
+    /// Capturing earlier returns `a0` and would have "confirmed" the hardcoded
+    /// empty map by accident.
+    ///
+    /// Three things this pins that reading `deriving EncCBOR` would get wrong:
+    ///
+    /// ```text
+    ///   82                      NonMyopic = array(2)
+    ///   a2                      likelihoodsNM = DEFINITE map(2)   <- 2 <= 23
+    ///   581c <28 bytes>         pool id
+    ///   9f  fa........ x100  ff Likelihood = INDEFINITE array     <- 100 > 23
+    ///   1b <8 bytes>            rewardPotNM
+    /// ```
+    ///
+    /// * the map is DEFINITE because `encodeMap` switches at 23 entries;
+    /// * each `Likelihood` is INDEFINITE because `variableListLenEncoding`
+    ///   switches at the same threshold and a `Likelihood` always has 100
+    ///   elements — a definite `0x98 0x64` header is the natural-looking wrong
+    ///   answer here (#938);
+    /// * every `LogWeight` is `0xfa` float32, never `0xf9` half or `0xfb`
+    ///   double, at every magnitude — `EncCBOR Float = encodeFloat` is a
+    ///   distinct primitive from `encodeFloat16` with no shortest-form logic.
+    ///
+    /// POOL_B is a real zero-stake pool: `sigma = 0` makes `t = 0`, so every
+    /// log-weight is exactly `0.0`. cardano-cli renders it as 100 x `1` because
+    /// its JSON view shows `exp(LogWeight)` — do NOT validate against that JSON,
+    /// which reports `1.4e305` and `+inf` for a field that is an f32.
+    ///
+    /// THIS TEST EXISTS TO FAIL LOUDLY ON A NODE BUMP. If a future cardano-node
+    /// changes this shape, RE-CAPTURE with the example above and update these
+    /// bytes deliberately — never adjust the encoder until the test passes
+    /// again. Silent re-fitting is how a wire encoder ends up matching nothing.
+    #[test]
+    fn non_myopic_bytes_match_a_cardano_node_11_0_1_capture() {
+        use crate::node::n2c_query::types::NonMyopicSnapshot;
+
+        const POOL_A: &str = "55cf8ff54601445d6cfde29af421492606909808d27f7fa2907b7b39";
+        const POOL_B: &str = "af8ada6478a95a98d2e4329b93d1d3905bfd4eab9a28834c51e83365";
+
+        /// cardano-node's own 100 LogWeights for POOL_A, as decimal f32
+    /// literals. Written independently of the expected hex below so a
+    /// byte-order or float-width bug still fails the comparison.
+    #[rustfmt::skip]
+    const POOL_A_WEIGHTS: [f32; 100] = [
+        0.0f32, 212.52563f32, 311.01892f32, 375.68585f32, 423.83038f32,
+        462.1482f32, 493.94257f32, 521.0882f32, 544.7521f32, 565.71014f32,
+        584.5048f32, 601.5299f32, 617.0807f32, 631.3839f32, 644.6178f32,
+        656.92487f32, 668.42084f32, 679.2009f32, 689.3446f32, 698.9186f32,
+        707.97974f32, 716.5767f32, 724.7516f32, 732.5408f32, 739.9763f32,
+        747.08636f32, 753.89575f32, 760.42664f32, 766.6987f32, 772.72974f32,
+        778.5355f32, 784.13055f32, 789.52783f32, 794.7392f32, 799.77545f32,
+        804.6464f32, 809.3612f32, 813.9281f32, 818.3548f32, 822.6483f32,
+        826.8152f32, 830.86145f32, 834.7928f32, 838.6144f32, 842.33105f32,
+        845.9474f32, 849.4677f32, 852.8959f32, 856.2357f32, 859.4906f32,
+        862.6639f32, 865.75867f32, 868.77783f32, 871.7241f32, 874.60016f32,
+        877.4083f32, 880.151f32, 882.8304f32, 885.4485f32, 888.0073f32,
+        890.5088f32, 892.95465f32, 895.34656f32, 897.68616f32, 899.975f32,
+        902.2145f32, 904.406f32, 906.55096f32, 908.6506f32, 910.7061f32,
+        912.7186f32, 914.6894f32, 916.6193f32, 918.50946f32, 920.3609f32,
+        922.17444f32, 923.95105f32, 925.6915f32, 927.3968f32, 929.06757f32,
+        930.70465f32, 932.3088f32, 933.8806f32, 935.4209f32, 936.9303f32,
+        938.40936f32, 939.85876f32, 941.27905f32, 942.6708f32, 944.03455f32,
+        945.37085f32, 946.6802f32, 947.963f32, 949.2199f32, 950.45123f32,
+        951.6574f32, 952.839f32, 953.9962f32, 955.12964f32, 956.23956f32,
+    ];
+
+        const REWARD_POT: u64 = 13959940472045;
+
+        let nm = NonMyopicSnapshot {
+            likelihoods: vec![
+                (hex::decode(POOL_A).unwrap(), POOL_A_WEIGHTS.to_vec()),
+                // A zero-stake pool: t = 0 makes every log-weight exactly 0.
+                (hex::decode(POOL_B).unwrap(), vec![0.0f32; 100]),
+            ],
+            reward_pot: REWARD_POT,
+        };
+
+        let mut buf = Vec::new();
+        let mut enc = minicbor::Encoder::new(&mut buf);
+        encode_non_myopic(&mut enc, &nm);
+
+        let expected = concat!(
+            "82", // NonMyopic = array(2)
+            "a2", // likelihoodsNM = DEFINITE map(2)
+            "581c55cf8ff54601445d6cfde29af421492606909808d27f7fa2907b7b39",
+            "9f", // Likelihood = INDEFINITE array
+            "fa00000000fa43548690fa439b826cfa43bbd7cafa43d3ea4afa43e712f8fa43f6f8a6fa440245a5",
+            "fa44083022fa440d6d73fa4412204ffa441661eafa441a452afa441dd892fa4421278afa44243b31",
+            "fa44271aeffa4429ccdcfa442c560efa442ebacafa4430feb4fa443324e9fa4435301afa4437229c",
+            "fa4438fe7cfa443ac587fa443c7954fa443e1b4efa443facb8fa44412eb4fa4442a246fa4444085b",
+            "fa444561c8fa4446af4ffa4447f1a1fa4449295ffa444a571efa444b7b66fa444c96b5fa444da97e",
+            "fa444eb42cfa444fb722fa4450b2bdfa4451a752fa44529530fa44537ca2fa44545deffa44553956",
+            "fa44560f16fa4456df66fa4457aa7dfa4458708efa445931c8fa4459ee58fa445aa669fa445b5a22",
+            "fa445c09aafa445cb525fa445d5cb4fa445e0078fa445ea090fa445f3d19fa445fd62efa44606bea",
+            "fa4460fe66fa44618dbafa446219fcfa4462a343fa446329a3fa4463ad31fa44642dfefa4464ac1f",
+            "fa446527a3fa4465a09bfa44661719fa44668b2afa4466fcdefa44676c42fa4467d965fa44684453",
+            "fa4468ad19fa446913c3fa4469785cfa4469daf0fa446a3b8afa446a9a33fa446af6f6fa446b51dc",
+            "fa446baaeefa446c0236fa446c57bcfa446cab88fa446cfda2fa446d4e13fa446d9ce1fa446dea13",
+            "fa446e35b2fa446e7fc2fa446ec84cfa446f0f55",
+            "ff", // break
+            "581caf8ada6478a95a98d2e4329b93d1d3905bfd4eab9a28834c51e83365",
+            "9f",
+            "fa00000000fa00000000fa00000000fa00000000fa00000000fa00000000fa00000000fa00000000",
+            "fa00000000fa00000000fa00000000fa00000000fa00000000fa00000000fa00000000fa00000000",
+            "fa00000000fa00000000fa00000000fa00000000fa00000000fa00000000fa00000000fa00000000",
+            "fa00000000fa00000000fa00000000fa00000000fa00000000fa00000000fa00000000fa00000000",
+            "fa00000000fa00000000fa00000000fa00000000fa00000000fa00000000fa00000000fa00000000",
+            "fa00000000fa00000000fa00000000fa00000000fa00000000fa00000000fa00000000fa00000000",
+            "fa00000000fa00000000fa00000000fa00000000fa00000000fa00000000fa00000000fa00000000",
+            "fa00000000fa00000000fa00000000fa00000000fa00000000fa00000000fa00000000fa00000000",
+            "fa00000000fa00000000fa00000000fa00000000fa00000000fa00000000fa00000000fa00000000",
+            "fa00000000fa00000000fa00000000fa00000000fa00000000fa00000000fa00000000fa00000000",
+            "fa00000000fa00000000fa00000000fa00000000fa00000000fa00000000fa00000000fa00000000",
+            "fa00000000fa00000000fa00000000fa00000000fa00000000fa00000000fa00000000fa00000000",
+            "fa00000000fa00000000fa00000000fa00000000",
+            "ff",
+            "1b00000cb24d4afced", // rewardPotNM
+        );
+
+        assert_eq!(
+            hex::encode(&buf),
+            expected,
+            "NonMyopic bytes must equal cardano-node 11.0.1's own reply for the \
+             same values — if a node bump changed this, RE-CAPTURE and update the \
+             fixture deliberately rather than adjusting the encoder to match"
+        );
+    }
+
     /// BYTE FIXTURE captured from cardano-node 11.0.1's OWN N2C socket.
     ///
     /// `SnapShot` is not a type I could read off cardano-ledger: cardano-node 11.0.1 pins
@@ -3617,6 +3836,12 @@ mod tests {
             dreps: vec![],
             committee: Box::new(CommitteeSnapshot::default()),
             gen_delegs: vec![],
+            // One pool with a full-length Likelihood, so the arity assertions
+            // below exercise the real shape rather than an empty map.
+            non_myopic: Box::new(crate::node::n2c_query::types::NonMyopicSnapshot {
+                likelihoods: vec![(vec![0xAAu8; 28], vec![-1.5f32; 100])],
+                reward_pot: 14_031_561_968_424,
+            }),
         };
 
         let encoded = encode_query_result(&result);

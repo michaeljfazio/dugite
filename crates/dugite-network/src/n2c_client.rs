@@ -568,8 +568,27 @@ impl N2CClient {
     /// Query ledger state (`DebugLedgerState` -- Shelley query tag 4).
     ///
     /// Returns raw MsgResult CBOR payload.
+    ///
+    /// NOTE: tag 4 is `GetProposedPParamsUpdates` in the consensus query
+    /// numbering, not the ledger state — a real cardano-node answers this with
+    /// `82 04 81 a0` (an empty proposed-update map). The query that carries
+    /// `NewEpochState`, and the one `cardano-cli query ledger-state` issues, is
+    /// [`Self::query_debug_new_epoch_state`] (tag 12). Tracked separately; not
+    /// changed here because it alters `dugite-cli query ledger-state`'s output
+    /// and needs its own validation round.
     pub async fn query_ledger_state(&mut self) -> Result<Vec<u8>, NetworkError> {
         self.send_shelley_query(4).await
+    }
+
+    /// Query the full `NewEpochState` (`DebugNewEpochState` -- Shelley query
+    /// tag 12).
+    ///
+    /// This is what `cardano-cli query ledger-state` issues, and the reply that
+    /// carries `EpochState.esNonMyopic` at `NewEpochState[3][3]`.
+    ///
+    /// Returns raw MsgResult CBOR payload.
+    pub async fn query_debug_new_epoch_state(&mut self) -> Result<Vec<u8>, NetworkError> {
+        self.send_shelley_query(12).await
     }
 
     /// Query protocol state (`DebugProtocolState` -- Shelley query tag 8).

@@ -1095,6 +1095,24 @@ impl Node {
                 entries.sort_by(|a, b| a.0.cmp(&b.0));
                 entries
             },
+            non_myopic: {
+                let mut likelihoods: Vec<(Vec<u8>, Vec<f32>)> = ls
+                    .epochs
+                    .non_myopic
+                    .likelihoods
+                    .iter()
+                    .map(|(pool_id, l)| (pool_id.as_ref().to_vec(), l.0.clone()))
+                    .collect();
+                // Upstream holds this in a key-ordered `VMap` and encodes it in
+                // that order; the ledger holds a `HashMap`. Without this sort
+                // the same node would emit a different byte string for the same
+                // state on consecutive runs.
+                likelihoods.sort_by(|a, b| a.0.cmp(&b.0));
+                crate::node::n2c_query::types::NonMyopicSnapshot {
+                    likelihoods,
+                    reward_pot: ls.epochs.non_myopic.reward_pot.0,
+                }
+            },
             constitution_url: ls
                 .gov
                 .governance
