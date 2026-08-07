@@ -1,0 +1,619 @@
+{
+  "schema_version": 2,
+  "timestamp": "2026-08-07T11:28:56Z",
+  "git_rev": "a0d88fb1000518b264358728d91e6476a91a1fa2",
+  "release_tag": "v2.7.1",
+  "preset": "standard",
+  "cardano_node_version": "11.0.1",
+  "cardano_cli_version": "11.0.0.0",
+  "gate_integrity": {
+    "strict": true,
+    "admissible": true,
+    "missing": [],
+    "denominators_file": "/Users/michaelfazio/Source/dugite/.claude/worktrees/conway-testing-issues/.claude/skills/devnet-validate/scripts/../schemas/denominators.json"
+  },
+  "rounds": [
+    {
+      "name": "round1",
+      "pass": true,
+      "evidence_dir": "/private/tmp/claude-501/-Users-michaelfazio-Source-dugite--claude-worktrees-conway-testing-issues/a9ca9d7b-2d1b-415e-a403-27cba1e694f0/scratchpad/gate-bundle-20260807T100744Z/round1",
+      "duration_seconds": 120,
+      "git_rev": "a0d88fb1000518b264358728d91e6476a91a1fa2",
+      "cardano_node_version": "11.0.1",
+      "cardano_cli_version": "11.0.0.0",
+      "blocks": {
+        "total_forges": 61,
+        "canonical": 61,
+        "orphans": 0,
+        "orphan_rate": 0.0000
+      },
+      "tip_age": {
+        "avg_seconds": 1.46,
+        "p99_seconds": 5.00
+      },
+      "chain_density": 0.513,
+      "tx_zoo": {
+        "status": "ok",
+        "pass": 151,
+        "fail": 0,
+        "skip": 3,
+        "total": 154,
+        "expected": 154,
+        "source": "round"
+      },
+      "predicates": {
+        "p1_forge_cross_check": true,
+        "p2_per_bp_attribution": true,
+        "p3_tx_inclusion": null,
+        "p4_tip_parity": true,
+        "p5_tip_age": true
+      },
+      "log_errors": {
+        "dugite-bp": {
+          "errors": 0,
+          "warns": 16
+        },
+        "dugite-relay": {
+          "errors": 0,
+          "warns": 133
+        },
+        "cardano-bp": {
+          "errors": 0,
+          "warns": 0
+        }
+      },
+      "anomalies": [],
+      "epoch_transitions_observed": 0,
+      "n2n_adversarial": {
+        "status": "ok",
+        "pass": 26,
+        "fail": 0,
+        "panic": 0,
+        "silent_skip": 0,
+        "total": 26,
+        "expected": 26
+      },
+      "cli_parity": {
+        "status": "ok",
+        "equal": 23,
+        "divergent": 0,
+        "env_skip": 0,
+        "state_skip": 0,
+        "error": 0,
+        "total": 26,
+        "compared": 26,
+        "expected": 26
+      },
+      "parity_matrix": {
+        "status": "absent",
+        "total": null,
+        "match": null,
+        "offdiag": null,
+        "classdiff": null,
+        "knowndiff": null,
+        "stateful": null,
+        "expected": null,
+        "categories": null,
+        "per_category": null
+      },
+      "chaos": {
+        "status": "ok",
+        "pass": 4,
+        "fail": 0,
+        "env_skip": 0,
+        "total": 5,
+        "expected": 5
+      },
+      "rpc": {
+        "status": "ok",
+        "pass": 27,
+        "fail": 0,
+        "error": 0,
+        "env_skip": 0,
+        "state_skip": 0,
+        "total": 27,
+        "expected": 27
+      },
+      "throughput": {
+        "status": "absent",
+        "scenarios": null,
+        "max_blocks_per_sec": null,
+        "min_blocks_per_sec": null
+      },
+      "resources": {
+        "status": "absent",
+        "samples": null,
+        "max_rss_kb": null,
+        "max_fds": null,
+        "max_cpu_pct": null
+      },
+      "determinism": {
+        "status": "absent",
+        "verdict": null
+      },
+      "log_anomalies": {
+        "status": "absent",
+        "rows": null
+      }
+    },
+    {
+      "name": "round1p",
+      "pass": true,
+      "evidence_dir": "/private/tmp/claude-501/-Users-michaelfazio-Source-dugite--claude-worktrees-conway-testing-issues/a9ca9d7b-2d1b-415e-a403-27cba1e694f0/scratchpad/gate-bundle-20260807T100744Z/round1p",
+      "duration_seconds": 120,
+      "git_rev": "a0d88fb1000518b264358728d91e6476a91a1fa2",
+      "cardano_node_version": "11.0.1",
+      "cardano_cli_version": "11.0.0.0",
+      "blocks": {
+        "total_forges": 63,
+        "canonical": 63,
+        "orphans": 0,
+        "orphan_rate": 0.0000
+      },
+      "tip_age": {
+        "avg_seconds": 1.88,
+        "p99_seconds": 7.00
+      },
+      "chain_density": 0.529,
+      "tx_zoo": {
+        "status": "absent",
+        "pass": null,
+        "fail": null,
+        "skip": null,
+        "total": null,
+        "expected": 154,
+        "source": "none"
+      },
+      "predicates": {
+        "p1_forge_cross_check": true,
+        "p2_per_bp_attribution": true,
+        "p3_tx_inclusion": null,
+        "p4_tip_parity": true,
+        "p5_tip_age": true
+      },
+      "log_errors": {
+        "dugite-bp": {
+          "errors": 0,
+          "warns": 4
+        },
+        "dugite-relay": {
+          "errors": 0,
+          "warns": 59
+        },
+        "cardano-bp": {
+          "errors": 0,
+          "warns": 0
+        }
+      },
+      "anomalies": [],
+      "epoch_transitions_observed": 0,
+      "n2n_adversarial": {
+        "status": "absent",
+        "pass": null,
+        "fail": null,
+        "panic": null,
+        "silent_skip": null,
+        "total": null,
+        "expected": 26
+      },
+      "cli_parity": {
+        "status": "absent",
+        "equal": null,
+        "divergent": null,
+        "env_skip": null,
+        "state_skip": null,
+        "error": null,
+        "total": null,
+        "compared": null,
+        "expected": 26
+      },
+      "parity_matrix": {
+        "status": "ok",
+        "total": 99,
+        "match": 96,
+        "offdiag": 0,
+        "classdiff": 0,
+        "knowndiff": 1,
+        "stateful": 2,
+        "expected": 99,
+        "categories": [
+          "01-bookkeeping",
+          "02-native-scripts",
+          "03-plutus",
+          "04-stake",
+          "05-governance-certs",
+          "06-proposals",
+          "07-voting",
+          "08-negative",
+          "11-mempool",
+          "18-plutus-edges"
+        ],
+        "per_category": {
+          "11": {
+            "total": 6,
+            "match": 6,
+            "offdiag": 0,
+            "classdiff": 0,
+            "knowndiff": 0,
+            "stateful": 0
+          },
+          "18": {
+            "total": 12,
+            "match": 12,
+            "offdiag": 0,
+            "classdiff": 0,
+            "knowndiff": 0,
+            "stateful": 0
+          },
+          "01": {
+            "total": 10,
+            "match": 10,
+            "offdiag": 0,
+            "classdiff": 0,
+            "knowndiff": 0,
+            "stateful": 0
+          },
+          "02": {
+            "total": 7,
+            "match": 7,
+            "offdiag": 0,
+            "classdiff": 0,
+            "knowndiff": 0,
+            "stateful": 0
+          },
+          "03": {
+            "total": 13,
+            "match": 13,
+            "offdiag": 0,
+            "classdiff": 0,
+            "knowndiff": 0,
+            "stateful": 0
+          },
+          "04": {
+            "total": 9,
+            "match": 9,
+            "offdiag": 0,
+            "classdiff": 0,
+            "knowndiff": 0,
+            "stateful": 0
+          },
+          "05": {
+            "total": 8,
+            "match": 6,
+            "offdiag": 0,
+            "classdiff": 0,
+            "knowndiff": 0,
+            "stateful": 2
+          },
+          "06": {
+            "total": 7,
+            "match": 7,
+            "offdiag": 0,
+            "classdiff": 0,
+            "knowndiff": 0,
+            "stateful": 0
+          },
+          "07": {
+            "total": 7,
+            "match": 7,
+            "offdiag": 0,
+            "classdiff": 0,
+            "knowndiff": 0,
+            "stateful": 0
+          },
+          "08": {
+            "total": 20,
+            "match": 19,
+            "offdiag": 0,
+            "classdiff": 0,
+            "knowndiff": 1,
+            "stateful": 0
+          }
+        }
+      },
+      "chaos": {
+        "status": "absent",
+        "pass": null,
+        "fail": null,
+        "env_skip": null,
+        "total": null,
+        "expected": 5
+      },
+      "rpc": {
+        "status": "absent",
+        "pass": null,
+        "fail": null,
+        "error": null,
+        "env_skip": null,
+        "state_skip": null,
+        "total": null,
+        "expected": 27
+      },
+      "throughput": {
+        "status": "absent",
+        "scenarios": null,
+        "max_blocks_per_sec": null,
+        "min_blocks_per_sec": null
+      },
+      "resources": {
+        "status": "absent",
+        "samples": null,
+        "max_rss_kb": null,
+        "max_fds": null,
+        "max_cpu_pct": null
+      },
+      "determinism": {
+        "status": "absent",
+        "verdict": null
+      },
+      "log_anomalies": {
+        "status": "absent",
+        "rows": null
+      }
+    },
+    {
+      "name": "round2",
+      "pass": true,
+      "evidence_dir": "/private/tmp/claude-501/-Users-michaelfazio-Source-dugite--claude-worktrees-conway-testing-issues/a9ca9d7b-2d1b-415e-a403-27cba1e694f0/scratchpad/gate-bundle-20260807T100744Z/round2",
+      "duration_seconds": 1800,
+      "git_rev": "a0d88fb1000518b264358728d91e6476a91a1fa2",
+      "cardano_node_version": "11.0.1",
+      "cardano_cli_version": "11.0.0.0",
+      "blocks": {
+        "total_forges": 897,
+        "canonical": 897,
+        "orphans": 0,
+        "orphan_rate": 0.0000
+      },
+      "tip_age": {
+        "avg_seconds": 1.19,
+        "p99_seconds": 6.00
+      },
+      "chain_density": 0.495,
+      "tx_zoo": {
+        "status": "short",
+        "pass": 100,
+        "fail": 3,
+        "skip": 1,
+        "total": 104,
+        "expected": 154,
+        "source": "round"
+      },
+      "predicates": {
+        "p1_forge_cross_check": true,
+        "p2_per_bp_attribution": true,
+        "p3_tx_inclusion": true,
+        "p4_tip_parity": true,
+        "p5_tip_age": true
+      },
+      "log_errors": {
+        "dugite-bp": {
+          "errors": 0,
+          "warns": 6
+        },
+        "dugite-relay": {
+          "errors": 0,
+          "warns": 9
+        },
+        "cardano-bp": {
+          "errors": 0,
+          "warns": 0
+        }
+      },
+      "anomalies": [],
+      "epoch_transitions_observed": 0,
+      "n2n_adversarial": {
+        "status": "absent",
+        "pass": null,
+        "fail": null,
+        "panic": null,
+        "silent_skip": null,
+        "total": null,
+        "expected": 26
+      },
+      "cli_parity": {
+        "status": "absent",
+        "equal": null,
+        "divergent": null,
+        "env_skip": null,
+        "state_skip": null,
+        "error": null,
+        "total": null,
+        "compared": null,
+        "expected": 26
+      },
+      "parity_matrix": {
+        "status": "absent",
+        "total": null,
+        "match": null,
+        "offdiag": null,
+        "classdiff": null,
+        "knowndiff": null,
+        "stateful": null,
+        "expected": null,
+        "categories": null,
+        "per_category": null
+      },
+      "chaos": {
+        "status": "absent",
+        "pass": null,
+        "fail": null,
+        "env_skip": null,
+        "total": null,
+        "expected": 5
+      },
+      "rpc": {
+        "status": "absent",
+        "pass": null,
+        "fail": null,
+        "error": null,
+        "env_skip": null,
+        "state_skip": null,
+        "total": null,
+        "expected": 27
+      },
+      "throughput": {
+        "status": "absent",
+        "scenarios": null,
+        "max_blocks_per_sec": null,
+        "min_blocks_per_sec": null
+      },
+      "resources": {
+        "status": "absent",
+        "samples": null,
+        "max_rss_kb": null,
+        "max_fds": null,
+        "max_cpu_pct": null
+      },
+      "determinism": {
+        "status": "absent",
+        "verdict": null
+      },
+      "log_anomalies": {
+        "status": "absent",
+        "rows": null
+      }
+    },
+    {
+      "name": "round3",
+      "pass": true,
+      "evidence_dir": "/private/tmp/claude-501/-Users-michaelfazio-Source-dugite--claude-worktrees-conway-testing-issues/a9ca9d7b-2d1b-415e-a403-27cba1e694f0/scratchpad/gate-bundle-20260807T100744Z/round3",
+      "duration_seconds": 60,
+      "git_rev": "a0d88fb1000518b264358728d91e6476a91a1fa2",
+      "cardano_node_version": "11.0.1",
+      "cardano_cli_version": "11.0.0.0",
+      "blocks": {
+        "total_forges": 34,
+        "canonical": 34,
+        "orphans": 0,
+        "orphan_rate": 0.0000
+      },
+      "tip_age": {
+        "avg_seconds": 2.17,
+        "p99_seconds": 9.00
+      },
+      "chain_density": 0.630,
+      "tx_zoo": {
+        "status": "absent",
+        "pass": null,
+        "fail": null,
+        "skip": null,
+        "total": null,
+        "expected": 154,
+        "source": "none"
+      },
+      "predicates": {
+        "p1_forge_cross_check": true,
+        "p2_per_bp_attribution": true,
+        "p3_tx_inclusion": null,
+        "p4_tip_parity": true,
+        "p5_tip_age": null
+      },
+      "log_errors": {
+        "dugite-bp": {
+          "errors": 0,
+          "warns": 7
+        },
+        "dugite-relay": {
+          "errors": 0,
+          "warns": 5
+        },
+        "cardano-bp": {
+          "errors": 0,
+          "warns": 0
+        }
+      },
+      "anomalies": [],
+      "epoch_transitions_observed": 0,
+      "n2n_adversarial": {
+        "status": "absent",
+        "pass": null,
+        "fail": null,
+        "panic": null,
+        "silent_skip": null,
+        "total": null,
+        "expected": 26
+      },
+      "cli_parity": {
+        "status": "absent",
+        "equal": null,
+        "divergent": null,
+        "env_skip": null,
+        "state_skip": null,
+        "error": null,
+        "total": null,
+        "compared": null,
+        "expected": 26
+      },
+      "parity_matrix": {
+        "status": "absent",
+        "total": null,
+        "match": null,
+        "offdiag": null,
+        "classdiff": null,
+        "knowndiff": null,
+        "stateful": null,
+        "expected": null,
+        "categories": null,
+        "per_category": null
+      },
+      "chaos": {
+        "status": "absent",
+        "pass": null,
+        "fail": null,
+        "env_skip": null,
+        "total": null,
+        "expected": 5
+      },
+      "rpc": {
+        "status": "absent",
+        "pass": null,
+        "fail": null,
+        "error": null,
+        "env_skip": null,
+        "state_skip": null,
+        "total": null,
+        "expected": 27
+      },
+      "throughput": {
+        "status": "absent",
+        "scenarios": null,
+        "max_blocks_per_sec": null,
+        "min_blocks_per_sec": null
+      },
+      "resources": {
+        "status": "absent",
+        "samples": null,
+        "max_rss_kb": null,
+        "max_fds": null,
+        "max_cpu_pct": null
+      },
+      "determinism": {
+        "status": "absent",
+        "verdict": null
+      },
+      "log_anomalies": {
+        "status": "absent",
+        "rows": null
+      }
+    }
+  ],
+  "summary": {
+    "pass": true,
+    "rounds_pass": 4,
+    "rounds_fail": 0,
+    "total_canonical_blocks": 1055,
+    "total_tx_zoo_pass": 251,
+    "total_tx_zoo_fail": 3,
+    "invalid_forges_detected": 0,
+    "critical_anomalies": 0,
+    "parity_offdiag_total": 0
+  },
+  "trend": {
+    "baseline_tag": "v2.7.0",
+    "canonical_blocks_delta": 1055,
+    "tx_zoo_pass_delta": 185,
+    "regressions": [],
+    "improvements": []
+  }
+}
