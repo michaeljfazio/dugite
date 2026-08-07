@@ -16,6 +16,22 @@ NAME="$(zoo_name)"
 zoo_require_devnet
 
 ADDR=$(cat "$ZOO_PAY_ADDR_FILE")
+# Wait for the mempool to drain BEFORE selecting an input.
+#
+# `zoo_largest_utxo` queries the LEDGER's UTxO set, which is blind to mempool claims, and
+# every script in this category selects from the SAME shared genesis address. So an
+# earlier script's still-pending transaction leaves an input that looks spendable and is
+# not: building on it yields an unavoidable input-conflict rejection, the tx is dropped,
+# and the symptom is "tx on 0/3 observers after 120s" — a node-looking failure with a
+# harness cause.
+#
+# This is #918's mechanism, which 11c already guards against for exactly this reason
+# ("it inherited 11a/11b's in-flight transactions"). The remedy simply had not been
+# applied to the rest of the category, so the failure stayed intermittent — it depends on
+# whether the previous script's tx happened to be included in time. Measured: 11d failed
+# this way in a single-batch zoo run after passing the two before it.
+zoo_wait_mempool_quiet 60 || true
+
 UTXO=$(zoo_largest_utxo "$ADDR") || { zoo_record "$NAME" FAIL "" "no-utxo"; exit 1; }
 TXIN=${UTXO%% *}
 AMT=${UTXO##* }
