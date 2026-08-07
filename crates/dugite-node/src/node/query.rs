@@ -343,9 +343,18 @@ impl Node {
         // leadership-schedule` computes the schedule CLIENT-side and takes σ
         // straight from this answer, so a denominator inflated from active
         // stake to circulation shrinks σ and drops leader slots.
+        // CLAMPED AT CONSTRUCTION, not at the encoder.
+        //
+        // `pdTotalActiveStake` is a `NonZero Coin` upstream, and `calculatePoolDistr'`
+        // applies its non-zero fallback when it BUILDS the distribution — so every Haskell
+        // consumer, including the leadership-schedule sigma denominator, sees the clamped
+        // value, never a raw 0. dugite clamped only in `encode_pool_distr2`, which is
+        // equivalent today (when the total is 0 the pool map is empty, so internal readers
+        // are vacuous) but stops being equivalent the moment any internal consumer reads
+        // the unclamped total. Clamping here keeps the invariant where the value is made.
         let (pool_distr, pool_distr_total_active_stake) = {
             match ls.epochs.snapshots.set.as_ref() {
-                None => (Vec::new(), 0u64),
+                None => (Vec::new(), 1u64),
                 Some(snap) => {
                     // `spssNumDelegators` — the count of credentials delegating
                     // to the pool IN THIS SNAPSHOT.
@@ -378,7 +387,8 @@ impl Node {
                     // `VMap.toMap` yields ascending key order; the response is a
                     // CBOR map, so a stable order keeps it byte-comparable.
                     entries.sort_by(|a, b| a.pool_id.cmp(&b.pool_id));
-                    (entries, total)
+                    // See the note above: NonZero at construction.
+                    (entries, total.max(1))
                 }
             }
         };
