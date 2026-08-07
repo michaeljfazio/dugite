@@ -1284,6 +1284,14 @@ Network magic: Mainnet=764824073, Preview=2, Preprod=1
   lines, `LedgerSeq was incoherent` (absence = positive evidence #985's re-anchor
   fired), #1057 genesis declines, RSS drift. Fewer than 3 usable samples FAILS
   rather than passing vacuously.
+- `testnet/local-devnet/wait-tip-parity.sh` — waits until relay, dugite-bp AND cardano-bp
+  report the SAME tip block, for N consecutive samples. Run it before any `soak.sh`: p4
+  scores exact parity across all three observers, so a soak started right after a
+  disruption measures RECONVERGENCE and fails on noise (measured twice: 79% then 83%).
+  `wait-catchup.sh` is NOT a substitute — it allows a 5-block gap by default and compares
+  only cardano-bp against dugite-bp, never the relay. Both its queries are bounded,
+  because a SIGSTOPped node's socket still listens and an unbounded query hangs the gate
+  on the very condition it exists to catch.
 - `testnet/local-devnet/genesis-fork-round.sh` — the #1057 reproduction (Round 12), now
   a regression gate: it REQUIRES live in-place adoption of a genesis-divergent chain,
   across a restart. Needs depth asymmetry (`LD_POOL2_STAKE_PCT=85`), freezes the
