@@ -1596,6 +1596,7 @@ dependencies = [
  "dugite-primitives",
  "dugite-serialization",
  "dugite-uplc",
+ "hex",
  "imbl",
  "minicbor 0.26.5",
  "num-bigint",
