@@ -101,10 +101,103 @@ dugite-lsm (LSM-tree on-disk storage for UTxO-HD)
 - 28-byte hash types (DRep keys, pool voter keys, required signers) must be padded to 32 bytes via `Hash28::to_hash32_padded()` — do not use `Hash<32>::from()` directly on 28-byte hashes
 
 ## Current Focus
-**v2.8.0 (2026-08-08) — the NonMyopic record becomes real.**
+**v2.8.0 (2026-08-08) — the NonMyopic record becomes real, and the RUPD pulser
+grows up.**
 **RE-SYNC RELEASE: SNAPSHOT_VERSION 37 -> 38**, so existing DBs replay chunks on
-first restart. Closes **#1067**. Open: #1068, **#1070**, **#1071** (both found by
-this release's own gate), #1008, and the Dijkstra set.
+first restart. Closes **#1067**, **#1072** (CONSENSUS), and the pulser-alignment
+programme's Phases 0/1/2/4 plus Phase 3's ledger half. Open: #1068, **#1070**,
+**#1071** (needs the `Pulsing` wire arm — see below), #1008, the Dijkstra set,
+and one filed `PulsingSnapshot` divergence.
+
+### The pulser-alignment programme
+
+Design + full status table: `docs/superpowers/specs/2026-08-08-pulser-alignment-design.md`.
+
+**#1072 (CONSENSUS)** — NEWEPOCH applies a reward update only when a pulser
+exists. `nesRu` is `SNothing` whenever no block landed strictly after the
+epoch's `4k/f` mark, and the `SNothing` arm is `pure es`: no deltaR, no deltaT,
+no rewards, **no `ssFee` drain**. dugite applied one unconditionally. The fee
+drain sitting OUTSIDE the gate was a second defect found by review, and its test
+was structurally blind (fixture `epoch_fees` = 0 against a `saturating_sub`).
+
+**Phase 0 — the number that gates the rest.** ~2.55 s for the mainnet-scale
+reward fold inside ONE boundary block, linear in credentials
+(`state::rupd_work_measurement`, `--release`, `#[ignore]`d). That overruns a 1 s
+slot by 2.5x, so incremental pulsing is justified. **The first measurement said
+0.29 s and would have retired the work**: a fixed 1000 ADA per credential made
+per-pool `sigma` ~5e-10, floored `maxPool'` to zero, and dropped every MEMBER
+reward, so the fold returned one entry per pool and the timing described a loop
+over 50 pools while claiming to describe 1000 credentials. An assertion that
+the fold rewarded at least half its input is the only reason the number is
+right.
+
+**Phase 3's ledger half.** The reward fold is now CREDENTIAL-major via
+`PoolRewardInfo` (upstream's own decomposition), and production runs THROUGH
+`RewardFold` with a single maximal pulse — no batch path beside a pulse path to
+drift. The gate is a differential property, `fold_incremental(any pulse_size)
+== fold_batch`, proptested with owner and zero-stake credentials seeded so the
+skip paths land AT chunk boundaries. The work queue is sorted: upstream's
+balance is a `Set` consumed in `Ord` order, and an unsorted queue would make the
+folded/pending split differ across a restart, so two nodes computing identical
+rewards would still disagree about `nesRu`.
+
+**Phase 1b — `fvTotalStake`.** `pending_avvm_return` did not only correct the
+expansion; it corrected `total_stake`, which is **sigma's denominator**, so it
+reached `maxPool'`, every member share and every likelihood. Deleting it while
+freezing only the monetary terms would have left the pot pre-AVVM and the
+DISTRIBUTION post-AVVM — worse than the patch. `MonetaryStep` now freezes
+`total_stake` as Haskell's `FreeVars` does.
+
+**Phase 4 CLOSED as YAGNI, measured not asserted.** `ConwayGovState[6]` sampled
+from both nodes across a full epoch is `array(2)` with no sum tag, every time:
+upstream's encoder force-completes, so `DRPulsing` never reaches the wire.
+Implementing it would add ledger, snapshot and rollback surface for zero
+observable difference.
+
+**Still open in Phase 3**: per-block pulse scheduling and the `nesRu` wire arms
+(#1071). The arms CANNOT ship first — decoding the captured `Pulsing` record
+shows `balance` (work remaining) and `RewardAns` (answer so far) are live fold
+state, so a node computing at the boundary has nothing to encode from. The plan
+that put the arms in Phase 2 was wrong.
+
+### Three wrong readings of a real artefact, all caught the same way
+
+Worth more than any individual correction: each was plausible, each survived
+review, and each fell to **decoding or sampling the whole thing rather than its
+head**.
+
+1. The `Pulsing` arm was scheduled before incremental pulsing. Reading only the
+   record's head made the `Pulser` look like a summary.
+2. The tag-258 set inside the `Pulser` was called "the fold's work queue". It is
+   `fvAddrsRew` — **140** entries where the real queue holds **19**. Both are
+   credential sets inside the pulser; the COUNTS separate them (140 tracks live
+   registrations, 19 is what the GO snapshot carries in epoch 2). The test
+   asserting it PASSED and would have kept passing — only the meaning was wrong.
+3. Phase 4's "no wire form" was asserted from the types. True, as it turned out,
+   but it took a capture to know.
+
+### #938's threshold, still not fully swept — found by byte-diffing a live node
+
+`costModels` arrays were framed DEFINITE where cardano-node 11.0.1 frames them
+indefinite (`98 a6` vs `9f … ff`). `variableListLenEncoding` switches above
+`lengthThreshold = 23`, and a real cost model is 166+ parameters, so every
+`costModels` reply differed. #938 swept this exact threshold through the block
+and transaction encoders and missed the LSQ pparams path.
+
+It survived every release gate because **both framings decode to the same
+list** — cardano-cli renders identical JSON, cli-parity passes on
+`protocol-parameters`, and no suite comparing VALUES can see it. Only a raw byte
+diff against a running Haskell node shows it. Found while investigating Phase 4,
+which is the argument for running an investigation whose expected answer is
+"no change needed".
+
+### Rollback: the RUPD freeze pair is now atomic
+
+`rupd_monetary` had no `LedgerDelta`, so a rollback regressed the flag while the
+frozen terms stayed newer. It was SAFE — by a two-step argument about which
+fields are read when, which is exactly what #985 was. Both are now written by
+the same branch. The delta field is `Option<Option<MonetaryStep>>`: collapsing
+"not recorded" into "genuinely absent" is #1028's defect verbatim.
 
 ### #1067 — both halves of `NonMyopic` were invented, not just the named one
 
