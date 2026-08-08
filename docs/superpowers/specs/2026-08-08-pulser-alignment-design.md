@@ -185,21 +185,59 @@ a pure language it cannot observe a different value than an eager snapshot of
 the same inputs. **[R2]** Combined with §2.2 (no wire form), Phase 4 is reduced
 to an internal-representation change with no external justification — see Phase 4.
 
-### 3.4 Work distribution — unmeasured
+### 3.4 Work distribution — MEASURED 2026-08-08
 
-One 8 s tip-age stall observed at a devnet boundary with **2 pools**. Mainnet has
-~1.3M credentials. **That number does not exist yet and this design does not
-pretend otherwise** — Phase 0 produces it.
+One 8 s tip-age stall was observed at a devnet boundary with **2 pools**, and
+mainnet has ~1.3M credentials. Phase 0 has now produced the real number
+(`state::rupd_work_measurement`, release build, M-series):
+
+| creds | pools | wall | ns/cred |
+|---:|---:|---:|---:|
+| 1,000 | 50 | 4.8 ms | 4828 |
+| 10,000 | 500 | 26.9 ms | 2688 |
+| 50,000 | 1,500 | 90.1 ms | 1803 |
+| 200,000 | 3,100 | 392.2 ms | 1961 |
+
+**Extrapolated to mainnet (1.3M creds / 3.1k pools): ~2.55 s inside ONE
+boundary block.** Scaling is linear (1.13x per-credential over a 10x size
+increase), so the extrapolation is sound.
+
+A 2.55 s fold overruns a 1 s slot by 2.5x. It does not stall the chain — mainnet
+blocks arrive ~20 s apart — but it freezes the node for the boundary block, and
+a producer whose leader slot lands in that window forges late or not at all.
+**Phase 3 is justified on work distribution**, independently of `nesRu` parity.
+
+> **The first version of this measurement said 0.29 s and would have retired
+> Phase 3.** It used a fixed 1000 ADA per credential, which against a 37.2B
+> circulation made per-pool `sigma` ~5e-10, floored `maxPool'` to zero, and
+> dropped every MEMBER reward — the fold returned exactly one entry per pool
+> and the timing described a loop over 50 pools while claiming to describe
+> 1000 credentials. `time_fold` now asserts the fold rewarded at least half the
+> input credentials, and `TOTAL_DELEGATED` is held constant across scales at
+> ~65% of circulation. The assertion is what changed the conclusion, and it is
+> the same failure family as #916/#917/#945: a check reporting a clean number
+> while measuring nothing.
 
 ---
 
 ## 4. Design
 
-### Phase 0 — measure before building (no shipping code)
+### Phase 0 — DONE (measured 2026-08-08): **GO on Phase 3**
 
-Instrument the boundary; measure reward-computation wall time at preprod scale
-and, if feasible, mainnet replay. Deliverable: a number, and a go/no-go on
-Phase 3. Phases 1-2 proceed regardless — they are correctness, not performance.
+Deliverable was a number and a go/no-go. Both are in §3.4: **~2.55 s** for the
+mainnet-scale fold inside one boundary block, linear in credentials, against a
+1 s slot. That is a go.
+
+Measured by scaling a synthetic snapshot rather than by instrumenting a mainnet
+replay — the replay route is blocked on disk (§5b), and the synthetic route
+turned out to be the better instrument anyway, since it isolates the fold from
+block application and can be re-run in half a second on any machine.
+
+`--release` is required; a debug number overstates the stall ~10x. The two
+measurement tests are `#[ignore]`d, because a wall-clock assertion in CI
+measures runner load — the flake shape already hit in `dugite-monitor`'s probe
+timeout. The one automatic assertion is scale-relative (not super-linear),
+which catches a real algorithmic regression without pinning a wall clock.
 
 ### Phase 1a — DONE (validated 2026-08-08)
 
