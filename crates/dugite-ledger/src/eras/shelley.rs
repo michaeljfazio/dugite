@@ -535,6 +535,11 @@ impl EraRules for ShelleyRules {
                 ctx.max_lovelace_supply,
                 &epochs.non_myopic,
                 epochs.rupd_monetary,
+                // Hand the boundary whatever the per-block pulses accumulated.
+                // `take` clears it with the rest of the RUPD freeze below, so a
+                // fold cannot survive into the next epoch and be resumed
+                // against a rotated GO snapshot.
+                epochs.rupd_fold.fold.take(),
             );
 
             // Issue #438/#471: per-boundary reward-debug dump.  No-op
@@ -1450,6 +1455,7 @@ mod tests {
             rupd_addrs_rew: None,
             rupd_pulser_started: false,
             rupd_monetary: None,
+            rupd_fold: Default::default(),
             pending_avvm_return: 0,
         }
     }

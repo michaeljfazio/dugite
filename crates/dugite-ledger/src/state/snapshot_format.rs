@@ -444,6 +444,8 @@ impl From<LedgerStateSnapshot> for super::LedgerState {
                 rupd_addrs_rew: s.rupd_addrs_rew.map(Arc::new),
                 rupd_pulser_started: s.rupd_pulser_started,
                 rupd_monetary: s.rupd_monetary,
+                // Transient: rebuilt at the next block, completed at the boundary.
+                rupd_fold: Default::default(),
                 pending_avvm_return: s.pending_avvm_return,
             },
             tip: s.tip,

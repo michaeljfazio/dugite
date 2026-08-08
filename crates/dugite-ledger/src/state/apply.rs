@@ -596,6 +596,20 @@ impl LedgerState {
             }
         }
 
+        // Phase 3: one pulse of the member fold per block, spreading the ~2.55 s
+        // mainnet-scale boundary fold (Phase 0) across the pulsing window.
+        //
+        // A no-op before the mark (`rupd_monetary` is None) and idempotent once
+        // the balance is exhausted, so it is safe to call unconditionally on
+        // every block rather than replicating the window classification here —
+        // a second copy of that condition is the N-copies trap (#985/#1015).
+        if block.era != Era::Byron {
+            let prev_d = self.epochs.prev_d.clone();
+            let pv = self.epochs.prev_protocol_version_major;
+            let k = self.security_param;
+            crate::state::rewards::pulse_rupd_member_fold(&mut self.epochs, &prev_d, pv, k);
+        }
+
         if block.era != Era::Byron
             && self.epochs.prev_protocol_version_major <= 6
             && self.epochs.rupd_addrs_rew.is_none()
