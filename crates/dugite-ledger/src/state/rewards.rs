@@ -219,7 +219,25 @@ pub fn compute_reward_update(
     // the current circulating supply. Hoisted above every early return because
     // it is `sigma`'s denominator and so is needed to build `newLikelihoods`,
     // which Haskell produces unconditionally in `startStep`.
-    let total_stake = max_lovelace_supply.saturating_sub(reserves.0);
+    //
+    // Read from the FREEZE when one exists — Haskell's `fvTotalStake`, captured
+    // at the 4k/f mark rather than recomputed here. The two agree wherever
+    // reserves are immobile mid-epoch, which is everywhere except a boundary
+    // whose era translation moves them: Shelley→Allegra, where
+    // `returnRedeemAddrsToReserves` credits the unredeemed AVVM coin before the
+    // reward update is applied.
+    //
+    // dugite patched that single boundary with `pending_avvm_return`, subtracted
+    // back off the reserves passed in here. Reading the frozen value removes
+    // both the patch and the unstated invariant it encoded. It also has to be
+    // this field and not just `deltaR1`: `total_stake` is `sigma`'s denominator,
+    // so freezing only the monetary terms would have left the reward
+    // DISTRIBUTION reading post-AVVM reserves while the pot read pre-AVVM —
+    // strictly worse than the patch.
+    let total_stake = match frozen_monetary {
+        Some(m) => m.total_stake,
+        None => max_lovelace_supply.saturating_sub(reserves.0),
+    };
 
     // Haskell has no early return here: `startStep` always computes
     // `newLikelihoods`, and `completeRupd` always folds it through
@@ -2035,6 +2053,7 @@ mod tests {
     /// discriminator that ruled the formula out as the cause — and a permanent
     /// guard against any future change to `maxPool'`, `mkApparentPerformance`,
     /// `leaderRew` or `memberRew` that would silently shift real payouts.
+
     #[test]
     fn test_preview_epoch_1363_reward_is_byte_exact_vs_chain() {
         const POOL: u8 = 0x4b; // pool1fw7yf4… (ours, produces blocks)
@@ -2315,6 +2334,120 @@ mod tests {
             with_registered, with_retired,
             "#898: retiring an unrelated pool must not change this pool's member \
              reward — its delegated stake stays in Haskell's `sumAllActiveStake`"
+        );
+    }
+
+    /// `compute_reward_update` must READ the frozen `total_stake`, not
+    /// recompute it.
+    ///
+    /// The unit tests on `start_step_monetary` prove the value is FROZEN
+    /// correctly. They say nothing about whether the consumer reads it — and
+    /// disarming the consumer left all of them green, which is #1057's lesson
+    /// verbatim: a RED-proven unit test bounds the function, not the system.
+    ///
+    /// This drives the real entry point twice with identical inputs EXCEPT the
+    /// frozen `total_stake`, and asserts the rewards differ. A build that
+    /// recomputes `maxSupply - reserves` produces identical output both times,
+    /// because `reserves` is the same in both calls.
+    #[test]
+    fn compute_reward_update_reads_the_frozen_total_stake() {
+        use crate::state::reward_pulser::MonetaryStep;
+
+        const POOL: u8 = 0x11;
+        const MEMBER: u8 = 0x22;
+
+        let mut delegations = HashMap::new();
+        let mut stake_distribution = HashMap::new();
+        let mut pool_stake = HashMap::new();
+        let mut pool_params = HashMap::new();
+
+        // Pool stake must sit BELOW saturation or `sigma` clamps to z0 = 1/nOpt
+        // and the total_stake difference becomes invisible — which is exactly
+        // what the first version of this fixture did, at 500e12 against a
+        // 31e15 total (sigma_raw = 0.016 vs z0 = 0.002, clamped in both runs
+        // and so identical rewards for the wrong reason).
+        // 30e12 / 31e15 = 0.00097 < 0.002, so sigma tracks total_stake.
+        delegations.insert(cred32(MEMBER), h28(POOL));
+        stake_distribution.insert(cred32(MEMBER), Lovelace(30_000_000_000_000));
+        pool_stake.insert(h28(POOL), Lovelace(30_000_000_000_000));
+        pool_params.insert(
+            h28(POOL),
+            pool_reg(h28(POOL), 0, 340_000_000, (1, 10), vec![], 0xd1),
+        );
+
+        let go = StakeSnapshot {
+            epoch: EpochNo(200),
+            delegations: Arc::new(delegations),
+            pool_stake,
+            pool_params: Arc::new(pool_params),
+            stake_distribution: Arc::new(stake_distribution),
+            epoch_fees: Lovelace(0),
+            epoch_block_count: 0,
+            epoch_blocks_by_pool: Arc::new(HashMap::new()),
+        };
+        let mut bprev: HashMap<Hash28, u64> = HashMap::new();
+        bprev.insert(h28(POOL), 21_600);
+
+        let mut params = dugite_primitives::protocol_params::ProtocolParameters::mainnet_defaults();
+        params.rho = rat(3, 1000);
+        params.tau = rat(1, 5);
+        params.a0 = rat(3, 10);
+        params.n_opt = 500;
+        params.active_slots_coeff = 0.05;
+
+        let reserves = Lovelace(14_000_000_000_000_000);
+        // Same monetary terms in both runs; ONLY total_stake differs, so any
+        // difference in the output has exactly one possible cause.
+        let base = MonetaryStep {
+            delta_r1: 42_000_000_000_000,
+            delta_t1: 8_400_000_000_000,
+            r: 33_600_000_000_000,
+            expected_blocks: 21_600,
+            total_stake: 31_000_000_000_000_000,
+        };
+        let shifted = MonetaryStep {
+            // The AVVM return, at mainnet's order of magnitude.
+            total_stake: 31_000_000_000_000_000 - 318_200_635_000_000,
+            ..base
+        };
+
+        let run = |m: MonetaryStep| {
+            super::compute_reward_update(
+                &params,
+                &rat(0, 1),
+                11,
+                Some(&go),
+                &bprev,
+                Lovelace(0),
+                reserves,
+                Lovelace(0),
+                &HashMap::new(),
+                None,
+                432_000,
+                0,
+                super::super::MAX_LOVELACE_SUPPLY,
+                &Default::default(),
+                Some(m),
+            )
+        };
+
+        let a = run(base);
+        let b = run(shifted);
+
+        let ra = a.rewards.get(&cred32(MEMBER)).map(|l| l.0).unwrap_or(0);
+        let rb = b.rewards.get(&cred32(MEMBER)).map(|l| l.0).unwrap_or(0);
+        assert!(
+            ra > 0 && rb > 0,
+            "both runs must actually pay the member ({ra}, {rb}) — a fixture \
+             that pays nothing would satisfy the inequality below vacuously"
+        );
+        assert_ne!(
+            ra, rb,
+            "total_stake is sigma's denominator, so changing ONLY the frozen \
+             value must move the member reward. Identical rewards mean the \
+             frozen value was ignored and maxSupply - reserves was recomputed \
+             — which is exactly the AVVM divergence pending_avvm_return used \
+             to patch"
         );
     }
 }

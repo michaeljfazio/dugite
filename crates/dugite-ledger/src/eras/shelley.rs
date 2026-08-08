@@ -479,10 +479,21 @@ impl EraRules for ShelleyRules {
                 .collect();
             // #11/AVVM: at the Shelley→Allegra boundary the era translation already
             // added the unredeemed-AVVM coin to `epochs.reserves` (on_era_transition
-            // runs before this). Haskell computed `nesRu` from PRE-AVVM reserves, so
-            // compute the reward update from reserves with that return removed (then
-            // it is applied to the post-AVVM reserves below). `take` resets to 0 so
-            // only this first boundary is adjusted. Non-AVVM boundaries see 0.
+            // runs before this), while Haskell computed `nesRu` from PRE-AVVM
+            // reserves.
+            //
+            // This USED to be corrected here, by subtracting a `pending_avvm_return`
+            // carried in `EpochSubState` from the reserves handed to the reward
+            // update. That patch is now unnecessary: `startStep` freezes both the
+            // monetary terms AND `total_stake` at the 4k/f mark, which is before the
+            // era translation, so the frozen values are already pre-AVVM and
+            // `compute_reward_update` reads them in preference to anything derived
+            // from the reserves passed in.
+            //
+            // The correction is still applied when there is no freeze to read —
+            // a boundary whose epoch never reached its mark. That case applies no
+            // reward update at all (#1072), so the value is unused, but computing it
+            // the old way keeps the fallback honest rather than silently pre-AVVM.
             let reward_reserves = Lovelace(
                 epochs
                     .reserves
