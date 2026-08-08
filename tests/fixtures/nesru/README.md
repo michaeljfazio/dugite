@@ -31,7 +31,38 @@ JSON view cannot tell you which state you captured.
 The all-zero `RewardUpdate` is expected at epoch 0 — no stake in `go`, no
 blocks in `bprev`. It pins the SHAPE, not the values.
 
-## `Pulsing` is NOT observable on this devnet — a corrected assumption
+## `pulsing.hex` — CAPTURED after seeding 120 credentials
+
+The threshold reasoning below was acted on rather than filed, and it worked.
+With 120 registered + delegated + funded stake credentials, `Pulsing` holds
+across the whole window instead of a single block:
+
+```text
+slot 1122 (offset 322)  SJust Pulsing (sum tag 0)
+slot 1131 (offset 331)  SJust Pulsing (sum tag 0)
+slot 1145 (offset 345)  SJust Pulsing (sum tag 0)
+```
+
+```text
+81            array(1)  = SJust
+  83          array(3)  = the sum          <- THREE elements, unlike Complete's two
+    00        tag 0     = Pulsing
+    88        array(8)  = RewardSnapShot   <- rewFees, rewProtocolVersion,
+                                              rewNonMyopic, rewDeltaR1, rewR,
+                                              rewDeltaT1, rewLikelihoods, rewLeaders
+    ...       Pulser
+```
+
+7.4 KB, versus 11 bytes for `Complete` at epoch 0 — the snapshot carries real
+likelihoods and leader rewards.
+
+Seeding recipe (`scratchpad/seed-batched.sh`): 120 credentials cannot go in one
+tx (`MaxTxSizeUTxO`, 32488 vs 16384), so they are batched 40 per tx with the
+funder's UTxO re-queried each round, since the previous batch consumes the
+change output. Registration alone is not enough — `resolveInstantStake` counts
+a credential only if it is registered AND delegated AND holds non-zero stake.
+
+## Why the first attempt saw no `Pulsing` — a corrected assumption
 
 The design spec predicted `Pulsing` in slots ~321-335 and `Complete` from
 ~336. **That was wrong.** The capture at slot 324 — four slots past the `4k/f`
