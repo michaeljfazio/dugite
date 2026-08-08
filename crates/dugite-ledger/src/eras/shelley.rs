@@ -440,7 +440,20 @@ impl EraRules for ShelleyRules {
         // their genesis 0→1 RUPD (issue #438) is unaffected.
         let is_byron_to_shelley_fork =
             ctx.shelley_transition_epoch > 0 && new_epoch.0 == ctx.shelley_transition_epoch;
-        if !is_byron_to_shelley_fork {
+        // #1072: Haskell's NEWEPOCH applies a reward update only when a pulser
+        // exists. `nesRu` is `SNothing` whenever no block landed strictly after
+        // this epoch's `4k/f` mark, and the `SNothing` arm is `pure es` — no
+        // deltaR, no deltaT, no rewards credited, no `ssFee` drain. dugite
+        // applied one unconditionally, which diverges permanently once it
+        // happens. See `state::reward_pulser`.
+        if !epochs.rupd_pulser_started {
+            debug!(
+                epoch = new_epoch.0,
+                "No RUPD pulser for the closed epoch (no block after 4k/f) — \
+                 applying no reward update, matching Haskell's SNothing arm"
+            );
+        }
+        if !is_byron_to_shelley_fork && epochs.rupd_pulser_started {
             let go_ref = epochs.snapshots.go.as_ref();
             // Issue #438: RUPD uses Haskell's `prevPParams` (= the protocol
             // parameters that were active in the PREVIOUS epoch), NOT
@@ -1384,6 +1397,7 @@ mod tests {
                 denominator: 1,
             },
             rupd_addrs_rew: None,
+            rupd_pulser_started: false,
             pending_avvm_return: 0,
         }
     }
@@ -2127,6 +2141,12 @@ mod tests {
     fn test_shelley_epoch_transition_computes_rupd() {
         // Set up state with a GO snapshot containing one pool that produced blocks.
         // After epoch transition, reserves should decrease (indicating RUPD ran).
+        //
+        // #1072: a reward update is applied only when a pulser exists — i.e. a
+        // block landed strictly after `epoch_first + 4k/f`. This test's premise
+        // IS that one did, so it must say so; Haskell's `SNothing` arm would
+        // otherwise (correctly) apply nothing. See the sibling test
+        // `epoch_transition_applies_no_rupd_without_a_pulser`.
         let params = ProtocolParameters::mainnet_defaults();
         let ctx = make_shelley_ctx(&params);
         let rules = ShelleyRules::new();
@@ -2136,6 +2156,7 @@ mod tests {
         let mut gov = make_gov_sub();
         let mut epochs = make_epoch_sub();
         let mut consensus = make_consensus_sub();
+        epochs.rupd_pulser_started = true;
 
         let pool_id = Hash28::from_bytes([1u8; 28]);
         let owner_key = Hash28::from_bytes([2u8; 28]);
@@ -2285,6 +2306,127 @@ mod tests {
 
     /// Byron→Shelley reserves init recomputes `reserves = maxLovelaceSupply −
     /// sumCoinUTxO(liveByronUTxO)`, overwriting whatever reserves held before.
+    #[test]
+    fn epoch_transition_applies_no_rupd_without_a_pulser() {
+        // Set up state with a GO snapshot containing one pool that produced blocks.
+        // After epoch transition, reserves should decrease (indicating RUPD ran).
+        //
+        // #1072: a reward update is applied only when a pulser exists — i.e. a
+        // block landed strictly after `epoch_first + 4k/f`. This test's premise
+        // IS that one did, so it must say so; Haskell's `SNothing` arm would
+        // otherwise (correctly) apply nothing. See the sibling test
+        // `epoch_transition_applies_no_rupd_without_a_pulser`.
+        let params = ProtocolParameters::mainnet_defaults();
+        let ctx = make_shelley_ctx(&params);
+        let rules = ShelleyRules::new();
+
+        let mut utxo = make_utxo_sub(vec![]);
+        let mut certs = make_cert_sub();
+        let mut gov = make_gov_sub();
+        let mut epochs = make_epoch_sub();
+        let mut consensus = make_consensus_sub();
+        // #1072: NO pulser — no block landed after `epoch_first + 4k/f`.
+        epochs.rupd_pulser_started = false;
+
+        let pool_id = Hash28::from_bytes([1u8; 28]);
+        let owner_key = Hash28::from_bytes([2u8; 28]);
+        let delegator_cred = Hash32::from_bytes([3u8; 32]);
+
+        // Set up pool registration with pledge met via delegator stake.
+        let pool_reg = PoolRegistration {
+            pool_id,
+            vrf_keyhash: Hash32::ZERO,
+            pledge: Lovelace(1_000_000_000), // 1000 ADA pledge
+            cost: Lovelace(340_000_000),     // 340 ADA cost
+            margin_numerator: 1,
+            margin_denominator: 100,
+            reward_account: vec![],
+            owners: vec![owner_key],
+            relays: vec![],
+            metadata_url: None,
+            metadata_hash: None,
+        };
+
+        // Register the pool and set up delegation.
+        Arc::make_mut(&mut certs.pool_params).insert(pool_id, pool_reg.clone());
+        certs.delegations.insert(delegator_cred, pool_id);
+
+        // Register a reward account for the delegator.
+        certs.reward_accounts.insert(delegator_cred, Lovelace(0));
+
+        // Build a GO snapshot with the pool having stake.
+        let mut pool_stake = HashMap::new();
+        pool_stake.insert(pool_id, Lovelace(10_000_000_000_000)); // 10M ADA
+        let mut stake_dist = HashMap::new();
+        stake_dist.insert(delegator_cred, Lovelace(10_000_000_000_000));
+
+        let go_snapshot = crate::state::StakeSnapshot {
+            epoch: EpochNo(3),
+            delegations: std::sync::Arc::new(
+                certs
+                    .delegations
+                    .iter()
+                    .map(|(k, v)| (*k, *v))
+                    .collect::<std::collections::HashMap<_, _>>(),
+            ),
+            pool_stake,
+            pool_params: Arc::clone(&certs.pool_params),
+            stake_distribution: Arc::new(stake_dist),
+            epoch_fees: Lovelace(500_000_000), // 500 ADA fees
+            epoch_block_count: 100,
+            epoch_blocks_by_pool: Arc::new(HashMap::new()),
+        };
+
+        epochs.snapshots.go = Some(go_snapshot);
+        epochs.snapshots.rupd_ready = true;
+
+        // Pool produced blocks in previous epoch.
+        let mut blocks_by_pool = HashMap::new();
+        blocks_by_pool.insert(pool_id, 50);
+        epochs.snapshots.bprev_blocks_by_pool = Arc::new(blocks_by_pool);
+        epochs.snapshots.ss_fee = Lovelace(500_000_000);
+
+        // Set reserves high enough for expansion.
+        let initial_reserves = 10_000_000_000_000_000u64; // 10B ADA
+        epochs.reserves = Lovelace(initial_reserves);
+        let initial_treasury = epochs.treasury.0;
+
+        // Set d < 0.8 so decentralisation allows pool rewards.
+        epochs.prev_d = dugite_primitives::transaction::Rational {
+            numerator: 1,
+            denominator: 2,
+        };
+
+        let result = rules.process_epoch_transition(
+            EpochNo(6),
+            &ctx,
+            &mut utxo,
+            &mut certs,
+            &mut gov,
+            &mut epochs,
+            &mut consensus,
+        );
+        assert!(result.is_ok());
+
+        // Haskell `NewEpoch.hs:162`: `SNothing -> pure es`. With no pulser the
+        // boundary applies NOTHING — no deltaR, no deltaT, no rewards, no fee
+        // drain. dugite applied a full update unconditionally before #1072,
+        // which diverges permanently the first time a chain goes quiet across
+        // its `4k/f` mark (an 80-slot window on the devnet, shorter than the
+        // chaos suite's outage).
+        //
+        // Disarming the fix — dropping `&& epochs.rupd_pulser_started` from the
+        // boundary guard — turns this red on the reserves assertion.
+        assert_eq!(
+            epochs.reserves.0, initial_reserves,
+            "reserves must not move when no RUPD pulser exists (#1072)"
+        );
+        assert_eq!(
+            epochs.treasury.0, initial_treasury,
+            "treasury must not move when no RUPD pulser exists (#1072)"
+        );
+    }
+
     #[test]
     fn recompute_initial_reserves_subtracts_full_utxo_sum() {
         let max = 45_000_000_000_000_000u64;

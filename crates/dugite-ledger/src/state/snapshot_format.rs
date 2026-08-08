@@ -229,6 +229,15 @@ pub struct LedgerStateSnapshot {
     /// the GO snapshot (stale reward balances). Observed live as the
     /// ~2998 ADA replay-seam offset at mainnet boundary 337→338.
     pub rupd_addrs_rew: Option<std::collections::HashSet<Hash32>>,
+
+    /// Whether a RUPD pulser exists for the epoch in progress (#1072).
+    ///
+    /// PERSISTED deliberately. A mid-epoch restart past the `4k/f` mark that
+    /// dropped this would re-derive `SNothing` at the next boundary and skip a
+    /// reward update Haskell applies — the same class of bug the
+    /// `rupd_addrs_rew` doc records for mainnet 337→338, but affecting whether
+    /// the update happens at all rather than how it is routed.
+    pub rupd_pulser_started: bool,
     /// #736 (same class): AVVM return amount pending at the next epoch
     /// boundary (Shelley→Allegra transition). Set once at the era
     /// transition and consumed at the following boundary; a mid-epoch
@@ -343,6 +352,7 @@ impl From<&super::LedgerState> for LedgerStateSnapshot {
             // #736: persist the pv≤6 RUPD startStep capture — historical
             // state that a restart cannot re-derive.
             rupd_addrs_rew: s.epochs.rupd_addrs_rew.as_deref().cloned(),
+            rupd_pulser_started: s.epochs.rupd_pulser_started,
             pending_avvm_return: s.epochs.pending_avvm_return,
         }
     }
@@ -425,6 +435,7 @@ impl From<LedgerStateSnapshot> for super::LedgerState {
                 // the ~2998 ADA replay-seam treasury shortfall + stale
                 // reward balances at the next pv≤6 boundary.
                 rupd_addrs_rew: s.rupd_addrs_rew.map(Arc::new),
+                rupd_pulser_started: s.rupd_pulser_started,
                 pending_avvm_return: s.pending_avvm_return,
             },
             tip: s.tip,
@@ -540,6 +551,7 @@ mod tests {
             stake_key_deposits,
             pool_deposits,
             rupd_addrs_rew,
+            rupd_pulser_started,
             pending_avvm_return,
         } = &snap;
 
@@ -604,6 +616,12 @@ mod tests {
                 .all(|l| l.0.len() == crate::state::non_myopic::SAMPLE_SIZE),
             "non_myopic.likelihoods holds a short Likelihood — a truncated \
              sequence writes fewer bytes and weakens the hash"
+        );
+        assert!(
+            *rupd_pulser_started,
+            "rupd_pulser_started is false — a bool at its default contributes \
+             the same bytes as an absent field, so #1072's persisted state \
+             would be invisible to the layout hash"
         );
         assert_ne!(
             non_myopic.reward_pot.0, 0,

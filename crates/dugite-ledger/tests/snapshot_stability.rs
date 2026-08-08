@@ -115,11 +115,17 @@ fn snapshot_format_hash_stability() {
     //   474c7869c31088f4310932825ca44657df5be7bfebd1da93abf57732b1f72f2e
     //     SNAPSHOT 37 (#994, PulsingSnapshot presence flags)
     //
-    // Current: SNAPSHOT 37 -> 38 (#1067). This IS a layout change — two
-    // positional bincode additions, `EpochSubState.non_myopic` and
-    // `PendingRewardUpdate.non_myopic` — so it is the first of the two rules
-    // above and SNAPSHOT_VERSION was bumped with it.
-    const EXPECTED_HASH: &str = "0b78b7f6df8e66b194d3578d74a9c53624742eda20fb8a7aa4685d4fa03f0089";
+    //   0b78b7f6df8e66b194d3578d74a9c53624742eda20fb8a7aa4685d4fa03f0089
+    //     SNAPSHOT 38, #1067 fields only (never released — see
+    //     xtask/tests/snapshot_one_bump_invariant.rs)
+    //
+    // Current: SNAPSHOT 38, extended in place. #1067 added
+    // `EpochSubState.non_myopic` + `PendingRewardUpdate.non_myopic`; #1072 adds
+    // `EpochSubState.rupd_pulser_started`. Both are positional bincode
+    // additions, so both are layout changes — but 38 was never tagged, so they
+    // ship as ONE re-sync rather than two. That invariant is enforced by
+    // `xtask/tests/snapshot_one_bump_invariant.rs`, not by convention.
+    const EXPECTED_HASH: &str = "18412a2fa73784959e6e07aa6e54d0cd208a72ba7209058ac1f3f582446bddcb";
 
     if EXPECTED_HASH == "COMPUTE_ON_FIRST_RUN" {
         panic!(

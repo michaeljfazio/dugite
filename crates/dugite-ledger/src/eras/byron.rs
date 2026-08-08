@@ -1453,6 +1453,7 @@ mod tests {
                 denominator: 1,
             },
             rupd_addrs_rew: None,
+            rupd_pulser_started: false,
             pending_avvm_return: 0,
         }
     }

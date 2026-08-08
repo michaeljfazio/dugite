@@ -608,7 +608,20 @@ impl EraRules for ConwayRules {
         // +4.887M ADA reserves excess by preview epoch 1269 and a
         // +25K-lovelace per-pool reward overshoot at every subsequent
         // boundary.
-        {
+        // #1072: Haskell's NEWEPOCH applies a reward update only when a pulser
+        // exists. `nesRu` is `SNothing` whenever no block landed strictly after
+        // this epoch's `4k/f` mark, and the `SNothing` arm is `pure es` — no
+        // deltaR, no deltaT, no rewards credited, no `ssFee` drain. dugite
+        // applied one unconditionally, which diverges permanently once it
+        // happens. See `state::reward_pulser`.
+        if !epochs.rupd_pulser_started {
+            debug!(
+                epoch = new_epoch.0,
+                "No RUPD pulser for the closed epoch (no block after 4k/f) — \
+                 applying no reward update, matching Haskell's SNothing arm"
+            );
+        }
+        if epochs.rupd_pulser_started {
             let go_ref = epochs.snapshots.go.as_ref();
             // Issue #438: RUPD uses Haskell's `prevPParams` (= the protocol
             // parameters that were active in the PREVIOUS epoch), NOT
@@ -2089,6 +2102,7 @@ fn make_empty_epoch_sub() -> EpochSubState {
             denominator: 1,
         },
         rupd_addrs_rew: None,
+        rupd_pulser_started: false,
         pending_avvm_return: 0,
     }
 }
@@ -2208,6 +2222,7 @@ mod tests {
                 denominator: 1,
             },
             rupd_addrs_rew: None,
+            rupd_pulser_started: false,
             pending_avvm_return: 0,
         }
     }
