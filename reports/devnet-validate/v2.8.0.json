@@ -1,7 +1,7 @@
 {
   "schema_version": 2,
-  "timestamp": "2026-08-07T19:50:43Z",
-  "git_rev": "c19caa86a252979808a2605db8111e8b447e97fe",
+  "timestamp": "2026-08-08T09:34:02Z",
+  "git_rev": "3548fec40bfed1a759389275d6a34262b6e93bc9",
   "release_tag": "v2.8.0",
   "preset": "standard",
   "cardano_node_version": "11.0.1",
@@ -16,22 +16,22 @@
     {
       "name": "round1",
       "pass": true,
-      "evidence_dir": "evidence-archive/auto/round1-20260807T183858Z",
+      "evidence_dir": "evidence-archive/auto/round1-20260808T081835Z",
       "duration_seconds": 120,
-      "git_rev": "c19caa86a252979808a2605db8111e8b447e97fe",
+      "git_rev": "3548fec40bfed1a759389275d6a34262b6e93bc9",
       "cardano_node_version": "11.0.1",
       "cardano_cli_version": "11.0.0.0",
       "blocks": {
-        "total_forges": 63,
-        "canonical": 63,
+        "total_forges": 46,
+        "canonical": 46,
         "orphans": 0,
         "orphan_rate": 0.0000
       },
       "tip_age": {
-        "avg_seconds": 1.44,
-        "p99_seconds": 6.00
+        "avg_seconds": 2.44,
+        "p99_seconds": 8.00
       },
-      "chain_density": 0.568,
+      "chain_density": 0.377,
       "tx_zoo": {
         "status": "ok",
         "pass": 151,
@@ -139,22 +139,22 @@
     {
       "name": "round1p",
       "pass": true,
-      "evidence_dir": "evidence-archive/auto/round1p-20260807T190946Z",
+      "evidence_dir": "evidence-archive/auto/round1p-20260808T085559Z",
       "duration_seconds": 120,
-      "git_rev": "f0023994305e23fe1aa040bc95c1ac9446894900",
+      "git_rev": "0db3ca334826eadacf24dcc77cae1b5f593e1be7",
       "cardano_node_version": "11.0.1",
       "cardano_cli_version": "11.0.0.0",
       "blocks": {
-        "total_forges": 56,
-        "canonical": 56,
+        "total_forges": 68,
+        "canonical": 68,
         "orphans": 0,
         "orphan_rate": 0.0000
       },
       "tip_age": {
-        "avg_seconds": 1.52,
-        "p99_seconds": 5.00
+        "avg_seconds": 0.88,
+        "p99_seconds": 7.00
       },
-      "chain_density": 0.471,
+      "chain_density": 0.571,
       "tx_zoo": {
         "status": "absent",
         "pass": null,
@@ -354,28 +354,28 @@
     {
       "name": "round2",
       "pass": true,
-      "evidence_dir": "evidence-archive/auto/20260807T192623Z",
+      "evidence_dir": "evidence-archive/auto/20260808T091208Z",
       "duration_seconds": 900,
-      "git_rev": "f0023994305e23fe1aa040bc95c1ac9446894900",
+      "git_rev": "0db3ca334826eadacf24dcc77cae1b5f593e1be7",
       "cardano_node_version": "11.0.1",
       "cardano_cli_version": "11.0.0.0",
       "blocks": {
-        "total_forges": 470,
-        "canonical": 470,
-        "orphans": 0,
-        "orphan_rate": 0.0000
+        "total_forges": 441,
+        "canonical": 420,
+        "orphans": 21,
+        "orphan_rate": 0.0476
       },
       "tip_age": {
-        "avg_seconds": 1.86,
+        "avg_seconds": 1.39,
         "p99_seconds": 6.00
       },
-      "chain_density": 0.520,
+      "chain_density": 0.465,
       "tx_zoo": {
         "status": "short",
-        "pass": 63,
+        "pass": 60,
         "fail": 2,
         "skip": 1,
-        "total": 66,
+        "total": 63,
         "expected": 154,
         "source": "round"
       },
@@ -389,11 +389,11 @@
       "log_errors": {
         "dugite-bp": {
           "errors": 0,
-          "warns": 7
+          "warns": 6
         },
         "dugite-relay": {
           "errors": 0,
-          "warns": 7
+          "warns": 8
         },
         "cardano-bp": {
           "errors": 0,
@@ -477,22 +477,22 @@
     {
       "name": "round3",
       "pass": true,
-      "evidence_dir": "evidence/20260807T194727Z",
+      "evidence_dir": "evidence/20260808T093157Z",
       "duration_seconds": 60,
-      "git_rev": "f0023994305e23fe1aa040bc95c1ac9446894900",
+      "git_rev": "0db3ca334826eadacf24dcc77cae1b5f593e1be7",
       "cardano_node_version": "11.0.1",
       "cardano_cli_version": "11.0.0.0",
       "blocks": {
-        "total_forges": 34,
-        "canonical": 34,
+        "total_forges": 31,
+        "canonical": 31,
         "orphans": 0,
         "orphan_rate": 0.0000
       },
       "tip_age": {
-        "avg_seconds": 0.42,
-        "p99_seconds": 1.00
+        "avg_seconds": 2.25,
+        "p99_seconds": 5.00
       },
-      "chain_density": 0.586,
+      "chain_density": 0.534,
       "tx_zoo": {
         "status": "absent",
         "pass": null,
@@ -602,8 +602,8 @@
     "pass": true,
     "rounds_pass": 4,
     "rounds_fail": 0,
-    "total_canonical_blocks": 623,
-    "total_tx_zoo_pass": 214,
+    "total_canonical_blocks": 565,
+    "total_tx_zoo_pass": 211,
     "total_tx_zoo_fail": 2,
     "invalid_forges_detected": 0,
     "critical_anomalies": 0,
@@ -611,8 +611,8 @@
   },
   "trend": {
     "baseline_tag": "v2.7.1",
-    "canonical_blocks_delta": -432,
-    "tx_zoo_pass_delta": -37,
+    "canonical_blocks_delta": -490,
+    "tx_zoo_pass_delta": -40,
     "regressions": [],
     "improvements": []
   }
