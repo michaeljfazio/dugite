@@ -474,7 +474,31 @@ it — but the differential property is what makes the change reviewable, since
 a replay that passes tells you the answers matched without telling you the
 frozen table was actually frozen.
 
-**Not attempted in v2.8.0.** It is a restructuring of a consensus-critical fold
+**Ledger half LANDED and validated.** The credential-major restructure, the
+incremental `RewardFold`, and the differential gate are in. Production runs
+THROUGH the fold with a single maximal pulse, so there is no batch path beside
+the pulse path to drift (the N-copies trap of #985/#932/#938, with a
+consensus-critical fold inside it).
+
+Live validation, devnet Round 1 against cardano-node 11.0.1:
+
+```text
+verify.sh          p1/p2/p4/p5 PASS   tip-parity 24/24 = 100%
+node logs          0 ERROR on all three nodes
+adversarial N2N    26/26          UTxO RPC   0 ERROR
+pots (tip-pinned, block 895, after a RUPD boundary)
+  treasury  10559788876077   IDENTICAL on both nodes
+  reserves  5989391426218560 IDENTICAL on both nodes
+```
+
+Two zoo scripts failed in that round (04i, 11e) and both PASSED on re-run
+against the same devnet and binary — flakes, not regressions. Verified rather
+than assumed: they had passed 151/0/154 in v2.7.1 and in this release's earlier
+gate, so a shrug was not available.
+
+**Still open in Phase 3**: per-block pulse scheduling (the fold runs at the
+boundary in one pulse, not spread across the epoch) and the `nesRu` wire arms
+that depend on it. It is a restructuring of a consensus-critical fold
 and belongs in its own release with its own gate, not appended to one that
 already carries a validated consensus fix (#1072). Everything it needs is in
 place: the freeze (Phase 1a), the measurement (Phase 0), and the wire fixtures
