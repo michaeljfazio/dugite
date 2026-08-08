@@ -121,11 +121,12 @@ fn snapshot_format_hash_stability() {
     //
     // Current: SNAPSHOT 38, extended in place. #1067 added
     // `EpochSubState.non_myopic` + `PendingRewardUpdate.non_myopic`; #1072 adds
-    // `EpochSubState.rupd_pulser_started`. Both are positional bincode
+    // `EpochSubState.rupd_pulser_started`; Phase 1a adds
+    // `EpochSubState.rupd_monetary`. All are positional bincode
     // additions, so both are layout changes — but 38 was never tagged, so they
     // ship as ONE re-sync rather than two. That invariant is enforced by
     // `xtask/tests/snapshot_one_bump_invariant.rs`, not by convention.
-    const EXPECTED_HASH: &str = "18412a2fa73784959e6e07aa6e54d0cd208a72ba7209058ac1f3f582446bddcb";
+    const EXPECTED_HASH: &str = "55e033f5fbfc9b399568358c27c4f04690cd489295fbc4ddee557f4c9c54fb80";
 
     if EXPECTED_HASH == "COMPUTE_ON_FIRST_RUN" {
         panic!(

@@ -249,6 +249,24 @@ pub struct EpochSubState {
     /// state; see `state::reward_pulser`.
     pub rupd_pulser_started: bool,
 
+    /// The monetary half of `startStep`, FROZEN at the 4k/f mark (Phase 1a).
+    ///
+    /// `deltaR1`, `deltaT1` and `_R` are computed from `casReserves`,
+    /// `prevPParams`, `ssFee` and `nesBprev` as they stood at the freeze
+    /// instant — which is what Haskell does (`PulsingReward.hs:117-141`),
+    /// rather than re-reading them at the boundary.
+    ///
+    /// The VALUES are the same either way: reserves cannot move mid-epoch (MIR
+    /// queues into `dsIRewards` and drains at the boundary; `applyRUpd` IS the
+    /// boundary), and the other three are written only by SNAP/EPOCH/NEWEPOCH.
+    /// dugite was therefore right by accident; this makes it right by
+    /// construction, and removes the unstated invariant that
+    /// `pending_avvm_return` exists to patch around.
+    ///
+    /// `None` when the epoch has not reached its mark — which is exactly when
+    /// [`Self::rupd_pulser_started`] is false, so the two move together.
+    pub rupd_monetary: Option<super::reward_pulser::MonetaryStep>,
+
     /// AVVM coin returned to reserves by `returnRedeemAddrsToReserves` at the
     /// Shelley→Allegra era boundary, captured so the SAME-boundary reward update
     /// is computed from PRE-AVVM reserves. In Haskell the reward update applied

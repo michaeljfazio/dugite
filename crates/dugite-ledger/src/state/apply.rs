@@ -530,6 +530,7 @@ impl LedgerState {
                 // The new epoch starts with none, and re-arms only when a block
                 // lands past its own 4k/f mark.
                 self.epochs.rupd_pulser_started = false;
+                self.epochs.rupd_monetary = None;
             }
         } else if self.era != Era::Byron && self.epochs.protocol_params.protocol_version_major >= 9
         {
@@ -574,6 +575,23 @@ impl LedgerState {
             if window.classify(block.slot()) != crate::state::reward_pulser::RewardTiming::TooEarly
             {
                 self.epochs.rupd_pulser_started = true;
+
+                // Phase 1a: freeze the monetary step HERE, from the state as it
+                // stands at the mark — Haskell's `startStep` reads
+                // `casReserves`/`prevPParams`/`ssFee`/`nesBprev` at this instant,
+                // not at the boundary.
+                let pp = &self.epochs.prev_protocol_params;
+                let blocks: u64 = self.epochs.snapshots.bprev_blocks_by_pool.values().sum();
+                self.epochs.rupd_monetary = Some(crate::state::reward_pulser::start_step_monetary(
+                    (pp.rho.numerator, pp.rho.denominator),
+                    (pp.tau.numerator, pp.tau.denominator),
+                    (self.epochs.prev_d.numerator, self.epochs.prev_d.denominator),
+                    pp.active_slot_coeff_rational(),
+                    self.epochs.reserves.0,
+                    self.epochs.snapshots.ss_fee.0,
+                    blocks,
+                    self.epoch_length,
+                ));
             }
         }
 

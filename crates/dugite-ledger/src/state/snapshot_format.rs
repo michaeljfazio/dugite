@@ -238,6 +238,12 @@ pub struct LedgerStateSnapshot {
     /// `rupd_addrs_rew` doc records for mainnet 337→338, but affecting whether
     /// the update happens at all rather than how it is routed.
     pub rupd_pulser_started: bool,
+
+    /// The 4k/f-frozen monetary step (Phase 1a). PERSISTED for the same reason
+    /// as `rupd_pulser_started`: a mid-epoch restart past the mark that dropped
+    /// it would re-derive the values from boundary-time state, silently
+    /// reintroducing the accidental-correctness this freeze removes.
+    pub rupd_monetary: Option<super::reward_pulser::MonetaryStep>,
     /// #736 (same class): AVVM return amount pending at the next epoch
     /// boundary (Shelley→Allegra transition). Set once at the era
     /// transition and consumed at the following boundary; a mid-epoch
@@ -353,6 +359,7 @@ impl From<&super::LedgerState> for LedgerStateSnapshot {
             // state that a restart cannot re-derive.
             rupd_addrs_rew: s.epochs.rupd_addrs_rew.as_deref().cloned(),
             rupd_pulser_started: s.epochs.rupd_pulser_started,
+            rupd_monetary: s.epochs.rupd_monetary,
             pending_avvm_return: s.epochs.pending_avvm_return,
         }
     }
@@ -436,6 +443,7 @@ impl From<LedgerStateSnapshot> for super::LedgerState {
                 // reward balances at the next pv≤6 boundary.
                 rupd_addrs_rew: s.rupd_addrs_rew.map(Arc::new),
                 rupd_pulser_started: s.rupd_pulser_started,
+                rupd_monetary: s.rupd_monetary,
                 pending_avvm_return: s.pending_avvm_return,
             },
             tip: s.tip,
@@ -552,6 +560,7 @@ mod tests {
             pool_deposits,
             rupd_addrs_rew,
             rupd_pulser_started,
+            rupd_monetary,
             pending_avvm_return,
         } = &snap;
 
@@ -616,6 +625,11 @@ mod tests {
                 .all(|l| l.0.len() == crate::state::non_myopic::SAMPLE_SIZE),
             "non_myopic.likelihoods holds a short Likelihood — a truncated \
              sequence writes fewer bytes and weakens the hash"
+        );
+        assert!(
+            rupd_monetary.is_some(),
+            "rupd_monetary is None — bincode writes nothing for a None, so the \
+             frozen MonetaryStep's layout would be invisible to the hash"
         );
         assert!(
             *rupd_pulser_started,
