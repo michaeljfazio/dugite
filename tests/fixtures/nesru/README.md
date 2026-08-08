@@ -44,9 +44,24 @@ devnet and cannot be reliably captured from it.
 
 Consequences for Phase 2:
 
-* the `Pulsing` arm needs either a network with enough stake credentials that
-  the fold spans several blocks, or a synthetic fixture built from the Haskell
-  encoder definition and **labelled as synthetic** — never presented as a
+* the `Pulsing` arm needs a network with enough ACTIVE stake credentials that
+  the fold spans several blocks. The threshold is lower than it looks —
+  **~100 credentials is enough** (measured, not guessed):
+
+  | active creds | pulseSize | pulses | ~slots to complete | Pulsing observable? |
+  |---|---|---|---|---|
+  | 5    | 1  | 5   | 10  | no — completes in the window |
+  | 100  | 1  | 100 | 200 | **yes** |
+  | 1000 | 7  | 143 | 286 | yes |
+
+  `pulseSize = max 1 (ceil(creds / 4k))` stays **1** until credentials exceed
+  `4k = 160`, so the pulse COUNT grows linearly and overruns the 80-slot window
+  long before the pulse SIZE starts absorbing it. Registering and delegating
+  ~100 stake credentials, then waiting two boundaries for them to reach the
+  `go` snapshot, makes `Pulsing` observable for most of slots 321-400.
+
+  Failing that, a synthetic fixture built from the Haskell encoder definition
+  and **labelled as synthetic** — never presented as a
   capture. Shipping a guessed encoding as though it were observed is the
   #1057 / #1067 mistake, where reading a shape off `deriving EncCBOR` produced
   a plausible wrong answer both times.
