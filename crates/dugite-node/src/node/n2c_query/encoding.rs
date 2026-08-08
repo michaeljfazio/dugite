@@ -651,40 +651,25 @@ pub(crate) fn encode_protocol_params_cbor(
         enc.map(cm_count).ok();
         if let Some(ref v1) = pp.cost_models_v1 {
             enc.u32(0).ok();
-            enc.array(v1.len() as u64).ok();
-            for cost in v1 {
-                enc.i64(*cost).ok();
-            }
+            encode_cost_model(enc, v1);
         }
         if let Some(ref v2) = pp.cost_models_v2 {
             enc.u32(1).ok();
-            enc.array(v2.len() as u64).ok();
-            for cost in v2 {
-                enc.i64(*cost).ok();
-            }
+            encode_cost_model(enc, v2);
         }
         if let Some(ref v3) = pp.cost_models_v3 {
             enc.u32(2).ok();
-            enc.array(v3.len() as u64).ok();
-            for cost in v3 {
-                enc.i64(*cost).ok();
-            }
+            encode_cost_model(enc, v3);
         }
         // PlutusV4 (Dijkstra, key 3).
         if let Some(ref v4) = pp.cost_models_v4 {
             enc.u32(3).ok();
-            enc.array(v4.len() as u64).ok();
-            for cost in v4 {
-                enc.i64(*cost).ok();
-            }
+            encode_cost_model(enc, v4);
         }
         // #770: unknown-language entries (keys ≥ 4) in ascending key order.
         for (key, costs) in &pp.cost_models_unknown {
             enc.u32(u32::from(*key)).ok();
-            enc.array(costs.len() as u64).ok();
-            for cost in costs {
-                enc.i64(*cost).ok();
-            }
+            encode_cost_model(enc, costs);
         }
     }
 
@@ -2555,6 +2540,46 @@ fn encode_debug_epoch_state(
     encode_non_myopic(enc, non_myopic);
 }
 
+/// One cost-model array, framed per Haskell `variableListLenEncoding`.
+///
+/// ```haskell
+/// lengthThreshold = 23
+/// variableListLenEncoding len contents =
+///   if len <= lengthThreshold then exactListLenEncoding len contents
+///                             else encodeListLenIndef <> contents <> encodeBreak
+/// ```
+///
+/// `EncCBOR CostModel` goes through `encodeFoldableEncoder`, so a real cost
+/// model — 166 parameters for PlutusV1, more for V2/V3 — is ALWAYS above the
+/// threshold and therefore always indefinite. dugite wrote a definite header at
+/// all five sites, so every `costModels` reply differed from cardano-node's
+/// bytes: `98 a6` where the Haskell node sends `9f … ff`.
+///
+/// #938 swept this threshold through the block and transaction encoders and
+/// missed the LSQ pparams path. It survived because both framings decode
+/// identically — cardano-cli renders the same JSON either way, so no parity
+/// suite comparing VALUES could see it. It was found by diffing raw
+/// `GetGovState` bytes between a dugite node and cardano-node 11.0.1 on the
+/// devnet, at `RatifyState → EnactState → PParams → costModels`.
+///
+/// Shared rather than inlined five times: the duplication is what let one site
+/// drift from the rest in #932/#938, and here all five were wrong together
+/// precisely because there was no single place to fix.
+fn encode_cost_model(enc: &mut minicbor::Encoder<&mut Vec<u8>>, costs: &[i64]) {
+    const LENGTH_THRESHOLD: usize = 23;
+    if costs.len() <= LENGTH_THRESHOLD {
+        enc.array(costs.len() as u64).ok();
+    } else {
+        enc.begin_array().ok();
+    }
+    for cost in costs {
+        enc.i64(*cost).ok();
+    }
+    if costs.len() > LENGTH_THRESHOLD {
+        enc.end().ok();
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn encode_debug_new_epoch_state(
     enc: &mut minicbor::Encoder<&mut Vec<u8>>,
@@ -3261,6 +3286,60 @@ pub(crate) fn strip_wrappers_for_test(cbor: &[u8]) -> Vec<u8> {
 
 #[cfg(test)]
 mod tests {
+
+    /// `costModels` arrays must be INDEFINITE, pinned to cardano-node bytes.
+    ///
+    /// Not derived from the Haskell source but OBSERVED: a live cardano-node
+    /// 11.0.1 on the devnet emits `a2 00 9f 1a 00032361 ...` for
+    /// `RatifyState -> EnactState -> PParams -> costModels`, where dugite
+    /// emitted `a2 00 98 a6 1a 00032361 ...` — `0x9f` (indefinite open)
+    /// against `0x98 a6` (definite, 166 entries).
+    ///
+    /// Both framings decode to the same list, which is why no parity suite
+    /// comparing VALUES ever caught it, and why #938's sweep of this exact
+    /// threshold could miss the LSQ path with no test going red. Only a raw
+    /// byte diff against a running Haskell node shows it.
+    #[test]
+    fn cost_model_arrays_use_the_indefinite_framing_above_23_entries() {
+        let mut buf = Vec::new();
+        let mut enc = minicbor::Encoder::new(&mut buf);
+        let costs: Vec<i64> = (0..166).collect();
+        super::encode_cost_model(&mut enc, &costs);
+        assert_eq!(
+            buf[0], 0x9f,
+            "166 entries is above lengthThreshold=23, so Haskell emits \
+             encodeListLenIndef; got {:#04x}",
+            buf[0]
+        );
+        assert_eq!(
+            *buf.last().unwrap(),
+            0xff,
+            "indefinite arrays close with a break"
+        );
+
+        // At or below the threshold the definite form is correct, and emitting
+        // the indefinite form there would be just as wrong.
+        let mut small = Vec::new();
+        let mut e2 = minicbor::Encoder::new(&mut small);
+        let short: Vec<i64> = (0..23).collect();
+        super::encode_cost_model(&mut e2, &short);
+        assert_eq!(
+            small[0], 0x97,
+            "23 entries stays definite (array(23) = 0x97)"
+        );
+        assert_ne!(
+            *small.last().unwrap(),
+            0xff,
+            "definite arrays have no break"
+        );
+
+        // The boundary itself: 24 must flip.
+        let mut b24 = Vec::new();
+        let mut e3 = minicbor::Encoder::new(&mut b24);
+        let c24: Vec<i64> = (0..24).collect();
+        super::encode_cost_model(&mut e3, &c24);
+        assert_eq!(b24[0], 0x9f, "24 entries is the first indefinite case");
+    }
     use super::*;
     use crate::node::n2c_query::types::{
         CommitteeMemberSnapshot, CommitteeSnapshot, DRepDelegationGroup, DRepKey, DRepSnapshot,
