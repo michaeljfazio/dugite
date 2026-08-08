@@ -131,6 +131,107 @@ pub fn pulse_size(num_stake_creds: u64, security_param: u64) -> u64 {
     num_stake_creds.div_ceil(denom).max(1)
 }
 
+/// The monetary half of `startStep`: everything derivable before any per-pool
+/// or per-credential work.
+///
+/// ```haskell
+/// -- PulsingReward.hs:117-141
+/// Coin reserves = acnt ^. casReservesL
+/// pr = es ^. prevPParamsEpochStateL
+/// deltaR1 = rationalToCoinViaFloor $ min 1 eta * unboundRational (pr ^. ppRhoL) * fromIntegral reserves
+/// d = unboundRational (pr ^. ppDG)
+/// expectedBlocks = floor $ (1 - d) * unboundRational (activeSlotVal asc) * fromIntegral (unEpochSize slotsPerEpoch)
+/// eta | d >= 0.8 = 1
+///     | otherwise = blocksMade % expectedBlocks
+/// Coin rPot = ssFee ss <> deltaR1
+/// deltaT1 = floor $ unboundRational (pr ^. ppTauL) * fromIntegral rPot
+/// _R = Coin $ rPot - deltaT1
+/// ```
+///
+/// Extracted so the pulser and the current single-pass path share ONE
+/// implementation. A second copy of this arithmetic is the N-copies trap that
+/// produced #985, #1015 and #977 here — the copy nobody edits is the one that
+/// goes wrong.
+///
+/// All arithmetic stays in exact `Rat`: Haskell computes these in `Rational`
+/// and floors once per stage (`rationalToCoinViaFloor`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MonetaryStep {
+    /// `deltaR1` — monetary expansion drawn from reserves.
+    pub delta_r1: u64,
+    /// `deltaT1` — the treasury cut, `floor(tau * rPot)`.
+    pub delta_t1: u64,
+    /// `_R = rPot - deltaT1`, the pot AFTER the treasury cut. Becomes
+    /// `rewardPotNM` (#1067) and the numerator of every pool's `maxPool'`.
+    pub r: u64,
+    /// `expectedBlocks`, clamped to >= 1; `0` when the `d >= 4/5` branch made
+    /// it irrelevant. Retained for diagnostics — a value of 1 means the clamp
+    /// fired, which distorts `eta`.
+    pub expected_blocks: u64,
+}
+
+/// Compute [`MonetaryStep`] from the inputs `startStep` freezes.
+///
+/// `d >= 4/5` is tested in exact rational form (`5*d_num >= 4*d_den`), matching
+/// Haskell's `d >= 0.8` on a `UnitInterval`. A float comparison here is the
+/// #629 defect.
+#[allow(clippy::too_many_arguments)]
+pub fn start_step_monetary(
+    rho: (u64, u64),
+    tau: (u64, u64),
+    d: (u64, u64),
+    active_slot_coeff: (u64, u64),
+    reserves: u64,
+    epoch_fees: u64,
+    blocks_made: u64,
+    slots_per_epoch: u64,
+) -> MonetaryStep {
+    use super::Rat;
+
+    let rho_r = Rat::from_i128(rho.0 as i128, rho.1.max(1) as i128);
+    let (d_num, d_den) = (d.0 as i128, d.1.max(1) as i128);
+
+    // Overlay gate: `d >= 4/5` <=> `5*d_num >= 4*d_den`, exact.
+    let d_ge_4_5 = 5 * d_num >= 4 * d_den;
+
+    let (expansion, expected_blocks) = if d_ge_4_5 {
+        // eta = 1: full expansion, no block-production adjustment.
+        (
+            rho_r.mul(&Rat::from_i128(reserves as i128, 1)).floor_u64(),
+            0,
+        )
+    } else {
+        let one_minus_d = Rat::from_i128(d_den - d_num, d_den);
+        let f = Rat::from_i128(
+            active_slot_coeff.0 as i128,
+            active_slot_coeff.1.max(1) as i128,
+        );
+        let slots = Rat::from_i128(slots_per_epoch as i128, 1);
+        let expected = one_minus_d.mul(&f).mul(&slots).floor_u64().max(1);
+        // Capping blocks_made at expected is equivalent to `min 1 eta`.
+        let effective = blocks_made.min(expected);
+        (
+            rho_r
+                .mul(&Rat::from_i128(reserves as i128, 1))
+                .mul(&Rat::from_i128(effective as i128, expected as i128))
+                .floor_u64(),
+            expected,
+        )
+    };
+
+    let r_pot = expansion + epoch_fees;
+    let delta_t1 = Rat::from_i128(tau.0 as i128, tau.1.max(1) as i128)
+        .mul(&Rat::from_i128(r_pot as i128, 1))
+        .floor_u64();
+
+    MonetaryStep {
+        delta_r1: expansion,
+        delta_t1,
+        r: r_pot - delta_t1,
+        expected_blocks,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -245,6 +346,74 @@ mod tests {
         let mut v = [member_lo.clone(), b.clone(), leader_hi.clone(), a.clone()];
         v.sort_by_key(|e| e.ord_key());
         assert_eq!(v[0], leader_hi, "the minimum must be the leader reward");
+    }
+
+    /// Mainnet-shaped: rho=3/1000, tau=1/5, d=0, f=1/20, epoch=432000.
+    ///
+    /// Values computed by hand from the Haskell formula rather than by running
+    /// this function — a test that re-derives its expectation from the code
+    /// under test asserts only that the code is deterministic.
+    ///
+    ///   expectedBlocks = floor(1 * 1/20 * 432000)        = 21600
+    ///   deltaR1        = floor(3/1000 * 1e15 * 21600/21600) = 3_000_000_000_000
+    ///   rPot           = deltaR1 + fees                  = 3_000_000_001_000
+    ///   deltaT1        = floor(1/5 * rPot)               =   600_000_000_200
+    ///   _R             = rPot - deltaT1                  = 2_400_000_000_800
+    #[test]
+    fn monetary_step_matches_hand_computed_haskell() {
+        let m = start_step_monetary(
+            (3, 1000),             // rho
+            (1, 5),                // tau
+            (0, 1),                // d
+            (1, 20),               // f
+            1_000_000_000_000_000, // reserves
+            1_000,                 // fees
+            21_600,                // blocks made == expected => eta = 1
+            432_000,               // slots per epoch
+        );
+        assert_eq!(m.expected_blocks, 21_600);
+        assert_eq!(m.delta_r1, 3_000_000_000_000);
+        assert_eq!(m.delta_t1, 600_000_000_200);
+        assert_eq!(m.r, 2_400_000_000_800);
+        assert_eq!(
+            m.r + m.delta_t1,
+            m.delta_r1 + 1_000,
+            "rPot must be conserved"
+        );
+    }
+
+    /// `d >= 4/5` short-circuits eta to 1 and skips the expected-blocks path.
+    /// Tested in EXACT rational form: `d = 4/5` is the boundary and must take
+    /// the overlay branch (`>=`, not `>`). A float comparison here is #629.
+    #[test]
+    fn overlay_gate_is_exact_at_four_fifths() {
+        let at = start_step_monetary((3, 1000), (1, 5), (4, 5), (1, 20), 1_000_000, 0, 0, 432_000);
+        assert_eq!(at.expected_blocks, 0, "d == 4/5 must take the eta=1 branch");
+        assert_eq!(at.delta_r1, 3_000, "full expansion, unadjusted by blocks");
+
+        // Just below the boundary: eta applies, and with 0 blocks made the
+        // expansion collapses to 0 — a materially different answer, which is
+        // what makes the exact comparison load-bearing.
+        let below = start_step_monetary(
+            (3, 1000),
+            (1, 5),
+            (79, 100),
+            (1, 20),
+            1_000_000,
+            0,
+            0,
+            432_000,
+        );
+        assert!(below.expected_blocks > 0);
+        assert_eq!(below.delta_r1, 0);
+    }
+
+    /// `expectedBlocks` is clamped to >= 1 so `eta` cannot divide by zero.
+    #[test]
+    fn expected_blocks_never_zero_on_the_eta_path() {
+        // (1 - d) * f * slots rounds to 0 for a tiny epoch.
+        let m = start_step_monetary((3, 1000), (1, 5), (0, 1), (1, 20), 1_000_000, 0, 0, 1);
+        assert_eq!(m.expected_blocks, 1);
     }
 
     #[test]
