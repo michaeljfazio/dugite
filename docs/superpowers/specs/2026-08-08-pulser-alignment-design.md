@@ -314,8 +314,26 @@ the identical trap #1067's capture had before epoch 3, and the reason
 `is_json_visible()` exists on the type: **the JSON cannot be used to decide
 whether the capture landed in the right window.** Use the CBOR.
 
-Both arms should be captured — `Pulsing` in slots ~321-335 and `Complete` after
-— since the encoder needs fixtures for each.
+**CORRECTION, measured 2026-08-08.** The prediction above — `Pulsing` in slots
+~321-335 — is WRONG. A capture at slot 324, four slots past the mark, is
+already `Complete`:
+
+```text
+slot 120  80                        SNothing
+slot 324  818201850000a00082a000    Complete   <- expected Pulsing here
+slot 353  818201850000a00082a000    Complete
+```
+
+`pulseSize = max 1 (ceil(numStakeCreds / 4k))` is 1 on the devnet and there are
+a handful of credentials, so the fold completes in a SINGLE pulse — on the first
+block past the mark. `Pulsing` exists for at most one block and cannot be pinned
+from this network.
+
+So the `Complete` arm is captured (`tests/fixtures/nesru/`) and the `Pulsing`
+arm is NOT. It needs a network with enough stake credentials for the fold to
+span blocks, or a fixture built from the Haskell encoder and labelled SYNTHETIC.
+Shipping a guessed `Pulsing` encoding as though it were observed is the
+#1057/#1067 mistake.
 
 ### Phase 3 — RUPD incremental pulsing (gated on Phase 0)
 
