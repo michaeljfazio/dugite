@@ -1,4 +1,5 @@
 use super::non_myopic::{leader_probability, Likelihood, NonMyopic};
+use super::reward_pulser::PoolRewardInfo;
 use super::{LedgerState, PendingRewardUpdate, StakeSnapshot};
 use dugite_primitives::hash::{Hash28, Hash32};
 use dugite_primitives::protocol_params::ProtocolParameters;
@@ -529,13 +530,10 @@ pub fn compute_reward_update(
     // Entry = (is_member, producing_pool_id, amount).
     let mut reward_entries: HashMap<Hash32, Vec<(bool, Hash28, u64)>> = HashMap::new();
 
-    let mut delegators_by_pool: HashMap<Hash28, Vec<Hash32>> = HashMap::new();
-    for (cred_hash, pool_id) in go.delegations.iter() {
-        delegators_by_pool
-            .entry(*pool_id)
-            .or_default()
-            .push(*cred_hash);
-    }
+    // Haskell `PoolRewardInfo`, keyed by pool: every per-pool term the
+    // credential fold reads. Built pool-major, consumed credential-major.
+    let mut pool_reward_table: HashMap<Hash28, PoolRewardInfo> =
+        HashMap::with_capacity(go.pool_stake.len());
 
     let mut owner_stake_by_pool: HashMap<Hash28, u64> = HashMap::new();
     for (pool_id, pool_reg) in go.pool_params.iter() {
@@ -655,77 +653,99 @@ pub fn compute_reward_update(
             .map(|o| o.to_hash32_padded())
             .collect();
 
-        if let Some(delegators) = delegators_by_pool.get(pool_id) {
-            for cred_hash in delegators {
-                if owner_set.contains(cred_hash) {
-                    continue;
-                }
+        // Pre-Babbage (pv<=6) leader-reward prefilter (Haskell `collectLRs`,
+        // Cardano/Ledger/Shelley/Rewards.hs): include the leader reward iff
+        // `hardforkBabbageForgoRewardPrefilter pv || isAccountRegistered op`.
+        // For pv>=7 (Babbage+, errata 17.2) the check is bypassed. A dropped
+        // leader reward is never credited → stays in the pot → undistributed →
+        // returned to reserves (matches Haskell deltaR2). Member rewards are
+        // gated independently by the per-member prefilter in the fold below.
+        let leader = if operator_reward > 0 {
+            let op_key = LedgerState::reward_account_to_hash(&pool_reg.reward_account);
+            let included = prev_protocol_version_major >= 7 || registered_at_startstep(&op_key);
+            included.then_some((op_key, operator_reward))
+        } else {
+            None
+        };
 
-                // Mirror Haskell `rewardOnePoolMember.prefilter`
-                // (eras/shelley/impl/.../Rewards.hs:262):
-                //   prefilter = hardforkBabbageForgoRewardPrefilter pv || hk ∈ addrsRew
-                //
-                // For pv ≤ 6 (Shelley-Alonzo), the member credential must be
-                // currently registered in the reward-accounts set or the
-                // computed reward is dropped at startStep time. For pv ≥ 7
-                // (Babbage onward, ledger errata 17.2) the prefilter is
-                // bypassed; routing of unregistered rewards happens at
-                // applyRUpd time (frTotalUnregistered → treasury).
-                if prev_protocol_version_major <= 6 && !registered_at_startstep(cred_hash) {
-                    continue;
-                }
+        pool_reward_table.insert(
+            *pool_id,
+            PoolRewardInfo {
+                pool_id: *pool_id,
+                pool_active_stake: pool_active_stake.0,
+                pool_reward,
+                cost,
+                margin_num,
+                margin_den,
+                owner_set,
+                leader,
+            },
+        );
+    }
 
-                let member_stake = go
-                    .stake_distribution
-                    .get(cred_hash)
-                    .copied()
-                    .unwrap_or(Lovelace(0))
-                    .0;
-
-                if member_stake == 0 || pool_active_stake.0 == 0 {
-                    continue;
-                }
-
-                let member_share = if pool_reward <= cost {
-                    0u64
-                } else {
-                    let remainder = pool_reward - cost;
-                    let one_minus_margin = Rat::from_i128(margin_den - margin_num, margin_den);
-                    let member_frac =
-                        Rat::from_i128(member_stake as i128, pool_active_stake.0 as i128);
-                    Rat::from_i128(remainder as i128, 1)
-                        .mul(&one_minus_margin)
-                        .mul(&member_frac)
-                        .floor_u64()
-                };
-
-                if member_share > 0 {
-                    reward_entries.entry(*cred_hash).or_default().push((
-                        true,
-                        *pool_id,
-                        member_share,
-                    ));
-                }
-            }
+    // ---- the CREDENTIAL-MAJOR member fold ---------------------------------
+    //
+    // Haskell folds `rewardOnePoolMember` over `Credential 'Staking`, which is
+    // why the captured pulser's work queue is a set of credentials rather than
+    // of pools (`tests/fixtures/nesru/pulsing.hex`). dugite folded pool-major
+    // with an inner delegator loop; that produces identical output — the
+    // aggregation below sorts, so entry order is unobservable — but it cannot
+    // be chunked to match upstream's pulse, because a single pool can hold
+    // hundreds of thousands of delegators.
+    //
+    // Every per-pool term is now read from the frozen `PoolRewardInfo` table
+    // through `&self`, so the classic incremental-fold hazard — a per-pool
+    // quantity silently recomputed per credential against state that has moved
+    // on — is not expressible here.
+    for (cred_hash, pool_id) in go.delegations.iter() {
+        let Some(info) = pool_reward_table.get(pool_id) else {
+            continue;
+        };
+        if info.owner_set.contains(cred_hash) {
+            continue;
         }
 
-        if operator_reward > 0 {
-            let op_key = LedgerState::reward_account_to_hash(&pool_reg.reward_account);
-            // Pre-Babbage (pv<=6) leader-reward prefilter (Haskell `collectLRs`,
-            // Cardano/Ledger/Shelley/Rewards.hs): include the leader reward iff
-            // `hardforkBabbageForgoRewardPrefilter pv || isAccountRegistered op`.
-            // For pv>=7 (Babbage+, errata 17.2) the check is bypassed. A dropped
-            // leader reward is never credited → stays in the pot → undistributed →
-            // returned to reserves (matches Haskell deltaR2). Member rewards are
-            // gated independently by the per-member prefilter above.
-            let leader_included =
-                prev_protocol_version_major >= 7 || registered_at_startstep(&op_key);
-            if leader_included {
-                reward_entries
-                    .entry(op_key)
-                    .or_default()
-                    .push((false, *pool_id, operator_reward));
-            }
+        // Mirror Haskell `rewardOnePoolMember.prefilter`
+        // (eras/shelley/impl/.../Rewards.hs:262):
+        //   prefilter = hardforkBabbageForgoRewardPrefilter pv || hk ∈ addrsRew
+        //
+        // For pv ≤ 6 (Shelley-Alonzo), the member credential must be currently
+        // registered in the reward-accounts set or the computed reward is
+        // dropped at startStep time. For pv ≥ 7 (Babbage onward, ledger errata
+        // 17.2) the prefilter is bypassed; routing of unregistered rewards
+        // happens at applyRUpd time (frTotalUnregistered → treasury).
+        if prev_protocol_version_major <= 6 && !registered_at_startstep(cred_hash) {
+            continue;
+        }
+
+        let member_stake = go
+            .stake_distribution
+            .get(cred_hash)
+            .copied()
+            .unwrap_or(Lovelace(0))
+            .0;
+
+        let member_share = info.member_reward(member_stake);
+        if member_share > 0 {
+            reward_entries
+                .entry(*cred_hash)
+                .or_default()
+                .push((true, *pool_id, member_share));
+        }
+    }
+
+    // ---- leader rewards ---------------------------------------------------
+    //
+    // Separate from the member fold, exactly as upstream keeps `collectLRs`
+    // separate from `rewardOnePoolMember`: a leader reward is a property of the
+    // pool, not of a delegating credential, and an operator who also delegates
+    // must not be paid twice.
+    for info in pool_reward_table.values() {
+        if let Some((op_key, amount)) = info.leader {
+            reward_entries
+                .entry(op_key)
+                .or_default()
+                .push((false, info.pool_id, amount));
         }
     }
 
