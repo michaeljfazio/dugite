@@ -275,6 +275,48 @@ hardcoding by accident, the identical trap #1067's capture had before epoch 3.
 
 Closes #1071 and #1072; removes the `09w-ledger-state` exclusion.
 
+### Phase 2 — status and the exact next step
+
+**Landed**: `PulsingRewUpdate { Pulsing(RewardSnapShot) | Complete(RewardSnapShot) }`
+with `Option::None` for `SNothing` — a three-state space where #1072 shipped a
+bool. Closes F5's representation gap. Tests pin that BOTH constructors apply at
+the boundary (only `None` does not), that `complete` is idempotent and
+preserves the freeze, and that `Pulsing` is JSON-invisible.
+
+**Not landed**: the swap of `rupd_pulser_started`/`rupd_monetary` for
+`Option<PulsingRewUpdate>`, and the `nesRu` wire arms.
+
+**The next increment is blocked on a capture, not on code.** The wire shape is
+
+```text
+SNothing              -> array(0)                          (dugite emits this today)
+SJust (Pulsing s p)   -> array(1)[ array(3)[0, s, p] ]
+SJust (Complete r)    -> array(1)[ array(2)[1, r] ]
+```
+
+and it must be PINNED to cardano-node bytes rather than derived from the
+Haskell types — the `SnapShot` record (#1057) and `NonMyopic` (#1067) both
+proved that reading a shape off `deriving EncCBOR` produces a plausible wrong
+answer. `RewardSnapShot` alone has eight fields including a `NonMyopic` and a
+`Map (Credential Staking) (Set Reward)`; guessing its framing is not an option.
+
+**Capture procedure**, and the trap it must avoid:
+
+1. Bring up the devnet; wait for an epoch to pass slot `first + 4k/f` (320).
+2. Wait a further ~15-20 slots for the pulser to COMPLETE (`pulseSize = 1` with
+   few credentials), i.e. sample around slots 340-395 of the epoch.
+3. Capture `NewEpochState[4]` from cardano-node's socket.
+
+Capturing OUTSIDE that window yields `array(0)` for `SNothing` — or, between
+320 and ~335, a `Pulsing` whose JSON is `null` and which is easy to mistake for
+`SNothing`. Either would "confirm" the current hardcoding by accident. This is
+the identical trap #1067's capture had before epoch 3, and the reason
+`is_json_visible()` exists on the type: **the JSON cannot be used to decide
+whether the capture landed in the right window.** Use the CBOR.
+
+Both arms should be captured — `Pulsing` in slots ~321-335 and `Complete` after
+— since the encoder needs fixtures for each.
+
 ### Phase 3 — RUPD incremental pulsing (gated on Phase 0)
 
 `pulse_size = max(1, ceil(num_stake_creds / (4k)))`; `done` when the balance map
