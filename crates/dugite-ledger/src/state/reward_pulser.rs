@@ -37,7 +37,11 @@
 //! boundary-time read produced the same numbers — it was right by accident,
 //! and this module makes it right by construction.
 
+use dugite_primitives::hash::{Hash28, Hash32};
 use dugite_primitives::time::SlotNo;
+use dugite_primitives::value::Lovelace;
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 
 /// Haskell's "Goldilocks labeling of when to do the reward calculation".
 ///
@@ -200,6 +204,49 @@ mod tests {
         );
     }
 
+    /// Haskell picks a PV<3 credential's single reward with
+    /// `Set.deleteFindMin` over `Ord Reward` (`Rewards.hs:176-181`):
+    /// LeaderReward sorts before MemberReward, then ascending pool id.
+    ///
+    /// dugite stores entries in a `Vec`, so the ORDER must be reproduced
+    /// explicitly. Getting it wrong pays the wrong reward to any credential
+    /// earning from more than one source — a mainnet Shelley-era divergence,
+    /// silent because both choices are plausible amounts.
+    #[test]
+    fn reward_entry_ord_is_leader_first_then_pool_id() {
+        let p = |b: u8| Hash28::from_bytes([b; 28]);
+        let leader_hi = RewardEntry {
+            is_member: false,
+            pool_id: p(0xFF),
+            amount: 1,
+        };
+        let member_lo = RewardEntry {
+            is_member: true,
+            pool_id: p(0x00),
+            amount: 999,
+        };
+        // Leader wins even with the LARGER pool id and a smaller amount:
+        // the discriminator dominates, and amount is not part of the key.
+        assert!(leader_hi.ord_key() < member_lo.ord_key());
+
+        let a = RewardEntry {
+            is_member: true,
+            pool_id: p(0x01),
+            amount: 5,
+        };
+        let b = RewardEntry {
+            is_member: true,
+            pool_id: p(0x02),
+            amount: 5,
+        };
+        assert!(a.ord_key() < b.ord_key(), "ties break on ASCENDING pool id");
+
+        // `deleteFindMin` semantics over a mixed set.
+        let mut v = [member_lo.clone(), b.clone(), leader_hi.clone(), a.clone()];
+        v.sort_by_key(|e| e.ord_key());
+        assert_eq!(v[0], leader_hi, "the minimum must be the leader reward");
+    }
+
     #[test]
     fn pulse_size_is_creds_over_4k_never_zero() {
         // mainnet-ish: 1.3M creds, k=2160 => 4k = 8640 => ceil(1_300_000/8640) = 151
@@ -212,4 +259,85 @@ mod tests {
         assert_eq!(pulse_size(8640, 2160), 1);
         assert_eq!(pulse_size(8641, 2160), 2);
     }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Phase 1(a): the frozen inputs
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// One entry of Haskell's `Map (Credential Staking) (Set Reward)`.
+///
+/// dugite keeps rewards UNAGGREGATED until `filterRewards` runs, because at
+/// PV<3 a credential earning from several sources is paid only ONE reward,
+/// selected by `Set.deleteFindMin` — Ord on `Reward`, which orders
+/// `LeaderReward` before `MemberReward` and then by ascending pool id
+/// (`Rewards.hs:176-181`). A plain `u64` total cannot express that choice.
+///
+/// This mirrors the tuple the existing reward loop already builds, so the
+/// established `filterRewards` implementation keeps working unchanged.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RewardEntry {
+    /// `false` = LeaderReward, `true` = MemberReward. Named for the Ord.
+    pub is_member: bool,
+    pub pool_id: Hash28,
+    pub amount: u64,
+}
+
+impl RewardEntry {
+    /// Haskell's `Ord Reward` key: leader before member, then pool id.
+    ///
+    /// `Set.deleteFindMin` picks the minimum under exactly this order, so any
+    /// container dugite uses must reproduce it or the mainnet Shelley-era
+    /// replay diverges on which reward a multi-source credential is paid.
+    pub fn ord_key(&self) -> (bool, Hash28) {
+        (self.is_member, self.pool_id)
+    }
+}
+
+/// Haskell `FreeVars` — the per-pool data the member-reward fold closes over.
+///
+/// ```haskell
+/// data FreeVars = FreeVars
+///   { fvAddrsRew :: !(Set (Credential Staking))
+///   , fvTotalStake :: !Coin
+///   , fvProtVer :: !ProtVer
+///   , fvPoolRewardInfo :: !(VMap VB VB (KeyHash StakePool) PoolRewardInfo) }
+/// ```
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct FreeVars {
+    /// `fvAddrsRew`. `None` above PV6, where the prefilter short-circuits
+    /// (`Rewards.hs:315`) — capturing ~1.3M mainnet credentials into persisted
+    /// state for a set nothing reads would be pure cost.
+    pub addrs_rew: Option<std::collections::HashSet<Hash32>>,
+    /// `fvTotalStake` = `circulation es maxSupply` = `maxSupply - reserves`,
+    /// read at the FREEZE instant, not at the boundary.
+    pub total_stake: u64,
+    pub prot_ver: u64,
+}
+
+/// Haskell `RewardSnapShot` — everything `startStep` freezes, so the boundary
+/// only has to finish the fold.
+///
+/// ```haskell
+/// data RewardSnapShot = RewardSnapShot
+///   { rewFees, rewProtocolVersion, rewNonMyopic, rewDeltaR1, rewR, rewDeltaT1
+///   , rewLikelihoods :: !(VMap VB VB (KeyHash StakePool) Likelihood)
+///   , rewLeaders     :: !(Map (Credential Staking) (Set Reward)) }
+/// ```
+///
+/// `rewR` is `_R = rPot - deltaT1`, the pot AFTER the treasury cut — the same
+/// value that becomes `rewardPotNM` (#1067).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct RewardSnapShot {
+    pub fees: Lovelace,
+    pub protocol_version: u64,
+    pub non_myopic: super::non_myopic::NonMyopic,
+    pub delta_r1: Lovelace,
+    pub r: Lovelace,
+    pub delta_t1: Lovelace,
+    pub likelihoods: HashMap<Hash28, super::non_myopic::Likelihood>,
+    /// `rewLeaders` — leader rewards, computed at the freeze and merged with
+    /// the member fold by `completeRupd`.
+    pub leaders: HashMap<Hash32, Vec<RewardEntry>>,
+    pub free_vars: FreeVars,
 }
