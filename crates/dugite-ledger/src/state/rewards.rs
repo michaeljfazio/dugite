@@ -173,6 +173,186 @@ fn build_new_likelihoods(
         .collect()
 }
 
+/// Haskell `mkPoolRewardInfo` over every pool in the GO snapshot.
+///
+/// Split out of `compute_reward_update` so it can run at the 4k/f MARK
+/// rather than only at the boundary. Per-block pulsing needs the per-pool
+/// terms to exist before the first pulse — the credential fold reads them —
+/// and they are all derived from inputs `startStep` has already frozen, so
+/// building them early is a relocation, not a semantic change.
+///
+/// Returns the table keyed by pool. Pools that minted no block, or whose
+/// pledge is unmet, or whose reward rounds to zero, are ABSENT — the fold
+/// then skips their delegators by lookup miss, exactly as the pool-major
+/// loop skipped them by `continue`.
+#[allow(clippy::too_many_arguments)]
+fn build_pool_reward_table(
+    go: &StakeSnapshot,
+    bprev_blocks_by_pool: &HashMap<Hash28, u64>,
+    pp: &ProtocolParameters,
+    n_opt: u64,
+    reward_pot: u64,
+    total_stake: u64,
+    total_active_stake: u64,
+    total_blocks_in_epoch: u64,
+    d_ge_4_5: bool,
+    d_num: i128,
+    d_den: i128,
+    prev_protocol_version_major: u64,
+    registered_at_startstep: &dyn Fn(&Hash32) -> bool,
+) -> HashMap<Hash28, PoolRewardInfo> {
+    let mut pool_reward_table: HashMap<Hash28, PoolRewardInfo> =
+        HashMap::with_capacity(go.pool_stake.len());
+    let mut owner_stake_by_pool: HashMap<Hash28, u64> = HashMap::new();
+    for (pool_id, pool_reg) in go.pool_params.iter() {
+        let mut owner_stake = 0u64;
+        for owner in &pool_reg.owners {
+            let owner_key = owner.to_hash32_padded();
+            if go.delegations.get(&owner_key) == Some(pool_id) {
+                owner_stake += go
+                    .stake_distribution
+                    .get(&owner_key)
+                    .map(|l| l.0)
+                    .unwrap_or(0);
+            }
+        }
+        owner_stake_by_pool.insert(*pool_id, owner_stake);
+    }
+
+    for (pool_id, pool_active_stake) in &go.pool_stake {
+        if bprev_blocks_by_pool.get(pool_id).copied().unwrap_or(0) == 0 {
+            continue;
+        }
+
+        let pool_reg = match go.pool_params.get(pool_id) {
+            Some(reg) => reg,
+            None => continue,
+        };
+
+        // NOTE: the pre-Babbage (pv<=6) reward-account registration prefilter
+        // gates ONLY the LEADER (operator) reward, NOT the whole pool. Haskell
+        // `collectLRs` (Cardano/Ledger/Shelley/Rewards.hs): the leader reward is
+        // included iff `hardforkBabbageForgoRewardPrefilter pv || isAccountRegistered
+        // account accounts`; member rewards are gated separately by their own
+        // per-member prefilter (`hk ∈ addrsRew`) in `rewardOnePoolMember`. A
+        // previous whole-pool `continue` here dropped the MEMBER rewards too,
+        // under-distributing them back into reserves (mainnet ep213: 4 pools with
+        // unregistered operators but registered members → +180,457,654,009 lovelace
+        // reserves divergence, cross-checked byte-exact vs Koios). The leader gate
+        // now lives at the operator-credit site below.
+        let self_delegated = owner_stake_by_pool.get(pool_id).copied().unwrap_or(0);
+        if self_delegated < pool_reg.pledge.0 {
+            debug!(
+                "Pool {} pledge not met: {} < {}",
+                pool_id.to_hex(),
+                self_delegated,
+                pool_reg.pledge.0
+            );
+            continue;
+        }
+
+        let a0_r = Rat::from_i128(pp.a0.numerator as i128, pp.a0.denominator.max(1) as i128);
+        let z0 = Rat::from_i128(1, n_opt as i128);
+        let sigma_raw = Rat::from_i128(pool_active_stake.0 as i128, total_stake as i128);
+        let p_raw = Rat::from_i128(pool_reg.pledge.0 as i128, total_stake as i128);
+        let sigma = sigma_raw.min_rat(&z0);
+        let p = p_raw.min_rat(&z0);
+
+        let f4 = z0.sub(&sigma).div(&z0);
+        let f3 = sigma.sub(&p.mul(&f4)).div(&z0);
+        let f2 = sigma.add(&p.mul(&a0_r).mul(&f3));
+        let f1 = Rat::from_i128(reward_pot as i128, 1).div(&Rat::from_i128(1, 1).add(&a0_r));
+        let max_pool = f1.mul(&f2).floor_u64();
+
+        let blocks_made = bprev_blocks_by_pool.get(pool_id).copied().unwrap_or(0);
+        debug!(
+            pool = ?pool_id.as_bytes()[..4],
+            blocks_made,
+            max_pool,
+            pool_stake = pool_active_stake.0,
+            total_stake,
+            total_active_stake,
+            total_blocks = total_blocks_in_epoch,
+            reward_pot,
+            self_delegated,
+            pledge = pool_reg.pledge.0,
+            n_opt,
+            d_num = d_num as i64,
+            d_den = d_den as i64,
+            "Per-pool reward input"
+        );
+
+        let pool_reward = if pool_active_stake.0 == 0 {
+            0u64
+        } else if d_ge_4_5 {
+            max_pool
+        } else if blocks_made == 0 {
+            0u64
+        } else {
+            let perf = Rat::from_i128(blocks_made as i128, total_blocks_in_epoch as i128).mul(
+                &Rat::from_i128(total_active_stake as i128, pool_active_stake.0 as i128),
+            );
+            perf.mul(&Rat::from_i128(max_pool as i128, 1)).floor_u64()
+        };
+
+        if pool_reward == 0 {
+            continue;
+        }
+
+        let cost = pool_reg.cost.0;
+        let margin_num = pool_reg.margin_numerator as i128;
+        let margin_den = pool_reg.margin_denominator.max(1) as i128;
+
+        let operator_reward = if pool_reward <= cost {
+            pool_reward
+        } else {
+            let remainder = pool_reward - cost;
+            let margin = Rat::from_i128(margin_num, margin_den);
+            let one_minus_margin = Rat::from_i128(margin_den - margin_num, margin_den);
+            let s_over_sigma = Rat::from_i128(self_delegated as i128, pool_active_stake.0 as i128);
+            let share = margin.add(&one_minus_margin.mul(&s_over_sigma));
+            let op_extra = share.mul(&Rat::from_i128(remainder as i128, 1)).floor_u64();
+            cost + op_extra
+        };
+
+        let owner_set: std::collections::HashSet<Hash32> = pool_reg
+            .owners
+            .iter()
+            .map(|o| o.to_hash32_padded())
+            .collect();
+
+        // Pre-Babbage (pv<=6) leader-reward prefilter (Haskell `collectLRs`,
+        // Cardano/Ledger/Shelley/Rewards.hs): include the leader reward iff
+        // `hardforkBabbageForgoRewardPrefilter pv || isAccountRegistered op`.
+        // For pv>=7 (Babbage+, errata 17.2) the check is bypassed. A dropped
+        // leader reward is never credited → stays in the pot → undistributed →
+        // returned to reserves (matches Haskell deltaR2). Member rewards are
+        // gated independently by the per-member prefilter in the fold below.
+        let leader = if operator_reward > 0 {
+            let op_key = LedgerState::reward_account_to_hash(&pool_reg.reward_account);
+            let included = prev_protocol_version_major >= 7 || registered_at_startstep(&op_key);
+            included.then_some((op_key, operator_reward))
+        } else {
+            None
+        };
+
+        pool_reward_table.insert(
+            *pool_id,
+            PoolRewardInfo {
+                pool_id: *pool_id,
+                pool_active_stake: pool_active_stake.0,
+                pool_reward,
+                cost,
+                margin_num,
+                margin_den,
+                owner_set,
+                leader,
+            },
+        );
+    }
+    pool_reward_table
+}
+
 /// Compute a reward update from explicit parameters, without requiring a `LedgerState`.
 ///
 /// This is the standalone version of the reward calculation that was previously
@@ -550,156 +730,22 @@ pub fn compute_reward_update(
 
     // Haskell `PoolRewardInfo`, keyed by pool: every per-pool term the
     // credential fold reads. Built pool-major, consumed credential-major.
-    let mut pool_reward_table: HashMap<Hash28, PoolRewardInfo> =
-        HashMap::with_capacity(go.pool_stake.len());
 
-    let mut owner_stake_by_pool: HashMap<Hash28, u64> = HashMap::new();
-    for (pool_id, pool_reg) in go.pool_params.iter() {
-        let mut owner_stake = 0u64;
-        for owner in &pool_reg.owners {
-            let owner_key = owner.to_hash32_padded();
-            if go.delegations.get(&owner_key) == Some(pool_id) {
-                owner_stake += go
-                    .stake_distribution
-                    .get(&owner_key)
-                    .map(|l| l.0)
-                    .unwrap_or(0);
-            }
-        }
-        owner_stake_by_pool.insert(*pool_id, owner_stake);
-    }
-
-    for (pool_id, pool_active_stake) in &go.pool_stake {
-        if bprev_blocks_by_pool.get(pool_id).copied().unwrap_or(0) == 0 {
-            continue;
-        }
-
-        let pool_reg = match go.pool_params.get(pool_id) {
-            Some(reg) => reg,
-            None => continue,
-        };
-
-        // NOTE: the pre-Babbage (pv<=6) reward-account registration prefilter
-        // gates ONLY the LEADER (operator) reward, NOT the whole pool. Haskell
-        // `collectLRs` (Cardano/Ledger/Shelley/Rewards.hs): the leader reward is
-        // included iff `hardforkBabbageForgoRewardPrefilter pv || isAccountRegistered
-        // account accounts`; member rewards are gated separately by their own
-        // per-member prefilter (`hk ∈ addrsRew`) in `rewardOnePoolMember`. A
-        // previous whole-pool `continue` here dropped the MEMBER rewards too,
-        // under-distributing them back into reserves (mainnet ep213: 4 pools with
-        // unregistered operators but registered members → +180,457,654,009 lovelace
-        // reserves divergence, cross-checked byte-exact vs Koios). The leader gate
-        // now lives at the operator-credit site below.
-        let self_delegated = owner_stake_by_pool.get(pool_id).copied().unwrap_or(0);
-        if self_delegated < pool_reg.pledge.0 {
-            debug!(
-                "Pool {} pledge not met: {} < {}",
-                pool_id.to_hex(),
-                self_delegated,
-                pool_reg.pledge.0
-            );
-            continue;
-        }
-
-        let a0_r = Rat::from_i128(pp.a0.numerator as i128, pp.a0.denominator.max(1) as i128);
-        let z0 = Rat::from_i128(1, n_opt as i128);
-        let sigma_raw = Rat::from_i128(pool_active_stake.0 as i128, total_stake as i128);
-        let p_raw = Rat::from_i128(pool_reg.pledge.0 as i128, total_stake as i128);
-        let sigma = sigma_raw.min_rat(&z0);
-        let p = p_raw.min_rat(&z0);
-
-        let f4 = z0.sub(&sigma).div(&z0);
-        let f3 = sigma.sub(&p.mul(&f4)).div(&z0);
-        let f2 = sigma.add(&p.mul(&a0_r).mul(&f3));
-        let f1 = Rat::from_i128(reward_pot as i128, 1).div(&Rat::from_i128(1, 1).add(&a0_r));
-        let max_pool = f1.mul(&f2).floor_u64();
-
-        let blocks_made = bprev_blocks_by_pool.get(pool_id).copied().unwrap_or(0);
-        debug!(
-            pool = ?pool_id.as_bytes()[..4],
-            blocks_made,
-            max_pool,
-            pool_stake = pool_active_stake.0,
-            total_stake,
-            total_active_stake,
-            total_blocks = total_blocks_in_epoch,
-            reward_pot,
-            self_delegated,
-            pledge = pool_reg.pledge.0,
-            n_opt,
-            d_num = d_num as i64,
-            d_den = d_den as i64,
-            "Per-pool reward input"
-        );
-
-        let pool_reward = if pool_active_stake.0 == 0 {
-            0u64
-        } else if d_ge_4_5 {
-            max_pool
-        } else if blocks_made == 0 {
-            0u64
-        } else {
-            let perf = Rat::from_i128(blocks_made as i128, total_blocks_in_epoch as i128).mul(
-                &Rat::from_i128(total_active_stake as i128, pool_active_stake.0 as i128),
-            );
-            perf.mul(&Rat::from_i128(max_pool as i128, 1)).floor_u64()
-        };
-
-        if pool_reward == 0 {
-            continue;
-        }
-
-        let cost = pool_reg.cost.0;
-        let margin_num = pool_reg.margin_numerator as i128;
-        let margin_den = pool_reg.margin_denominator.max(1) as i128;
-
-        let operator_reward = if pool_reward <= cost {
-            pool_reward
-        } else {
-            let remainder = pool_reward - cost;
-            let margin = Rat::from_i128(margin_num, margin_den);
-            let one_minus_margin = Rat::from_i128(margin_den - margin_num, margin_den);
-            let s_over_sigma = Rat::from_i128(self_delegated as i128, pool_active_stake.0 as i128);
-            let share = margin.add(&one_minus_margin.mul(&s_over_sigma));
-            let op_extra = share.mul(&Rat::from_i128(remainder as i128, 1)).floor_u64();
-            cost + op_extra
-        };
-
-        let owner_set: std::collections::HashSet<Hash32> = pool_reg
-            .owners
-            .iter()
-            .map(|o| o.to_hash32_padded())
-            .collect();
-
-        // Pre-Babbage (pv<=6) leader-reward prefilter (Haskell `collectLRs`,
-        // Cardano/Ledger/Shelley/Rewards.hs): include the leader reward iff
-        // `hardforkBabbageForgoRewardPrefilter pv || isAccountRegistered op`.
-        // For pv>=7 (Babbage+, errata 17.2) the check is bypassed. A dropped
-        // leader reward is never credited → stays in the pot → undistributed →
-        // returned to reserves (matches Haskell deltaR2). Member rewards are
-        // gated independently by the per-member prefilter in the fold below.
-        let leader = if operator_reward > 0 {
-            let op_key = LedgerState::reward_account_to_hash(&pool_reg.reward_account);
-            let included = prev_protocol_version_major >= 7 || registered_at_startstep(&op_key);
-            included.then_some((op_key, operator_reward))
-        } else {
-            None
-        };
-
-        pool_reward_table.insert(
-            *pool_id,
-            PoolRewardInfo {
-                pool_id: *pool_id,
-                pool_active_stake: pool_active_stake.0,
-                pool_reward,
-                cost,
-                margin_num,
-                margin_den,
-                owner_set,
-                leader,
-            },
-        );
-    }
+    let pool_reward_table = build_pool_reward_table(
+        go,
+        bprev_blocks_by_pool,
+        pp,
+        n_opt,
+        reward_pot,
+        total_stake,
+        total_active_stake,
+        total_blocks_in_epoch,
+        d_ge_4_5,
+        d_num,
+        d_den,
+        prev_protocol_version_major,
+        &registered_at_startstep,
+    );
 
     // ---- the CREDENTIAL-MAJOR member fold ---------------------------------
     //
