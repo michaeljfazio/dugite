@@ -80,7 +80,12 @@ impl LedgerState {
         // treasury cut (tau × expansion) moves reserves → treasury.  No individual
         // rewards are distributed (no pools).  We must replicate this — skipping it
         // creates a permanent reserves/treasury offset.
-        {
+        // #1072: gated on a pulser existing, exactly as the production era
+        // paths are. This helper is `#[doc(hidden)]` and test-only, but leaving
+        // it ungated is the #977 / #1015 trap verbatim — the third copy is the
+        // one every unit test drives, so a test written against it would go
+        // green on always-apply semantics while production correctly skips.
+        if self.epochs.rupd_pulser_started {
             // Haskell's startStep uses THREE separate data sources:
             //   1. ssStakeGo: stake/pool/delegation data (2 epochs ago)
             //   2. nesBprev (BlocksMade): block production from previous epoch
@@ -1040,6 +1045,10 @@ mod tests {
         st.consensus.last_epoch_block_nonce = Hash32::from_bytes([0xEF; 32]);
         st.consensus.previous_epoch_nonce = Hash32::ZERO;
 
+        // #1072: these tests assert a reward update IS applied, so they must
+        // declare the precondition — a block landed past `epoch_first + 4k/f`.
+        // Haskell's SNothing arm would otherwise correctly apply nothing.
+        st.epochs.rupd_pulser_started = true;
         st.process_epoch_transition(EpochNo(st.epoch.0 + 1));
 
         assert_eq!(
@@ -1053,6 +1062,10 @@ mod tests {
 
         // A second transition moves it again, to whatever epoch_nonce just was.
         let second_old = st.consensus.epoch_nonce;
+        // #1072: these tests assert a reward update IS applied, so they must
+        // declare the precondition — a block landed past `epoch_first + 4k/f`.
+        // Haskell's SNothing arm would otherwise correctly apply nothing.
+        st.epochs.rupd_pulser_started = true;
         st.process_epoch_transition(EpochNo(st.epoch.0 + 1));
         assert_eq!(
             st.consensus.previous_epoch_nonce, second_old,
@@ -1091,6 +1104,10 @@ mod tests {
         state.epochs.snapshots.set = Some(StakeSnapshot::empty(EpochNo(20)));
         state.epochs.snapshots.go = Some(StakeSnapshot::empty(EpochNo(30)));
 
+        // #1072: these tests assert a reward update IS applied, so they must
+        // declare the precondition — a block landed past `epoch_first + 4k/f`.
+        // Haskell's SNothing arm would otherwise correctly apply nothing.
+        state.epochs.rupd_pulser_started = true;
         state.process_epoch_transition(EpochNo(1));
 
         // go ← old set (epoch 20), set ← old mark (epoch 10), new mark created.
@@ -1128,6 +1145,10 @@ mod tests {
         state.utxo.pending_donations = donation;
 
         let treasury_before = state.epochs.treasury;
+        // #1072: these tests assert a reward update IS applied, so they must
+        // declare the precondition — a block landed past `epoch_first + 4k/f`.
+        // Haskell's SNothing arm would otherwise correctly apply nothing.
+        state.epochs.rupd_pulser_started = true;
         state.process_epoch_transition(EpochNo(1));
 
         // Treasury must have grown by at least the donation amount.
@@ -1246,6 +1267,10 @@ mod tests {
 
         let before = *state.certs.reward_accounts.get(&delegator_hash).unwrap();
 
+        // #1072: these tests assert a reward update IS applied, so they must
+        // declare the precondition — a block landed past `epoch_first + 4k/f`.
+        // Haskell's SNothing arm would otherwise correctly apply nothing.
+        state.epochs.rupd_pulser_started = true;
         state.process_epoch_transition(EpochNo(1));
 
         let after = state
@@ -1295,6 +1320,10 @@ mod tests {
         gov_state.committee_hot_keys.insert(cold_a, hot_a);
         gov_state.committee_hot_keys.insert(cold_b, hot_b);
 
+        // #1072: these tests assert a reward update IS applied, so they must
+        // declare the precondition — a block landed past `epoch_first + 4k/f`.
+        // Haskell's SNothing arm would otherwise correctly apply nothing.
+        state.epochs.rupd_pulser_started = true;
         state.process_epoch_transition(EpochNo(1));
 
         let g = &state.gov.governance;
@@ -1321,6 +1350,10 @@ mod tests {
         let captured_fees = Lovelace(5_000_000);
         state.utxo.epoch_fees = captured_fees;
 
+        // #1072: these tests assert a reward update IS applied, so they must
+        // declare the precondition — a block landed past `epoch_first + 4k/f`.
+        // Haskell's SNothing arm would otherwise correctly apply nothing.
+        state.epochs.rupd_pulser_started = true;
         state.process_epoch_transition(EpochNo(1));
 
         assert_eq!(
@@ -1361,6 +1394,10 @@ mod tests {
         let treasury_before = state.epochs.treasury;
         let reserves_before = state.epochs.reserves;
 
+        // #1072: these tests assert a reward update IS applied, so they must
+        // declare the precondition — a block landed past `epoch_first + 4k/f`.
+        // Haskell's SNothing arm would otherwise correctly apply nothing.
+        state.epochs.rupd_pulser_started = true;
         state.process_epoch_transition(EpochNo(1));
 
         assert_eq!(
@@ -1451,6 +1488,10 @@ mod tests {
 
         let treasury_before = state.epochs.treasury;
 
+        // #1072: these tests assert a reward update IS applied, so they must
+        // declare the precondition — a block landed past `epoch_first + 4k/f`.
+        // Haskell's SNothing arm would otherwise correctly apply nothing.
+        state.epochs.rupd_pulser_started = true;
         state.process_epoch_transition(EpochNo(1));
 
         // Treasury must have grown beyond just the monetary expansion (there should
@@ -1500,6 +1541,10 @@ mod tests {
         assert!(state.certs.pending_retirements.contains_key(&pool_id));
 
         // Transition to epoch 3: pool should be retired.
+        // #1072: these tests assert a reward update IS applied, so they must
+        // declare the precondition — a block landed past `epoch_first + 4k/f`.
+        // Haskell's SNothing arm would otherwise correctly apply nothing.
+        state.epochs.rupd_pulser_started = true;
         state.process_epoch_transition(EpochNo(3));
 
         assert!(
@@ -1542,6 +1587,10 @@ mod tests {
         });
 
         let treasury_before = state.epochs.treasury;
+        // #1072: these tests assert a reward update IS applied, so they must
+        // declare the precondition — a block landed past `epoch_first + 4k/f`.
+        // Haskell's SNothing arm would otherwise correctly apply nothing.
+        state.epochs.rupd_pulser_started = true;
         state.process_epoch_transition(EpochNo(5));
 
         // Pool must be gone.
@@ -1577,6 +1626,10 @@ mod tests {
 
         let dormant_before = state.gov.governance.num_dormant_epochs;
 
+        // #1072: these tests assert a reward update IS applied, so they must
+        // declare the precondition — a block landed past `epoch_first + 4k/f`.
+        // Haskell's SNothing arm would otherwise correctly apply nothing.
+        state.epochs.rupd_pulser_started = true;
         state.process_epoch_transition(EpochNo(1));
 
         // With no proposals the epoch is dormant — counter increments by 1.
@@ -1602,6 +1655,10 @@ mod tests {
         assert!(state.epochs.snapshots.set.is_none());
         assert!(state.epochs.snapshots.go.is_none());
 
+        // #1072: these tests assert a reward update IS applied, so they must
+        // declare the precondition — a block landed past `epoch_first + 4k/f`.
+        // Haskell's SNothing arm would otherwise correctly apply nothing.
+        state.epochs.rupd_pulser_started = true;
         state.process_epoch_transition(EpochNo(1));
 
         assert_eq!(state.epoch, EpochNo(1), "epoch must advance to 1");
@@ -1632,6 +1689,10 @@ mod tests {
         let pool_id = Hash28::from_bytes([0x10u8; 28]);
         Arc::make_mut(&mut state.consensus.epoch_blocks_by_pool).insert(pool_id, blocks_this_epoch);
 
+        // #1072: these tests assert a reward update IS applied, so they must
+        // declare the precondition — a block landed past `epoch_first + 4k/f`.
+        // Haskell's SNothing arm would otherwise correctly apply nothing.
+        state.epochs.rupd_pulser_started = true;
         state.process_epoch_transition(EpochNo(1));
 
         assert_eq!(
@@ -1663,6 +1724,10 @@ mod tests {
         state.consensus.last_epoch_block_nonce = prev_hash;
         let epoch_nonce_before = state.consensus.epoch_nonce;
 
+        // #1072: these tests assert a reward update IS applied, so they must
+        // declare the precondition — a block landed past `epoch_first + 4k/f`.
+        // Haskell's SNothing arm would otherwise correctly apply nothing.
+        state.epochs.rupd_pulser_started = true;
         state.process_epoch_transition(EpochNo(1));
 
         // epoch_nonce' = blake2b_256(candidate || prev_hash_nonce)
@@ -1703,7 +1768,15 @@ mod tests {
         let fee = Lovelace(10_000_000); // 10 ADA
         state_with_fee.epochs.snapshots.ss_fee = fee;
 
+        // #1072: these tests assert a reward update IS applied, so they must
+        // declare the precondition — a block landed past `epoch_first + 4k/f`.
+        // Haskell's SNothing arm would otherwise correctly apply nothing.
+        state_no_fee.epochs.rupd_pulser_started = true;
         state_no_fee.process_epoch_transition(EpochNo(1));
+        // #1072: these tests assert a reward update IS applied, so they must
+        // declare the precondition — a block landed past `epoch_first + 4k/f`.
+        // Haskell's SNothing arm would otherwise correctly apply nothing.
+        state_with_fee.epochs.rupd_pulser_started = true;
         state_with_fee.process_epoch_transition(EpochNo(1));
 
         // With a positive ss_fee, the reward pot = expansion + fee, and treasury
@@ -1770,6 +1843,10 @@ mod tests {
             pool_hash: pool_id,
         });
 
+        // #1072: these tests assert a reward update IS applied, so they must
+        // declare the precondition — a block landed past `epoch_first + 4k/f`.
+        // Haskell's SNothing arm would otherwise correctly apply nothing.
+        state.epochs.rupd_pulser_started = true;
         state.process_epoch_transition(EpochNo(1));
 
         // After the rebuild, stake_map must contain the UTxO's lovelace for the cred.
@@ -1810,6 +1887,10 @@ mod tests {
         state.utxo.pending_donations = donation;
         let treasury_before = state.epochs.treasury;
 
+        // #1072: these tests assert a reward update IS applied, so they must
+        // declare the precondition — a block landed past `epoch_first + 4k/f`.
+        // Haskell's SNothing arm would otherwise correctly apply nothing.
+        state.epochs.rupd_pulser_started = true;
         state.process_epoch_transition(EpochNo(1));
 
         // After the transition the donation must have landed in the treasury.

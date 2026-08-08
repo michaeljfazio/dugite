@@ -8905,6 +8905,15 @@ impl Node {
         state.epochs.protocol_params.active_slots_coeff = protocol_params.active_slots_coeff;
         state.epochs.prev_protocol_params.active_slots_coeff = protocol_params.active_slots_coeff;
 
+        // #1072: `set_epoch_length` above ran BEFORE `active_slots_coeff` was
+        // known (the decoded array(31) PParams carry no `f`, so it used the
+        // 0.05 default). Re-derive the stability windows now that `f` is right,
+        // and with them the RUPD pulser flag — an imported ledger whose tip is
+        // already past `epoch_first + 4k/f` corresponds to a Haskell
+        // `nesRu = SJust`, and starting it at `false` would skip a reward
+        // update cardano-node applies.
+        state.finalise_genesis_derived_windows();
+
         // Set network
         let network_id = if network_magic == 764824073 {
             dugite_primitives::network::NetworkId::Mainnet

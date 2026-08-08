@@ -2078,6 +2078,7 @@ impl LedgerState {
         // queue, mirroring `genesis_delegates_before` immediately above.
         let future_gen_delegs_before = self.future_gen_delegs.clone();
         let rupd_addrs_rew_before = self.epochs.rupd_addrs_rew.clone();
+        let rupd_pulser_started_before = self.epochs.rupd_pulser_started;
 
         // Apply the block (all state mutations happen here). In deferred mode
         // this returns the captured Phase-2 work items without draining them.
@@ -2192,6 +2193,11 @@ impl LedgerState {
         };
         if rupd_changed {
             delta.rupd_addrs_rew_snapshot = Some(self.epochs.rupd_addrs_rew.clone());
+        }
+
+        // #1072: same treatment, plain equality — it is a bool.
+        if rupd_pulser_started_before != self.epochs.rupd_pulser_started {
+            delta.rupd_pulser_started_snapshot = Some(self.epochs.rupd_pulser_started);
         }
 
         // Extract the UTxO diff from the DiffSeq entry that apply_block just pushed.

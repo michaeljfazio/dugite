@@ -189,6 +189,12 @@ proptest! {
             .map(|(k, v)| (*k, v.0))
             .collect();
 
+        // #1072: a reward update applies only when a pulser exists; these
+
+        // properties are about the boundary WITH one.
+
+        state.epochs.rupd_pulser_started = true;
+
         state.process_epoch_transition(new_epoch);
 
         // ── Step 3: Measure total rewards credited ───────────────────────────
@@ -275,6 +281,9 @@ proptest! {
 
         let mut state = state;
         let new_epoch = EpochNo(state.epoch.0 + 1);
+        // #1072: a reward update applies only when a pulser exists; these
+        // properties are about the boundary WITH one.
+        state.epochs.rupd_pulser_started = true;
         state.process_epoch_transition(new_epoch);
 
         // ── Step 3: Verify the post-transition total is unchanged ─────────────
@@ -360,6 +369,9 @@ proptest! {
 
         let mut state = state;
         let new_epoch = EpochNo(state.epoch.0 + 1);
+        // #1072: a reward update applies only when a pulser exists; these
+        // properties are about the boundary WITH one.
+        state.epochs.rupd_pulser_started = true;
         state.process_epoch_transition(new_epoch);
 
         // ── Step 3: Verify the new mark has the correct epoch tag ────────────
@@ -568,6 +580,9 @@ proptest! {
                 .count();
 
             // ── Step 4: Run the epoch transition ─────────────────────────────
+            // #1072: a reward update applies only when a pulser exists; these
+            // properties are about the boundary WITH one.
+            state.epochs.rupd_pulser_started = true;
             state.process_epoch_transition(new_epoch);
 
             // ── Step 5(a): Retired pool must be absent from pool_params ──────
@@ -767,6 +782,9 @@ proptest! {
         let reward_pot = total_rewards_available.saturating_sub(treasury_cut);
 
         // ── Step 4: Run the epoch transition ─────────────────────────────────
+        // #1072: a reward update applies only when a pulser exists; these
+        // properties are about the boundary WITH one.
+        state.epochs.rupd_pulser_started = true;
         state.process_epoch_transition(new_epoch);
 
         // ── Step 5: Measure per-pool reward credits ──────────────────────────
@@ -953,6 +971,9 @@ proptest! {
         );
 
         // ── Step 4: Run the epoch transition N → N+1 ─────────────────────────
+        // #1072: a reward update applies only when a pulser exists; these
+        // properties are about the boundary WITH one.
+        state.epochs.rupd_pulser_started = true;
         state.process_epoch_transition(new_epoch);
 
         // ── Step 5: Verify new params are active AFTER the transition ─────────
@@ -1050,6 +1071,9 @@ proptest! {
         let new_epoch = EpochNo(old_epoch.0 + 1);
 
         // ── Step 2: Run one epoch transition ─────────────────────────────────
+        // #1072: a reward update applies only when a pulser exists; these
+        // properties are about the boundary WITH one.
+        state.epochs.rupd_pulser_started = true;
         state.process_epoch_transition(new_epoch);
 
         // ── Step 3: Epoch number advanced by exactly 1 ───────────────────────

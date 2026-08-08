@@ -472,6 +472,8 @@ fn test_process_pool_retirement() {
     assert!(state.certs.pending_retirements.get(&pool_id) == Some(&EpochNo(2)));
 
     // Trigger epoch transition to epoch 2
+    // #1072: assert-a-RUPD-applies tests must declare the pulser precondition.
+    state.epochs.rupd_pulser_started = true;
     state.process_epoch_transition(EpochNo(2));
     // Now the pool should be retired
     assert!(!state.certs.pool_params.contains_key(&pool_id));
@@ -513,6 +515,8 @@ fn test_epoch_transition_snapshots() {
     });
 
     // Epoch 0 -> 1: first snapshot taken
+    // #1072: assert-a-RUPD-applies tests must declare the pulser precondition.
+    state.epochs.rupd_pulser_started = true;
     state.process_epoch_transition(EpochNo(1));
     assert!(state.epochs.snapshots.mark.is_some());
     assert!(state.epochs.snapshots.set.is_none());
@@ -522,6 +526,8 @@ fn test_epoch_transition_snapshots() {
     assert_eq!(mark.pool_stake[&pool_id], Lovelace(1_000_000));
 
     // Epoch 1 -> 2: mark becomes set
+    // #1072: assert-a-RUPD-applies tests must declare the pulser precondition.
+    state.epochs.rupd_pulser_started = true;
     state.process_epoch_transition(EpochNo(2));
     assert!(state.epochs.snapshots.mark.is_some());
     assert!(state.epochs.snapshots.set.is_some());
@@ -531,6 +537,8 @@ fn test_epoch_transition_snapshots() {
     assert_eq!(set.epoch, EpochNo(1));
 
     // Epoch 2 -> 3: set becomes go
+    // #1072: assert-a-RUPD-applies tests must declare the pulser precondition.
+    state.epochs.rupd_pulser_started = true;
     state.process_epoch_transition(EpochNo(3));
     assert!(state.epochs.snapshots.mark.is_some());
     assert!(state.epochs.snapshots.set.is_some());
@@ -697,8 +705,14 @@ fn test_reward_calculation() {
     });
 
     // Build up snapshots: 3 rotations to populate "go"
+    // #1072: assert-a-RUPD-applies tests must declare the pulser precondition.
+    state.epochs.rupd_pulser_started = true;
     state.process_epoch_transition(EpochNo(1));
+    // #1072: assert-a-RUPD-applies tests must declare the pulser precondition.
+    state.epochs.rupd_pulser_started = true;
     state.process_epoch_transition(EpochNo(2));
+    // #1072: assert-a-RUPD-applies tests must declare the pulser precondition.
+    state.epochs.rupd_pulser_started = true;
     state.process_epoch_transition(EpochNo(3));
 
     // Pool produced blocks proportional to its stake
@@ -709,10 +723,14 @@ fn test_reward_calculation() {
 
     // Epoch 3->4: triggers reward CALCULATION using "go" snapshot.
     // With RUPD deferred timing, rewards are computed here but not yet applied.
+    // #1072: assert-a-RUPD-applies tests must declare the pulser precondition.
+    state.epochs.rupd_pulser_started = true;
     state.process_epoch_transition(EpochNo(4));
 
     // Epoch 4->5: APPLIES the rewards computed at 3->4 boundary.
     // This matches Haskell's deferred RUPD application.
+    // #1072: assert-a-RUPD-applies tests must declare the pulser precondition.
+    state.epochs.rupd_pulser_started = true;
     state.process_epoch_transition(EpochNo(5));
 
     // Treasury should have increased (rewards applied at 4->5)
@@ -773,8 +791,14 @@ fn test_reward_calculation_no_blocks_no_rewards() {
     });
 
     // Build snapshots: need 3 rotations to populate "go"
+    // #1072: assert-a-RUPD-applies tests must declare the pulser precondition.
+    state.epochs.rupd_pulser_started = true;
     state.process_epoch_transition(EpochNo(1));
+    // #1072: assert-a-RUPD-applies tests must declare the pulser precondition.
+    state.epochs.rupd_pulser_started = true;
     state.process_epoch_transition(EpochNo(2));
+    // #1072: assert-a-RUPD-applies tests must declare the pulser precondition.
+    state.epochs.rupd_pulser_started = true;
     state.process_epoch_transition(EpochNo(3));
 
     // No blocks produced but some fees collected
@@ -783,8 +807,12 @@ fn test_reward_calculation_no_blocks_no_rewards() {
     state.consensus.epoch_block_count = 0;
 
     // Epoch 3->4: computes rewards (deferred via RUPD)
+    // #1072: assert-a-RUPD-applies tests must declare the pulser precondition.
+    state.epochs.rupd_pulser_started = true;
     state.process_epoch_transition(EpochNo(4));
     // Epoch 4->5: applies the deferred rewards
+    // #1072: assert-a-RUPD-applies tests must declare the pulser precondition.
+    state.epochs.rupd_pulser_started = true;
     state.process_epoch_transition(EpochNo(5));
 
     // Pool produced no blocks, so performance = 0, no pool rewards
@@ -839,8 +867,14 @@ fn test_expected_blocks_zero_clamped_to_one() {
     });
 
     // Build snapshots: 3 rotations to populate "go"
+    // #1072: assert-a-RUPD-applies tests must declare the pulser precondition.
+    state.epochs.rupd_pulser_started = true;
     state.process_epoch_transition(EpochNo(1));
+    // #1072: assert-a-RUPD-applies tests must declare the pulser precondition.
+    state.epochs.rupd_pulser_started = true;
     state.process_epoch_transition(EpochNo(2));
+    // #1072: assert-a-RUPD-applies tests must declare the pulser precondition.
+    state.epochs.rupd_pulser_started = true;
     state.process_epoch_transition(EpochNo(3));
 
     // Simulate 1 block produced and some fees — should NOT panic
@@ -852,8 +886,12 @@ fn test_expected_blocks_zero_clamped_to_one() {
     let treasury_before = state.epochs.treasury.0;
 
     // Epoch 3->4: computes rewards (deferred via RUPD); would divide by zero without the fix
+    // #1072: assert-a-RUPD-applies tests must declare the pulser precondition.
+    state.epochs.rupd_pulser_started = true;
     state.process_epoch_transition(EpochNo(4));
     // Epoch 4->5: applies the deferred rewards
+    // #1072: assert-a-RUPD-applies tests must declare the pulser precondition.
+    state.epochs.rupd_pulser_started = true;
     state.process_epoch_transition(EpochNo(5));
 
     // Verify the system did not panic and rewards were distributed
@@ -916,8 +954,16 @@ fn test_reward_pledge_not_met_zero_rewards() {
         pool_hash: pool_id,
     });
 
+    // #1072: assert-a-RUPD-applies tests must declare the pulser precondition.
+
+    state.epochs.rupd_pulser_started = true;
+
     state.process_epoch_transition(EpochNo(1));
+    // #1072: assert-a-RUPD-applies tests must declare the pulser precondition.
+    state.epochs.rupd_pulser_started = true;
     state.process_epoch_transition(EpochNo(2));
+    // #1072: assert-a-RUPD-applies tests must declare the pulser precondition.
+    state.epochs.rupd_pulser_started = true;
     state.process_epoch_transition(EpochNo(3));
 
     // expected_blocks = 432000 * 0.05 = 21600
@@ -925,8 +971,12 @@ fn test_reward_pledge_not_met_zero_rewards() {
     Arc::make_mut(&mut state.consensus.epoch_blocks_by_pool).insert(pool_id, 21600);
     state.consensus.epoch_block_count = 21600;
     // Epoch 3->4: computes rewards (deferred via RUPD)
+    // #1072: assert-a-RUPD-applies tests must declare the pulser precondition.
+    state.epochs.rupd_pulser_started = true;
     state.process_epoch_transition(EpochNo(4));
     // Epoch 4->5: applies the deferred rewards
+    // #1072: assert-a-RUPD-applies tests must declare the pulser precondition.
+    state.epochs.rupd_pulser_started = true;
     state.process_epoch_transition(EpochNo(5));
 
     // No pool rewards when pledge not met — all goes to treasury as undistributed
@@ -977,8 +1027,16 @@ fn test_reward_operator_gets_registered_reward_account() {
         pool_hash: pool_id,
     });
 
+    // #1072: assert-a-RUPD-applies tests must declare the pulser precondition.
+
+    state.epochs.rupd_pulser_started = true;
+
     state.process_epoch_transition(EpochNo(1));
+    // #1072: assert-a-RUPD-applies tests must declare the pulser precondition.
+    state.epochs.rupd_pulser_started = true;
     state.process_epoch_transition(EpochNo(2));
+    // #1072: assert-a-RUPD-applies tests must declare the pulser precondition.
+    state.epochs.rupd_pulser_started = true;
     state.process_epoch_transition(EpochNo(3));
 
     // expected_blocks = 432000 * 0.05 = 21600
@@ -986,8 +1044,12 @@ fn test_reward_operator_gets_registered_reward_account() {
     Arc::make_mut(&mut state.consensus.epoch_blocks_by_pool).insert(pool_id, 21600);
     state.consensus.epoch_block_count = 21600;
     // Epoch 3->4: computes rewards (deferred via RUPD)
+    // #1072: assert-a-RUPD-applies tests must declare the pulser precondition.
+    state.epochs.rupd_pulser_started = true;
     state.process_epoch_transition(EpochNo(4));
     // Epoch 4->5: applies the deferred rewards
+    // #1072: assert-a-RUPD-applies tests must declare the pulser precondition.
+    state.epochs.rupd_pulser_started = true;
     state.process_epoch_transition(EpochNo(5));
 
     // Operator reward should go to owner_hash credential, not pool_id padded to 32
@@ -1053,6 +1115,10 @@ fn test_epoch_fee_reset_on_transition() {
 
     state.utxo.epoch_fees = Lovelace(1_000_000);
     state.consensus.epoch_block_count = 10;
+
+    // #1072: assert-a-RUPD-applies tests must declare the pulser precondition.
+
+    state.epochs.rupd_pulser_started = true;
 
     state.process_epoch_transition(EpochNo(1));
 
@@ -1168,6 +1234,8 @@ fn test_epoch_nonce_computation() {
     let candidate_at_transition = state.consensus.candidate_nonce;
     let lab_at_transition = state.consensus.lab_nonce;
     let last_epoch_block_before = state.consensus.last_epoch_block_nonce; // ZERO at first transition
+                                                                          // #1072: assert-a-RUPD-applies tests must declare the pulser precondition.
+    state.epochs.rupd_pulser_started = true;
     state.process_epoch_transition(EpochNo(1));
 
     // epoch_nonce should have been updated from genesis_hash
@@ -1350,12 +1418,16 @@ fn test_drep_activity_tracking() {
 
     // Epoch transition to epoch 7 — DRep last active at epoch 3, threshold is 5
     // 7 - 3 = 4, which is not > 5, so DRep should remain active
+    // #1072: assert-a-RUPD-applies tests must declare the pulser precondition.
+    state.epochs.rupd_pulser_started = true;
     state.process_epoch_transition(EpochNo(7));
     assert!(state.gov.governance.dreps.contains_key(&key));
     assert!(state.gov.governance.dreps[&key].active);
 
     // Epoch transition to epoch 9 — 9 - 3 = 6 > 5, so DRep should be marked inactive
     // Per CIP-1694: inactive DReps remain registered but are excluded from voting power
+    // #1072: assert-a-RUPD-applies tests must declare the pulser precondition.
+    state.epochs.rupd_pulser_started = true;
     state.process_epoch_transition(EpochNo(9));
     assert!(state.gov.governance.dreps.contains_key(&key)); // Still registered
     assert!(!state.gov.governance.dreps[&key].active); // But inactive
@@ -1394,6 +1466,8 @@ fn test_committee_expiration_during_epoch_transition() {
     // Haskell ledger and issue #433, expired members are RETAINED in the map
     // (surfaced as MemberStatus=Expired at query time) — not pruned. Both the
     // hot-key authorization and the expiration entry must survive.
+    // #1072: assert-a-RUPD-applies tests must declare the pulser precondition.
+    state.epochs.rupd_pulser_started = true;
     state.process_epoch_transition(EpochNo(5));
     // cold1 retained with hot key auth (status=Expired surfaced via query)
     assert!(state.gov.governance.committee_hot_keys.contains_key(&cold1));
@@ -1406,6 +1480,8 @@ fn test_committee_expiration_during_epoch_transition() {
     assert!(state.gov.governance.committee_hot_keys.contains_key(&cold2));
 
     // At epoch 10, cold2 reaches its expiry. Still retained (Expired status).
+    // #1072: assert-a-RUPD-applies tests must declare the pulser precondition.
+    state.epochs.rupd_pulser_started = true;
     state.process_epoch_transition(EpochNo(10));
     assert!(state.gov.governance.committee_hot_keys.contains_key(&cold2));
     assert!(state
@@ -1503,6 +1579,8 @@ fn test_drep_marked_inactive_on_expiry() {
     assert!(state.gov.governance.dreps[&key].active);
 
     // At epoch 3 (0 + 2 < 3, so inactive): DRep should be marked inactive but NOT removed
+    // #1072: assert-a-RUPD-applies tests must declare the pulser precondition.
+    state.epochs.rupd_pulser_started = true;
     state.process_epoch_transition(EpochNo(3));
     assert!(state.gov.governance.dreps.contains_key(&key)); // Still registered
     assert!(!state.gov.governance.dreps[&key].active); // But inactive
@@ -1546,10 +1624,16 @@ fn test_governance_proposal_deposit_refund() {
     // Expiry filter: expires_epoch < self.epoch (old epoch before transition)
     // At transition to 7, self.epoch=6, 6 < 6 = false → still active
     // At transition to 8, self.epoch=7, 6 < 7 = true → expired
+    // #1072: assert-a-RUPD-applies tests must declare the pulser precondition.
+    state.epochs.rupd_pulser_started = true;
     state.process_epoch_transition(EpochNo(6));
     assert_eq!(state.gov.governance.proposals.len(), 1); // still active through epoch 6
+                                                         // #1072: assert-a-RUPD-applies tests must declare the pulser precondition.
+    state.epochs.rupd_pulser_started = true;
     state.process_epoch_transition(EpochNo(7));
     assert_eq!(state.gov.governance.proposals.len(), 1); // still active (6 < 6 = false)
+                                                         // #1072: assert-a-RUPD-applies tests must declare the pulser precondition.
+    state.epochs.rupd_pulser_started = true;
     state.process_epoch_transition(EpochNo(8));
 
     // Proposal should be expired
@@ -1935,11 +2019,15 @@ fn test_governance_proposal_expiry() {
     // At transition to 7, self.epoch=6, 6 < 6 = false → still active
     // At transition to 8, self.epoch=7, 6 < 7 = true → expired
     for e in 1..=7 {
+        // #1072: assert-a-RUPD-applies tests must declare the pulser precondition.
+        state.epochs.rupd_pulser_started = true;
         state.process_epoch_transition(EpochNo(e));
     }
     assert_eq!(state.gov.governance.proposals.len(), 1);
 
     // Advance to epoch 8 — should expire (self.epoch=7, 6 < 7 = true)
+    // #1072: assert-a-RUPD-applies tests must declare the pulser precondition.
+    state.epochs.rupd_pulser_started = true;
     state.process_epoch_transition(EpochNo(8));
     assert_eq!(state.gov.governance.proposals.len(), 0);
 }
@@ -2057,6 +2145,8 @@ fn test_info_action_never_ratified() {
     assert_eq!(state.gov.governance.proposals.len(), 1);
 
     // InfoAction should NOT be ratified at epoch transition — it stays active
+    // #1072: assert-a-RUPD-applies tests must declare the pulser precondition.
+    state.epochs.rupd_pulser_started = true;
     state.process_epoch_transition(EpochNo(1));
     assert_eq!(state.gov.governance.proposals.len(), 1); // still active
     assert!(state.gov.governance.last_ratified.is_empty()); // not ratified
@@ -2064,12 +2154,20 @@ fn test_info_action_never_ratified() {
     // expires_epoch = 0 + 3 = 3; expiry filter: expires_epoch < self.epoch (old epoch)
     // At transition to 4, self.epoch=3, 3 < 3 = false → still active
     // At transition to 5, self.epoch=4, 3 < 4 = true → expired
+    // #1072: assert-a-RUPD-applies tests must declare the pulser precondition.
+    state.epochs.rupd_pulser_started = true;
     state.process_epoch_transition(EpochNo(2));
     assert_eq!(state.gov.governance.proposals.len(), 1); // still active
+                                                         // #1072: assert-a-RUPD-applies tests must declare the pulser precondition.
+    state.epochs.rupd_pulser_started = true;
     state.process_epoch_transition(EpochNo(3));
     assert_eq!(state.gov.governance.proposals.len(), 1); // still active (self.epoch=2, 3 < 2 = false)
+                                                         // #1072: assert-a-RUPD-applies tests must declare the pulser precondition.
+    state.epochs.rupd_pulser_started = true;
     state.process_epoch_transition(EpochNo(4));
     assert_eq!(state.gov.governance.proposals.len(), 1); // still active (self.epoch=3, 3 < 3 = false)
+                                                         // #1072: assert-a-RUPD-applies tests must declare the pulser precondition.
+    state.epochs.rupd_pulser_started = true;
     state.process_epoch_transition(EpochNo(5));
     assert_eq!(state.gov.governance.proposals.len(), 0); // expired (self.epoch=4, 3 < 4 = true)
     assert_eq!(state.gov.governance.last_expired.len(), 1);
@@ -2103,24 +2201,32 @@ fn test_ratify_state_tracks_expired_proposals() {
     assert_eq!(state.gov.governance.proposals.len(), 1);
 
     // Epoch 1: proposal still active, not expired, not ratified (no votes)
+    // #1072: assert-a-RUPD-applies tests must declare the pulser precondition.
+    state.epochs.rupd_pulser_started = true;
     state.process_epoch_transition(EpochNo(1));
     assert_eq!(state.gov.governance.proposals.len(), 1);
     assert!(state.gov.governance.last_ratified.is_empty());
     assert!(state.gov.governance.last_expired.is_empty());
 
     // Epoch 2: still active (expires_epoch = 2, self.epoch=1, 2 < 1 = false)
+    // #1072: assert-a-RUPD-applies tests must declare the pulser precondition.
+    state.epochs.rupd_pulser_started = true;
     state.process_epoch_transition(EpochNo(2));
     assert_eq!(state.gov.governance.proposals.len(), 1);
     assert!(state.gov.governance.last_ratified.is_empty());
     assert!(state.gov.governance.last_expired.is_empty());
 
     // Epoch 3: still active (self.epoch=2, 2 < 2 = false)
+    // #1072: assert-a-RUPD-applies tests must declare the pulser precondition.
+    state.epochs.rupd_pulser_started = true;
     state.process_epoch_transition(EpochNo(3));
     assert_eq!(state.gov.governance.proposals.len(), 1);
     assert!(state.gov.governance.last_ratified.is_empty());
     assert!(state.gov.governance.last_expired.is_empty());
 
     // Epoch 4: proposal expires (self.epoch=3, 2 < 3 = true)
+    // #1072: assert-a-RUPD-applies tests must declare the pulser precondition.
+    state.epochs.rupd_pulser_started = true;
     state.process_epoch_transition(EpochNo(4));
     assert_eq!(state.gov.governance.proposals.len(), 0);
     assert!(state.gov.governance.last_ratified.is_empty());
@@ -2209,6 +2315,8 @@ fn proposal_is_not_ratifiable_at_the_first_boundary_after_submission() {
     assert_eq!(state.epochs.protocol_params.n_opt, 500, "original value");
 
     // ── First boundary: captures the snapshot, ratifies NOTHING.
+    // #1072: assert-a-RUPD-applies tests must declare the pulser precondition.
+    state.epochs.rupd_pulser_started = true;
     state.process_epoch_transition(EpochNo(1));
     assert_eq!(
         state.epochs.protocol_params.n_opt, 500,
@@ -2225,6 +2333,8 @@ fn proposal_is_not_ratifiable_at_the_first_boundary_after_submission() {
     );
 
     // ── Second boundary: the snapshot containing it is now the one consumed.
+    // #1072: assert-a-RUPD-applies tests must declare the pulser precondition.
+    state.epochs.rupd_pulser_started = true;
     state.process_epoch_transition(EpochNo(2));
     assert_eq!(
         state.epochs.protocol_params.n_opt, 1000,
@@ -2320,6 +2430,8 @@ fn test_parameter_change_ratification() {
     // never a candidate at the first boundary after submission. This test
     // exercises ratification logic, not that timing.
     state.freeze_prior_boundary_pulser();
+    // #1072: assert-a-RUPD-applies tests must declare the pulser precondition.
+    state.epochs.rupd_pulser_started = true;
     state.process_epoch_transition(EpochNo(1));
 
     assert_eq!(state.epochs.protocol_params.n_opt, 1000); // updated
@@ -2404,6 +2516,10 @@ fn test_parameter_change_not_ratified_below_threshold() {
         );
     }
 
+    // #1072: assert-a-RUPD-applies tests must declare the pulser precondition.
+
+    state.epochs.rupd_pulser_started = true;
+
     state.process_epoch_transition(EpochNo(1));
 
     assert_eq!(state.epochs.protocol_params.max_tx_size, 16384); // unchanged
@@ -2484,6 +2600,8 @@ fn test_treasury_withdrawal_ratification() {
     // never a candidate at the first boundary after submission. This test
     // exercises ratification logic, not that timing.
     state.freeze_prior_boundary_pulser();
+    // #1072: assert-a-RUPD-applies tests must declare the pulser precondition.
+    state.epochs.rupd_pulser_started = true;
     state.process_epoch_transition(EpochNo(1));
 
     assert_eq!(state.epochs.treasury, Lovelace(5_000_000_000)); // 10B - 5B = 5B
@@ -2566,6 +2684,8 @@ fn test_no_confidence_ratification() {
     // never a candidate at the first boundary after submission. This test
     // exercises ratification logic, not that timing.
     state.freeze_prior_boundary_pulser();
+    // #1072: assert-a-RUPD-applies tests must declare the pulser precondition.
+    state.epochs.rupd_pulser_started = true;
     state.process_epoch_transition(EpochNo(1));
 
     // Committee should be disbanded
@@ -2655,6 +2775,8 @@ fn test_hard_fork_ratification() {
     // never a candidate at the first boundary after submission. This test
     // exercises ratification logic, not that timing.
     state.freeze_prior_boundary_pulser();
+    // #1072: assert-a-RUPD-applies tests must declare the pulser precondition.
+    state.epochs.rupd_pulser_started = true;
     state.process_epoch_transition(EpochNo(1));
     assert_eq!(state.epochs.protocol_params.protocol_version_major, 11);
     assert_eq!(state.epochs.protocol_params.protocol_version_minor, 0);
@@ -3289,6 +3411,8 @@ fn test_arc_cow_epoch_snapshot_shares_arcs() {
         .insert(cred_hash, Lovelace(1_000_000));
 
     // Trigger epoch transition to create a "mark" snapshot
+    // #1072: assert-a-RUPD-applies tests must declare the pulser precondition.
+    state.epochs.rupd_pulser_started = true;
     state.process_epoch_transition(EpochNo(1));
 
     // The mark snapshot should reflect the live state's delegations/pool_params at snapshot time.
@@ -4597,6 +4721,8 @@ fn test_pre_conway_pp_update_quorum_met() {
         .push((hash2, update));
 
     // Trigger epoch transition to epoch 5
+    // #1072: assert-a-RUPD-applies tests must declare the pulser precondition.
+    state.epochs.rupd_pulser_started = true;
     state.process_epoch_transition(EpochNo(5));
 
     // Updates should be applied
@@ -4635,6 +4761,10 @@ fn test_pre_conway_pp_update_quorum_not_met() {
         .or_default()
         .push((hash2, update));
 
+    // #1072: assert-a-RUPD-applies tests must declare the pulser precondition.
+
+    state.epochs.rupd_pulser_started = true;
+
     state.process_epoch_transition(EpochNo(5));
 
     // Updates should NOT be applied
@@ -4663,6 +4793,10 @@ fn test_pre_conway_pp_update_protocol_version() {
         .entry(EpochNo(9))
         .or_default()
         .push((hash1, update));
+
+    // #1072: assert-a-RUPD-applies tests must declare the pulser precondition.
+
+    state.epochs.rupd_pulser_started = true;
 
     state.process_epoch_transition(EpochNo(10));
 
@@ -4733,6 +4867,10 @@ fn test_pre_conway_pp_update_past_epochs_cleaned() {
         .or_default()
         .push((hash1, update));
 
+    // #1072: assert-a-RUPD-applies tests must declare the pulser precondition.
+
+    state.epochs.rupd_pulser_started = true;
+
     state.process_epoch_transition(EpochNo(10));
 
     // All past proposals should be cleaned up
@@ -4769,6 +4907,8 @@ fn test_pre_conway_pp_update_survives_intermediate_epoch() {
 
     // Transition 20→21: proposals target epoch 21, should NOT be applied yet
     // but must survive the cleanup
+    // #1072: assert-a-RUPD-applies tests must declare the pulser precondition.
+    state.epochs.rupd_pulser_started = true;
     state.process_epoch_transition(EpochNo(21));
     assert!(
         !state.epochs.pending_pp_updates.is_empty(),
@@ -4778,6 +4918,8 @@ fn test_pre_conway_pp_update_survives_intermediate_epoch() {
     assert_eq!(state.epochs.protocol_params.protocol_version_major, 9);
 
     // Transition 21→22: proposals targeting epoch 21 should now be applied
+    // #1072: assert-a-RUPD-applies tests must declare the pulser precondition.
+    state.epochs.rupd_pulser_started = true;
     state.process_epoch_transition(EpochNo(22));
     assert_eq!(state.epochs.protocol_params.protocol_version_major, 8);
     assert_eq!(state.epochs.protocol_params.protocol_version_minor, 0);
@@ -4827,6 +4969,10 @@ fn test_pre_conway_pp_update_split_vote_no_merge() {
             .push((Hash32::from_bytes([i; 32]), ppu_b.clone()));
     }
 
+    // #1072: assert-a-RUPD-applies tests must declare the pulser precondition.
+
+    state.epochs.rupd_pulser_started = true;
+
     state.process_epoch_transition(EpochNo(5));
 
     // Neither value reached quorum: enact nothing. The old bug would have
@@ -4875,6 +5021,10 @@ fn test_pre_conway_pp_update_sanity_guard_rejects() {
         .entry(EpochNo(4))
         .or_default()
         .push((Hash32::from_bytes([2u8; 32]), bad_ppu));
+
+    // #1072: assert-a-RUPD-applies tests must declare the pulser precondition.
+
+    state.epochs.rupd_pulser_started = true;
 
     state.process_epoch_transition(EpochNo(5));
 
@@ -6245,6 +6395,10 @@ fn test_inactive_drep_remains_registered() {
         anchor: None,
     });
     assert!(state.gov.governance.dreps[&key].active);
+
+    // #1072: assert-a-RUPD-applies tests must declare the pulser precondition.
+
+    state.epochs.rupd_pulser_started = true;
 
     state.process_epoch_transition(EpochNo(5));
     assert!(state.gov.governance.dreps.contains_key(&key));
@@ -8186,6 +8340,8 @@ fn test_snapshot_rotation_mark_set_go() {
     state.epochs.needs_stake_rebuild = false;
 
     // Epoch 0 -> 1: creates mark snapshot, set/go are None
+    // #1072: assert-a-RUPD-applies tests must declare the pulser precondition.
+    state.epochs.rupd_pulser_started = true;
     state.process_epoch_transition(EpochNo(1));
     assert!(state.epochs.snapshots.mark.is_some());
     assert_eq!(
@@ -8196,6 +8352,8 @@ fn test_snapshot_rotation_mark_set_go() {
     assert!(state.epochs.snapshots.go.is_none());
 
     // Epoch 1 -> 2: mark -> set, new mark created
+    // #1072: assert-a-RUPD-applies tests must declare the pulser precondition.
+    state.epochs.rupd_pulser_started = true;
     state.process_epoch_transition(EpochNo(2));
     assert!(state.epochs.snapshots.mark.is_some());
     assert_eq!(
@@ -8210,6 +8368,8 @@ fn test_snapshot_rotation_mark_set_go() {
     assert!(state.epochs.snapshots.go.is_none());
 
     // Epoch 2 -> 3: set -> go, mark -> set, new mark created
+    // #1072: assert-a-RUPD-applies tests must declare the pulser precondition.
+    state.epochs.rupd_pulser_started = true;
     state.process_epoch_transition(EpochNo(3));
     assert!(state.epochs.snapshots.mark.is_some());
     assert_eq!(
@@ -8266,6 +8426,8 @@ fn test_pool_retirement_at_scheduled_epoch() {
     state.certs.pending_retirements.insert(pool_id, EpochNo(5));
 
     // Transition to epoch 5: pool should be retired and removed
+    // #1072: assert-a-RUPD-applies tests must declare the pulser precondition.
+    state.epochs.rupd_pulser_started = true;
     state.process_epoch_transition(EpochNo(5));
     assert!(
         !state.certs.pool_params.contains_key(&pool_id),
@@ -8313,6 +8475,8 @@ fn test_pool_reregistration_cancels_retirement() {
     state.certs.pending_retirements.remove(&pool_id);
 
     // Transition to epoch 5: pool should still exist
+    // #1072: assert-a-RUPD-applies tests must declare the pulser precondition.
+    state.epochs.rupd_pulser_started = true;
     state.process_epoch_transition(EpochNo(5));
     assert!(
         state.certs.pool_params.contains_key(&pool_id),
@@ -8328,6 +8492,8 @@ fn test_zero_total_stake_no_panic() {
     state.epochs.needs_stake_rebuild = false;
     // No delegations, no stake - should not panic or divide by zero
     state.epochs.reserves = Lovelace(MAX_LOVELACE_SUPPLY);
+    // #1072: assert-a-RUPD-applies tests must declare the pulser precondition.
+    state.epochs.rupd_pulser_started = true;
     state.process_epoch_transition(EpochNo(1));
     // If we get here, no panic occurred
     assert_eq!(state.epoch, EpochNo(1));
@@ -8357,6 +8523,8 @@ fn test_protocol_param_update_at_epoch_boundary() {
     assert_eq!(state.epochs.protocol_params.min_fee_a, 44);
 
     // Transition: old epoch is 4, proposals for epoch 4 are applied
+    // #1072: assert-a-RUPD-applies tests must declare the pulser precondition.
+    state.epochs.rupd_pulser_started = true;
     state.process_epoch_transition(EpochNo(5));
 
     assert_eq!(
@@ -8376,6 +8544,10 @@ fn test_epoch_transition_resets_accumulators() {
     state.consensus.epoch_block_count = 42;
     Arc::make_mut(&mut state.consensus.epoch_blocks_by_pool)
         .insert(Hash28::from_bytes([1; 28]), 10);
+
+    // #1072: assert-a-RUPD-applies tests must declare the pulser precondition.
+
+    state.epochs.rupd_pulser_started = true;
 
     state.process_epoch_transition(EpochNo(1));
 
@@ -8682,6 +8854,8 @@ fn test_update_committee_no_cc_required() {
     // never a candidate at the first boundary after submission. This test
     // exercises ratification logic, not that timing.
     state.freeze_prior_boundary_pulser();
+    // #1072: assert-a-RUPD-applies tests must declare the pulser precondition.
+    state.epochs.rupd_pulser_started = true;
     state.process_epoch_transition(EpochNo(1));
 
     // Verify new CC member was added
@@ -8743,6 +8917,8 @@ fn test_parameter_change_fails_without_cc() {
     state.process_proposal(&tx_hash, 0, &proposal);
 
     // Ratify at epoch boundary
+    // #1072: assert-a-RUPD-applies tests must declare the pulser precondition.
+    state.epochs.rupd_pulser_started = true;
     state.process_epoch_transition(EpochNo(1));
 
     // Verify drep_activity was NOT updated
@@ -8828,6 +9004,8 @@ fn test_chained_parameter_changes() {
     // never a candidate at the first boundary after submission. This test
     // exercises ratification logic, not that timing.
     state.freeze_prior_boundary_pulser();
+    // #1072: assert-a-RUPD-applies tests must declare the pulser precondition.
+    state.epochs.rupd_pulser_started = true;
     state.process_epoch_transition(EpochNo(1));
     assert_eq!(state.epochs.protocol_params.drep_activity, 25);
 
@@ -8887,6 +9065,8 @@ fn test_chained_parameter_changes() {
     // is not yet in any snapshot (it was submitted during epoch 1 and the
     // snapshot from boundary 0→1 predates it).  Per Haskell DRep pulser timing,
     // proposals submitted in epoch E are ratified at boundary E+1→E+2.
+    // #1072: assert-a-RUPD-applies tests must declare the pulser precondition.
+    state.epochs.rupd_pulser_started = true;
     state.process_epoch_transition(EpochNo(2));
     assert_eq!(
         state.epochs.protocol_params.drep_activity, 25,
@@ -8894,6 +9074,8 @@ fn test_chained_parameter_changes() {
     );
 
     // Ratify second proposal at the next boundary (snapshot from boundary 1→2 now contains proposal2)
+    // #1072: assert-a-RUPD-applies tests must declare the pulser precondition.
+    state.epochs.rupd_pulser_started = true;
     state.process_epoch_transition(EpochNo(3));
     assert_eq!(
         state.epochs.protocol_params.drep_activity, 31,
@@ -8974,6 +9156,8 @@ fn test_cost_model_update_via_governance() {
     // never a candidate at the first boundary after submission. This test
     // exercises ratification logic, not that timing.
     state.freeze_prior_boundary_pulser();
+    // #1072: assert-a-RUPD-applies tests must declare the pulser precondition.
+    state.epochs.rupd_pulser_started = true;
     state.process_epoch_transition(EpochNo(1));
 
     assert_eq!(
@@ -9054,6 +9238,8 @@ fn test_pre_conway_ppup_version_upgrade() {
         .push((genesis2, ppu));
 
     // Epoch transition 0 -> 1 should apply the update
+    // #1072: assert-a-RUPD-applies tests must declare the pulser precondition.
+    state.epochs.rupd_pulser_started = true;
     state.process_epoch_transition(EpochNo(1));
 
     assert_eq!(
@@ -9135,6 +9321,8 @@ fn test_hard_fork_initiation_ratification() {
     // never a candidate at the first boundary after submission. This test
     // exercises ratification logic, not that timing.
     state.freeze_prior_boundary_pulser();
+    // #1072: assert-a-RUPD-applies tests must declare the pulser precondition.
+    state.epochs.rupd_pulser_started = true;
     state.process_epoch_transition(EpochNo(1));
 
     assert_eq!(
@@ -9193,6 +9381,10 @@ fn test_prev_action_id_chain_mismatch_blocks_ratification() {
             anchor: None,
         },
     );
+
+    // #1072: assert-a-RUPD-applies tests must declare the pulser precondition.
+
+    state.epochs.rupd_pulser_started = true;
 
     state.process_epoch_transition(EpochNo(1));
 
@@ -9269,6 +9461,8 @@ fn test_committee_min_size_update_via_governance() {
     // never a candidate at the first boundary after submission. This test
     // exercises ratification logic, not that timing.
     state.freeze_prior_boundary_pulser();
+    // #1072: assert-a-RUPD-applies tests must declare the pulser precondition.
+    state.epochs.rupd_pulser_started = true;
     state.process_epoch_transition(EpochNo(1));
 
     assert_eq!(
@@ -10228,6 +10422,8 @@ fn test_epoch_nonce_for_slot_matches_transition_result() {
     let predicted = state.epoch_nonce_for_slot(slot_in_epoch_6);
 
     // Now actually run the transition and verify epoch_nonce matches.
+    // #1072: assert-a-RUPD-applies tests must declare the pulser precondition.
+    state.epochs.rupd_pulser_started = true;
     state.process_epoch_transition(EpochNo(6));
 
     assert_eq!(
@@ -10253,6 +10449,10 @@ fn test_epoch_nonce_neutral_prev_hash_nonce() {
     state.consensus.last_epoch_block_nonce = Hash32::ZERO; // NeutralNonce
     state.consensus.lab_nonce = Hash32::from_bytes([0xBB; 32]);
 
+    // #1072: assert-a-RUPD-applies tests must declare the pulser precondition.
+
+    state.epochs.rupd_pulser_started = true;
+
     state.process_epoch_transition(EpochNo(6));
 
     // Per Haskell TICKN: NeutralNonce is identity, so epoch_nonce = candidate
@@ -10277,6 +10477,10 @@ fn test_epoch_nonce_neutral_candidate_nonce() {
     state.consensus.last_epoch_block_nonce = prev_hash;
     state.consensus.lab_nonce = Hash32::from_bytes([0xDD; 32]);
 
+    // #1072: assert-a-RUPD-applies tests must declare the pulser precondition.
+
+    state.epochs.rupd_pulser_started = true;
+
     state.process_epoch_transition(EpochNo(6));
 
     assert_eq!(
@@ -10300,6 +10504,10 @@ fn test_epoch_nonce_both_non_zero() {
     state.consensus.candidate_nonce = candidate;
     state.consensus.last_epoch_block_nonce = prev_hash;
     state.consensus.lab_nonce = Hash32::from_bytes([0x33; 32]);
+
+    // #1072: assert-a-RUPD-applies tests must declare the pulser precondition.
+
+    state.epochs.rupd_pulser_started = true;
 
     state.process_epoch_transition(EpochNo(6));
 
@@ -10326,6 +10534,10 @@ fn test_epoch_nonce_both_zero() {
     state.consensus.candidate_nonce = Hash32::ZERO;
     state.consensus.last_epoch_block_nonce = Hash32::ZERO;
     state.consensus.lab_nonce = Hash32::from_bytes([0x44; 32]);
+
+    // #1072: assert-a-RUPD-applies tests must declare the pulser precondition.
+
+    state.epochs.rupd_pulser_started = true;
 
     state.process_epoch_transition(EpochNo(6));
 
@@ -10408,6 +10620,10 @@ fn test_epoch_transition_uses_old_prev_hash_nonce() {
     state.consensus.candidate_nonce = candidate;
     state.consensus.last_epoch_block_nonce = old_prev_hash;
     state.consensus.lab_nonce = lab;
+
+    // #1072: assert-a-RUPD-applies tests must declare the pulser precondition.
+
+    state.epochs.rupd_pulser_started = true;
 
     state.process_epoch_transition(EpochNo(11));
 
@@ -14770,6 +14986,10 @@ fn test_treasury_accumulates_at_correct_rate_no_double_counting() {
         state.utxo.epoch_fees = Lovelace(per_epoch_fees);
         state.consensus.epoch_block_count = actual_blocks_per_epoch;
 
+        // #1072: assert-a-RUPD-applies tests must declare the pulser precondition.
+
+        state.epochs.rupd_pulser_started = true;
+
         state.process_epoch_transition(EpochNo(epoch_idx as u64));
         treasury_history.push(state.epochs.treasury.0);
         eprintln!(
@@ -14867,6 +15087,8 @@ fn test_treasury_value_snap_plus_rupd_no_double_count() {
     for epoch_idx in 1..=6u32 {
         state.utxo.epoch_fees = Lovelace(per_epoch_fees);
         state.consensus.epoch_block_count = actual_blocks_per_epoch;
+        // #1072: assert-a-RUPD-applies tests must declare the pulser precondition.
+        state.epochs.rupd_pulser_started = true;
         state.process_epoch_transition(EpochNo(epoch_idx as u64));
 
         // Key invariant: no deferred pending RUPD exists after any boundary.
@@ -14904,6 +15126,8 @@ fn test_treasury_value_snap_plus_rupd_no_double_count() {
     let treasury_before = state.epochs.treasury.0;
     state.utxo.epoch_fees = Lovelace(per_epoch_fees);
     state.consensus.epoch_block_count = actual_blocks_per_epoch;
+    // #1072: assert-a-RUPD-applies tests must declare the pulser precondition.
+    state.epochs.rupd_pulser_started = true;
     state.process_epoch_transition(EpochNo(7));
     let treasury_after = state.epochs.treasury.0;
 
@@ -15149,6 +15373,8 @@ fn test_treasury_withdrawal_via_governance_reduces_treasury() {
     // never a candidate at the first boundary after submission. This test
     // exercises ratification logic, not that timing.
     state.freeze_prior_boundary_pulser();
+    // #1072: assert-a-RUPD-applies tests must declare the pulser precondition.
+    state.epochs.rupd_pulser_started = true;
     state.process_epoch_transition(EpochNo(1));
 
     let treasury_after = state.epochs.treasury.0;
@@ -15230,6 +15456,8 @@ fn test_epoch_fees_not_double_counted_through_snapshot_chain() {
     let mut blocks_by_pool = HashMap::new();
     blocks_by_pool.insert(Hash28::from_bytes([0x01; 28]), actual_blocks);
     state.consensus.epoch_blocks_by_pool = Arc::new(blocks_by_pool);
+    // #1072: assert-a-RUPD-applies tests must declare the pulser precondition.
+    state.epochs.rupd_pulser_started = true;
     state.process_epoch_transition(EpochNo(1));
     let initial_reserves = 8_000_000_000_000_000u64;
     let initial_expansion = (3u128 * initial_reserves as u128 / 1000) as u64;
@@ -15247,6 +15475,8 @@ fn test_epoch_fees_not_double_counted_through_snapshot_chain() {
     // This is the FIRST and ONLY time epoch0_fees contribute to treasury.
     state.utxo.epoch_fees = Lovelace(0);
     state.consensus.epoch_block_count = 0;
+    // #1072: assert-a-RUPD-applies tests must declare the pulser precondition.
+    state.epochs.rupd_pulser_started = true;
     state.process_epoch_transition(EpochNo(2));
     assert!(
         state.epochs.pending_reward_update.is_none(),
@@ -15283,6 +15513,8 @@ fn test_epoch_fees_not_double_counted_through_snapshot_chain() {
     // epoch0_fees must NOT appear again here.
     state.utxo.epoch_fees = Lovelace(0);
     state.consensus.epoch_block_count = 0;
+    // #1072: assert-a-RUPD-applies tests must declare the pulser precondition.
+    state.epochs.rupd_pulser_started = true;
     state.process_epoch_transition(EpochNo(3));
 
     let treasury_after_epoch3 = state.epochs.treasury.0;
@@ -15301,6 +15533,8 @@ fn test_epoch_fees_not_double_counted_through_snapshot_chain() {
     // Boundary 3→4: set=mark3 (fees=0, blocks=0) → also delta=0.
     state.utxo.epoch_fees = Lovelace(0);
     state.consensus.epoch_block_count = 0;
+    // #1072: assert-a-RUPD-applies tests must declare the pulser precondition.
+    state.epochs.rupd_pulser_started = true;
     state.process_epoch_transition(EpochNo(4));
     let treasury_after_epoch4 = state.epochs.treasury.0;
     assert_eq!(
@@ -15311,6 +15545,8 @@ fn test_epoch_fees_not_double_counted_through_snapshot_chain() {
     // Boundary 4→5: set=mark4 (fees=0, blocks=0) → also delta=0.
     state.utxo.epoch_fees = Lovelace(0);
     state.consensus.epoch_block_count = 0;
+    // #1072: assert-a-RUPD-applies tests must declare the pulser precondition.
+    state.epochs.rupd_pulser_started = true;
     state.process_epoch_transition(EpochNo(5));
     let treasury_after_epoch5 = state.epochs.treasury.0;
     assert_eq!(
@@ -15403,6 +15639,8 @@ fn test_rupd_fires_at_first_epoch_canonical_treasury() {
     // expansion0  = floor(0.003 * 15T)   = 45_000_000_000_000
     // tc0         = floor(0.2 * exp0)    =  9_000_000_000_000  ← Koios match
     // delta_R     = tc0 - epoch_fees     =  9_000_000_000_000  (fees=0)
+    // #1072: assert-a-RUPD-applies tests must declare the pulser precondition.
+    state.epochs.rupd_pulser_started = true;
     state.process_epoch_transition(EpochNo(1));
 
     let expansion0 = 45_000_000_000_000u64;
@@ -15425,6 +15663,8 @@ fn test_rupd_fires_at_first_epoch_canonical_treasury() {
     let _ = expansion0;
     state.consensus.epoch_block_count = 0;
     state.utxo.epoch_fees = Lovelace(0);
+    // #1072: assert-a-RUPD-applies tests must declare the pulser precondition.
+    state.epochs.rupd_pulser_started = true;
     state.process_epoch_transition(EpochNo(2));
 
     let expansion1 = (3u128 * r0 as u128 / 1000) as u64;
@@ -15498,6 +15738,8 @@ fn test_rupd_compounding_treasury_over_three_epochs() {
     state.consensus.epoch_block_count = full_blocks;
     state.utxo.epoch_fees = Lovelace(0);
     state.consensus.epoch_blocks_by_pool = make_blocks(full_blocks);
+    // #1072: assert-a-RUPD-applies tests must declare the pulser precondition.
+    state.epochs.rupd_pulser_started = true;
     state.process_epoch_transition(EpochNo(1));
     let t0 = state.epochs.treasury.0;
     let r0 = state.epochs.reserves.0;
@@ -15517,6 +15759,8 @@ fn test_rupd_compounding_treasury_over_three_epochs() {
     state.consensus.epoch_block_count = full_blocks;
     state.utxo.epoch_fees = Lovelace(0);
     state.consensus.epoch_blocks_by_pool = make_blocks(full_blocks);
+    // #1072: assert-a-RUPD-applies tests must declare the pulser precondition.
+    state.epochs.rupd_pulser_started = true;
     state.process_epoch_transition(EpochNo(2));
     let t1 = state.epochs.treasury.0;
     let r1 = state.epochs.reserves.0;
@@ -15529,6 +15773,8 @@ fn test_rupd_compounding_treasury_over_three_epochs() {
     state.consensus.epoch_block_count = full_blocks;
     state.utxo.epoch_fees = Lovelace(0);
     state.consensus.epoch_blocks_by_pool = make_blocks(full_blocks);
+    // #1072: assert-a-RUPD-applies tests must declare the pulser precondition.
+    state.epochs.rupd_pulser_started = true;
     state.process_epoch_transition(EpochNo(3));
     let t2 = state.epochs.treasury.0;
     let r2 = state.epochs.reserves.0;
@@ -15541,6 +15787,8 @@ fn test_rupd_compounding_treasury_over_three_epochs() {
     state.consensus.epoch_block_count = full_blocks;
     state.utxo.epoch_fees = Lovelace(0);
     state.consensus.epoch_blocks_by_pool = make_blocks(full_blocks);
+    // #1072: assert-a-RUPD-applies tests must declare the pulser precondition.
+    state.epochs.rupd_pulser_started = true;
     state.process_epoch_transition(EpochNo(4));
     let t3 = state.epochs.treasury.0;
     let r3 = state.epochs.reserves.0;
