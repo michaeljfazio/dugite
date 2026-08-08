@@ -1237,6 +1237,7 @@ impl LedgerState {
                     denominator: 1,
                 }, // Genesis: d=1
                 rupd_addrs_rew: None,           // #11: captured at startStep during apply
+                rupd_pulser_started: false,
                 pending_avvm_return: 0,
             },
             tip: Tip::origin(),
@@ -1787,6 +1788,7 @@ impl LedgerState {
                 prev_protocol_version_major,
                 prev_d,
                 rupd_addrs_rew: None, // #11: captured at startStep during apply
+                rupd_pulser_started: false,
                 pending_avvm_return: 0,
             },
             tip,
