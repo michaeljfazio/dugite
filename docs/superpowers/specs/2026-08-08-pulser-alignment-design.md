@@ -1,7 +1,7 @@
 # Pulser alignment — bringing dugite's RUPD and DRep pulsers to 100% structural parity
 
-Status: **revision 3 — Phases 0, 1a, 2 and 4 CLOSED; Phase 3's ledger half
-LANDED and live-validated; Phase 5's rollback half LANDED.**
+Status: **revision 4 — Phases 0, 1a, 1b, 2, 3 and 4 CLOSED; Phase 5's rollback
+half LANDED. Only the `nesRu` wire arms (#1071) remain.**
 Date: 2026-08-08
 
 | Phase | State |
@@ -10,7 +10,7 @@ Date: 2026-08-08
 | 1a — explicit `startStep` freeze | **DONE**, pot-parity validated |
 | 1b — delete `pending_avvm_return` | **BLOCKED** on mainnet replay disk (§5b) |
 | 2 — RUPD state machine + #1072 | **DONE.** Wire arms MOVED to 3 — they need a live fold |
-| 3 — incremental pulsing | **LEDGER HALF DONE**, pots byte-exact live. Per-block scheduling + wire arms open |
+| 3 — incremental pulsing | **DONE** — credential-major fold, incremental `RewardFold`, per-block scheduling. Only the `nesRu` wire arms remain (#1071) |
 | 4 — DRep internal pulsing | **CLOSED as YAGNI** — measured unobservable, not asserted |
 | 5 — persistence + rollback | **Rollback DONE** (freeze pair now atomic). Legacy cleanup open |
 
