@@ -724,6 +724,13 @@ impl EraRules for ConwayRules {
             // Without this, `epoch_state_debug::rewards_summary` sees `None` and
             // emits `total_distributed = 0`, masking the real per-pool payout.
             epochs.last_applied_rupd = Some(rupd);
+        } else {
+            // #1072 (F7): no update was applied, so the debug dumper must not
+            // report the PREVIOUS boundary's one as fresh. Haskell's
+            // `rewardUpdate` field is null on this path; a stale `Some` here
+            // manufactures phantom diffs in the cross-validation harness at
+            // exactly the boundary it would be inspecting.
+            epochs.last_applied_rupd = None;
         }
 
         // Issue #670: drain `utxo.epoch_fees` by the same `ssFee` that the
@@ -731,8 +738,18 @@ impl EraRules for ConwayRules {
         // `utxosFees -= ssFee` semantics so `utxosFees` is a multi-epoch
         // running total. See `shelley.rs` for the full rationale; the
         // reset to zero at the end of this function is removed below.
-        let ss_fee_drained = epochs.snapshots.ss_fee;
-        utxo.epoch_fees = Lovelace(utxo.epoch_fees.0.saturating_sub(ss_fee_drained.0));
+        // #1072: the drain is part of the REWARD UPDATE, not of the boundary.
+        // `deltaF = invert (toDeltaCoin feesSS)` is a field of `RewardUpdate`
+        // (PulsingReward.hs:276) applied only by `updateRewards`, so on the
+        // `SNothing` arm Haskell leaves `utxosFees` untouched and SNAP captures
+        // the FULL undrained pot into the next `ssFee`. Draining it here
+        // regardless would destroy `ss_fee` lovelace on exactly the boundary
+        // this gate exists to protect — a pot-conservation break, plus a
+        // short fee pot for the NEXT reward update.
+        if epochs.rupd_pulser_started {
+            let drained = epochs.snapshots.ss_fee;
+            utxo.epoch_fees = Lovelace(utxo.epoch_fees.0.saturating_sub(drained.0));
+        }
 
         // Rotate snapshots: go <- set <- mark, capture fees.
         //
@@ -2136,6 +2153,76 @@ mod tests {
     // -----------------------------------------------------------------------
     // Test helpers
     // -----------------------------------------------------------------------
+
+    /// #1072 on the CONWAY path — the era every real network runs, and the one
+    /// the original fix shipped with zero coverage of.
+    ///
+    /// Haskell `ConwayNewEpoch.hs:173`: `SNothing -> pure es0`. No deltaR, no
+    /// deltaT, no rewards, and — because `deltaF` is a FIELD of `RewardUpdate`
+    /// (`PulsingReward.hs:276`) applied only by `updateRewards` — no `ssFee`
+    /// drain either.
+    ///
+    /// Both halves are RED-provable independently: dropping
+    /// `epochs.rupd_pulser_started` from the RUPD guard moves the pots;
+    /// dropping it from the fee-drain guard moves `epoch_fees`.
+    #[test]
+    fn conway_boundary_applies_no_rupd_and_no_fee_drain_without_a_pulser() {
+        let params = ProtocolParameters::mainnet_defaults();
+        let ctx = make_conway_ctx(&params);
+        let rules = ConwayRules::new();
+
+        let mut utxo = make_utxo_sub(vec![]);
+        let mut certs = make_cert_sub();
+        let mut gov = make_gov_sub();
+        let mut epochs = make_epoch_sub();
+        let mut consensus = make_consensus_sub();
+        epochs.protocol_params = params.clone();
+        epochs.prev_protocol_params = params.clone();
+
+        // No block landed after `epoch_first + 4k/f`.
+        epochs.rupd_pulser_started = false;
+
+        // Reserves large enough that a monetary expansion would be unmistakable
+        // if one fired — #438 makes expansion fire even with an empty GO.
+        let initial_reserves = 10_000_000_000_000_000u64;
+        epochs.reserves = Lovelace(initial_reserves);
+        let initial_treasury = epochs.treasury.0;
+
+        // Non-zero on BOTH sides, or `saturating_sub` hides the drain.
+        utxo.epoch_fees = Lovelace(7_777_777);
+        epochs.snapshots.ss_fee = Lovelace(5_555_555);
+
+        rules
+            .process_epoch_transition(
+                EpochNo(6),
+                &ctx,
+                &mut utxo,
+                &mut certs,
+                &mut gov,
+                &mut epochs,
+                &mut consensus,
+            )
+            .expect("conway boundary");
+
+        assert_eq!(
+            epochs.reserves.0, initial_reserves,
+            "reserves must not move when no RUPD pulser exists (#1072)"
+        );
+        assert_eq!(
+            epochs.treasury.0, initial_treasury,
+            "treasury must not move when no RUPD pulser exists (#1072)"
+        );
+        assert_eq!(
+            utxo.epoch_fees.0, 7_777_777,
+            "epoch_fees must not be drained when no RUPD pulser exists (#1072 F1) \
+             — draining it destroys lovelace outright and shorts the next \
+             reward update by the same amount"
+        );
+        assert!(
+            epochs.last_applied_rupd.is_none(),
+            "no update was applied, so the debug dumper must not report one (#1072 F7)"
+        );
+    }
 
     fn make_conway_ctx(params: &ProtocolParameters) -> RuleContext<'_> {
         let delegates = Box::leak(Box::new(HashMap::new()));

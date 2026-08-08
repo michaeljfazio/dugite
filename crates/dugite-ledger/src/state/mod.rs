@@ -1872,6 +1872,45 @@ impl LedgerState {
     }
 
     /// Configure the epoch length (from Shelley genesis)
+    /// Re-derive the stability windows and the RUPD pulser flag after genesis
+    /// protocol parameters have been applied (#1072).
+    ///
+    /// # Why this is separate from [`Self::set_epoch_length`]
+    ///
+    /// `set_epoch_length` computes `4k/f` from
+    /// `active_slot_coeff_rational()`, but the Mithril / Haskell-snapshot
+    /// import path calls it BEFORE it copies `active_slots_coeff` out of
+    /// genesis — the decoded `array(31)` PParams carry no `f`, so the default
+    /// `0.05` is used. That was harmless while the window fed only the pv<=6
+    /// reward prefilter; it is not harmless now that the window decides whether
+    /// a reward update happens AT ALL, in every era. On an `f = 0.5` network
+    /// the window would be 10x too wide.
+    ///
+    /// It also derives `rupd_pulser_started`. An imported ledger is NOT a fresh
+    /// one: if its tip slot is already past `epoch_first + 4k/f` then the chain
+    /// has seen a qualifying block and Haskell's imported `NewEpochState`
+    /// carries `nesRu = SJust`. Starting at `false` would skip a reward update
+    /// Haskell applies — the same permanent divergence #1072 is about, arriving
+    /// through the import path instead.
+    ///
+    /// Call AFTER genesis params are in `epochs.protocol_params`.
+    pub fn finalise_genesis_derived_windows(&mut self) {
+        self.set_epoch_length(self.epoch_length, self.security_param);
+
+        let epoch_first = self.first_slot_of_epoch(self.epoch.0);
+        let window = crate::state::reward_pulser::RewardWindow::new(
+            epoch_first,
+            self.randomness_stabilisation_window,
+        );
+        let tip_slot = self
+            .tip
+            .point
+            .slot()
+            .unwrap_or(dugite_primitives::time::SlotNo(0));
+        self.epochs.rupd_pulser_started =
+            window.classify(tip_slot) != crate::state::reward_pulser::RewardTiming::TooEarly;
+    }
+
     pub fn set_epoch_length(&mut self, epoch_length: u64, security_param: u64) {
         self.epoch_length = epoch_length;
         self.security_param = security_param;

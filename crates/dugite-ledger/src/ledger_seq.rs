@@ -291,6 +291,17 @@ pub struct LedgerDelta {
     /// as a change) — O(1) either way since cloning the outer `Option` is
     /// just an `Arc` refcount bump.
     pub rupd_addrs_rew_snapshot: Option<Option<Arc<HashSet<Hash32>>>>,
+
+    /// Post-block value of `epochs.rupd_pulser_started` when it changed
+    /// (#1072). `None` = unchanged by this block.
+    ///
+    /// Consensus-bearing and set MID-EPOCH, so it MUST have a delta
+    /// representation: a field with none regresses to the anchor's value on
+    /// rollback, and the anchor can lag the tip by up to `k` blocks — on the
+    /// devnet ~80 slots, the entire width of the window this flag tracks.
+    /// That is #985's failure mode, and it is why this sits beside
+    /// `rupd_addrs_rew_snapshot` rather than being left to the epoch fold.
+    pub rupd_pulser_started_snapshot: Option<bool>,
 }
 
 impl LedgerDelta {
@@ -329,6 +340,7 @@ impl LedgerDelta {
             pending_pp_updates_snapshot: None,
             future_pp_updates_snapshot: None,
             rupd_addrs_rew_snapshot: None,
+            rupd_pulser_started_snapshot: None,
         }
     }
 }
@@ -1263,6 +1275,9 @@ pub fn apply_delta_to_state(state: &mut LedgerState, delta: &LedgerDelta) {
     if let Some(rar) = &delta.rupd_addrs_rew_snapshot {
         state.epochs.rupd_addrs_rew = rar.clone();
     }
+    if let Some(started) = delta.rupd_pulser_started_snapshot {
+        state.epochs.rupd_pulser_started = started;
+    }
 
     // Update tip to reflect this block.
     state.tip = dugite_primitives::block::Tip {
@@ -1730,7 +1745,34 @@ fn _assert_ledger_state_fields_audited(state: LedgerState) {
         certs: _,
         gov: _,
         consensus: _,
-        epochs: _,
+        // EXHAUSTIVE — no `..`. A new `EpochSubState` field must be added here,
+        // which forces whoever adds it to decide whether it needs a
+        // `LedgerDelta` representation. `epochs: _` is how
+        // `rupd_pulser_started` (#1072) reached a branch with no delta and
+        // therefore no rollback restore: the guard sat one level above where
+        // the field landed. `{ field: _, .. }` would NOT fix that — the `..`
+        // still matches anything new — which is why every field is named.
+        epochs:
+            crate::state::substates::EpochSubState {
+                snapshots: _,
+                treasury: _,
+                reserves: _,
+                pending_reward_update: _,
+                non_myopic: _,
+                last_applied_rupd: _,
+                pending_pp_updates: _,
+                future_pp_updates: _,
+                needs_stake_rebuild: _,
+                ptr_stake: _,
+                ptr_stake_excluded: _,
+                protocol_params: _,
+                prev_protocol_params: _,
+                prev_protocol_version_major: _,
+                prev_d: _,
+                rupd_addrs_rew: _,
+                rupd_pulser_started: _,
+                pending_avvm_return: _,
+            },
         tip: _,
         era: _,
         pending_era_transition: _,
