@@ -417,11 +417,53 @@ cases of a plausible invented shape reaching the wire. The arms land when the
 state they describe exists — with `tests/fixtures/nesru/` as the oracle, which
 is the state this work leaves them in.
 
-### Phase 3 — RUPD incremental pulsing (gated on Phase 0)
+### Phase 3 — RUPD incremental pulsing — **GO** (Phase 0 cleared it, §3.4)
 
 `pulse_size = max(1, ceil(num_stake_creds / (4k)))`; `done` when the balance map
 is exhausted; `pulse_m` consumes `pulse_size` per block; `complete_m` folds the
 rest. Reproduce `clearRecent` on the accumulator.
+
+**The structural change is the loop's major axis.** dugite folds POOL-major —
+`for (pool_id, stake) in &go.pool_stake` with an inner `for cred_hash in
+delegators` (`rewards.rs:533`, `:742`). Upstream's work queue is
+CREDENTIAL-major: the captured pulser's remaining set is a tag-258 set of
+`8200581c…` items, i.e. `array(2)[0, bytes(28)]` = `Credential 'Staking`.
+Chunking a pool-major loop at pool granularity would NOT match — one pool can
+hold hundreds of thousands of delegators, so a "pulse" could be arbitrarily
+large and the `Pulsing` wire arm would still not reproduce upstream's queue.
+The fold has to be re-expressed credential-major, with the per-pool terms
+(`maxPool'`, `sigma`, leader reward) precomputed once into a per-pool table
+that the credential fold then reads — which is what upstream's `FreeVars` +
+`PoolRewardInfo` pair already is.
+
+**The safety gate is a differential property, not a replay.** Incremental and
+batch must produce byte-identical output from identical frozen inputs, which is
+directly assertable and cheap:
+
+```text
+fold_incremental(frozen, pulse_size = 1)   ==  fold_batch(frozen)
+fold_incremental(frozen, pulse_size = 7)   ==  fold_batch(frozen)
+fold_incremental(frozen, pulse_size = n)   ==  fold_batch(frozen)
+```
+
+Property-tested over random snapshots and pulse sizes, this pins the ONLY
+correctness claim Phase 3 makes — the restructuring changes when work happens,
+never what it computes. It also fails loudly on the specific hazard of a
+credential-major rewrite: a per-pool term (`maxPool'` denominators, the pledge
+check, `clearRecent`) accidentally recomputed per credential from mutating
+state instead of read from the frozen table.
+
+Run the preview replay (733 Conway boundaries, `db-preview` is on disk) as the
+end-to-end gate on top, per the standing rule that ledger changes are gated on
+it — but the differential property is what makes the change reviewable, since
+a replay that passes tells you the answers matched without telling you the
+frozen table was actually frozen.
+
+**Not attempted in v2.8.0.** It is a restructuring of a consensus-critical fold
+and belongs in its own release with its own gate, not appended to one that
+already carries a validated consensus fix (#1072). Everything it needs is in
+place: the freeze (Phase 1a), the measurement (Phase 0), and the wire fixtures
+(`tests/fixtures/nesru/`) that its `Pulsing` arm must reproduce.
 
 ### Phase 4 — DRep internal pulsing **(justification reduced [R2])**
 
