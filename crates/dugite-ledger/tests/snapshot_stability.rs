@@ -126,7 +126,7 @@ fn snapshot_format_hash_stability() {
     // additions, so both are layout changes — but 38 was never tagged, so they
     // ship as ONE re-sync rather than two. That invariant is enforced by
     // `xtask/tests/snapshot_one_bump_invariant.rs`, not by convention.
-    const EXPECTED_HASH: &str = "55e033f5fbfc9b399568358c27c4f04690cd489295fbc4ddee557f4c9c54fb80";
+    const EXPECTED_HASH: &str = "ea9ce3ba3840ac8d99da93a47062410f322ed7736466b167ca2e536ad2f48e54";
 
     if EXPECTED_HASH == "COMPUTE_ON_FIRST_RUN" {
         panic!(

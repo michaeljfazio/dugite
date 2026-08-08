@@ -591,6 +591,7 @@ impl LedgerState {
                     self.epochs.snapshots.ss_fee.0,
                     blocks,
                     self.epoch_length,
+                    crate::state::MAX_LOVELACE_SUPPLY,
                 ));
             }
         }

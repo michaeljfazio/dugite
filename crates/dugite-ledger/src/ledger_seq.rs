@@ -3224,6 +3224,7 @@ mod rupd_freeze_rollback {
             delta_t1: r / 5,
             r: r - r / 5,
             expected_blocks: 100,
+            total_stake: 31_000_000_000_000_000,
         }
     }
 

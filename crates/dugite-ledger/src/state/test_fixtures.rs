@@ -215,6 +215,11 @@ pub fn populated_ledger_state() -> LedgerState {
         delta_t1: 600_000_000_200,
         r: 2_400_000_000_800,
         expected_blocks: 21_600,
+        // Deliberately NOT max_supply - reserves for this fixture's reserves:
+        // the whole point of freezing it is that it can differ from a
+        // boundary-time recomputation, so a fixture that made them equal
+        // could not tell a frozen read from a live one.
+        total_stake: 31_112_484_745_368_612,
     });
     state.epochs.rupd_addrs_rew = Some(Arc::new({
         let mut s = HashSet::new();

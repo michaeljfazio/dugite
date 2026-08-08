@@ -168,6 +168,28 @@ pub struct MonetaryStep {
     /// it irrelevant. Retained for diagnostics — a value of 1 means the clamp
     /// fired, which distorts `eta`.
     pub expected_blocks: u64,
+    /// `fvTotalStake` — `maxSupply - casReserves` AT THE FREEZE INSTANT.
+    ///
+    /// Haskell freezes this into `FreeVars`, and the captured mainnet-shaped
+    /// pulser carries it verbatim (`fvTotalStake = 54003425994184880` in
+    /// `tests/fixtures/nesru/pulsing.hex`). dugite recomputed it at the
+    /// boundary instead.
+    ///
+    /// Those agree everywhere reserves are immobile mid-epoch (§3.1), which is
+    /// everywhere EXCEPT a boundary whose era translation moves reserves —
+    /// i.e. Shelley→Allegra, where `returnRedeemAddrsToReserves` credits the
+    /// unredeemed AVVM coin BEFORE the reward update is applied. dugite
+    /// patched that one case with `pending_avvm_return`, a bespoke correction
+    /// carried in `EpochSubState` and subtracted back off at exactly one
+    /// boundary.
+    ///
+    /// Freezing the value removes the patch AND its unstated invariant. Note
+    /// this is not only about `deltaR1`: `total_stake` is `sigma`'s
+    /// denominator, so it reaches `maxPool'` and every pool's likelihood. A
+    /// version of this change that froze only the monetary terms would have
+    /// left the reward DISTRIBUTION reading post-AVVM reserves while the pot
+    /// read pre-AVVM — worse than the patch it removed.
+    pub total_stake: u64,
 }
 
 /// Compute [`MonetaryStep`] from the inputs `startStep` freezes.
@@ -185,6 +207,7 @@ pub fn start_step_monetary(
     epoch_fees: u64,
     blocks_made: u64,
     slots_per_epoch: u64,
+    max_lovelace_supply: u64,
 ) -> MonetaryStep {
     use super::Rat;
 
@@ -229,6 +252,9 @@ pub fn start_step_monetary(
         delta_t1,
         r: r_pot - delta_t1,
         expected_blocks,
+        // `fvTotalStake` — frozen here rather than recomputed at the boundary,
+        // which is what makes `pending_avvm_return` unnecessary.
+        total_stake: max_lovelace_supply.saturating_sub(reserves),
     }
 }
 
@@ -306,6 +332,9 @@ impl PulsingRewUpdate {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `maxLovelaceSupply`, mainnet.
+    const MAX_SUPPLY: u64 = 45_000_000_000_000_000;
 
     /// Devnet geometry: `epochLength=400`, `k=40`, `f=0.5` => `sr = 4k/f = 320`.
     fn devnet_window(epoch_first: u64) -> RewardWindow {
@@ -441,6 +470,7 @@ mod tests {
             1_000,                 // fees
             21_600,                // blocks made == expected => eta = 1
             432_000,               // slots per epoch
+            MAX_SUPPLY,            // maxLovelaceSupply
         );
         assert_eq!(m.expected_blocks, 21_600);
         assert_eq!(m.delta_r1, 3_000_000_000_000);
@@ -458,7 +488,17 @@ mod tests {
     /// the overlay branch (`>=`, not `>`). A float comparison here is #629.
     #[test]
     fn overlay_gate_is_exact_at_four_fifths() {
-        let at = start_step_monetary((3, 1000), (1, 5), (4, 5), (1, 20), 1_000_000, 0, 0, 432_000);
+        let at = start_step_monetary(
+            (3, 1000),
+            (1, 5),
+            (4, 5),
+            (1, 20),
+            1_000_000,
+            0,
+            0,
+            432_000,
+            MAX_SUPPLY,
+        );
         assert_eq!(at.expected_blocks, 0, "d == 4/5 must take the eta=1 branch");
         assert_eq!(at.delta_r1, 3_000, "full expansion, unadjusted by blocks");
 
@@ -474,6 +514,7 @@ mod tests {
             0,
             0,
             432_000,
+            MAX_SUPPLY,
         );
         assert!(below.expected_blocks > 0);
         assert_eq!(below.delta_r1, 0);
@@ -483,7 +524,17 @@ mod tests {
     #[test]
     fn expected_blocks_never_zero_on_the_eta_path() {
         // (1 - d) * f * slots rounds to 0 for a tiny epoch.
-        let m = start_step_monetary((3, 1000), (1, 5), (0, 1), (1, 20), 1_000_000, 0, 0, 1);
+        let m = start_step_monetary(
+            (3, 1000),
+            (1, 5),
+            (0, 1),
+            (1, 20),
+            1_000_000,
+            0,
+            0,
+            1,
+            MAX_SUPPLY,
+        );
         assert_eq!(m.expected_blocks, 1);
     }
 
@@ -1019,5 +1070,120 @@ mod fold_differential {
         assert_eq!(RewardFold::pulse_size(161, 40), 2, "just past 4k");
         // Mainnet: 1.3M credentials, k = 2160 => 4k = 8640.
         assert_eq!(RewardFold::pulse_size(1_300_000, 2160), 151);
+    }
+}
+
+/// The frozen `total_stake` must WIN over a boundary-time recomputation.
+///
+/// This is what retires `pending_avvm_return`. At the Shelley->Allegra boundary
+/// `returnRedeemAddrsToReserves` credits the unredeemed AVVM coin to reserves
+/// BEFORE the reward update is applied, so a boundary-time
+/// `maxSupply - reserves` is post-AVVM while Haskell's `fvTotalStake` — frozen
+/// at the 4k/f mark — is pre-AVVM. dugite corrected the gap with a bespoke
+/// field subtracted back off at exactly one boundary.
+#[cfg(test)]
+mod frozen_total_stake {
+    use super::*;
+
+    const MAX_SUPPLY: u64 = 45_000_000_000_000_000;
+
+    /// `start_step_monetary` records `maxSupply - reserves` as it stood at the
+    /// freeze, not as it stands later.
+    #[test]
+    fn start_step_freezes_total_stake_at_the_mark() {
+        let pre_avvm_reserves = 14_000_000_000_000_000u64;
+        let m = start_step_monetary(
+            (3, 1000),
+            (1, 5),
+            (0, 1),
+            (1, 20),
+            pre_avvm_reserves,
+            0,
+            21_600,
+            432_000,
+            MAX_SUPPLY,
+        );
+        assert_eq!(
+            m.total_stake,
+            MAX_SUPPLY - pre_avvm_reserves,
+            "fvTotalStake is maxSupply - casReserves at the FREEZE instant"
+        );
+    }
+
+    /// The frozen value differs from a post-AVVM recomputation, and that
+    /// difference is exactly the returned coin.
+    ///
+    /// Without this the whole change is untestable on any network dugite runs:
+    /// the devnet starts in Conway and has no Shelley->Allegra boundary, and
+    /// the mainnet replay that would show it is blocked on disk (§5b). So the
+    /// property is asserted arithmetically instead of observed — stated plainly
+    /// rather than dressed up as an end-to-end result.
+    #[test]
+    fn the_frozen_value_differs_from_a_post_avvm_recomputation() {
+        let pre_avvm_reserves = 14_000_000_000_000_000u64;
+        let avvm_returned = 318_200_635_000_000u64; // mainnet order of magnitude
+        let post_avvm_reserves = pre_avvm_reserves + avvm_returned;
+
+        let m = start_step_monetary(
+            (3, 1000),
+            (1, 5),
+            (0, 1),
+            (1, 20),
+            pre_avvm_reserves,
+            0,
+            21_600,
+            432_000,
+            MAX_SUPPLY,
+        );
+        let recomputed_at_boundary = MAX_SUPPLY - post_avvm_reserves;
+
+        assert_ne!(
+            m.total_stake, recomputed_at_boundary,
+            "if these were equal the fixture would not exercise the AVVM case \
+             at all, and the test would pass for a build that ignored the \
+             frozen value entirely"
+        );
+        assert_eq!(
+            m.total_stake - recomputed_at_boundary,
+            avvm_returned,
+            "the gap between frozen and recomputed IS the returned AVVM coin — \
+             which is precisely what pending_avvm_return used to subtract back \
+             off by hand"
+        );
+    }
+
+    /// `total_stake` is `sigma`'s denominator, so getting it wrong moves every
+    /// pool's reward, not just the pot.
+    ///
+    /// Recorded as an assertion because the tempting smaller change — freeze
+    /// only the monetary terms, keep recomputing `total_stake` — would leave
+    /// the pot pre-AVVM and the DISTRIBUTION post-AVVM. That is worse than the
+    /// patch it replaces: the patch at least kept the two consistent.
+    #[test]
+    fn total_stake_moves_sigma_not_just_the_pot() {
+        let a = start_step_monetary(
+            (3, 1000),
+            (1, 5),
+            (0, 1),
+            (1, 20),
+            14_000_000_000_000_000,
+            0,
+            21_600,
+            432_000,
+            MAX_SUPPLY,
+        );
+        let b = start_step_monetary(
+            (3, 1000),
+            (1, 5),
+            (0, 1),
+            (1, 20),
+            14_318_200_635_000_000,
+            0,
+            21_600,
+            432_000,
+            MAX_SUPPLY,
+        );
+        assert_ne!(a.total_stake, b.total_stake, "sigma denominator moved");
+        assert_ne!(a.delta_r1, b.delta_r1, "and so did the pot");
     }
 }
