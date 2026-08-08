@@ -1,5 +1,5 @@
 use super::non_myopic::{leader_probability, Likelihood, NonMyopic};
-use super::reward_pulser::PoolRewardInfo;
+use super::reward_pulser::{MemberFoldCtx, PoolRewardInfo, RewardFold};
 use super::{LedgerState, PendingRewardUpdate, StakeSnapshot};
 use dugite_primitives::hash::{Hash28, Hash32};
 use dugite_primitives::protocol_params::ProtocolParameters;
@@ -697,41 +697,32 @@ pub fn compute_reward_update(
     // through `&self`, so the classic incremental-fold hazard — a per-pool
     // quantity silently recomputed per credential against state that has moved
     // on — is not expressible here.
-    for (cred_hash, pool_id) in go.delegations.iter() {
-        let Some(info) = pool_reward_table.get(pool_id) else {
-            continue;
-        };
-        if info.owner_set.contains(cred_hash) {
-            continue;
-        }
+    // The pv<=6 member prefilter (Haskell `rewardOnePoolMember.prefilter`,
+    // eras/shelley/impl/.../Rewards.hs:262):
+    //   prefilter = hardforkBabbageForgoRewardPrefilter pv || hk ∈ addrsRew
+    // For pv ≤ 6 (Shelley-Alonzo) the member credential must be registered in
+    // the reward-accounts set frozen at startStep, or the computed reward is
+    // dropped. For pv ≥ 7 (Babbage onward, ledger errata 17.2) the prefilter is
+    // bypassed; unregistered rewards are routed at applyRUpd time
+    // (frTotalUnregistered → treasury). Applied inside `RewardFold::pulse`.
+    let ctx = MemberFoldCtx {
+        table: &pool_reward_table,
+        delegations: &go.delegations,
+        stake: &go.stake_distribution,
+        pv_major: prev_protocol_version_major,
+        registered: &registered_at_startstep,
+    };
 
-        // Mirror Haskell `rewardOnePoolMember.prefilter`
-        // (eras/shelley/impl/.../Rewards.hs:262):
-        //   prefilter = hardforkBabbageForgoRewardPrefilter pv || hk ∈ addrsRew
-        //
-        // For pv ≤ 6 (Shelley-Alonzo), the member credential must be currently
-        // registered in the reward-accounts set or the computed reward is
-        // dropped at startStep time. For pv ≥ 7 (Babbage onward, ledger errata
-        // 17.2) the prefilter is bypassed; routing of unregistered rewards
-        // happens at applyRUpd time (frTotalUnregistered → treasury).
-        if prev_protocol_version_major <= 6 && !registered_at_startstep(cred_hash) {
-            continue;
-        }
-
-        let member_stake = go
-            .stake_distribution
-            .get(cred_hash)
-            .copied()
-            .unwrap_or(Lovelace(0))
-            .0;
-
-        let member_share = info.member_reward(member_stake);
-        if member_share > 0 {
-            reward_entries
-                .entry(*cred_hash)
-                .or_default()
-                .push((true, *pool_id, member_share));
-        }
+    // Production runs the fold to completion in one call. That is deliberate:
+    // this is the SAME code path an incrementally-pulsed fold takes, just with
+    // a single maximal pulse, so there is no second implementation to drift.
+    // #985/#932/#938 were all N-copies defects where the copy nobody edited was
+    // the live one; a batch path kept beside a pulse path would be the same
+    // trap with a consensus-critical fold inside it.
+    let mut fold = RewardFold::new(&go.delegations);
+    fold.complete(&ctx);
+    for (cred, entries) in fold.into_entries() {
+        reward_entries.entry(cred).or_default().extend(entries);
     }
 
     // ---- leader rewards ---------------------------------------------------

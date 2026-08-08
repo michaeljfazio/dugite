@@ -715,3 +715,309 @@ impl PoolRewardInfo {
             .floor_u64()
     }
 }
+
+/// Everything the member fold reads. All of it frozen at `startStep`.
+///
+/// Bundled into one borrow so a pulse cannot be handed a mix of frozen and
+/// live inputs — the defect shape behind #988 (a reader mixing frozen with
+/// live terms) and #949 (a term fixed in the live path while the frozen path
+/// kept the old value).
+pub struct MemberFoldCtx<'a, F: Fn(&Hash32) -> bool> {
+    /// Per-pool terms, keyed by pool.
+    pub table: &'a HashMap<Hash28, PoolRewardInfo>,
+    /// `ssDelegations` — credential to pool.
+    pub delegations: &'a HashMap<Hash32, Hash28>,
+    /// `ssStake` — active stake per credential.
+    pub stake: &'a HashMap<Hash32, Lovelace>,
+    /// Protocol major version in force BEFORE the boundary.
+    pub pv_major: u64,
+    /// `hk ∈ addrsRew`, the pv<=6 member prefilter.
+    pub registered: F,
+}
+
+/// A reward entry: `(is_member, producing_pool, amount)`.
+pub type RewardEntryTriple = (bool, Hash28, u64);
+
+/// Haskell's `RewardPulser` — a work queue of credentials plus the answer so far.
+///
+/// ```haskell
+/// data RewardPulser c ... = RSLP
+///   !Int                                 -- pulse size
+///   !(FreeVars c)                        -- frozen inputs
+///   !(VMap.KVVector ...)                 -- the balance: work remaining
+///   !(RewardAns c)                       -- the answer accumulated so far
+/// ```
+///
+/// The queue is **sorted**, which is not cosmetic. Upstream's balance is a
+/// `Set (Credential 'Staking)` and pulses consume it in `Ord` order; dugite's
+/// source is a `HashMap`, whose iteration order varies per process. An unsorted
+/// queue would make the split between "already folded" and "still pending"
+/// differ across restarts and rollbacks — two nodes, or one node before and
+/// after a restart, would disagree about `nesRu` even while computing identical
+/// rewards. Sorting also makes `remaining()` directly encodable as the wire
+/// arm's tag-258 set.
+#[derive(Clone, Debug)]
+pub struct RewardFold {
+    queue: Vec<Hash32>,
+    cursor: usize,
+    acc: HashMap<Hash32, Vec<RewardEntryTriple>>,
+}
+
+impl RewardFold {
+    /// Freeze the work queue from the delegation map.
+    pub fn new(delegations: &HashMap<Hash32, Hash28>) -> Self {
+        let mut queue: Vec<Hash32> = delegations.keys().copied().collect();
+        queue.sort_unstable();
+        RewardFold {
+            queue,
+            cursor: 0,
+            acc: HashMap::new(),
+        }
+    }
+
+    /// `pulseSize = max 1 (ceil (size balance / (4 * k)))`, per `startStep`.
+    pub fn pulse_size(num_credentials: usize, security_param_k: u64) -> usize {
+        let denom = (4 * security_param_k).max(1) as usize;
+        num_credentials.div_ceil(denom).max(1)
+    }
+
+    /// Credentials still to fold — upstream's `balance`, in `Ord` order.
+    pub fn remaining(&self) -> &[Hash32] {
+        &self.queue[self.cursor..]
+    }
+
+    /// `done` — the balance is exhausted.
+    pub fn is_done(&self) -> bool {
+        self.cursor >= self.queue.len()
+    }
+
+    /// Fold at most `n` more credentials. Returns how many were consumed.
+    ///
+    /// Chunking is unobservable in the result: each credential contributes only
+    /// to its own key, and the caller aggregates with a sort. That property is
+    /// what `fold_incremental == fold_batch` asserts, and it is the ONLY
+    /// correctness claim incremental pulsing makes.
+    pub fn pulse<F: Fn(&Hash32) -> bool>(&mut self, n: usize, ctx: &MemberFoldCtx<'_, F>) -> usize {
+        let end = (self.cursor + n).min(self.queue.len());
+        let consumed = end - self.cursor;
+        for idx in self.cursor..end {
+            let cred = self.queue[idx];
+            let Some(pool_id) = ctx.delegations.get(&cred) else {
+                continue;
+            };
+            let Some(info) = ctx.table.get(pool_id) else {
+                continue;
+            };
+            if info.owner_set.contains(&cred) {
+                continue;
+            }
+            if ctx.pv_major <= 6 && !(ctx.registered)(&cred) {
+                continue;
+            }
+            let member_stake = ctx.stake.get(&cred).copied().unwrap_or(Lovelace(0)).0;
+            let share = info.member_reward(member_stake);
+            if share > 0 {
+                self.acc
+                    .entry(cred)
+                    .or_default()
+                    .push((true, *pool_id, share));
+            }
+        }
+        self.cursor = end;
+        consumed
+    }
+
+    /// `completeM` — fold whatever is left in one go.
+    pub fn complete<F: Fn(&Hash32) -> bool>(&mut self, ctx: &MemberFoldCtx<'_, F>) {
+        let left = self.queue.len() - self.cursor;
+        self.pulse(left, ctx);
+    }
+
+    /// The accumulated member entries. Panics if the fold is unfinished — a
+    /// partial answer read as a complete one would under-pay silently, which
+    /// is exactly the class of bug the whole pulser design exists to avoid.
+    pub fn into_entries(self) -> HashMap<Hash32, Vec<RewardEntryTriple>> {
+        assert!(
+            self.is_done(),
+            "reward fold read at {}/{} credentials — a partial answer is not a \
+             reward update, and treating it as one silently under-pays every \
+             credential past the cursor",
+            self.cursor,
+            self.queue.len()
+        );
+        self.acc
+    }
+}
+
+/// The differential gate on incremental pulsing.
+///
+/// Incremental pulsing makes exactly ONE correctness claim: it changes *when*
+/// the reward fold runs, never *what* it computes. These tests assert that
+/// claim directly, which is stronger than a replay — a passing replay tells you
+/// the answers matched, not that chunking was irrelevant to them.
+#[cfg(test)]
+mod fold_differential {
+    use super::*;
+    use proptest::prelude::*;
+    use std::collections::HashSet;
+
+    fn h28(i: u64) -> Hash28 {
+        let mut b = [0u8; 28];
+        b[..8].copy_from_slice(&i.to_be_bytes());
+        dugite_primitives::Hash(b)
+    }
+
+    fn h32(i: u64) -> Hash32 {
+        let mut b = [0u8; 32];
+        // Scatter, so sorted order is not insertion order and a fold that
+        // accidentally depends on one is not saved by them coinciding.
+        b[..8].copy_from_slice(&i.wrapping_mul(0x9e37_79b9_7f4a_7c15).to_be_bytes());
+        dugite_primitives::Hash(b)
+    }
+
+    #[allow(clippy::type_complexity)]
+    fn synth(
+        creds: usize,
+        pools: usize,
+    ) -> (
+        HashMap<Hash28, PoolRewardInfo>,
+        HashMap<Hash32, Hash28>,
+        HashMap<Hash32, Lovelace>,
+    ) {
+        let mut table = HashMap::new();
+        for p in 0..pools {
+            let id = h28(p as u64);
+            table.insert(
+                id,
+                PoolRewardInfo {
+                    pool_id: id,
+                    pool_active_stake: 1_000_000_000_000,
+                    pool_reward: 500_000_000 + p as u64 * 7,
+                    cost: 170_000_000,
+                    margin_num: 1,
+                    margin_den: 50,
+                    // Make one credential per pool an owner, so the owner skip
+                    // is exercised at chunk boundaries too.
+                    owner_set: HashSet::from([h32(p as u64)]),
+                    leader: None,
+                },
+            );
+        }
+        let mut delegations = HashMap::new();
+        let mut stake = HashMap::new();
+        for c in 0..creds {
+            let cred = h32(c as u64);
+            delegations.insert(cred, h28((c % pools) as u64));
+            // Some zero-stake credentials, which the fold must skip identically
+            // no matter which chunk they land in.
+            stake.insert(
+                cred,
+                Lovelace(if c % 11 == 0 { 0 } else { 1_000_000 + c as u64 }),
+            );
+        }
+        (table, delegations, stake)
+    }
+
+    proptest! {
+        /// `fold_incremental(frozen, any pulse_size) == fold_batch(frozen)`.
+        #[test]
+        fn chunking_is_unobservable_in_the_result(
+            creds in 1usize..300,
+            pools in 1usize..12,
+            pulse in 1usize..64,
+        ) {
+            let (table, delegations, stake) = synth(creds, pools);
+            let ctx = MemberFoldCtx {
+                table: &table,
+                delegations: &delegations,
+                stake: &stake,
+                pv_major: 11,
+                registered: |_: &Hash32| true,
+            };
+
+            let mut batch = RewardFold::new(&delegations);
+            batch.complete(&ctx);
+
+            let mut inc = RewardFold::new(&delegations);
+            let mut guard = 0;
+            while !inc.is_done() {
+                inc.pulse(pulse, &ctx);
+                guard += 1;
+                prop_assert!(guard <= creds + 1, "pulse failed to make progress");
+            }
+
+            prop_assert_eq!(batch.into_entries(), inc.into_entries());
+        }
+
+        /// Pulsing must always make progress, or a node wedges mid-epoch.
+        #[test]
+        fn every_pulse_advances_the_cursor(creds in 1usize..100, pools in 1usize..6) {
+            let (table, delegations, stake) = synth(creds, pools);
+            let ctx = MemberFoldCtx {
+                table: &table, delegations: &delegations, stake: &stake,
+                pv_major: 11, registered: |_: &Hash32| true,
+            };
+            let mut f = RewardFold::new(&delegations);
+            let before = f.remaining().len();
+            let consumed = f.pulse(1, &ctx);
+            prop_assert_eq!(consumed, 1);
+            prop_assert_eq!(f.remaining().len(), before - 1);
+        }
+    }
+
+    /// The work queue must not depend on `HashMap` iteration order.
+    ///
+    /// Upstream's balance is a `Set (Credential 'Staking)` consumed in `Ord`
+    /// order. dugite's source is a `HashMap`, whose order varies per process —
+    /// so without the sort, the split between folded and pending would differ
+    /// across a restart or a rollback, and two nodes computing identical
+    /// rewards would still disagree about `nesRu`.
+    #[test]
+    fn the_queue_is_deterministic_regardless_of_insertion_order() {
+        let n = 200u64;
+        let mut a: HashMap<Hash32, Hash28> = HashMap::new();
+        for i in 0..n {
+            a.insert(h32(i), h28(i % 3));
+        }
+        let mut b: HashMap<Hash32, Hash28> = HashMap::new();
+        for i in (0..n).rev() {
+            b.insert(h32(i), h28(i % 3));
+        }
+        let qa = RewardFold::new(&a);
+        let qb = RewardFold::new(&b);
+        assert_eq!(qa.remaining(), qb.remaining());
+        assert!(
+            qa.remaining().windows(2).all(|w| w[0] < w[1]),
+            "the queue must be strictly ascending — the wire arm encodes it as \
+             a Set and a Haskell peer decodes it as one"
+        );
+    }
+
+    /// A partial fold must never be mistaken for a finished one.
+    #[test]
+    #[should_panic(expected = "a partial answer is not a reward update")]
+    fn reading_an_unfinished_fold_panics() {
+        let (table, delegations, stake) = synth(50, 3);
+        let ctx = MemberFoldCtx {
+            table: &table,
+            delegations: &delegations,
+            stake: &stake,
+            pv_major: 11,
+            registered: |_: &Hash32| true,
+        };
+        let mut f = RewardFold::new(&delegations);
+        f.pulse(10, &ctx);
+        let _ = f.into_entries();
+    }
+
+    /// `pulseSize = max 1 (ceil (size balance / (4 * k)))`.
+    #[test]
+    fn pulse_size_matches_start_step() {
+        assert_eq!(RewardFold::pulse_size(0, 40), 1, "never zero — would wedge");
+        assert_eq!(RewardFold::pulse_size(1, 40), 1);
+        assert_eq!(RewardFold::pulse_size(160, 40), 1, "at 4k exactly");
+        assert_eq!(RewardFold::pulse_size(161, 40), 2, "just past 4k");
+        // Mainnet: 1.3M credentials, k = 2160 => 4k = 8640.
+        assert_eq!(RewardFold::pulse_size(1_300_000, 2160), 151);
+    }
+}
