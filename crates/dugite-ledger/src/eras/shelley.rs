@@ -438,6 +438,23 @@ impl EraRules for ShelleyRules {
         // Networks that genesis directly in Shelley (preview/devnet,
         // shelley_transition_epoch == 0) never match a real boundary here, so
         // their genesis 0→1 RUPD (issue #438) is unaffected.
+        //
+        // SUBSUMED by the #1072 gate below, and retained deliberately.
+        // `rupd_pulser_started` is set only by a block with `era != Byron`
+        // (`apply.rs`), and it is cleared at every boundary — so through the
+        // final Byron epoch nothing can set it, and the gate already declines
+        // to apply a reward update at this exact boundary. This condition
+        // cannot change the outcome.
+        //
+        // Phase 5 called for retiring it. Not done, and the reason is the
+        // point: no network available here reaches a Byron→Shelley boundary —
+        // the devnet genesises in Conway, and the mainnet replay that would
+        // exercise it is blocked on disk (§5b of the pulser design). Deleting
+        // a guard whose redundancy rests on an argument, on a path no test can
+        // reach, for tidiness alone, is how #1057 was made worse. It stays
+        // until something can actually run the boundary; the argument for its
+        // redundancy is written down so the next person does not have to
+        // rediscover it.
         let is_byron_to_shelley_fork =
             ctx.shelley_transition_epoch > 0 && new_epoch.0 == ctx.shelley_transition_epoch;
         // #1072: Haskell's NEWEPOCH applies a reward update only when a pulser
