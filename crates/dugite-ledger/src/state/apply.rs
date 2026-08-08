@@ -2214,8 +2214,17 @@ impl LedgerState {
         }
 
         // #1072: same treatment, plain equality — it is a bool.
+        //
+        // The frozen monetary terms are recorded TOGETHER with the flag, not on
+        // their own change-detect. `EpochSubState::rupd_monetary` documents that
+        // the two "move together"; snapshotting them independently is what would
+        // make that false on rollback, and a rollback that restored one but not
+        // the other is #985's shape (a field current in what a delta touches,
+        // stale in what none does). Writing both here means the pair is atomic
+        // by construction rather than by a coincidence of change-detection.
         if rupd_pulser_started_before != self.epochs.rupd_pulser_started {
             delta.rupd_pulser_started_snapshot = Some(self.epochs.rupd_pulser_started);
+            delta.rupd_monetary_snapshot = Some(self.epochs.rupd_monetary);
         }
 
         // Extract the UTxO diff from the DiffSeq entry that apply_block just pushed.

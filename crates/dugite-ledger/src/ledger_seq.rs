@@ -302,6 +302,26 @@ pub struct LedgerDelta {
     /// That is #985's failure mode, and it is why this sits beside
     /// `rupd_addrs_rew_snapshot` rather than being left to the epoch fold.
     pub rupd_pulser_started_snapshot: Option<bool>,
+
+    /// The frozen monetary terms, snapshotted with the flag above.
+    ///
+    /// `Option<Option<..>>`: the OUTER `None` means "unchanged by this block",
+    /// the INNER `None` means "the epoch had not reached its mark". Collapsing
+    /// them would make "not recorded" and "genuinely absent" the same value —
+    /// #1028's exact type defect, where an `Option` that could not express the
+    /// distinction is what let the two be confused.
+    ///
+    /// `EpochSubState::rupd_monetary` documents that it and
+    /// `rupd_pulser_started` "move together". Snapshotting only the flag made
+    /// that false across a rollback: the flag regressed while the monetary
+    /// terms stayed at the newer value. Nothing read the pair in that state —
+    /// RUPD is skipped while the flag is false, and the next block past the
+    /// mark rewrites both — so this was safe by a two-step argument about
+    /// which fields are read when.
+    ///
+    /// #985 is what a two-step argument about staleness is worth. The pair now
+    /// moves atomically, so the invariant is enforced rather than reasoned to.
+    pub rupd_monetary_snapshot: Option<Option<super::state::reward_pulser::MonetaryStep>>,
 }
 
 impl LedgerDelta {
@@ -341,6 +361,7 @@ impl LedgerDelta {
             future_pp_updates_snapshot: None,
             rupd_addrs_rew_snapshot: None,
             rupd_pulser_started_snapshot: None,
+            rupd_monetary_snapshot: None,
         }
     }
 }
@@ -1277,6 +1298,9 @@ pub fn apply_delta_to_state(state: &mut LedgerState, delta: &LedgerDelta) {
     }
     if let Some(started) = delta.rupd_pulser_started_snapshot {
         state.epochs.rupd_pulser_started = started;
+    }
+    if let Some(mon) = &delta.rupd_monetary_snapshot {
+        state.epochs.rupd_monetary = *mon;
     }
 
     // Update tip to reflect this block.
@@ -3183,6 +3207,92 @@ mod tests {
             "the live ledger must be left untouched — this is the assertion that \
              fails without the guard, installing genesis PV 6 onto a PV 11 chain \
              and arming the NotActiveOverlaySlot rejection"
+        );
+    }
+}
+
+/// The RUPD freeze pair must survive a rollback ATOMICALLY.
+#[cfg(test)]
+mod rupd_freeze_rollback {
+    use super::*;
+    use crate::state::reward_pulser::MonetaryStep;
+    use dugite_primitives::protocol_params::ProtocolParameters;
+
+    fn step(r: u64) -> MonetaryStep {
+        MonetaryStep {
+            delta_r1: r,
+            delta_t1: r / 5,
+            r: r - r / 5,
+            expected_blocks: 100,
+        }
+    }
+
+    /// A delta that rolls back the flag must roll back the monetary terms.
+    ///
+    /// `EpochSubState::rupd_monetary` documents that it and
+    /// `rupd_pulser_started` "move together". Before this pairing only the flag
+    /// had a delta: a rollback across the 4k/f mark regressed the flag to
+    /// `false` while the monetary terms stayed at the newer values.
+    ///
+    /// That was SAFE, by a two-step argument — RUPD is skipped while the flag
+    /// is false, and the next block past the mark rewrites both — which is
+    /// exactly the kind of argument #985 turned out to be. There, a field
+    /// current in everything a delta touched and stale in everything none did
+    /// produced a PV6/d=1 chimera on a PV11 chain. Enforced now, not reasoned
+    /// to.
+    #[test]
+    fn rolling_back_the_flag_also_rolls_back_the_frozen_terms() {
+        let mut state = LedgerState::new(ProtocolParameters::mainnet_defaults());
+        // Post-mark state, as it stands at the tip we roll back from.
+        state.epochs.rupd_pulser_started = true;
+        state.epochs.rupd_monetary = Some(step(17_989_722_017_445));
+
+        // A delta whose PRE-block state was pre-mark.
+        let mut delta = LedgerDelta::new(SlotNo(1120), Hash32::from_bytes([7u8; 32]), BlockNo(42));
+        delta.rupd_pulser_started_snapshot = Some(false);
+        delta.rupd_monetary_snapshot = Some(None);
+
+        apply_delta_to_state(&mut state, &delta);
+
+        assert!(!state.epochs.rupd_pulser_started, "the flag rolled back");
+        assert!(
+            state.epochs.rupd_monetary.is_none(),
+            "the frozen monetary terms must roll back WITH the flag; leaving \
+             them at the newer value is the #985 shape — current in what the \
+             delta touches, stale in what it does not"
+        );
+    }
+
+    /// The doubly-optional type must keep "not recorded" distinct from
+    /// "genuinely absent".
+    ///
+    /// Collapsing `Option<Option<MonetaryStep>>` to `Option<MonetaryStep>` is
+    /// #1028's defect verbatim — a type that cannot express the distinction is
+    /// what let the two be confused. This drives both values through the SAME
+    /// restore path and asserts they behave DIFFERENTLY, so the collapse cannot
+    /// pass unnoticed.
+    #[test]
+    fn unrecorded_and_absent_are_not_the_same_value() {
+        let mut state = LedgerState::new(ProtocolParameters::mainnet_defaults());
+        state.epochs.rupd_monetary = Some(step(999));
+
+        // Outer None: this block did not touch the pair — leave it alone.
+        let mut untouched = LedgerDelta::new(SlotNo(1), Hash32::from_bytes([1u8; 32]), BlockNo(1));
+        untouched.rupd_monetary_snapshot = None;
+        apply_delta_to_state(&mut state, &untouched);
+        assert_eq!(
+            state.epochs.rupd_monetary.as_ref().map(|m| m.delta_r1),
+            Some(999),
+            "an unrecorded delta must not clear the frozen terms"
+        );
+
+        // Inner None: the pre-block state genuinely had no freeze yet.
+        let mut cleared = LedgerDelta::new(SlotNo(2), Hash32::from_bytes([2u8; 32]), BlockNo(2));
+        cleared.rupd_monetary_snapshot = Some(None);
+        apply_delta_to_state(&mut state, &cleared);
+        assert!(
+            state.epochs.rupd_monetary.is_none(),
+            "a recorded absence must clear the frozen terms"
         );
     }
 }
