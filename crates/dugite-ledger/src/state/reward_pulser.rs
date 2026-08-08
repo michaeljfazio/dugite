@@ -232,6 +232,77 @@ pub fn start_step_monetary(
     }
 }
 
+/// Haskell `PulsingRewUpdate` — `NewEpochState[4]` (`nesRu`).
+///
+/// ```haskell
+/// data PulsingRewUpdate
+///   = Pulsing !RewardSnapShot !Pulser
+///   | Complete !RewardUpdate
+///
+/// encCBOR (Pulsing s p) = encode (Sum Pulsing 0 !> To s !> To p)
+/// encCBOR (Complete r)  = encode (Sum Complete 1 !> To r)
+///
+/// instance ToJSON PulsingRewUpdate where
+///   toJSON = \case
+///     Pulsing _ _ -> Null          -- renders the SAME as SNothing
+///     Complete ru -> toJSON ru
+/// ```
+///
+/// This is LEDGER STATE, not a query convenience: two nodes that disagree
+/// about which constructor holds at a given slot disagree about
+/// `NewEpochState`, even when the eventual rewards match.
+///
+/// `Pulsing` renders as JSON `null`, identically to `SNothing` — which is why
+/// #1071's observed divergence rate was ~20% (the `Complete` window) rather
+/// than ~80% (the whole post-4k/f span). On the CBOR wire they are distinct.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub enum PulsingRewUpdate {
+    /// Inputs frozen, fold still outstanding.
+    ///
+    /// Carries the frozen snapshot so the boundary can finish without
+    /// re-reading anything — and so a tick that crosses a boundary while past
+    /// the NEW epoch's mark keeps the PRE-rotation environment. That is the F5
+    /// case a bool could not express: `Tick.hs`'s `bheadTransition` builds
+    /// `RupdEnv bprev es` from `nes0`, pre-NEWEPOCH.
+    Pulsing(Box<RewardSnapShot>),
+    /// Fold finished; ready to apply at the boundary.
+    Complete(Box<RewardSnapShot>),
+}
+
+impl PulsingRewUpdate {
+    /// The frozen snapshot, whichever constructor holds.
+    pub fn snapshot(&self) -> &RewardSnapShot {
+        match self {
+            PulsingRewUpdate::Pulsing(s) | PulsingRewUpdate::Complete(s) => s,
+        }
+    }
+
+    /// `completeStep` — force the pulser to completion. Idempotent on
+    /// `Complete`, matching `completeRupd (Complete x) = pure (x, mempty)`.
+    pub fn complete(self) -> Self {
+        match self {
+            PulsingRewUpdate::Pulsing(s) => PulsingRewUpdate::Complete(s),
+            done @ PulsingRewUpdate::Complete(_) => done,
+        }
+    }
+
+    /// Whether a boundary reached now would apply a reward update.
+    ///
+    /// True for BOTH constructors — `NewEpoch.hs:163-166` completes a
+    /// `Pulsing` and applies it. Only `SNothing`, i.e. `Option::None`, applies
+    /// nothing. Naming this explicitly stops the #1072 mistake being made
+    /// again in the opposite direction: skipping the update while a pulser is
+    /// merely unfinished would be just as wrong as applying one with none.
+    pub fn applies_at_boundary(&self) -> bool {
+        true
+    }
+
+    /// cardano-cli renders `Pulsing` as JSON `null`, like `SNothing`.
+    pub fn is_json_visible(&self) -> bool {
+        matches!(self, PulsingRewUpdate::Complete(_))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -414,6 +485,68 @@ mod tests {
         // (1 - d) * f * slots rounds to 0 for a tiny epoch.
         let m = start_step_monetary((3, 1000), (1, 5), (0, 1), (1, 20), 1_000_000, 0, 0, 1);
         assert_eq!(m.expected_blocks, 1);
+    }
+
+    fn sample_snapshot() -> RewardSnapShot {
+        RewardSnapShot {
+            fees: Lovelace(1_000),
+            protocol_version: 10,
+            non_myopic: super::super::non_myopic::NonMyopic::default(),
+            delta_r1: Lovelace(3_000_000_000_000),
+            r: Lovelace(2_400_000_000_800),
+            delta_t1: Lovelace(600_000_000_200),
+            likelihoods: HashMap::new(),
+            leaders: HashMap::new(),
+            free_vars: FreeVars {
+                addrs_rew: None,
+                total_stake: 1_000_000,
+                prot_ver: 10,
+            },
+        }
+    }
+
+    /// BOTH constructors apply at the boundary — `NewEpoch.hs:163-166`
+    /// completes a `Pulsing` and applies it. Only `SNothing` applies nothing.
+    ///
+    /// This pins #1072 from the OTHER side: having fixed "applies with no
+    /// pulser", the symmetric mistake is "skips because the pulser is merely
+    /// unfinished". Both are divergences.
+    #[test]
+    fn both_constructors_apply_at_the_boundary_only_none_does_not() {
+        let p = PulsingRewUpdate::Pulsing(Box::new(sample_snapshot()));
+        let c = PulsingRewUpdate::Complete(Box::new(sample_snapshot()));
+        assert!(p.applies_at_boundary());
+        assert!(c.applies_at_boundary());
+        // `SNothing` is `Option::None`; there is no constructor for it, which
+        // is the type-level statement that "no pulser" is not a pulser state.
+        let none: Option<PulsingRewUpdate> = None;
+        assert!(none.is_none());
+    }
+
+    /// `completeStep` is idempotent on `Complete`
+    /// (`completeRupd (Complete x) = pure (x, mempty)`), and preserves the
+    /// frozen snapshot rather than recomputing it.
+    #[test]
+    fn complete_is_idempotent_and_preserves_the_frozen_snapshot() {
+        let p = PulsingRewUpdate::Pulsing(Box::new(sample_snapshot()));
+        let once = p.clone().complete();
+        assert!(matches!(once, PulsingRewUpdate::Complete(_)));
+        assert_eq!(
+            once.snapshot(),
+            p.snapshot(),
+            "completing must not alter the freeze"
+        );
+        let twice = once.clone().complete();
+        assert_eq!(twice, once, "completeStep must be idempotent");
+    }
+
+    /// `Pulsing` renders as JSON `null`, identically to `SNothing`
+    /// (`RewardUpdate.hs:359-365`). This is why #1071 measured ~20% and not
+    /// ~80%: only the `Complete` window is JSON-observable.
+    #[test]
+    fn pulsing_is_json_invisible_like_snothing() {
+        assert!(!PulsingRewUpdate::Pulsing(Box::new(sample_snapshot())).is_json_visible());
+        assert!(PulsingRewUpdate::Complete(Box::new(sample_snapshot())).is_json_visible());
     }
 
     #[test]
