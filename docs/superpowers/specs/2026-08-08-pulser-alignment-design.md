@@ -1,7 +1,25 @@
 # Pulser alignment — bringing dugite's RUPD and DRep pulsers to 100% structural parity
 
-Status: **DESIGN — revision 2, post adversarial review. Not approved for implementation.**
+Status: **revision 3 — Phases 0, 1a, 2 and 4 CLOSED; Phase 3's ledger half
+LANDED and live-validated; Phase 5's rollback half LANDED.**
 Date: 2026-08-08
+
+| Phase | State |
+|---|---|
+| 0 — measure the boundary fold | **DONE.** ~2.55 s at mainnet scale, linear ⇒ **GO** on 3 (§3.4) |
+| 1a — explicit `startStep` freeze | **DONE**, pot-parity validated |
+| 1b — delete `pending_avvm_return` | **BLOCKED** on mainnet replay disk (§5b) |
+| 2 — RUPD state machine + #1072 | **DONE.** Wire arms MOVED to 3 — they need a live fold |
+| 3 — incremental pulsing | **LEDGER HALF DONE**, pots byte-exact live. Per-block scheduling + wire arms open |
+| 4 — DRep internal pulsing | **CLOSED as YAGNI** — measured unobservable, not asserted |
+| 5 — persistence + rollback | **Rollback DONE** (freeze pair now atomic). Legacy cleanup open |
+
+Three claims in revision 2 were wrong and are corrected in place rather than
+quietly edited: the Phase 2/3 ordering, `FreeVars[0]` read as the fold's work
+queue, and Phase 4's "no wire form" asserted rather than measured. Each is
+marked where it appears. The pattern is worth more than the corrections: all
+three were plausible readings of a real artefact, and all three fell to
+decoding or sampling the whole thing instead of its head.
 Tracks: #1071 (nesRu hardcoded SNothing), **#1072 (CONSENSUS — reward update
 applied unconditionally)**.
 
