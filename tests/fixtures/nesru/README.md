@@ -14,7 +14,19 @@ JSON view cannot tell you which state you captured.
 |---|---|---|---|
 | `snothing.hex` | 120 | `80` | `SNothing` — `array(0)`. What dugite emits today, unconditionally (#1071). |
 | `at-slot-324.hex` | 324 | `818201850000a00082a000` | **`Complete`, not `Pulsing`** — see below. |
-| `complete.hex` | 353 | `818201850000a00082a000` | `SJust (Complete r)`. |
+| `complete.hex` | 353 | `818201850000a00082a000` | `SJust (Complete r)`, all-zero (epoch 0). |
+| `pulsing.hex` | 1122 | 7.4 KB, `818300 88 …` | `SJust (Pulsing s p)` — see below. |
+| `complete-nonzero.hex` | 1165 | 2.6 KB, `818201 85 1b…` | `Complete` with REAL values. |
+
+The all-zero `complete.hex` pins the shape but exercises no field widths. Prefer
+`complete-nonzero.hex` for encoder work: its `deltaT` is a 64-bit
+`1b 00000345b632b621` and its `rs` carries real credentials, so a fixture that
+only ever saw zeros cannot hide a width or map-framing bug.
+
+**The transition is bracketed**: Pulsing at offsets 322/331/345, Complete at
+365. With 120 credentials the fold takes ~120 pulses, so it finishes between
+offsets 345 and 365 — roughly 25-45 blocks after the mark, matching
+~2 slots/block at f=0.5.
 
 ```text
 81                array(1)  = SJust
