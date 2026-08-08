@@ -224,6 +224,23 @@ pub struct EpochSubState {
     /// Set by the per-block capture in `apply.rs`, consumed and cleared by the
     /// boundary, exactly like [`Self::rupd_addrs_rew`].
     ///
+    /// # KNOWN GAP a bool cannot express (deferred to Phase 2)
+    ///
+    /// `Tick.hs`'s `bheadTransition` builds `RupdEnv bprev es` from **nes0** —
+    /// the PRE-boundary state — while passing `nesRu nes1`, post-NEWEPOCH. So a
+    /// single tick that both crosses a boundary AND lands past the NEW epoch's
+    /// `start_after` makes Haskell start a pulser frozen over PRE-rotation
+    /// `bprev`/`ssStakeGo`/`ssFee`, and apply it at the following boundary.
+    ///
+    /// dugite would instead compute at that boundary from POST-rotation state —
+    /// different inputs, different update. A bool cannot represent "a pulser
+    /// exists, frozen over the previous epoch's environment"; only the real
+    /// `Pulsing(RewardSnapShot, Pulser)` can.
+    ///
+    /// Reachable on an outage longer than one stabilisation window that spans a
+    /// boundary — 320+ slots on the devnet, i.e. within chaos-round territory.
+    /// NOT fixed by this field, and recorded here rather than left silent.
+    ///
     /// PHASE 2 REPLACES THIS with the real `Option<PulsingRewUpdate>` carrying
     /// the frozen `RewardSnapShot` and the pulser. It is a bool today because
     /// that is the whole of what the boundary decision needs while the update
