@@ -643,3 +643,75 @@ pub struct RewardSnapShot {
     pub leaders: HashMap<Hash32, Vec<RewardEntry>>,
     pub free_vars: FreeVars,
 }
+
+/// Haskell `PoolRewardInfo` — the per-pool terms computed ONCE, then read by
+/// the per-credential fold.
+///
+/// ```haskell
+/// data PoolRewardInfo = PoolRewardInfo
+///   { poolRelativeStake :: !StakeShare
+///   , poolPot           :: !Coin
+///   , poolPs            :: !PoolParams
+///   , poolBlocks        :: !Natural
+///   , poolLeaderReward  :: !LeaderOnlyReward
+///   }
+/// ```
+///
+/// This exists so the reward fold can be **credential-major**. dugite folded
+/// pool-major with an inner delegator loop, which cannot be chunked to match
+/// upstream: the pulser's work queue is a set of `Credential 'Staking` (see
+/// `tests/fixtures/nesru/pulsing.hex`, whose remaining set is `8200581c…`),
+/// and one pool can hold hundreds of thousands of delegators, so a pool-granular
+/// "pulse" would be unbounded.
+///
+/// Splitting the computation this way is also what makes the frozen/live
+/// distinction enforceable: every term here is derived from the `startStep`
+/// snapshot and is `&self` at fold time, so a per-credential recomputation
+/// against mutating state does not typecheck.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PoolRewardInfo {
+    /// The pool these terms belong to.
+    pub pool_id: Hash28,
+    /// `ssPoolStake` — the denominator of every member's share.
+    pub pool_active_stake: u64,
+    /// `poolPot` — the pool's whole reward before the operator's cut.
+    pub pool_reward: u64,
+    /// `ppCost`, and the margin as an exact fraction.
+    pub cost: u64,
+    pub margin_num: i128,
+    pub margin_den: i128,
+    /// Owners are paid through the leader reward, never as members.
+    pub owner_set: std::collections::HashSet<Hash32>,
+    /// `poolLeaderReward`, already gated by the pv<=6 registration prefilter.
+    /// `None` when the leader reward is dropped or zero.
+    pub leader: Option<(Hash32, u64)>,
+}
+
+impl PoolRewardInfo {
+    /// Haskell `rewardOnePoolMember` — a member's share of the pool pot.
+    ///
+    /// ```haskell
+    /// rewardOnePoolMember pp totalStake (RewardInfo ...) hk (StakeShare t) =
+    ///   ... memberRew poolPot poolPs (StakeShare sigma) (StakeShare t)
+    /// memberRew (Coin f') pool (StakeShare m) (StakeShare sigma)
+    ///   | f' <= c = mempty
+    ///   | otherwise = rationalToCoinViaFloor $
+    ///       fromIntegral (f' - c) * (1 - m') * sigma / m
+    /// ```
+    ///
+    /// The `f' <= c` short-circuit is load-bearing and NOT the same as clamping
+    /// a negative remainder to zero: it must be tested before the subtraction.
+    pub fn member_reward(&self, member_stake: u64) -> u64 {
+        use super::Rat;
+        if member_stake == 0 || self.pool_active_stake == 0 || self.pool_reward <= self.cost {
+            return 0;
+        }
+        let remainder = self.pool_reward - self.cost;
+        let one_minus_margin = Rat::from_i128(self.margin_den - self.margin_num, self.margin_den);
+        let member_frac = Rat::from_i128(member_stake as i128, self.pool_active_stake as i128);
+        Rat::from_i128(remainder as i128, 1)
+            .mul(&one_minus_margin)
+            .mul(&member_frac)
+            .floor_u64()
+    }
+}
