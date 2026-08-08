@@ -8,6 +8,7 @@ pub mod non_myopic;
 mod protocol_params;
 #[cfg(feature = "reward-debug-dump")]
 pub mod reward_debug;
+pub mod reward_pulser;
 mod rewards;
 mod snapshot;
 pub mod snapshot_format;
