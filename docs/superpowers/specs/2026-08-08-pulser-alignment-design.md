@@ -342,6 +342,39 @@ Unit coverage is required on every new type and transition — not only the
 end-to-end replays. Note the #1067 lesson in reverse: a RED-proven unit test
 bounds the FUNCTION, not the SYSTEM; the replays are what bound the system.
 
+## 5b. BLOCKER — Phase 1 cannot be validated on this machine
+
+Measured 2026-08-08, not estimated. `mithril-import` for mainnet stages the
+snapshot in `$TMPDIR/dugite-mithril` BEFORE writing the database:
+
+```
+free before import          263 GiB
+free after ~10 min          39 GiB      (224 GB staged in TMPDIR)
+final db-mainnet            not yet written
+```
+
+So mainnet needs roughly **224 GB temp + ~150 GB final = ~375 GB**, against
+263 GiB free with the 202 GB main `target/` already deleted. The import was
+aborted at 39 GiB free to protect a running devnet gate — filling the disk
+would have failed the gate and risked ImmutableDB corruption.
+
+**Consequence: Phase 1 must not be marked done here.** Its decisive test is the
+mainnet **epoch 235 -> 236** (Shelley->Allegra) replay proving
+`pending_avvm_return` is redundant once the freeze is explicit; preprod and
+preview carry no AVVM balances and cannot substitute. Options, in order:
+
+1. Run Phase 1's validation on a machine with >= 400 GB free.
+2. Teach `mithril-import` to stream chunks rather than staging the whole
+   snapshot — removes the 224 GB temp requirement and is independently
+   worth doing.
+3. Reconstruct a minimal mainnet chunk range around epoch 235-236 rather than
+   importing the whole chain.
+
+Until one of those exists, Phase 1 stops at the explicit-freeze design and the
+`pending_avvm_return` deletion stays UNSHIPPED. Deleting a compensation worth
+-561K ADA reserves / +184K ADA treasury on the strength of a gate that cannot
+observe it would be exactly the un-reddable-test failure recorded in section 5.
+
 ## 6. Validation gates
 
 - `just check` green at every phase
