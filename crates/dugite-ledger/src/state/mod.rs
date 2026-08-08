@@ -10,6 +10,9 @@ mod protocol_params;
 pub mod reward_debug;
 pub mod reward_pulser;
 mod rewards;
+/// Phase 0 measurement of the boundary reward fold (see the module docs).
+#[cfg(test)]
+mod rupd_work_measurement;
 mod snapshot;
 pub mod snapshot_format;
 pub mod substates;
