@@ -564,14 +564,54 @@ measurement recorded so the question does not get reopened on a guess.
 ```
 
 Stable across samples on both nodes, and the `RatifyState` half — the part
-cardano-cli renders — is the same size on both. Two readings are open: either
-cardano-node's completed pulser legitimately reports an emptied snapshot (its
-`psPoolDistr` is 0 on a chain with live pools, which points that way), or
-dugite's "frozen" proposal list is admitting mid-epoch submissions, which would
-be #922's shape in the embedded pulser. **Not fixed here**: guessing between
-them is exactly how #1057 was made worse, and the fix differs completely
-depending on which reading is right. Filed for oracle verification against
-`finishDRepPulser`.
+cardano-cli renders — is the same size on both.
+
+**ORACLE-CHECKED, and it eliminates one of the two hypotheses.**
+`finishDRepPulser` populates every field; it does NOT empty the snapshot on
+completion:
+
+```haskell
+finishDRepPulser (DRPulsing (DRepPulser {..})) =
+  ( PulsingSnapshot
+      dpProposals                       -- psProposals
+      finalDRepDistr                    -- psDRepDistr
+      dpDRepState                       -- psDRepState
+      (Map.map individualTotalPoolStake $ unPoolDistr finalStakePoolDistr)
+  , ratifyState' )
+```
+
+So "cardano-node legitimately reports an emptied snapshot" is REFUTED, and
+dugite's populated shape is the structurally correct one. What remains is a
+question about CONTENTS, not shape: cardano-node's four fields were all zero at
+every sample while dugite's were 8/0/2/4 on the same chain.
+
+Two candidate explanations survive, and they are distinguishable by ONE
+measurement rather than by reading more source:
+
+1. cardano-node's frozen snapshot genuinely was empty at the boundary that
+   created it — the devnet's proposals were submitted mid-epoch, after the
+   freeze — and dugite is reporting LIVE state where upstream reports FROZEN.
+   That is #922's shape reappearing in the embedded pulser.
+2. The devnet's pools genuinely carried no stake in the pulser's accumulated
+   distribution at that epoch, making all four legitimately zero on upstream.
+
+`psPoolDistr = 0` on a chain with two live pools is what makes (1) the stronger
+reading — but dugite's 4 entries against 2 registered pools is itself odd and
+needs explaining either way.
+
+**The deciding measurement**: sample the embedded pulser IMMEDIATELY after an
+epoch boundary and again late in the same epoch, on both nodes, with proposals
+submitted in between. If dugite's `psProposals` grows within an epoch while
+cardano-node's does not, it is (1) and the fix is to source the embedded
+snapshot from the frozen `dpProposals` — the same correction #922 applied to
+`GetProposals`. Still not fixed here: the measurement is cheap and the fix
+without it is a guess, which is how #1057 got worse.
+
+**Caveat on the source above**: it is read from cardano-ledger `master`, and
+cardano-node 11.0.1 pins CHaP per PACKAGE at an older revision. The refutation
+is robust to that (the constructor takes four populated arguments in both), but
+do not treat any FIELD ORDER read from master as pinned — that is the trap
+recorded in [[reference_running_node_is_the_wire_oracle]].
 
 ### Phase 5 — persistence, rollback, and import
 
