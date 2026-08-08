@@ -1771,6 +1771,7 @@ fn _assert_ledger_state_fields_audited(state: LedgerState) {
                 prev_d: _,
                 rupd_addrs_rew: _,
                 rupd_pulser_started: _,
+                rupd_monetary: _,
                 pending_avvm_return: _,
             },
         tip: _,

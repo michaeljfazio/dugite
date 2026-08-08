@@ -1454,6 +1454,7 @@ mod tests {
             },
             rupd_addrs_rew: None,
             rupd_pulser_started: false,
+            rupd_monetary: None,
             pending_avvm_return: 0,
         }
     }

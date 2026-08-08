@@ -155,7 +155,7 @@ pub fn pulse_size(num_stake_creds: u64, security_param: u64) -> u64 {
 ///
 /// All arithmetic stays in exact `Rat`: Haskell computes these in `Rational`
 /// and floors once per stage (`rationalToCoinViaFloor`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MonetaryStep {
     /// `deltaR1` — monetary expansion drawn from reserves.
     pub delta_r1: u64,

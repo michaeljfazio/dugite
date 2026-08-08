@@ -210,6 +210,12 @@ pub fn populated_ledger_state() -> LedgerState {
     // #1072: `true` is the non-default state — a bool left at `false` would
     // contribute the same bytes as an absent field to the layout hash.
     state.epochs.rupd_pulser_started = true;
+    state.epochs.rupd_monetary = Some(crate::state::reward_pulser::MonetaryStep {
+        delta_r1: 3_000_000_000_000,
+        delta_t1: 600_000_000_200,
+        r: 2_400_000_000_800,
+        expected_blocks: 21_600,
+    });
     state.epochs.rupd_addrs_rew = Some(Arc::new({
         let mut s = HashSet::new();
         s.insert(h32(0x10));

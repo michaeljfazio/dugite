@@ -2200,6 +2200,7 @@ mod tests {
             },
             rupd_addrs_rew: None,
             rupd_pulser_started: false,
+            rupd_monetary: None,
             pending_avvm_return: 0,
         }
     }
@@ -2843,6 +2844,7 @@ mod tests {
                 },
                 rupd_addrs_rew: None,
                 rupd_pulser_started: false,
+                rupd_monetary: None,
                 pending_avvm_return: 0,
             };
             let params = ProtocolParameters::mainnet_defaults();
@@ -3246,6 +3248,7 @@ mod tests {
                         },
                         rupd_addrs_rew: None,
                         rupd_pulser_started: false,
+                        rupd_monetary: None,
                         pending_avvm_return: 0,
                     };
                     let params = ProtocolParameters::mainnet_defaults();
@@ -4206,6 +4209,7 @@ mod tests {
                 },
                 rupd_addrs_rew: None,
                 rupd_pulser_started: false,
+                rupd_monetary: None,
                 pending_avvm_return: 0,
             };
             let params = ProtocolParameters::mainnet_defaults();
@@ -4430,6 +4434,7 @@ mod tests {
                     },
                     rupd_addrs_rew: None,
                     rupd_pulser_started: false,
+                    rupd_monetary: None,
                     pending_avvm_return: 0,
                 };
                 (utxo, certs, gov, epochs)
@@ -4834,6 +4839,7 @@ mod tests {
                     },
                     rupd_addrs_rew: None,
                     rupd_pulser_started: false,
+                    rupd_monetary: None,
                     pending_avvm_return: 0,
                 };
                 (utxo, certs, gov, epochs)
@@ -5227,6 +5233,7 @@ mod tests {
                         },
                         rupd_addrs_rew: None,
                         rupd_pulser_started: false,
+                        rupd_monetary: None,
                         pending_avvm_return: 0,
                     },
                 )
