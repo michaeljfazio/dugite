@@ -212,6 +212,7 @@ pub fn compute_reward_update(
     _shelley_transition_epoch: u64,
     max_lovelace_supply: u64,
     prev_non_myopic: &NonMyopic,
+    frozen_monetary: Option<crate::state::reward_pulser::MonetaryStep>,
 ) -> PendingRewardUpdate {
     // `totalStake` = `circulation es maxSupply = maxSupply <-> casReserves acnt`,
     // the current circulating supply. Hoisted above every early return because
@@ -315,6 +316,23 @@ pub fn compute_reward_update(
             .floor_u64()
     };
 
+    // Phase 1a: prefer the step FROZEN at 4k/f. Haskell computes deltaR1 /
+    // deltaT1 / _R inside `startStep`, mid-epoch; recomputing them here reads
+    // the same numbers only because reserves happen not to move mid-epoch.
+    // Consuming the frozen value makes that structural instead of accidental.
+    let (expansion, frozen_delta_t1, frozen_r) = match frozen_monetary {
+        Some(m) => {
+            debug_assert_eq!(
+                m.delta_r1, expansion,
+                "frozen deltaR1 must equal the boundary-recomputed value; a \
+                 mismatch means an input moved between 4k/f and the boundary, \
+                 which is exactly the invariant this freeze exists to enforce"
+            );
+            (m.delta_r1, Some(m.delta_t1), Some(m.r))
+        }
+        None => (expansion, None, None),
+    };
+
     let total_rewards_available = expansion + epoch_fees;
 
     if total_rewards_available == 0 {
@@ -328,12 +346,13 @@ pub fn compute_reward_update(
         };
     }
 
-    let tau = Rat::from_i128(tau_num, tau_den);
-    let treasury_cut = tau
-        .mul(&Rat::from_i128(total_rewards_available as i128, 1))
-        .floor_u64();
+    let treasury_cut = frozen_delta_t1.unwrap_or_else(|| {
+        Rat::from_i128(tau_num, tau_den)
+            .mul(&Rat::from_i128(total_rewards_available as i128, 1))
+            .floor_u64()
+    });
 
-    let reward_pot = total_rewards_available - treasury_cut;
+    let reward_pot = frozen_r.unwrap_or(total_rewards_available - treasury_cut);
 
     if total_stake == 0 {
         // #615b: Haskell's RewardUpdate carries only treasury_cut in deltaT;
@@ -966,6 +985,7 @@ impl LedgerState {
             self.shelley_transition_epoch,
             self.max_lovelace_supply,
             &self.epochs.non_myopic,
+            self.epochs.rupd_monetary,
         )
     }
 
@@ -1444,6 +1464,7 @@ mod tests {
             0,     // shelley_transition_epoch
             super::super::MAX_LOVELACE_SUPPLY,
             &Default::default(),
+            None,
         );
 
         assert!(
@@ -1499,6 +1520,7 @@ mod tests {
             0,
             MAX_SUPPLY,
             &Default::default(),
+            None,
         );
 
         // expansion = floor(rho * reserves) = floor(0.1 * 1_000_000) = 100_000
@@ -2119,6 +2141,7 @@ mod tests {
             0,
             super::super::MAX_LOVELACE_SUPPLY,
             &Default::default(),
+            None,
         );
 
         // The account whose on-chain withdrawal wedged the chain.
@@ -2265,6 +2288,7 @@ mod tests {
                 0,
                 super::super::MAX_LOVELACE_SUPPLY,
                 &Default::default(),
+                None,
             )
             .rewards
             .get(&member)
