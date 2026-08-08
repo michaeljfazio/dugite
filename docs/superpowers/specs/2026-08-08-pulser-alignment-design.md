@@ -392,15 +392,30 @@ shows it:
 
 ```text
 array(3)[ 0, RewardSnapShot(8) = 1178 B, Pulser = 6204 B ]
-                                          └─ array(4)[ 1, array(4)[ d9 0102 9f … ] , … ]
-                                                              remaining credentials
+
+Pulser = array(4)[ pulseSize=1, FreeVars 4688 B, balance 1369 B, RewardAns 145 B ]
+  FreeVars  = array(4)[ fvAddrsRew (tag-258 set, 140), fvTotalStake,
+                        fvProtVer, fvPoolRewardInfo (map 1) ]
+  balance   = map(19) Credential -> CompactCoin      <- work remaining
+  RewardAns = array(2)[ map(1), map(1) ]             <- answer so far
 ```
 
-The `Pulser` is **84% of the record**, and its head is a tag-258 indefinite set
-of the credentials still to be folded — the fold's live work queue at the
-queried slot. A node that computes the whole update at the boundary has no such
-state, so there is nothing to encode from. The `Pulsing` arm is therefore a
-CONSEQUENCE of incremental pulsing, not a precondition for it.
+The `Pulser` is **84% of the record**, and two of its four fields — `balance`
+and `RewardAns` — are live fold state that exists only while a fold is in
+progress. A node that computes the whole update at the boundary has neither, so
+there is nothing to encode from. The `Pulsing` arm is therefore a CONSEQUENCE
+of incremental pulsing, not a precondition for it.
+
+> **Correction.** The first reading of this fixture called `FreeVars[0]` "the
+> work queue". It is `fvAddrsRew`, the pv<=6 registration prefilter, and it
+> holds **140** entries where the real queue holds **19** — both are credential
+> sets inside the pulser, which is what made the misreading easy, and the
+> counts are what separate them. 140 is the 120 seeded credentials plus genesis
+> accounts in the LIVE registration set; 19 is what the GO snapshot carries in
+> epoch 2, since delegations registered in epoch 0 reach `go` only after two
+> boundaries. A set whose size tracks live registrations cannot be the queue of
+> a fold over a frozen snapshot. The conclusion survives the correction and is
+> stronger for it: two fields require a live fold, not one.
 
 The `Complete` arm has the same dependency from the other side: upstream's
 `Complete` carries a `RewardUpdate` (`deltaT, deltaR, rs, deltaF, nonMyopic`),

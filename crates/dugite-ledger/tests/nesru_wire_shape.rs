@@ -74,36 +74,42 @@ fn complete_is_sjust_array2_with_a_5_field_update() {
     }
 }
 
-/// The `Pulser` is the REMAINING FOLD STATE, and it dominates the record.
-///
-/// This is the measurement that says the `Pulsing` wire arm cannot be built
-/// before incremental pulsing exists. `array(3)[2]` is not a summary or a
-/// handful of parameters — it is 84% of the bytes, and its second field is a
-/// tagged indefinite set of the credentials still to be folded:
+/// The `Pulser`'s four fields, and which of them is the live fold state.
 ///
 /// ```text
-/// pulser = array(4)[ pulseSize, <4688 bytes>, <1369>, <145> ]
-///                      0x01        0x84         0xb3    0x82
-///                                   └─ array(4) whose head is the work queue:
-///                                      d9 0102 9f 8200581c…  (tag-258 indefinite set)
+/// pulser = array(4)[ pulseSize, FreeVars, balance, RewardAns ]
+///                      0x01       0x84     0xb3     0x82
+///                                 4688 B   1369 B   145 B
+///
+///   FreeVars  = array(4)[ fvAddrsRew   tag-258 set, 140 items
+///                       , fvTotalStake uint 54003425994184880
+///                       , fvProtVer    array(2)
+///                       , fvPoolRewardInfo map(1) ]
+///   balance   = map(19)  Credential -> CompactCoin   <- THE WORK QUEUE
+///   RewardAns = array(2)[ map(1), map(1) ]           <- the answer so far
 /// ```
 ///
-/// The queue sits one level deeper than a first read of the hex suggests —
-/// `84 01 84 d90102 9f`, not `84 01 d90102 9f`. That correction came from the
-/// fixture rejecting the assertion, which is the whole reason to write the
-/// check against captured bytes rather than against the type signature.
+/// **An earlier version of this test called the tag-258 set at `FreeVars[0]`
+/// "the work queue". It is not** — it is `fvAddrsRew`, the registered-accounts
+/// prefilter, and it holds **140** entries where the real queue holds **19**.
+/// The two are both credential sets and both sit inside the pulser, which is
+/// what makes the misreading easy; the counts are what separate them. 140 is
+/// the 120 credentials seeded into the LIVE registration set plus the genesis
+/// accounts, while 19 is what the GO snapshot actually carries in epoch 2 —
+/// delegations registered in epoch 0 reach `go` only after two boundaries, so
+/// the fold at epoch 2 still covers only the genesis credentials.
 ///
-/// `pulseSize = 1` here because `max 1 (ceil(creds / 4k))` stays 1 below
-/// 4k = 160, which is why ~100 credentials were needed to make `Pulsing`
-/// observable at all on the devnet.
+/// That divergence is the check: a set whose size tracks live registrations
+/// cannot be the queue of a fold over a frozen snapshot.
 ///
-/// Emitting this byte-exactly requires knowing WHICH credentials remain, in
-/// `Set` order, at the queried slot — i.e. the pulser must actually be pulsing.
-/// A node that computes the whole update at the boundary has no such state to
-/// report, so there is nothing to encode from. Phase 2 cannot ship this arm
-/// independently of Phase 3; the plan that separated them was wrong.
+/// The conclusion the misreading was cited for survives it, and is in fact
+/// stronger. BOTH `balance` (work remaining) and `RewardAns` (answer so far)
+/// are live fold state; neither exists in a node that computes the whole
+/// update at the boundary. So the `Pulsing` arm still cannot be emitted before
+/// incremental pulsing exists — the plan that put the wire arms in Phase 2 and
+/// pulsing in Phase 3 was wrong, for two reasons rather than one.
 #[test]
-fn the_pulser_carries_remaining_fold_state_not_a_summary() {
+fn the_pulser_carries_live_fold_state_not_a_summary() {
     let b = fixture("pulsing.hex");
     // 81 83 00, then an 1178-byte RewardSnapShot, then the pulser.
     let pulser = &b[1181..];
@@ -112,20 +118,26 @@ fn the_pulser_carries_remaining_fold_state_not_a_summary() {
         pulser[1], 0x01,
         "pulseSize = max 1 (ceil(creds/4k)) = 1 below 4k=160"
     );
-    assert_eq!(pulser[2], 0x84, "the fold state is itself an array(4)");
+    assert_eq!(pulser[2], 0x84, "FreeVars is array(4)");
     assert_eq!(
         &pulser[3..7],
         &[0xd9, 0x01, 0x02, 0x9f],
-        "the remaining credentials are a tag-258 INDEFINITE set — the fold's \
-         work queue, not a summary"
+        "FreeVars[0] is fvAddrsRew, a tag-258 indefinite set — the pv<=6 \
+         registration prefilter, NOT the fold's work queue"
     );
-    assert!(
-        pulser.len() * 10 > b.len() * 8,
-        "the pulser should dominate the record (>80%); got {} of {} bytes. \
-         If this shrinks, the capture was taken when the fold was nearly done \
-         and understates what the arm must reproduce",
-        pulser.len(),
-        b.len()
+    // The queue is the THIRD pulser field, a definite map of Credential ->
+    // CompactCoin. Locate it by walking past FreeVars (4688 bytes from its
+    // header at pulser[2]).
+    let balance = &pulser[2 + 4688..];
+    assert_eq!(
+        balance[0], 0xb3,
+        "the balance is map(19) — the credentials still to fold. A tag-258 \
+         set header here would mean fvAddrsRew was misidentified as the queue"
+    );
+    let ans = &balance[1369..];
+    assert_eq!(
+        ans[0], 0x82,
+        "RewardAns is array(2), the answer accumulated so far"
     );
 }
 
