@@ -207,6 +207,9 @@ pub fn populated_ledger_state() -> LedgerState {
     // update — different pool id and pot so a From impl that wires one field to
     // the other cannot pass.
     state.epochs.non_myopic = sample_non_myopic(0x31, 8_888_888);
+    // #1072: `true` is the non-default state — a bool left at `false` would
+    // contribute the same bytes as an absent field to the layout hash.
+    state.epochs.rupd_pulser_started = true;
     state.epochs.rupd_addrs_rew = Some(Arc::new({
         let mut s = HashSet::new();
         s.insert(h32(0x10));

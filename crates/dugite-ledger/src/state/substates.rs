@@ -196,6 +196,42 @@ pub struct EpochSubState {
     /// its snapshot value is always None for Conway epochs.
     pub rupd_addrs_rew: Option<Arc<HashSet<Hash32>>>,
 
+    /// Whether a RUPD pulser exists for the epoch currently being closed —
+    /// Haskell's `nesRu :: StrictMaybe PulsingRewUpdate` reduced to the one bit
+    /// the boundary needs today (#1072).
+    ///
+    /// ```haskell
+    /// -- NewEpoch.hs:161, identically ConwayNewEpoch.hs:172
+    /// es' <- case ru of
+    ///   SNothing -> pure es          -- NO reward update: no deltaR, no deltaT,
+    ///                                --  no rewards, no fee drain
+    ///   SJust p@(Pulsing _ _) -> ... completeRupd p ... updateRewards
+    ///   SJust (Complete ru')  -> updateRewards es eNo ru'
+    /// ```
+    ///
+    /// `ShelleyRUPD` only ever leaves `SNothing` when a block arrives with
+    /// `determineRewardTiming /= RewardsTooEarly`, i.e. strictly after
+    /// `epoch_first + 4k/f`. If no block lands in that window the pulser is
+    /// never started and the boundary applies NOTHING. dugite applied a full
+    /// reward update at every boundary regardless, which diverges permanently:
+    /// pots move on one side only, and a later withdrawal against a reward only
+    /// dugite credited is a block-validity split.
+    ///
+    /// Reachability is not theoretical. The window is `4k/f` wide — 80 slots on
+    /// the devnet — and both the chaos suite's SIGKILL and Round 3's 90 s
+    /// outage exceed it.
+    ///
+    /// Set by the per-block capture in `apply.rs`, consumed and cleared by the
+    /// boundary, exactly like [`Self::rupd_addrs_rew`].
+    ///
+    /// PHASE 2 REPLACES THIS with the real `Option<PulsingRewUpdate>` carrying
+    /// the frozen `RewardSnapShot` and the pulser. It is a bool today because
+    /// that is the whole of what the boundary decision needs while the update
+    /// is still computed in one pass — not because the distinction between
+    /// `Pulsing` and `Complete` does not matter. It does, and it is ledger
+    /// state; see `state::reward_pulser`.
+    pub rupd_pulser_started: bool,
+
     /// AVVM coin returned to reserves by `returnRedeemAddrsToReserves` at the
     /// Shelley→Allegra era boundary, captured so the SAME-boundary reward update
     /// is computed from PRE-AVVM reserves. In Haskell the reward update applied

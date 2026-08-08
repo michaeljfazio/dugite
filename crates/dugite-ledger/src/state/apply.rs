@@ -526,6 +526,10 @@ impl LedgerState {
                 // (Subsequent skipped-epoch boundaries see None → fall back to
                 // boundary accounts, matching Haskell's forced startStep.)
                 self.epochs.rupd_addrs_rew = None;
+                // #1072: the pulser for the closed epoch has been consumed.
+                // The new epoch starts with none, and re-arms only when a block
+                // lands past its own 4k/f mark.
+                self.epochs.rupd_pulser_started = false;
             }
         } else if self.era != Era::Byron && self.epochs.protocol_params.protocol_version_major >= 9
         {
@@ -556,6 +560,23 @@ impl LedgerState {
         // computed (left in reserves) where Haskell computes-then-routes them
         // to treasury. Observed live at mainnet 365→366: treasury short
         // 857600586 lovelace, reserves correspondingly high.
+        // #1072: record that a RUPD pulser exists for this epoch. Haskell's
+        // `ShelleyRUPD` leaves `SNothing` until a block arrives with
+        // `determineRewardTiming /= RewardsTooEarly`; a boundary reached with
+        // `SNothing` applies NO reward update at all. Ungated by protocol
+        // version — unlike the pv≤6 `addrs_rew` prefilter below, this governs
+        // whether the update happens AT ALL, in every era.
+        if block.era != Era::Byron && !self.epochs.rupd_pulser_started {
+            let window = crate::state::reward_pulser::RewardWindow::new(
+                self.first_slot_of_epoch(self.epoch.0),
+                self.randomness_stabilisation_window,
+            );
+            if window.classify(block.slot()) != crate::state::reward_pulser::RewardTiming::TooEarly
+            {
+                self.epochs.rupd_pulser_started = true;
+            }
+        }
+
         if block.era != Era::Byron
             && self.epochs.prev_protocol_version_major <= 6
             && self.epochs.rupd_addrs_rew.is_none()

@@ -2199,6 +2199,7 @@ mod tests {
                 denominator: 1,
             },
             rupd_addrs_rew: None,
+            rupd_pulser_started: false,
             pending_avvm_return: 0,
         }
     }
@@ -2841,6 +2842,7 @@ mod tests {
                     denominator: 1,
                 },
                 rupd_addrs_rew: None,
+                rupd_pulser_started: false,
                 pending_avvm_return: 0,
             };
             let params = ProtocolParameters::mainnet_defaults();
@@ -3243,6 +3245,7 @@ mod tests {
                             denominator: 1,
                         },
                         rupd_addrs_rew: None,
+                        rupd_pulser_started: false,
                         pending_avvm_return: 0,
                     };
                     let params = ProtocolParameters::mainnet_defaults();
@@ -4202,6 +4205,7 @@ mod tests {
                     denominator: 1,
                 },
                 rupd_addrs_rew: None,
+                rupd_pulser_started: false,
                 pending_avvm_return: 0,
             };
             let params = ProtocolParameters::mainnet_defaults();
@@ -4425,6 +4429,7 @@ mod tests {
                         denominator: 1,
                     },
                     rupd_addrs_rew: None,
+                    rupd_pulser_started: false,
                     pending_avvm_return: 0,
                 };
                 (utxo, certs, gov, epochs)
@@ -4828,6 +4833,7 @@ mod tests {
                         denominator: 1,
                     },
                     rupd_addrs_rew: None,
+                    rupd_pulser_started: false,
                     pending_avvm_return: 0,
                 };
                 (utxo, certs, gov, epochs)
@@ -5220,6 +5226,7 @@ mod tests {
                             denominator: 1,
                         },
                         rupd_addrs_rew: None,
+                        rupd_pulser_started: false,
                         pending_avvm_return: 0,
                     },
                 )
