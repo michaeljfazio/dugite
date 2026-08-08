@@ -599,7 +599,36 @@ measurement rather than by reading more source:
 reading — but dugite's 4 entries against 2 registered pools is itself odd and
 needs explaining either way.
 
-**The deciding measurement**: sample the embedded pulser IMMEDIATELY after an
+**MEASURED 2026-08-09 — and it answered a different question than it asked.**
+
+```text
+                     psProposals  psDRepDistr  psDRepState  psPoolDistr
+  just after boundary into epoch 1 (slot 403)
+    cardano-node             0            0            0          1
+    dugite                   0            0            0          2
+  late in the SAME epoch 1 (slot 434)
+    cardano-node             0            0            0          1
+    dugite                   0            0            0          2
+```
+
+`psProposals` stayed 0 on BOTH nodes at both samples, so the live-vs-frozen
+hypothesis is **inconclusive** — the proposals never landed and that half of
+the measurement was vacuous. Say so rather than reading "no growth" as "not
+live"; a test whose subject never appeared has not exonerated anything.
+
+What it did find is a STABLE divergence in the field nobody was watching:
+`psPoolDistr` is 1 on cardano-node and 2 on dugite, unchanged across samples.
+The devnet registers two pools but only pool1 carries stake. Upstream's
+`calculatePoolDistr'` guards on `spssNumDelegators > 0`; dugite's embedded
+pulser includes the zero-delegator pool. That is #964's filter — already
+applied in `encode_pool_distr2` for the main `PoolDistr`, so the embedded
+`psPoolDistr` is sourcing from somewhere that skips it.
+
+Small, non-consensus, and query-only, but it is a concrete named defect where
+there was previously a two-way unknown. Fix: source `psPoolDistr` through the
+same filtered path as `encode_pool_distr2` rather than from the live pool set.
+
+**The still-open measurement**: sample the embedded pulser IMMEDIATELY after an
 epoch boundary and again late in the same epoch, on both nodes, with proposals
 submitted in between. If dugite's `psProposals` grows within an epoch while
 cardano-node's does not, it is (1) and the fix is to source the embedded
