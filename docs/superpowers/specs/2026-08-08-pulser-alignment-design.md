@@ -8,11 +8,11 @@ Date: 2026-08-08
 |---|---|
 | 0 — measure the boundary fold | **DONE.** ~2.55 s at mainnet scale, linear ⇒ **GO** on 3 (§3.4) |
 | 1a — explicit `startStep` freeze | **DONE**, pot-parity validated |
-| 1b — delete `pending_avvm_return` | **BLOCKED** on mainnet replay disk (§5b) |
+| 1b — retire `pending_avvm_return` | **DONE** via frozen `fvTotalStake` — the spec's own instruction was under-specified, see below |
 | 2 — RUPD state machine + #1072 | **DONE.** Wire arms MOVED to 3 — they need a live fold |
 | 3 — incremental pulsing | **DONE** — credential-major fold, incremental `RewardFold`, per-block scheduling. Only the `nesRu` wire arms remain (#1071) |
 | 4 — DRep internal pulsing | **CLOSED as YAGNI** — measured unobservable, not asserted |
-| 5 — persistence + rollback | **Rollback DONE** (freeze pair now atomic). Legacy cleanup open |
+| 5 — persistence + rollback | **DONE.** Freeze pair atomic; the fold is deliberately transient (no snapshot change). `is_byron_to_shelley_fork` documented as subsumed, retained — untestable here |
 
 Three claims in revision 2 were wrong and are corrected in place rather than
 quietly edited: the Phase 2/3 ordering, `FreeVars[0]` read as the fold's work
