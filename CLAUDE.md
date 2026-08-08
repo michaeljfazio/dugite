@@ -178,6 +178,66 @@ for both pools plus `rewardPotNM` — is byte-identical to cardano-node's, and
 `09w-ledger-state` compares 48 key paths identical with the `likelihoodsNM`
 exclusion REMOVED.
 
+### #1072 — dugite applied a reward update at EVERY boundary (CONSENSUS, CLOSED)
+
+Haskell's NEWEPOCH applies one only when a pulser exists:
+
+```haskell
+-- NewEpoch.hs:161, identically ConwayNewEpoch.hs:172
+es' <- case ru of
+  SNothing -> pure es        -- no deltaR, no deltaT, no rewards, no fee drain
+  SJust p@(Pulsing _ _) -> ... completeRupd p ... updateRewards
+  SJust (Complete ru')  -> updateRewards es eNo ru'
+```
+
+`nesRu` is `SNothing` whenever no block landed strictly after
+`epoch_first + 4k/f`. dugite applied one regardless, so pots moved on one side
+only and stayed wrong. The window is 80 slots on the devnet — SHORTER than the
+chaos suite's SIGKILL and Round 3's 90 s outage, so it is reachable on the
+networks this repo tests, and permanent once it happens.
+
+Found by an adversarial review of the pulser spec, which had (correctly) ruled
+out the *reserves* route and then concluded "not a live divergence". The
+reserves analysis was right; a different route through the same gap was not.
+
+**The fix's first attempt introduced TWO NEW consensus bugs on the identical
+trigger**, both caught by a second adversarial review and both worth
+remembering:
+
+* **F1 — the `ssFee` drain was left outside the gate.** `deltaF` is a FIELD of
+  `RewardUpdate` (`PulsingReward.hs:276`) applied only by `updateRewards`, so
+  Haskell never touches `utxosFees` on the SNothing arm. dugite drained it
+  anyway: lovelace left the fee pot without entering any other pot, and the
+  next reward update was short by the same amount. The existing test could not
+  have caught it — the fixture's `epoch_fees` was 0 and `saturating_sub` masks
+  the subtraction. **A RED proof only bounds what you assert**; mine asserted
+  reserves and stopped three lines above the bug.
+* **F2 — no `LedgerDelta` representation**, so rollback restored the ANCHOR's
+  value. #985 again, in a change whose own spec called rollback "the largest
+  omission". The audit guard that should have caught it destructured
+  `LedgerState` with `epochs: _` — one level above where the field landed. It
+  is now EXHAUSTIVE over `EpochSubState`; note `{ field: _, .. }` does NOT
+  work, because the `..` still matches anything new.
+
+Also from that review: the import path started the flag `false` on a false
+premise (an imported ledger past the mark corresponds to `nesRu = SJust`); the
+test-only `state/epoch.rs` helper applied the RUPD ungated (#977/#1015's third
+copy, and gating it turned 4 tests red — proof they had been asserting
+always-apply); Conway had ZERO coverage of the gate; and `last_applied_rupd`
+kept the previous boundary's update on the SNothing path.
+
+**Proven live, not only by unit test.** `live-1072-differential.sh` stops the
+sole forger before the mark and restarts after the epoch end, so no block lands
+in the window and the boundary fires on the first block back. Both nodes must
+apply nothing — and do. It passes for the right reason: a reward update there
+would have moved ~1.8e13 lovelace of expansion plus a tau cut, and treasury
+stayed 0.
+
+**Still open (F5)**: a tick that crosses a boundary AND lands past the new
+epoch's mark makes Haskell freeze over PRE-rotation `bprev`/`ssStakeGo`/`ssFee`.
+A bool cannot express that; only `Pulsing(RewardSnapShot, Pulser)` can.
+Documented at the field, deferred to the pulser program's Phase 2.
+
 ### #1071 — `nesRu` is hardcoded SNothing, and every prior gate passed by luck
 
 Found BY this release's gate. `NewEpochState[4]` is `enc.array(0)`, while
