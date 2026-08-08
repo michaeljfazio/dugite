@@ -335,6 +335,50 @@ span blocks, or a fixture built from the Haskell encoder and labelled SYNTHETIC.
 Shipping a guessed `Pulsing` encoding as though it were observed is the
 #1057/#1067 mistake.
 
+**RESOLVED, 2026-08-08.** `pulseSize` stays 1 until `numStakeCreds > 4k = 160`,
+so ~100 credentials give ~100 pulses over ~200 slots against an 80-slot window
+— `Pulsing` then holds from the mark to the boundary. 120 registered, delegated
+and funded credentials were seeded (40 per tx; 120 in one tx is 32488 bytes
+against `maxTxSize` 16384) and both arms are now captured from cardano-node:
+
+```text
+slot 1122 (offset 322)  SJust Pulsing    8183 0088 …   7.4 KB
+slot 1165 (offset 365)  SJust Complete   8182 0185 …   2.6 KB
+```
+
+### Phase 2/3 ORDERING — corrected by the capture
+
+The plan had the `nesRu` wire arms in Phase 2 and incremental pulsing in Phase
+3. **That order is not achievable**, and decoding the `Pulsing` fixture is what
+shows it:
+
+```text
+array(3)[ 0, RewardSnapShot(8) = 1178 B, Pulser = 6204 B ]
+                                          └─ array(4)[ 1, array(4)[ d9 0102 9f … ] , … ]
+                                                              remaining credentials
+```
+
+The `Pulser` is **84% of the record**, and its head is a tag-258 indefinite set
+of the credentials still to be folded — the fold's live work queue at the
+queried slot. A node that computes the whole update at the boundary has no such
+state, so there is nothing to encode from. The `Pulsing` arm is therefore a
+CONSEQUENCE of incremental pulsing, not a precondition for it.
+
+The `Complete` arm has the same dependency from the other side: upstream's
+`Complete` carries a `RewardUpdate` (`deltaT, deltaR, rs, deltaF, nonMyopic`),
+whereas dugite's `Complete` carries the `RewardSnapShot` it froze — a Phase-1
+approximation that is adequate for boundary application (dugite recomputes
+there) but has no `rs` map to emit. And the timing differs regardless: upstream
+reaches `Complete` mid-epoch, ~35 slots before the boundary, where dugite would
+still report `Pulsing`.
+
+**So Phase 3 subsumes the wire arms.** Emitting them earlier could only produce
+a fabricated `Pulser`, which is worse than the honest `SNothing` dugite emits
+today: a wrong `nesRu` is a wrong `NewEpochState`, and #1057/#1067 are both
+cases of a plausible invented shape reaching the wire. The arms land when the
+state they describe exists — with `tests/fixtures/nesru/` as the oracle, which
+is the state this work leaves them in.
+
 ### Phase 3 — RUPD incremental pulsing (gated on Phase 0)
 
 `pulse_size = max(1, ceil(num_stake_creds / (4k)))`; `done` when the balance map
