@@ -267,6 +267,12 @@ pub struct EpochSubState {
     /// [`Self::rupd_pulser_started`] is false, so the two move together.
     pub rupd_monetary: Option<super::reward_pulser::MonetaryStep>,
 
+    /// The RUPD member fold in flight (Phase 3). TRANSIENT — see
+    /// [`super::reward_pulser::InFlightFold`]; it is deliberately absent from
+    /// `LedgerStateSnapshot`, so a restart mid-epoch rebuilds it and the
+    /// boundary completes it to the identical answer.
+    pub rupd_fold: super::reward_pulser::InFlightFold,
+
     /// AVVM coin returned to reserves by `returnRedeemAddrsToReserves` at the
     /// Shelley→Allegra era boundary, captured so the SAME-boundary reward update
     /// is computed from PRE-AVVM reserves. In Haskell the reward update applied

@@ -1187,3 +1187,138 @@ mod frozen_total_stake {
         assert_ne!(a.delta_r1, b.delta_r1, "and so did the pot");
     }
 }
+
+/// The RUPD member fold in flight: the frozen per-pool table plus the pulser.
+///
+/// TRANSIENT — deliberately not part of `LedgerStateSnapshot`. A node that
+/// restarts mid-epoch rebuilds it at the next block and completes it at the
+/// boundary, which by the differential property (`fold_incremental(any
+/// pulse_size) == fold_batch`) yields the identical reward update. Persisting
+/// it would add a large, consensus-adjacent structure to the snapshot and to
+/// rollback for no change in any computed value.
+///
+/// The one thing it WOULD buy is `nesRu` cursor fidelity across a restart, and
+/// that only becomes observable once the `Pulsing` wire arm exists. Recorded
+/// here so the trade-off is revisited then, rather than rediscovered.
+#[derive(Debug, Clone, Default)]
+pub struct InFlightFold {
+    /// `fvPoolRewardInfo` — built once at the mark from frozen inputs.
+    pub table: HashMap<Hash28, PoolRewardInfo>,
+    /// The pulser. `None` until the first pulse builds it.
+    pub fold: Option<RewardFold>,
+}
+
+impl InFlightFold {
+    /// Whether the fold has run to completion and can be applied as-is.
+    pub fn is_complete(&self) -> bool {
+        self.fold.as_ref().is_some_and(|f| f.is_done())
+    }
+
+    /// Credentials still to fold — upstream's `balance`, for the wire arm.
+    pub fn remaining(&self) -> usize {
+        self.fold.as_ref().map_or(0, |f| f.remaining().len())
+    }
+}
+
+/// Per-block pulsing must actually ADVANCE the fold.
+///
+/// The differential property makes chunking unobservable in the RESULT, which
+/// means no value comparison can tell a pulsing node from a batching one —
+/// disarming the boundary so it discards the pulses and refolds from scratch
+/// leaves all 1812 ledger tests green. That is correct, and it is exactly why
+/// the assertion here is on WORK DONE rather than on rewards.
+///
+/// Without it, per-block pulsing could be wired to do nothing — building the
+/// fold and never pulsing, or pulsing a fold nobody reads — and every existing
+/// test would still pass while the ~2.55 s boundary stall (Phase 0) remained
+/// exactly where it was.
+#[cfg(test)]
+mod pulse_advances {
+    use super::*;
+
+    fn h28(i: u64) -> Hash28 {
+        let mut b = [0u8; 28];
+        b[..8].copy_from_slice(&i.to_be_bytes());
+        dugite_primitives::Hash(b)
+    }
+    fn h32(i: u64) -> Hash32 {
+        let mut b = [0u8; 32];
+        b[..8].copy_from_slice(&i.wrapping_mul(0x9e37_79b9_7f4a_7c15).to_be_bytes());
+        dugite_primitives::Hash(b)
+    }
+
+    /// Successive pulses consume the queue and the fold eventually completes.
+    #[test]
+    fn successive_pulses_drain_the_queue() {
+        let mut delegations = HashMap::new();
+        for c in 0..40u64 {
+            delegations.insert(h32(c), h28(c % 4));
+        }
+        let table: HashMap<Hash28, PoolRewardInfo> = HashMap::new();
+        let stake: HashMap<Hash32, Lovelace> = HashMap::new();
+        let ctx = MemberFoldCtx {
+            table: &table,
+            delegations: &delegations,
+            stake: &stake,
+            pv_major: 11,
+            registered: |_: &Hash32| true,
+        };
+
+        let mut fold = RewardFold::new(&delegations);
+        assert_eq!(fold.remaining().len(), 40, "queue starts full");
+
+        let mut seen = vec![fold.remaining().len()];
+        let mut guard = 0;
+        while !fold.is_done() {
+            fold.pulse(7, &ctx);
+            seen.push(fold.remaining().len());
+            guard += 1;
+            assert!(guard <= 41, "pulsing failed to terminate");
+        }
+
+        assert!(
+            seen.windows(2).all(|w| w[1] < w[0]),
+            "every pulse must strictly reduce the queue; saw {seen:?}"
+        );
+        assert_eq!(*seen.last().unwrap(), 0, "the fold drains to empty");
+        assert!(
+            seen.len() > 2,
+            "with pulse=7 over 40 credentials this must take several pulses — \
+             a single step would mean the pulse size was ignored and the whole \
+             point (spreading the work) is lost"
+        );
+    }
+
+    /// `InFlightFold` reports progress, which is what the `Pulsing` wire arm
+    /// will encode as `balance`.
+    #[test]
+    fn in_flight_fold_reports_remaining_and_completion() {
+        let mut delegations = HashMap::new();
+        for c in 0..10u64 {
+            delegations.insert(h32(c), h28(0));
+        }
+        let mut f = InFlightFold::default();
+        assert_eq!(f.remaining(), 0, "no fold yet");
+        assert!(
+            !f.is_complete(),
+            "absent is not complete — the #1072 distinction"
+        );
+
+        f.fold = Some(RewardFold::new(&delegations));
+        assert_eq!(f.remaining(), 10);
+        assert!(!f.is_complete());
+
+        let table: HashMap<Hash28, PoolRewardInfo> = HashMap::new();
+        let stake: HashMap<Hash32, Lovelace> = HashMap::new();
+        let ctx = MemberFoldCtx {
+            table: &table,
+            delegations: &delegations,
+            stake: &stake,
+            pv_major: 11,
+            registered: |_: &Hash32| true,
+        };
+        f.fold.as_mut().unwrap().complete(&ctx);
+        assert_eq!(f.remaining(), 0);
+        assert!(f.is_complete());
+    }
+}

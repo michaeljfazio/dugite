@@ -341,6 +341,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             state.max_lovelace_supply,
             &Default::default(),
             None,
+            None,
         );
 
         let total: u64 = rupd.rewards.values().map(|l| l.0).sum();

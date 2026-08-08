@@ -156,6 +156,7 @@ fn time_fold_checked(creds: usize, pools: usize) -> (Duration, usize) {
         super::MAX_LOVELACE_SUPPLY,
         &Default::default(),
         None,
+        None,
     );
     let dt = t0.elapsed();
     let produced = out.rewards.len();

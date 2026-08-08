@@ -173,6 +173,86 @@ fn build_new_likelihoods(
         .collect()
 }
 
+/// One pulse of the RUPD member fold — Haskell `pulseStep`, driven per block.
+///
+/// ```haskell
+/// -- Rupd.hs, the JustRight arm
+/// SJust p@(Pulsing _ _) -> SJust <$> pulseStep p
+/// ```
+///
+/// Runs only inside the pulsing window: `rupd_monetary` is `Some` exactly when
+/// the epoch has passed its `4k/f` mark, so this is a no-op before the freeze
+/// and idempotent once the balance is exhausted.
+///
+/// Every input is read from the freeze, never from live state — the per-pool
+/// table is built once from `rupd_monetary`'s `r` and `total_stake`, and the
+/// GO snapshot it folds over is the PRE-rotation one that the boundary will
+/// also use (`compute_reward_update` runs before SNAP). So a pulse taken at
+/// block N and a pulse taken at block N+1 see identical inputs, which is what
+/// makes the differential property meaningful in production and not just in
+/// the proptest.
+pub(crate) fn pulse_rupd_member_fold(
+    epochs: &mut super::substates::EpochSubState,
+    prev_d: &dugite_primitives::transaction::Rational,
+    prev_protocol_version_major: u64,
+    security_param_k: u64,
+) {
+    let Some(monetary) = epochs.rupd_monetary else {
+        return; // before the mark — nothing frozen, nothing to pulse
+    };
+    let Some(go) = epochs.snapshots.go.clone() else {
+        return; // no GO snapshot yet (first two epochs)
+    };
+    if epochs.rupd_fold.is_complete() {
+        return; // `completeStep` is idempotent; so is this
+    }
+
+    let pp = epochs.prev_protocol_params.clone();
+    let bprev = epochs.snapshots.bprev_blocks_by_pool.clone();
+    let addrs = epochs.rupd_addrs_rew.clone();
+    let registered = move |c: &Hash32| -> bool { addrs.as_ref().is_none_or(|set| set.contains(c)) };
+
+    let fold_state = &mut epochs.rupd_fold;
+    if fold_state.fold.is_none() {
+        // Build the frozen per-pool table ONCE, from the frozen terms.
+        let (d_num, d_den) = (prev_d.numerator as i128, prev_d.denominator.max(1) as i128);
+        let total_active_stake: u64 = go
+            .pool_stake
+            .values()
+            .fold(0u64, |acc, s| acc.saturating_add(s.0));
+        let total_blocks_in_epoch: u64 = bprev.values().sum::<u64>().max(1);
+        fold_state.table = build_pool_reward_table(
+            &go,
+            &bprev,
+            &pp,
+            pp.n_opt.max(1),
+            monetary.r,
+            monetary.total_stake,
+            total_active_stake,
+            total_blocks_in_epoch,
+            5 * d_num >= 4 * d_den,
+            d_num,
+            d_den,
+            prev_protocol_version_major,
+            &registered,
+        );
+        fold_state.fold = Some(RewardFold::new(&go.delegations));
+    }
+
+    let Some(fold) = fold_state.fold.as_mut() else {
+        return;
+    };
+    let n = RewardFold::pulse_size(go.delegations.len(), security_param_k);
+    let ctx = MemberFoldCtx {
+        table: &fold_state.table,
+        delegations: &go.delegations,
+        stake: &go.stake_distribution,
+        pv_major: prev_protocol_version_major,
+        registered: &registered,
+    };
+    fold.pulse(n, &ctx);
+}
+
 /// Haskell `mkPoolRewardInfo` over every pool in the GO snapshot.
 ///
 /// Split out of `compute_reward_update` so it can run at the 4k/f MARK
@@ -394,6 +474,11 @@ pub fn compute_reward_update(
     max_lovelace_supply: u64,
     prev_non_myopic: &NonMyopic,
     frozen_monetary: Option<crate::state::reward_pulser::MonetaryStep>,
+    // The member fold as the per-block pulses left it, if any. `None` falls
+    // back to folding everything here, which is what a node that restarted
+    // mid-epoch does — and by the differential property it reaches the same
+    // answer, just without the work having been spread out.
+    prepulsed: Option<RewardFold>,
 ) -> PendingRewardUpdate {
     // `totalStake` = `circulation es maxSupply = maxSupply <-> casReserves acnt`,
     // the current circulating supply. Hoisted above every early return because
@@ -783,7 +868,12 @@ pub fn compute_reward_update(
     // #985/#932/#938 were all N-copies defects where the copy nobody edited was
     // the live one; a batch path kept beside a pulse path would be the same
     // trap with a consensus-critical fold inside it.
-    let mut fold = RewardFold::new(&go.delegations);
+    // Resume the pulser if blocks already advanced it; otherwise start fresh.
+    // `complete` folds whatever remains, so a fold that is already done costs
+    // nothing here and one that never started is folded in full — the two ends
+    // of the same code path, which is why `fold_incremental == fold_batch` is
+    // the only property this needs to be correct.
+    let mut fold = prepulsed.unwrap_or_else(|| RewardFold::new(&go.delegations));
     fold.complete(&ctx);
     for (cred, entries) in fold.into_entries() {
         reward_entries.entry(cred).or_default().extend(entries);
@@ -1061,6 +1151,10 @@ impl LedgerState {
             self.max_lovelace_supply,
             &self.epochs.non_myopic,
             self.epochs.rupd_monetary,
+            // This helper computes a reward update on demand rather than at a
+            // boundary, so there is no pulse history to resume from — it folds
+            // in full, which the differential property makes equivalent.
+            None,
         )
     }
 
@@ -1540,6 +1634,7 @@ mod tests {
             super::super::MAX_LOVELACE_SUPPLY,
             &Default::default(),
             None,
+            None,
         );
 
         assert!(
@@ -1595,6 +1690,7 @@ mod tests {
             0,
             MAX_SUPPLY,
             &Default::default(),
+            None,
             None,
         );
 
@@ -2218,6 +2314,7 @@ mod tests {
             super::super::MAX_LOVELACE_SUPPLY,
             &Default::default(),
             None,
+            None,
         );
 
         // The account whose on-chain withdrawal wedged the chain.
@@ -2365,6 +2462,7 @@ mod tests {
                 super::super::MAX_LOVELACE_SUPPLY,
                 &Default::default(),
                 None,
+                None,
             )
             .rewards
             .get(&member)
@@ -2474,6 +2572,7 @@ mod tests {
                 super::super::MAX_LOVELACE_SUPPLY,
                 &Default::default(),
                 Some(m),
+                None,
             )
         };
 
