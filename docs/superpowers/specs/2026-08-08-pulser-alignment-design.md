@@ -201,6 +201,31 @@ Instrument the boundary; measure reward-computation wall time at preprod scale
 and, if feasible, mainnet replay. Deliverable: a number, and a go/no-go on
 Phase 3. Phases 1-2 proceed regardless — they are correctness, not performance.
 
+### Phase 1a — DONE (validated 2026-08-08)
+
+Split out from Phase 1 because only 1b is blocked; treating them as one unit
+was an error that stalled work unnecessarily.
+
+Landed as four RED-proven increments: the frozen-input types
+(`RewardSnapShot`/`FreeVars`/`RewardEntry`, with `ord_key` reproducing
+`Set.deleteFindMin`); `start_step_monetary` as a SHARED function so the pulser
+and the current path cannot drift; the capture at the 4k/f mark into
+`EpochSubState.rupd_monetary`, persisted; and the boundary consuming it.
+
+Validated: **POT PARITY OK, byte-exact vs cardano-node**
+(`treasury=3347998634108 reserves=5996646011276436`), all predicates,
+tip-parity 176/176, NO ANOMALIES. That equivalence is the entire safety
+argument for the relocation, and it is now measured rather than argued.
+
+Carries a `debug_assert_eq!` that the frozen `deltaR1` equals the
+boundary-recomputed value, so if an input ever does begin moving mid-epoch,
+debug builds fail loudly instead of silently producing a different update.
+
+### Phase 1b — BLOCKED (see section 5b)
+
+Deleting `pending_avvm_return`. Redundant in principle now that the freeze is
+structural; unproven in fact until a mainnet ep235->236 replay runs.
+
 ### Phase 1 — make the freeze EXPLICIT (consensus-relevant)
 
 Capture a real `RewardSnapShot` + `FreeVars` at the existing 4k/f trigger,
