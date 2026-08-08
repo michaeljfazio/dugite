@@ -74,6 +74,61 @@ fn complete_is_sjust_array2_with_a_5_field_update() {
     }
 }
 
+/// The `Pulser` is the REMAINING FOLD STATE, and it dominates the record.
+///
+/// This is the measurement that says the `Pulsing` wire arm cannot be built
+/// before incremental pulsing exists. `array(3)[2]` is not a summary or a
+/// handful of parameters — it is 84% of the bytes, and its second field is a
+/// tagged indefinite set of the credentials still to be folded:
+///
+/// ```text
+/// pulser = array(4)[ pulseSize, <4688 bytes>, <1369>, <145> ]
+///                      0x01        0x84         0xb3    0x82
+///                                   └─ array(4) whose head is the work queue:
+///                                      d9 0102 9f 8200581c…  (tag-258 indefinite set)
+/// ```
+///
+/// The queue sits one level deeper than a first read of the hex suggests —
+/// `84 01 84 d90102 9f`, not `84 01 d90102 9f`. That correction came from the
+/// fixture rejecting the assertion, which is the whole reason to write the
+/// check against captured bytes rather than against the type signature.
+///
+/// `pulseSize = 1` here because `max 1 (ceil(creds / 4k))` stays 1 below
+/// 4k = 160, which is why ~100 credentials were needed to make `Pulsing`
+/// observable at all on the devnet.
+///
+/// Emitting this byte-exactly requires knowing WHICH credentials remain, in
+/// `Set` order, at the queried slot — i.e. the pulser must actually be pulsing.
+/// A node that computes the whole update at the boundary has no such state to
+/// report, so there is nothing to encode from. Phase 2 cannot ship this arm
+/// independently of Phase 3; the plan that separated them was wrong.
+#[test]
+fn the_pulser_carries_remaining_fold_state_not_a_summary() {
+    let b = fixture("pulsing.hex");
+    // 81 83 00, then an 1178-byte RewardSnapShot, then the pulser.
+    let pulser = &b[1181..];
+    assert_eq!(pulser[0], 0x84, "Pulser is array(4)");
+    assert_eq!(
+        pulser[1], 0x01,
+        "pulseSize = max 1 (ceil(creds/4k)) = 1 below 4k=160"
+    );
+    assert_eq!(pulser[2], 0x84, "the fold state is itself an array(4)");
+    assert_eq!(
+        &pulser[3..7],
+        &[0xd9, 0x01, 0x02, 0x9f],
+        "the remaining credentials are a tag-258 INDEFINITE set — the fold's \
+         work queue, not a summary"
+    );
+    assert!(
+        pulser.len() * 10 > b.len() * 8,
+        "the pulser should dominate the record (>80%); got {} of {} bytes. \
+         If this shrinks, the capture was taken when the fold was nearly done \
+         and understates what the arm must reproduce",
+        pulser.len(),
+        b.len()
+    );
+}
+
 /// The two arms must not be conflated: different arity, different tag.
 ///
 /// Emitting `Pulsing` with `Complete`'s framing would be self-undecodable by
@@ -84,6 +139,46 @@ fn the_two_arms_are_structurally_distinct() {
     let c = fixture("complete-nonzero.hex");
     assert_ne!(p[1], c[1], "arity must differ (0x83 vs 0x82)");
     assert_ne!(p[2], c[2], "sum tag must differ (0 vs 1)");
+}
+
+/// `RewardSnapShot`'s field ORDER, pinned by an arithmetic identity rather
+/// than by position alone.
+///
+/// Arity checks cannot distinguish three adjacent `u64`s. But `rPot = deltaR1
+/// + fees` and `R = rPot - deltaT1`, so with `rewFees = 0` the three satisfy
+/// `deltaR1 == R + deltaT1` in exactly one assignment. Reading them in any
+/// other order breaks the identity, which is what makes this a real check on
+/// the layout that `MonetaryStep` mirrors:
+///
+/// ```text
+/// [0] rewFees = 0
+/// [3] rewDeltaR1 = 17989722017445
+/// [4] rewR       = 14391777613956
+/// [5] rewDeltaT1 =  3597944403489     4 + 5 == 3  ✓
+/// ```
+#[test]
+fn reward_snapshot_field_order_is_fixed_by_the_pot_identity() {
+    let b = fixture("pulsing.hex");
+    // 81 83 00 88 <f0=00> <f1: 82 ..> <f2: 82 ..> <f3..f5: 1b + 8 bytes each>
+    assert_eq!(b[4], 0x00, "[0] rewFees is 0 in this capture");
+    let u64_at = |off: usize| {
+        assert_eq!(b[off], 0x1b, "expected a 64-bit uint at {off}");
+        u64::from_be_bytes(b[off + 1..off + 9].try_into().unwrap())
+    };
+    // f1 = ProtVer array(2) (3 bytes), f2 = NonMyopic array(2) (11 bytes).
+    let f3 = 5 + 3 + 11;
+    let (delta_r1, r, delta_t1) = (u64_at(f3), u64_at(f3 + 9), u64_at(f3 + 18));
+    assert_eq!(
+        delta_r1,
+        r + delta_t1,
+        "rPot identity broken: deltaR1={delta_r1} R={r} deltaT1={delta_t1}. \
+         Either the field order is not (deltaR1, R, deltaT1) or the capture \
+         came from an epoch with non-zero fees"
+    );
+    assert!(
+        delta_r1 > 0,
+        "a zero expansion would satisfy the identity vacuously"
+    );
 }
 
 /// The all-zero fixture pins shape but no field widths; the non-zero one must
