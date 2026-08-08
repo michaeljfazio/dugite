@@ -662,6 +662,7 @@ impl EraRules for ConwayRules {
                 ctx.shelley_transition_epoch,
                 ctx.max_lovelace_supply,
                 &epochs.non_myopic,
+                epochs.rupd_monetary,
             );
 
             // Issue #438/#471: per-boundary reward-debug dump.  No-op
