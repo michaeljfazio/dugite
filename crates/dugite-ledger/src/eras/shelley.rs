@@ -447,7 +447,12 @@ impl EraRules for ShelleyRules {
         // applied one unconditionally, which diverges permanently once it
         // happens. See `state::reward_pulser`.
         if !epochs.rupd_pulser_started {
-            debug!(
+            // INFO, not debug: this is the only externally visible evidence that
+            // the #1072 gate fired, and the live differential test greps for it.
+            // At the devnet's default `info` level a `debug!` here is invisible,
+            // which made the gate indistinguishable from "no reward was due
+            // anyway" — the measures-nothing family.
+            info!(
                 epoch = new_epoch.0,
                 "No RUPD pulser for the closed epoch (no block after 4k/f) — \
                  applying no reward update, matching Haskell's SNothing arm"
