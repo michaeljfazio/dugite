@@ -480,13 +480,56 @@ already carries a validated consensus fix (#1072). Everything it needs is in
 place: the freeze (Phase 1a), the measurement (Phase 0), and the wire fixtures
 (`tests/fixtures/nesru/`) that its `Pulsing` arm must reproduce.
 
-### Phase 4 — DRep internal pulsing **(justification reduced [R2])**
+### Phase 4 — DRep internal pulsing — **CLOSED, not implemented**
 
-Add `DRPulsing` as an **internal representation only**. There is no wire arm to
-emit and no query to serve (§2.2), and no semantic gap to close (§3.3). Its sole
-remaining value is work-spreading, so **Phase 4 is gated on Phase 0 exactly as
-Phase 3 is**, and is the first thing to cut if the measurement does not justify
-it. Acceptance criterion is a provable no-op on every ratification outcome.
+The "no wire arm" claim (§2.2) was an assertion, and after `fvAddrsRew` I stopped
+trusting assertions in this document. It is now MEASURED, with
+`capture_gov_pulser`, sampling `ConwayGovState[6]` from both nodes across a full
+devnet epoch including the 4k/f mark:
+
+```text
+slot off=241  cardano: array(2), no sum tag   dugite: array(2), no sum tag
+slot off=267  …290 …320 …346 …371 — identical at every sample
+```
+
+`DRepPulsingState` reaches the wire as a bare `array(2)`, never as a tagged sum.
+Upstream's encoder forces the pulser before encoding — `encCBOR` on a
+`DRPulsing` calls `finishDRepPulser` and writes the resulting `DRComplete` —
+so **`DRPulsing` is unobservable to any peer**, at any point in the epoch. It is
+an in-memory representation and nothing else.
+
+Combined with §3.3 (no semantic gap — inputs freeze at the same instant in both
+implementations) and Phase 0's finding that the measured cost is in the RUPD
+fold rather than the DRep one, Phase 4 has no remaining justification of any
+kind. **Implementing it would add ledger state, snapshot surface and rollback
+surface for zero observable difference**, and every one of those surfaces has
+produced a defect in this repo (#985, #989, #1057). Closed as YAGNI, with the
+measurement recorded so the question does not get reopened on a guess.
+
+> **The investigation was still worth running.** It did not change Phase 4, but
+> diffing the raw `GetGovState` bytes it captured found a live wire divergence
+> nothing else would have: `costModels` arrays framed definite where
+> cardano-node frames them indefinite (`98 a6` vs `9f … ff`), the #938 class in
+> the LSQ pparams path. Invisible to every value-comparing parity suite, since
+> both framings decode identically. See the commit for the fix.
+
+**One divergence remains open here.** The embedded `PulsingSnapshot` differs:
+
+```text
+                psProposals  psDRepDistr  psDRepState  psPoolDistr   bytes
+  cardano-node            0            0            0            0       5
+  dugite                  8            0            2            4    2081
+```
+
+Stable across samples on both nodes, and the `RatifyState` half — the part
+cardano-cli renders — is the same size on both. Two readings are open: either
+cardano-node's completed pulser legitimately reports an emptied snapshot (its
+`psPoolDistr` is 0 on a chain with live pools, which points that way), or
+dugite's "frozen" proposal list is admitting mid-epoch submissions, which would
+be #922's shape in the embedded pulser. **Not fixed here**: guessing between
+them is exactly how #1057 was made worse, and the fix differs completely
+depending on which reading is right. Filed for oracle verification against
+`finishDRepPulser`.
 
 ### Phase 5 — persistence, rollback, and import
 
