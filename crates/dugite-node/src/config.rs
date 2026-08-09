@@ -1350,9 +1350,11 @@ mod tests {
     #[test]
     fn byron_genesis_hash_matches_cardano_node() {
         // Byron hashes a canonical-JSON re-serialisation, NOT the file bytes.
-        // Two independent real files, so a rule that happens to fit one cannot
-        // pass: mainnet's value is the published one, preprod's is what
-        // cardano-node itself computed when handed dugite's own copy.
+        // Three independent real files, so a rule that happens to fit one cannot
+        // pass. Every value here was produced by `cardano-cli byron genesis
+        // print-genesis-hash` against these exact files — mainnet's also matches
+        // the published constant, and preview had no published reference at all,
+        // so cardano-cli is the oracle rather than a transcription.
         let root = Path::new(env!("CARGO_MANIFEST_DIR"))
             .parent()
             .and_then(|p| p.parent())
@@ -1367,6 +1369,10 @@ mod tests {
             (
                 "preprod",
                 "d4b8de7a11d929a323373cbab6c1a9bdc931beffff11db111cf9d57356ee1937",
+            ),
+            (
+                "preview",
+                "83de1d7302569ad56cf9139a41e2e11346d4cb4a31c00142557b6ab3fa550761",
             ),
         ];
 
@@ -1393,7 +1399,7 @@ mod tests {
             );
             checked += 1;
         }
-        assert_eq!(checked, 2, "both vectors must actually be exercised");
+        assert_eq!(checked, 3, "all three vectors must actually be exercised");
     }
 
     /// The configs dugite SHIPS must satisfy dugite's own validation.
