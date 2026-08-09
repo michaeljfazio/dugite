@@ -451,3 +451,36 @@ ground truth, because a definitional mismatch and a consensus defect are
 indistinguishable from the number alone.
 
 Recorded as [[feedback_verify_the_oracles_column_definitions]].
+
+
+### VERIFIED — Koios back-projection is proven, not inferred
+
+The Shelley supply decomposition
+
+```text
+maxLovelaceSupply = circulation + treasury + reserves + deposits
+```
+
+is a SHELLEY ledger invariant. Byron has none of those three pots. Yet:
+
+| epoch | era | circ + treasury + reserves | residual vs 45e15 |
+|---|---|---:|---:|
+| 207 | **Byron** | 44,990,355,124,443,039 | 9,644,875,556,961 |
+| 208 | Shelley | 44,990,281,511,141,602 | 9,718,488,858,398 |
+
+**Koios's Byron epoch satisfies a Shelley-only invariant**, to a deposits-sized
+residual, with the same shape as the Shelley epoch beside it. That is only
+possible by back-projecting the Shelley model backwards over Byron.
+
+So the comparison this investigation was built on was **invalid by
+construction**: dugite's fork-time UTxO (a real Byron quantity) was being
+diffed against Koios's `circulation` (a modelled Shelley quantity that does not
+exist in the Byron ledger). The 2.19e15 "divergence" is the model's own
+treasury/reserves split, not a dugite defect.
+
+**Status:** the METHODOLOGICAL question is closed — Koios cannot be the oracle
+for fork-time or Byron-era state, and this is demonstrated rather than argued.
+What remains is positive confirmation that dugite's Shelley-era pots match a
+real Haskell node, which needs one cardano-node `debug log-epoch-state`. That
+is a confirmation step, not an open defect: the evidence now points to dugite
+being correct, and no code change is indicated.
