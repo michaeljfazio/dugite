@@ -591,7 +591,11 @@ impl LedgerState {
                     self.epochs.snapshots.ss_fee.0,
                     blocks,
                     self.epoch_length,
-                    crate::state::MAX_LOVELACE_SUPPLY,
+                    // The node's CONFIGURED supply, not the constant: they
+                    // coincide on mainnet but a network with a different
+                    // maxLovelaceSupply would freeze the wrong total_stake,
+                    // and total_stake is sigma's denominator.
+                    self.max_lovelace_supply,
                 ));
             }
         }
