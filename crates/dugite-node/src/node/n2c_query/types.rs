@@ -965,7 +965,11 @@ pub struct GovStateSnapshot {
     /// `psDRepState` — same source as `GetDRepState` (tag 25).
     pub pulser_drep_state: Vec<DRepSnapshot>,
     /// `psPoolDistr` — same source as `GetStakeDistribution` (tag 5).
-    pub pulser_pool_distr: Vec<StakePoolSnapshot>,
+    /// `psPoolDistr`. `PoolDistrEntry`, not `StakePoolSnapshot`, because
+    /// `finishDRepPulser` derives it from `finalStakePoolDistr` and so
+    /// inherits `calculatePoolDistr'`'s `spssNumDelegators > 0` guard —
+    /// which needs the delegator count `StakePoolSnapshot` does not carry.
+    pub pulser_pool_distr: Vec<PoolDistrEntry>,
     /// `rsEnacted` — what WILL enact at the next boundary, and since #988
     /// step 2 what the boundary actually applies.
     pub ratify_enacted: Vec<(ProposalSnapshot, GovActionId)>,

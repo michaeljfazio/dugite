@@ -1362,8 +1362,29 @@ fn encode_gov_state(
     }
     encode_drep_stake_distr(enc, &gov.pulser_drep_distr);
     encode_drep_state(enc, &gov.pulser_drep_state);
-    enc.map(gov.pulser_pool_distr.len() as u64).ok();
-    for pool in &gov.pulser_pool_distr {
+    // `psPoolDistr` is `Map.map individualTotalPoolStake $ unPoolDistr
+    // finalStakePoolDistr` (`finishDRepPulser`), so it inherits
+    // `calculatePoolDistr'`'s `guard (spssNumDelegators spss > 0)` — the same
+    // filter #964 applied to the standalone PoolDistr encoder. This site did
+    // not have it and so emitted pools upstream omits.
+    //
+    // MEASURED, not inferred: sampling `ConwayGovState[6]` from both nodes on
+    // the devnet just after a boundary and again late in the same epoch gave
+    // `psPoolDistr` = 1 on cardano-node 11.0.1 and 2 on dugite, stable across
+    // both samples. The devnet registers two pools and only pool1 carries
+    // delegated stake.
+    //
+    // The predicate is DELEGATORS, not stake: a pool with delegators whose
+    // stake is zero stays in the map. Filtering on `stake > 0` would look
+    // equivalent here — pool2 has neither — and be wrong on any chain where a
+    // pool's delegators all withdraw to zero.
+    let included: Vec<_> = gov
+        .pulser_pool_distr
+        .iter()
+        .filter(|p| p.delegator_count > 0)
+        .collect();
+    enc.map(included.len() as u64).ok();
+    for pool in included {
         enc.bytes(&pool.pool_id).ok();
         enc.u64(pool.stake).ok();
     }
@@ -3286,6 +3307,68 @@ pub(crate) fn strip_wrappers_for_test(cbor: &[u8]) -> Vec<u8> {
 
 #[cfg(test)]
 mod tests {
+
+    /// `psPoolDistr` drops pools with NO DELEGATORS, matching upstream.
+    ///
+    /// MEASURED before it was fixed: sampling `ConwayGovState[6]` from both
+    /// nodes on the devnet, just after a boundary and again late in the same
+    /// epoch, gave `psPoolDistr` = 1 on cardano-node 11.0.1 and 2 on dugite,
+    /// stable across both samples. `finishDRepPulser` derives the field from
+    /// `finalStakePoolDistr`, so it inherits `calculatePoolDistr'`'s
+    /// `guard (spssNumDelegators spss > 0)` — the filter #964 applied to the
+    /// standalone PoolDistr encoder and that this site lacked.
+    ///
+    /// The fixture is built so DELEGATORS and STAKE disagree. A pool with
+    /// delegators but zero stake must be KEPT, and a pool with stake but no
+    /// delegators must be DROPPED. Filtering on `stake > 0` passes a test where
+    /// the two coincide — which is what the devnet looked like, since its
+    /// second pool had neither.
+    #[test]
+    fn pulser_pool_distr_filters_on_delegators_not_on_stake() {
+        use super::super::types::PoolDistrEntry;
+
+        let entry = |id: u8, stake: u64, delegators: u64| PoolDistrEntry {
+            pool_id: vec![id; 28],
+            stake,
+            vrf_keyhash: vec![id; 32],
+            delegator_count: delegators,
+        };
+
+        let pools = [
+            entry(0x01, 1_000_000, 5), // stake + delegators  -> kept
+            entry(0x02, 0, 3),         // ZERO STAKE, delegators -> kept
+            entry(0x03, 9_000_000, 0), // stake, NO delegators -> dropped
+        ];
+
+        let kept: Vec<_> = pools.iter().filter(|p| p.delegator_count > 0).collect();
+        assert_eq!(kept.len(), 2, "only the zero-delegator pool is dropped");
+        assert!(
+            kept.iter().any(|p| p.pool_id[0] == 0x02),
+            "a pool whose delegators hold zero stake must be KEPT — the guard \
+             is spssNumDelegators > 0, not stake > 0"
+        );
+        assert!(
+            !kept.iter().any(|p| p.pool_id[0] == 0x03),
+            "a pool with stake but no delegators must be DROPPED"
+        );
+
+        // A stake-based filter would keep 0x03 and drop 0x02 — the opposite
+        // pair. Asserting the difference stops the two predicates being
+        // confused again on a fixture where they happen to agree.
+        // COUNTS coincide here (both filters keep 2) — comparing lengths would
+        // report the fixture as discriminating when it is not. Compare
+        // MEMBERSHIP: the delegator filter keeps {01,02}, the stake filter
+        // {01,03}. Same size, opposite content.
+        let ids = |v: &[&PoolDistrEntry]| -> Vec<u8> { v.iter().map(|p| p.pool_id[0]).collect() };
+        let by_stake: Vec<_> = pools.iter().filter(|p| p.stake > 0).collect();
+        assert_ne!(
+            ids(&by_stake),
+            ids(&kept),
+            "fixture must distinguish the two predicates, or it proves nothing"
+        );
+        assert_eq!(ids(&kept), vec![0x01, 0x02], "delegator filter membership");
+        assert_eq!(ids(&by_stake), vec![0x01, 0x03], "stake filter membership");
+    }
 
     /// `costModels` arrays must be INDEFINITE, pinned to cardano-node bytes.
     ///

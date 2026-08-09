@@ -61,7 +61,9 @@ pub(crate) fn gov_state_snapshot(state: &NodeStateSnapshot) -> GovStateSnapshot 
         pulser_proposals: state.governance_proposals_frozen.clone(),
         pulser_drep_distr: state.drep_stake_distr.clone(),
         pulser_drep_state: state.drep_entries.clone(),
-        pulser_pool_distr: state.stake_pools.clone(),
+        // From `pool_distr`, NOT `stake_pools`: the latter has no delegator
+        // count, so the upstream filter cannot be applied to it.
+        pulser_pool_distr: state.pool_distr.clone(),
         ratify_enacted: state.ratify_enacted.clone(),
         ratify_expired: state.ratify_expired.clone(),
         ratify_delayed: state.ratify_delayed,
