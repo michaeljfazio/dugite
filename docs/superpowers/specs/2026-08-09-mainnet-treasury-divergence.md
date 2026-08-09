@@ -110,3 +110,51 @@ preview, preprod and the devnet all genesis **post-Byron**, so none has a
 Byron→Shelley translation and all start with treasury 0 — where dugite's
 assumption is correct. Mainnet is the only network that exercises it, which is
 exactly why the replay was run.
+
+
+---
+
+## MEASURED AT THE FORK 2026-08-09 — dugite's own instrumentation
+
+`eras/shelley.rs` logs the translation, so the inputs are directly observable
+rather than inferred:
+
+```text
+Byron->Shelley: reserves = maxLovelaceSupply - sumCoinUTxO(liveByronUTxO)
+  utxo_sum        = 31,111,977,147,073,356
+  new_reserves    = 13,888,022,852,926,644     (= 45e15 - utxo_sum, self-consistent)
+  redeem_sum      =      318,200,635,000,000   (465 AVVM redeem UTxOs)
+  nonredeem_sum   = 30,793,776,512,073,356     (729,474 UTxOs)
+
+Shelley->Allegra: returnRedeemAddrsToReserves
+  redeem_coin     =      318,200,635,000,000   credited to reserves
+  reserves_after  = 13,131,756,221,890,729
+```
+
+Against Koios epoch 208 (`reserves 13,406,339,661,812,158`):
+
+| | value |
+|---|---:|
+| dugite reserves at fork | 13,888,022,852,926,644 |
+| expected (Koios @208) | 13,406,339,661,812,158 |
+| **delta** | **+481,683,191,114,486** (dugite HIGH) |
+| of which AVVM redeem | 318,200,635,000,000 |
+| **unexplained** | **+163,482,556,114,486** |
+
+**THE SIGN FLIPS.** At the fork dugite's reserves are HIGH by 481.7e12 (so its
+UTxO is LOW). By epoch 267 its non-circulating supply is LOW by 2.19e15 (so its
+UTxO is HIGH). Two distinct effects, not one:
+
+1. **At the fork** — dugite's Byron UTxO sum is ~481.7e12 too LOW. The AVVM
+   redeem set (318.2e12) is the large part and is *deliberately* still in the
+   UTxO at this point per upstream, so the comparison against a post-AVVM Koios
+   figure double-counts it; the genuinely unexplained remainder is ~163.5e12.
+2. **Across Shelley+** — something adds ~2.19e15 to dugite's UTxO relative to
+   mainnet, or fails to remove it. This is the larger effect and it is NOT the
+   fork translation.
+
+So the fork translation is at most a minor contributor and the dominant defect
+is downstream of it. The next measurement must be a per-epoch pot comparison to
+find the FIRST epoch where the delta appears — a single number at epoch 267
+cannot distinguish a step change from a slow drift, and those have completely
+different causes.
