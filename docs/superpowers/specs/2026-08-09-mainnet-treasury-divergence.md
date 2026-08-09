@@ -158,3 +158,39 @@ is downstream of it. The next measurement must be a per-epoch pot comparison to
 find the FIRST epoch where the delta appears — a single number at epoch 267
 cannot distinguish a step change from a slow drift, and those have completely
 different causes.
+
+
+---
+
+## STRONGEST LEAD 2026-08-09 — reserves do not move across a boundary
+
+Two samples from the same running node, epochs 267 and 269:
+
+| | treasury | reserves |
+|---|---:|---:|
+| dugite @267 | 448,318,686,397,699 | 12,341,518,536,205,146 |
+| dugite @269 | 463,139,673,075,643 | 12,341,518,536,205,146 |
+| **change** | **+14,820,986,677,944** | **0 — UNCHANGED** |
+| mainnet change | +13,682,748,182,569 | **-13,839,565,138,166** |
+
+**dugite's treasury grew by 14.8e12 across two boundaries while its reserves
+did not move by a single lovelace.** Mainnet's reserves fell by 13.8e12 over
+the same span, which is the expected `deltaR1` draw.
+
+Treasury is credited and reserves are not debited. Either:
+
+1. `delta_reserves` is not being applied at `applyRUpd` — a conservation
+   defect that CREATES lovelace, which would compound every epoch and is the
+   right order of magnitude to explain a 2.19e15 gap accumulated over ~60
+   epochs; or
+2. `dugite_reserves_lovelace` is a stale gauge and the ledger is fine.
+
+(2) must be excluded first, and cheaply: read reserves from the ledger rather
+than the metric at two epochs. If the ledger also shows no movement, it is (1)
+and the defect is in the reserves side of `apply_pending_reward_update`.
+
+Note this is measured on a node WITHOUT the pot-parity gate that the devnet and
+preprod runs pass — those compare a single instant, and a pot that never moves
+matches a pot that never moves whenever both start equal. That is why a
+long-running mainnet replay found it and two green gates did not: the devnet
+never runs enough boundaries for the drift to separate from noise.
