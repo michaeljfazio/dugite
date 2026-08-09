@@ -3,8 +3,17 @@
 #
 #   1. wait for the cardano-node oracle to pass TARGET_EPOCH
 #   2. stop it cleanly (SIGTERM — kill -9 corrupts an ImmutableDB)
-#   3. replay the same chain with cardano-streamer, dumping per epoch
-#   4. diff the two dumps, bisecting to the first divergent epoch
+#   3. clone its chain for dugite (APFS copy-on-write, ~0 disk)
+#   4. replay with dugite, dumping per epoch
+#   5. replay the same chain with cardano-streamer, dumping per epoch
+#   6. diff the two dumps, bisecting to the first divergent epoch
+#
+# Steps 3-4 used to be manual, which is how a comparison ends up unable to say
+# which binary produced which side. Each step can be skipped for a re-run:
+# SKIP_WAIT / SKIP_CLONE / SKIP_DUGITE.
+#
+# TARGET_EPOCH defaults to 273 — the range validated so far. Set it to the
+# chain tip's epoch for a full run.
 #
 # The two dumps are taken at the SAME instant by construction: cardano-streamer
 # fires at `siFinal` when `isFirstSlotOfNewEpoch` using the post-block state,
@@ -16,6 +25,7 @@
 set -uo pipefail
 
 DUGITE_ROOT=${DUGITE_ROOT:-/Users/michaelfazio/Source/dugite}
+WT=${WT:-$DUGITE_ROOT/.claude/worktrees/nonmyopic-1067}
 # Use the PINNED oracle binary, copied out of dist-newstyle with a recorded
 # sha256 and commit (see oracle-bin/PROVENANCE.txt). Two separate hazards make
 # "resolve it from the build tree" wrong, and they pull in opposite directions:
@@ -84,7 +94,19 @@ fi
 # ── 2. stop the oracle ───────────────────────────────────────────────────
 # cstreamer CAN read a live ImmutableDB (measured), but it is CPU-bound and
 # would contend with a still-syncing node for the whole replay.
-pid=$(pgrep -f "cardano-node run .*db-cn-mainnet" | head -1)
+#
+# SKIP_STOP=1 leaves the node alone. This step has no business firing during a
+# dry run, and it HAS: setting SKIP_WAIT/SKIP_CLONE/SKIP_DUGITE to exercise the
+# guards still reached step 2 and terminated a mainnet sync 48% of the way in.
+# Nothing was lost — SIGTERM is the clean stop and it resumed at the same epoch
+# — but "the steps I skipped" is not the same set as "the steps that act", and
+# the only skip that was missing was the one with an external side effect.
+if [ "${SKIP_STOP:-0}" = "1" ]; then
+  log "SKIP_STOP=1 — leaving any running cardano-node alone"
+  pid=""
+else
+  pid=$(pgrep -f "cardano-node run .*db-cn-mainnet" | head -1)
+fi
 if [ -n "$pid" ]; then
   log "stopping cardano-node pid=$pid with SIGTERM (never -9: it corrupts the ImmutableDB)"
   kill -TERM "$pid"
@@ -102,7 +124,43 @@ else
   log "no cardano-node running against $CN_DB"
 fi
 
-# ── 3. cardano-streamer replay ───────────────────────────────────────────
+# ── 3. clone the chain for dugite ────────────────────────────────────────
+#
+# AFTER the node is stopped, so the tail chunk is complete. The clone script
+# excludes the tail while a node is live, because a chunk mid-write makes the
+# replay target move between runs.
+#
+# APFS copy-on-write, so a ~200 GB chain costs ~0 disk (measured: 13 GB cloned
+# with free space unchanged). dugite needs its OWN copy rather than reading
+# db-cn-mainnet directly: its open path may reconcile the secondary index,
+# truncate the tail to its verified prefix or quarantine a chunk (#926-#929),
+# and under a shared directory those repairs would land on the ORACLE's
+# database — silently corrupting the thing being compared against.
+DUGITE_DB=${DUGITE_DB:-$DUGITE_ROOT/db-mainnet-tip}
+if [ "${SKIP_CLONE:-0}" = "1" ]; then
+  log "SKIP_CLONE=1 — reusing $DUGITE_DB as-is"
+else
+  log "cloning $CN_DB -> $DUGITE_DB"
+  bash "$WT/scripts/validation/clone-cn-immutable-for-dugite.sh" "$CN_DB" "$DUGITE_DB" || {
+    log "ERROR clone failed"; exit 1; }
+fi
+
+# ── 4. dugite replay ─────────────────────────────────────────────────────
+#
+# dugite FIRST, even though it is the shorter of the two. It takes well under
+# an hour where cstreamer takes many, so running it first means a broken
+# binary, a missing config or a bad clone surfaces in minutes instead of after
+# a whole oracle replay has been spent.
+if [ "${SKIP_DUGITE:-0}" = "1" ]; then
+  log "SKIP_DUGITE=1 — reusing existing dugite dumps"
+else
+  log "running dugite dump-snapshot"
+  DUGITE_DUMP_DIGEST=1 DB="$DUGITE_DB" OUT="$OUT/dugite" \
+    bash "$WT/scripts/validation/dugite-mainnet-dump.sh" || {
+    log "ERROR dugite dump failed"; exit 1; }
+fi
+
+# ── 5. cardano-streamer replay ───────────────────────────────────────────
 mkdir -p "$OUT/cstreamer"
 # `--validate re` REAPPLIES blocks: the same ledger state transition without
 # re-verifying signatures and scripts. For a ledger-state comparison that is
@@ -130,9 +188,9 @@ if [ "$n" -eq 0 ]; then
   exit 1
 fi
 
-# ── 4. diff ──────────────────────────────────────────────────────────────
+# ── 6. diff ──────────────────────────────────────────────────────────────
 log "diffing"
-python3 "$DUGITE_ROOT/.claude/worktrees/nonmyopic-1067/scripts/validation/diff-cstreamer-dumps.py" \
+python3 "$WT/scripts/validation/diff-cstreamer-dumps.py" \
   --dugite "$OUT/dugite" \
   --cstreamer "$OUT/cstreamer" \
   --json "$OUT/report.json"
