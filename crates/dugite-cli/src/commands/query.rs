@@ -3203,8 +3203,13 @@ impl QueryCmd {
             } => {
                 let mut client = connect_and_acquire(&socket_path, testnet_magic).await?;
 
+                // Shelley tag 12 (`DebugNewEpochState`) — the query that
+                // carries `NewEpochState`, and the one `cardano-cli query
+                // ledger-state` issues. This called `query_ledger_state()`
+                // (tag 4, `GetProposedPParamsUpdates`) until #1070, so it
+                // returned four bytes of the wrong record from every node.
                 let raw = client
-                    .query_ledger_state()
+                    .query_debug_new_epoch_state()
                     .await
                     .map_err(|e| anyhow::anyhow!("Failed to query ledger state: {e}"))?;
 
