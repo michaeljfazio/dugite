@@ -240,3 +240,53 @@ skips.
 sample at 270. A flat delta at the tail cannot say WHERE the step happened;
 only walking the early epochs can. That requires a replay with per-boundary pot
 logging, which is the next session's first task.
+
+
+---
+
+## LOCATED 2026-08-09 — the step is AT the Shelley transition, and it balances
+
+dugite's own fork logging against Koios epoch 208:
+
+```text
+dugite @fork:  utxo 31,111,977,147,073,356
+             + reserves 13,888,022,852,926,644
+             + treasury 0
+             = 45,000,000,000,000,000
+
+koios  @208 :  circ 30,003,668,989,861,693
+             + reserves 13,406,339,661,812,158
+             + treasury  1,580,272,859,467,751
+             = 44,990,281,511,141,602
+```
+
+Decomposed:
+
+| | |
+|---|---:|
+| dugite utxo - koios circulation | +1,108,308,157,211,663 |
+| dugite reserves - koios reserves | +481,683,191,114,486 |
+| **sum of dugite's excesses** | **+1,589,991,348,326,149** |
+| koios treasury @208 | 1,580,272,859,467,751 |
+| **residual** | **9,718,488,858,398 (0.6%)** |
+
+**dugite's combined UTxO + reserves excess EQUALS mainnet's treasury to within
+0.6%.** Mainnet moves ~1.58e15 out of circulation and reserves into treasury at
+the Shelley transition; dugite does not. That single missing transfer is the
+whole step change, and it explains both signs at once — why dugite's UTxO and
+reserves are each too high at the fork, and why its treasury is short by the
+same total forever after.
+
+The 0.6% residual is the AVVM redeem set moving at Shelley->Allegra
+(318.2e12 logged) netting against Byron fee burn, and is a second-order term to
+resolve after the main transfer.
+
+**This contradicts `translateToShelleyLedgerStateFromUtxo`, which sets
+`casTreasury = Coin 0`** — so the transfer is NOT in the Byron translation. It
+must be applied elsewhere in the mainnet Shelley bootstrap: candidates are the
+Shelley genesis `initialFunds`/`maxLovelaceSupply` reconciliation, or a
+one-time MIR-like credit in epoch 208. Establish which BEFORE writing code; a
+1.58e15 constant that makes the number match is the fabricated-value trap.
+
+**Do not tag v2.8.0 until this is resolved.** The devnet gate and preprod soak
+are both clean and neither can see this: every testnet genesises post-Byron.
