@@ -1000,13 +1000,23 @@ async fn run_dump_snapshot(args: DumpSnapshotArgs) -> Result<()> {
         }
     })?;
 
-    // Dump final epoch (the current in-progress epoch at the stop point).
-    if blocks_applied > 0 && last_epoch != u64::MAX {
-        let snapshot = build_epoch_snapshot(&ledger, last_epoch, epoch_fees, max_lovelace_supply);
-
-        write_epoch_snapshot(&snapshot, last_epoch, &args.output_dir, &mut output)?;
-        epochs_written += 1;
-    }
+    // NO final snapshot. This used to dump the IN-PROGRESS epoch under
+    // `last_epoch`'s number, which OVERWROTE the boundary snapshot already
+    // written for that epoch — so the last file of every run was mid-epoch
+    // state wearing a boundary dump's name. (`epochs_written` exceeded the file
+    // count by exactly one, which was the only visible symptom.)
+    //
+    // It corrupted the comparison in three ways at once and every one of them
+    // looked like a ledger bug: `deposits.pool`/`stakeKey`/`total` diverged
+    // (filed as a defect before the cause was found — the boundary values are
+    // byte-exact), `snapshots.mark.blocks` held a whole epoch of block counts
+    // instead of the new epoch's first, and the epoch appeared as the one
+    // outlier outside a cleanly-explained window.
+    //
+    // cardano-streamer dumps at boundaries only, so an in-progress snapshot has
+    // no counterpart to compare against and no meaning in this comparison. The
+    // stop point is already reported in the completion log.
+    let _ = epoch_fees;
 
     let elapsed = start_time.elapsed();
     info!(

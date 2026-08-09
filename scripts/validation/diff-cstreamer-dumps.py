@@ -563,7 +563,15 @@ def main() -> int:
 
     real_diffs = {p: v for p, v in res.diff.items() if v}
     if real_diffs:
-        rc = 1
+        # NOT `rc = 1`. That overwrote the schema-gap code set above, so a gap
+        # was only ever reported when NOTHING else diverged — and a gap is the
+        # more serious of the two. A divergence means two values were compared
+        # and differ; a gap means a whole field was never compared on one side,
+        # which makes the comparison INCOMPLETE and every "N leaf comparisons"
+        # headline an overstatement. Masking the completeness failure behind the
+        # correctness failure is backwards, and it hid six uncompared top-level
+        # fields across all 64 mainnet epochs.
+        rc = rc or 1
         print("DIVERGENCES — bisected to the FIRST epoch per field path:")
         ordered = sorted(real_diffs.items(), key=lambda kv: min(e for e, _, _ in kv[1]))
         for p, entries in ordered[: args.max_examples * 4]:
