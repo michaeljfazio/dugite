@@ -513,3 +513,90 @@ Remaining for full byte-exactness: the same two values from a cardano-node
 synced to the same point. That requires a mainnet cardano-node, which this
 machine does not have — it is a comparison against an external implementation,
 not a gap in dugite's instrumentation.
+
+---
+
+## THE COMPARISON IS NOW SET UP — cardano-streamer, not Koios (2026-08-09)
+
+The last paragraph above is superseded: this machine now *does* have a mainnet
+cardano-node. `db-cn-mainnet` is a real cardano-node 11.0.1 ImmutableDB synced
+from genesis, and `cardano-streamer` replays it and dumps per-epoch ledger
+state — the oracle this investigation lacked for its whole first half.
+
+### The two dump points coincide — verified, not assumed
+
+This is the precondition the whole comparison rests on, and getting it wrong
+makes every epoch look divergent for a reason that is not a bug.
+
+| | fires when | state read | labelled |
+|---|---|---|---|
+| cardano-streamer | `siFinal`, `isFirstSlotOfNewEpoch swb` | `swbNewExtLedgerState swb` (post-block) | `swbEpochNo` — the NEW epoch |
+| dugite | `current_epoch > last_epoch`, post-`apply_block` | live `ledger` | `current_epoch` — the NEW epoch |
+
+Both therefore capture the first block of the new epoch, after every boundary
+transition has been applied. cardano-streamer's README says so outright: "all
+epoch-boundary transitions ... have already been applied, so all fields reflect
+the post-boundary state."
+
+### Byron is ORACLE-SILENT, and that is the point
+
+`buildSnapshotJson` returns `Nothing` for Byron, so cardano-streamer emits no
+file at all for epochs 0-207. That is correct and it is exactly what Koios got
+wrong: `ChainAccountState` is introduced BY the Shelley translation, so a Byron
+"treasury" is a back-projection, not ledger state. The comparator reports Byron
+epochs as oracle-silent, never as divergent.
+
+### A blocker found and fixed en route: `rupdNext` was ALWAYS NULL
+
+dugite's cstreamer-format dump read `EpochSubState::pending_reward_update` for
+`rupdNext`. That field has **no writer** — every occurrence in the tree is a
+`None` initializer plus one `take()`. So the single most important field of a
+reward cross-validation dataset was `null` in every dump ever produced, and
+would have compared vacuously against a populated oracle at every epoch.
+
+The `Some` arm was wrong on its own terms too: three fields where upstream has
+six, and it published dugite's NET signed `delta_reserves` under the name
+`deltaR1`, which is the GROSS monetary expansion.
+
+`forced_reward_update` now forces a complete fold, exactly as cardano-streamer
+forces its own pulser before dumping. This is well-defined at a boundary dump
+point because every input `startStep` freezes already holds its final value for
+the whole epoch once the epoch's first block has landed: `nesBprev` rotated AT
+the boundary, `ssFee` was frozen by SNAP AT the boundary, `casReserves` is
+immobile mid-epoch, and the `go` snapshot rotated at the boundary.
+
+Verified on real mainnet data — genesis to epoch 271, all six fields populate
+from the first epoch with a `go` snapshot and the identities hold exactly:
+
+```text
+epoch 215  rPot       39157090487879 = deltaR1 39149588654133 + epochFees
+           rewardPot  31325672390304 = rPot - deltaT1 7831418097575
+           deltaR2    21201342296023 = rewardPot - totalDistributed
+```
+
+### The harness
+
+* `scripts/validation/mainnet-exactness-run.sh` — waits for the oracle, stops
+  it with SIGTERM (and VERIFIES death; `kill`'s exit 0 does not prove it),
+  replays with cardano-streamer, diffs.
+* `scripts/validation/diff-cstreamer-dumps.py` — era-aware generic deep-diff,
+  bisecting to the FIRST divergent epoch per field path.
+
+Two scale facts that shaped it, both measured rather than guessed: the dugite
+dumps are **8.5 GB** across 271 epochs and **416 MB for epoch 271 alone**, so
+the differ indexes epoch -> path and loads one epoch at a time, reducing each
+side to a summary before the other is read. Maps above 500 entries collapse to
+`{count, sum, sha256-over-every-sorted-entry}` — which still detects a ONE
+LOVELACE change to ONE credential inside a 37,819-entry map, as its negative
+test asserts.
+
+**The differ's first version was a whitelist and silently compared none of**
+`rupdApplied`, `poolDistribution`, `snapshots`, `conwayGov`,
+`instantaneousRewards`. Found by checking field names against
+`buildSnapshotJson` rather than the README. Coverage 6,251 -> 17,956 leaf
+comparisons on the same corpus.
+
+### Run cost
+
+dugite's side: genesis to 271, 5,851,768 blocks, ~7 minutes.
+cardano-streamer's side: a full Haskell ledger replay from genesis — hours.
