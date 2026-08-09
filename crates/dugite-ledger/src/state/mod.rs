@@ -32,7 +32,7 @@ pub(crate) use governance::{
     pp_change_spo_threshold, prev_action_as_expected, DRepPPGroup, StakePoolPPGroup,
 };
 pub use non_myopic::{leader_probability, Likelihood, NonMyopic, DECAY_FACTOR, SAMPLE_SIZE};
-pub use rewards::compute_reward_update;
+pub use rewards::{compute_reward_update, forced_reward_update, ForcedRewardUpdate};
 // Re-export for the RUPD-apply sites in `eras::shelley` / `eras::conway`,
 // which are not descendants of `state` and cannot otherwise reach the
 // private `rewards` submodule. See issue #796.
