@@ -206,6 +206,24 @@ pub(crate) fn pulse_rupd_member_fold(
     if epochs.rupd_fold.is_complete() {
         return; // `completeStep` is idempotent; so is this
     }
+    // At pv<=6, `rupd_addrs_rew == None` does NOT mean "no prefilter" — it means
+    // the frozen `fvAddrsRew` has not been captured yet, and folding under it
+    // pays member rewards `rewardOnePoolMember` never creates (Rewards.hs:315).
+    // That was #1074. Unreachable now that the capture is ordered before this
+    // call (`apply.rs`), but kept because the failure mode is silent phantom
+    // rewards on a consensus path AND invisible everywhere except a pv<=6
+    // mainnet replay: `hardforkBabbageForgoRewardPrefilter` drops the prefilter
+    // at pv>=7, so permissive IS correct on devnet, preview and preprod.
+    //
+    // Declining the pulse is safe where guessing is not: the fold is driven
+    // per block and idempotent, so the work simply happens on the next one.
+    debug_assert!(
+        !(prev_protocol_version_major <= 6 && epochs.rupd_addrs_rew.is_none()),
+        "pv<=6 member fold pulsed before fvAddrsRew was captured"
+    );
+    if prev_protocol_version_major <= 6 && epochs.rupd_addrs_rew.is_none() {
+        return;
+    }
 
     let pp = epochs.prev_protocol_params.clone();
     let bprev = epochs.snapshots.bprev_blocks_by_pool.clone();

@@ -18349,3 +18349,200 @@ fn rollback_does_not_regress_era_across_block() {
          the anchor's frozen Byron value — #782"
     );
 }
+
+/// #1074 — the RUPD pulser's FIRST pulse must see the frozen `fvAddrsRew`.
+///
+/// This is an ORDERING defect, so it is deliberately driven through
+/// `apply_block` rather than through `pulse_rupd_member_fold` directly. The
+/// two statements involved are individually correct; only their sequence was
+/// wrong, and a unit test on either one is green under the bug. That is
+/// [[feedback_red_proven_unit_test_bounds_the_function_not_the_system]] —
+/// #1057's four green unit tests while the node got worse.
+///
+/// Upstream has no ordering to get wrong: `startStep` builds the pulser and
+/// its `FreeVars` (including `fvAddrsRew`) in one expression
+/// (PulsingReward.hs:89-212), so no pulse can precede the capture. dugite
+/// splits the two, and ran them backwards — the trigger block's first pulse
+/// folded `ceil(N/8640)` queue-head credentials with `rupd_addrs_rew == None`,
+/// which the predicate `is_none_or` reads as "everyone is registered". On
+/// mainnet that paid a deregistered credential a member reward
+/// `rewardOnePoolMember` never creates (Rewards.hs:315); routed to treasury at
+/// apply, it left treasury high and reserves low by 70,698 / 163,916 / 62,209
+/// lovelace at boundaries 233->234, 234->235, 235->236.
+///
+/// Only a pv<=6 replay can see this: `hardforkBabbageForgoRewardPrefilter`
+/// drops the prefilter at pv>=7, so the permissive default IS correct on
+/// devnet, preview and preprod — every network the gate runs on.
+#[test]
+fn first_pulse_applies_the_pv6_prefilter_to_the_queue_head() {
+    const POOL: u8 = 0x4b;
+    const OWNER: u8 = 0x90;
+    // `pulse_size = max 1 (ceil (N / 4k))` is ONE here, so exactly one
+    // credential is folded per block and only the queue HEAD is exposed to the
+    // defect. The queue is sorted ascending by `Hash32`, so the unregistered
+    // credential is given the lower byte deliberately: it must occupy index 0,
+    // mirroring mainnet's offender at index 3 of a pulse_size-10 queue. Put the
+    // registered one first instead and the first pulse folds a credential the
+    // prefilter would have kept anyway — the test then passes under the bug.
+    const UNREGISTERED: u8 = 0x11;
+    const REGISTERED: u8 = 0x22;
+
+    let h28 = |b: u8| Hash28::from_bytes([b; 28]);
+    let cred32 = |b: u8| h28(b).to_hash32_padded();
+    let rat = |n: u64, d: u64| dugite_primitives::transaction::Rational {
+        numerator: n,
+        denominator: d,
+    };
+
+    let mut params = ProtocolParameters::mainnet_defaults();
+    params.rho = rat(3, 1000);
+    params.tau = rat(1, 5);
+    params.a0 = rat(3, 10);
+    params.n_opt = 500;
+    params.active_slots_coeff = 0.05;
+
+    let mut state = LedgerState::new(params.clone());
+    state.epoch_length = 1000;
+    state.randomness_stabilisation_window = 100;
+    state.security_param = 10;
+    state.shelley_transition_epoch = 0;
+    state.byron_epoch_length = 0;
+
+    // Stakes are LARGE on purpose. A token 1000 ADA per credential drives sigma
+    // to ~1e-10, floors `maxPool'` to zero and makes every member reward 0 —
+    // at which point "the unregistered credential got nothing" is true for the
+    // wrong reason and the test passes under the bug. The registered-credential
+    // assertion below is what actually holds this honest.
+    let pool_stake_total: u64 = 1_000_000_000_000_000;
+    let per_delegator = pool_stake_total / 2;
+
+    let mut delegations: HashMap<Hash32, Hash28> = HashMap::new();
+    let mut stake_distribution: HashMap<Hash32, Lovelace> = HashMap::new();
+    for b in [REGISTERED, UNREGISTERED] {
+        delegations.insert(cred32(b), h28(POOL));
+        stake_distribution.insert(cred32(b), Lovelace(per_delegator));
+    }
+
+    let mut pool_stake: HashMap<Hash28, Lovelace> = HashMap::new();
+    pool_stake.insert(h28(POOL), Lovelace(pool_stake_total));
+
+    let mut reward_account = vec![0xe0u8];
+    reward_account.extend_from_slice(&[OWNER; 28]);
+    let mut pool_params: HashMap<Hash28, PoolRegistration> = HashMap::new();
+    pool_params.insert(
+        h28(POOL),
+        PoolRegistration {
+            pool_id: h28(POOL),
+            vrf_keyhash: cred32(0xff),
+            pledge: Lovelace(0),
+            cost: Lovelace(340_000_000),
+            margin_numerator: 7,
+            margin_denominator: 100,
+            reward_account,
+            // Neither delegator is an owner — `pulse` skips owners outright,
+            // which would mask the prefilter with an unrelated `continue`.
+            owners: vec![h28(OWNER)],
+            relays: vec![],
+            metadata_url: None,
+            metadata_hash: None,
+        },
+    );
+
+    state.epochs.snapshots.go = Some(StakeSnapshot {
+        epoch: EpochNo(0),
+        delegations: Arc::new(delegations),
+        pool_stake,
+        pool_params: Arc::new(pool_params),
+        stake_distribution: Arc::new(stake_distribution),
+        epoch_fees: Lovelace(0),
+        epoch_block_count: 0,
+        epoch_blocks_by_pool: Arc::new(HashMap::new()),
+    });
+
+    // eta = blocks / expected, expected = floor((1-d) * asc * epochLength) = 50.
+    let mut bprev: HashMap<Hash28, u64> = HashMap::new();
+    bprev.insert(h28(POOL), 50);
+    state.epochs.snapshots.bprev_blocks_by_pool = Arc::new(bprev);
+    state.epochs.snapshots.ss_fee = Lovelace(0);
+
+    state.epochs.reserves = Lovelace(10_000_000_000_000_000);
+    state.epochs.prev_protocol_params = params;
+    state.epochs.prev_d = rat(0, 1);
+    // The whole defect is invisible above this line — pv>=7 forgoes the
+    // prefilter entirely (`hardforkBabbageForgoRewardPrefilter`).
+    state.epochs.prev_protocol_version_major = 6;
+
+    // Only REGISTERED holds a reward account, i.e. only it is in `fvAddrsRew`.
+    state
+        .certs
+        .reward_accounts
+        .insert(cred32(REGISTERED), Lovelace(0));
+    assert!(
+        !state
+            .certs
+            .reward_accounts
+            .contains_key(&cred32(UNREGISTERED)),
+        "the unregistered credential must be absent from the accounts map, or \
+         the prefilter has nothing to exclude and the test is vacuous"
+    );
+
+    // Slot 101 is strictly past the mark (first + 100), so THIS block starts the
+    // pulser, captures fvAddrsRew and takes the first pulse — the one pulse the
+    // defect can reach. Slot 102 folds the second credential, which exists only
+    // to make the non-vacuity assertion below possible.
+    let block1 = make_test_block(101, 1, Hash32::ZERO, vec![]);
+    state
+        .apply_block(&block1, BlockValidationMode::ApplyOnly)
+        .expect("trigger block must apply");
+    let block2 = make_test_block(102, 2, *block1.hash(), vec![]);
+    state
+        .apply_block(&block2, BlockValidationMode::ApplyOnly)
+        .expect("second block must apply");
+
+    assert!(
+        state.epochs.rupd_monetary.is_some(),
+        "slot 101 is past the 4k/f mark — the monetary step must be frozen, \
+         otherwise no pulse ran and this test proves nothing"
+    );
+    assert!(
+        state.epochs.rupd_addrs_rew.is_some(),
+        "fvAddrsRew must be captured on the trigger block"
+    );
+
+    let fold = state
+        .epochs
+        .rupd_fold
+        .fold
+        .clone()
+        .expect("the trigger block must have built and pulsed the fold");
+    assert!(
+        fold.is_done(),
+        "pulse_size is 1 and two blocks landed, so both credentials must have \
+         been folded; an unfinished fold means the queue was larger than \
+         intended and the assertions below would read a partial answer"
+    );
+    let entries = fold.into_entries();
+
+    // NON-VACUITY: the fold must actually have paid somebody. Without this a
+    // zero-reward configuration satisfies the real assertion below trivially.
+    let registered_amount: u64 = entries
+        .get(&cred32(REGISTERED))
+        .map(|v| v.iter().map(|(_, _, a)| *a).sum())
+        .unwrap_or(0);
+    assert!(
+        registered_amount > 0,
+        "the registered delegator must earn a non-zero member reward — a fold \
+         that pays nobody cannot demonstrate that the prefilter excluded \
+         anybody"
+    );
+
+    // THE ASSERTION: upstream's `rewardOnePoolMember` never creates this
+    // reward, because the credential is not in the frozen `fvAddrsRew`.
+    assert!(
+        !entries.contains_key(&cred32(UNREGISTERED)),
+        "an unregistered credential in the queue head was paid {:?} by the \
+         first pulse — that reward does not exist upstream, and at apply time \
+         it is routed to TREASURY where Haskell leaves it in reserves (#1074)",
+        entries.get(&cred32(UNREGISTERED))
+    );
+}

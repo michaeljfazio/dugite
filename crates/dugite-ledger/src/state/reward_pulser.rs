@@ -1000,6 +1000,72 @@ mod fold_differential {
             prop_assert_eq!(batch.into_entries(), inc.into_entries());
         }
 
+        /// The same differential property at **pv<=6**, where the member
+        /// prefilter is live and rejects part of the queue.
+        ///
+        /// The pv=11 case above cannot reach the prefilter at all —
+        /// `hardforkBabbageForgoRewardPrefilter` forgoes it from pv7, and the
+        /// context passed `registered: |_| true`, so `ctx.registered` was never
+        /// once consulted in any proptest. That blind spot is why #1074's
+        /// permissive default survived: every network the gate runs on is
+        /// pv>=7, where permissive IS correct.
+        ///
+        /// This does NOT re-prove #1074 — that is an ordering defect between
+        /// two statements in `apply.rs` and both sides here share one closure.
+        /// What it bounds is the interaction the prefilter adds: a rejected
+        /// credential must be skipped identically whether it falls mid-chunk or
+        /// exactly on a chunk boundary.
+        #[test]
+        fn chunking_is_unobservable_under_the_pv6_prefilter(
+            creds in 1usize..300,
+            pools in 1usize..12,
+            pulse in 1usize..64,
+            modulus in 2usize..7,
+        ) {
+            let (table, delegations, stake) = synth(creds, pools);
+            // A non-trivial, deterministic registered set: every `modulus`-th
+            // credential in SORTED order is deregistered, so rejections land at
+            // varying offsets relative to each chunk edge as `pulse` varies.
+            let mut sorted: Vec<Hash32> = delegations.keys().copied().collect();
+            sorted.sort_unstable();
+            let dereg: HashSet<Hash32> = sorted
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| i % modulus == 0)
+                .map(|(_, c)| *c)
+                .collect();
+            prop_assume!(!dereg.is_empty() && dereg.len() < sorted.len());
+
+            let ctx = MemberFoldCtx {
+                table: &table,
+                delegations: &delegations,
+                stake: &stake,
+                pv_major: 6,
+                registered: |c: &Hash32| !dereg.contains(c),
+            };
+
+            let mut batch = RewardFold::new(&delegations);
+            batch.complete(&ctx);
+
+            let mut inc = RewardFold::new(&delegations);
+            let mut guard = 0;
+            while !inc.is_done() {
+                inc.pulse(pulse, &ctx);
+                guard += 1;
+                prop_assert!(guard <= creds + 1, "pulse failed to make progress");
+            }
+
+            let batch_entries = batch.into_entries();
+            // Non-vacuity: the prefilter must actually have removed somebody,
+            // otherwise this is the pv=11 case wearing a different pv_major and
+            // proves nothing about the prefilter.
+            prop_assert!(
+                dereg.iter().all(|c| !batch_entries.contains_key(c)),
+                "a deregistered credential was paid at pv<=6"
+            );
+            prop_assert_eq!(batch_entries, inc.into_entries());
+        }
+
         /// Pulsing must always make progress, or a node wedges mid-epoch.
         #[test]
         fn every_pulse_advances_the_cursor(creds in 1usize..100, pools in 1usize..6) {
