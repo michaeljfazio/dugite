@@ -173,6 +173,28 @@ mkdir -p "$OUT/cstreamer"
 #
 # `none` would be wrong — it does not compute the ledger at all.
 VALIDATE=${VALIDATE:-re}
+
+# Reduce oracle dumps AS THEY ARE WRITTEN, or the run dies on a full disk.
+# Measured on the 208-273 range: 0.0 MB at epoch 208, 42 MB at 227, 108 MB at
+# 247, 374 MB at 273 — superlinear in the delegator count, 8.3 GB for 66
+# epochs. Extrapolated past Conway that is several hundred GB of oracle output
+# for a full run, against ~224 GB free: the replay would have died somewhere
+# past epoch 400, hours in, with nothing to show.
+#
+# `stake` and `delegations` are ~98% of each file and the comparator digests
+# them anyway, so storing them raw buys nothing. Reducing in flight took the
+# existing dumps from 8.3 GB to 630 MB with a BYTE-IDENTICAL verdict — 66
+# paired epochs, 12,408 comparisons, 61 divergent, same field breakdown before
+# and after.
+log "starting the dump reducer (watch mode) — see reduce-cstreamer-dumps.py"
+python3 "$WT/scripts/validation/reduce-cstreamer-dumps.py" \
+  "$OUT/cstreamer" --watch --quiet &
+reducer=$!
+# Always reap it, including on a failed or interrupted replay: a watcher left
+# running against a directory the next run recreates is a confusing way to lose
+# an afternoon.
+trap 'kill "$reducer" 2>/dev/null' EXIT
+
 log "running cardano-streamer dump-epoch-snapshots (--validate $VALIDATE)"
 caffeinate -dimsu "$CSTREAMER" \
   --chain-dir "$CN_DB" \
@@ -181,6 +203,13 @@ caffeinate -dimsu "$CSTREAMER" \
   --validate "$VALIDATE" \
   dump-epoch-snapshots
 rc=$?
+
+# Stop watching, then make a FINAL pass: the watcher never touches the newest
+# file (cstreamer may still be writing it), so the last epoch is always left raw
+# until the replay is over.
+kill "$reducer" 2>/dev/null
+trap - EXIT
+python3 "$WT/scripts/validation/reduce-cstreamer-dumps.py" "$OUT/cstreamer" --all --quiet
 n=$(ls "$OUT/cstreamer" 2>/dev/null | wc -l | tr -d ' ')
 log "cstreamer exited rc=$rc, wrote $n epoch files"
 if [ "$n" -eq 0 ]; then
