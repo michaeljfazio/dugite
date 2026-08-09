@@ -322,7 +322,7 @@ measurement here; each looked right and each would have put a fabricated value
 on a consensus path.
 
 
-## ROOT CAUSE IDENTIFIED — unredeemed AVVM
+## STRONG LEAD (NOT root cause — see correction below) — unredeemed AVVM
 
 Byron genesis (`config/mainnet/byron-genesis.json`) is ENTIRELY `avvmDistr`:
 
@@ -362,3 +362,39 @@ Still do NOT write a constant. Verify the address classification and let the
 sum fall out — the fact that `genesis - koios_circulation` lands within 0.05%
 of the observed excess is what makes this a hypothesis worth testing, not a
 number worth hardcoding.
+
+
+### CORRECTION — the redeem predicate is spec-correct
+
+`Address::is_redeem` decodes the Byron inner payload `[root, attrs, addr_type]`
+and matches `addr_type == 2`, which is exactly Byron's Redeem type. It is NOT
+misclassifying redeem addresses, so "dugite missed ~790e12 of unredeemed AVVM"
+is **wrong as stated** — that was hypothesis nine and it dies with the other
+eight. The heading above is downgraded rather than deleted.
+
+What survives is the arithmetic, which is solid and independent of the cause:
+
+```text
+byron avvmDistr    31,112,484,745,000,000   (nonAvvmBalances = 0)
+dugite utxo @fork  31,111,977,147,073,356   = genesis - 507,597,926,644 fee burn
+koios circ  @208   30,003,668,989,861,693
+gap                 1,108,815,755,138,307
+of which redeem       318,200,635,000,000   (465 UTxOs, correctly classified)
+UNEXPLAINED           790,615,120,138,307
+```
+
+dugite's UTxO is genesis minus Byron fee burn — internally consistent and
+almost certainly right. So the question is what Koios's `circulation` EXCLUDES
+that is legitimately in the UTxO, and whether mainnet's ledger agrees with
+Koios or with dugite.
+
+**That makes the next step a cardano-node comparison, not more Koios.** The
+standing rule in this repo is that a cardano-node `debug log-epoch-state` dump
+beats Koios, which is sanity-only — and this entire investigation has been
+anchored on Koios columns whose exact definitions are unverified. A single
+epoch-208 dump from cardano-node settles whether there is a dugite defect here
+at all.
+
+**Nine hypotheses have now been killed by measurement.** The pattern is
+consistent enough to state plainly: every reading that explained the number was
+wrong, and each was refuted by one more measurement rather than by argument.
