@@ -194,3 +194,49 @@ preprod runs pass — those compare a single instant, and a pot that never moves
 matches a pot that never moves whenever both start equal. That is why a
 long-running mainnet replay found it and two green gates did not: the devnet
 never runs enough boundaries for the drift to separate from noise.
+
+
+---
+
+## RESOLVED TO A STEP CHANGE 2026-08-09 — and the conservation lead is DEAD
+
+Sampling the same node at three epochs:
+
+| epoch | treasury delta | reserves delta | **sum** |
+|---|---:|---:|---:|
+| 267 | -1,533,620,320,186,273 | -658,505,479,135,416 | **-2,192,125,799,321,689** |
+| 269 | -1,532,482,081,690,898 | -644,665,913,997,250 | **-2,177,147,995,688,148** |
+| 270 | -1,531,725,612,537,987 | -661,191,167,040,885 | **-2,192,916,779,578,872** |
+
+**The sum is FLAT at -2.19e15.** The +/-15e12 wobble is mid-epoch sampling, not
+drift. So:
+
+* **It is a STEP CHANGE, not a per-epoch formula error.** Per-epoch
+  accumulation is CORRECT — dugite debits reserves and credits treasury at the
+  right rate. Every "the reward formula is wrong" hypothesis is dead.
+* **The conservation lead is DEAD.** At epoch 270 reserves moved
+  -23,196,836,280,832. The identical values at 267 and 269 were two samples of
+  the SAME ledger epoch, not a pot that never moves. The gauge is live and
+  reserves are debited. **I nearly wrote a fix for a defect that does not
+  exist** — the "reserves are never debited" reading was wrong, and only a
+  third sample showed it.
+
+That is the sixth hypothesis killed by measurement in this investigation
+(#1072's gate, the treasury seed, the fork translation as sole cause, the
+supply constant, the stale gauge, and now conservation). Each was plausible;
+each would have produced a confident wrong change to a consensus path.
+
+## What remains
+
+A single ~2.19e15 step, early in the chain, of which ~1.53e15 sits in treasury
+and ~0.66e15 in reserves. dugite's treasury shortfall (-1.53e15) is close to
+mainnet's epoch-208 treasury (1.58e15), which upstream's
+`translateToShelleyLedgerStateFromUtxo` sets to `Coin 0` — so either Koios's
+`totals.treasury` counts something dugite does not model, or mainnet's treasury
+was credited by an event between the fork and the end of epoch 208 that dugite
+skips.
+
+**The remaining measurement is a per-epoch series across 208-215**, not another
+sample at 270. A flat delta at the tail cannot say WHERE the step happened;
+only walking the early epochs can. That requires a replay with per-boundary pot
+logging, which is the next session's first task.
