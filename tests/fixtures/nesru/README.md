@@ -118,3 +118,72 @@ Use the same example against a node in the window. Do not use cardano-cli's
 JSON to decide whether the capture landed correctly — `Pulsing` and `SNothing`
 are indistinguishable there. The example classifies from the CBOR and prints
 the verdict to stderr.
+
+---
+
+## The `Pulsing` record, DECODED (2026-08-09)
+
+Decoded with a real CBOR decoder rather than read off the head — the head is
+what produced three wrong readings of this same artefact before. Every field
+below is from `pulsing.hex`.
+
+```text
+array(1)                                  SJust
+  array(3)                                Pulsing
+    0                                     sum tag
+    array(8)                              RewardSnapShot
+      [0] 0                               rewFees
+      [1] array(2) [10, 0]                rewProtocolVersion
+      [2] array(2) [map(0), 13679988715120]  rewNonMyopic  <- the OLD NonMyopic
+      [3] 17989722017445                  rewDeltaR1
+      [4] 14391777613956                  rewR
+      [5] 3597944403489                   rewDeltaT1
+      [6] map(2)  hash28 -> array(100) f32   rewLikelihoods
+      [7] map(1)  RewardAcnt -> set Reward   rewLeaders
+    array(4)                              Pulser
+      [0] 1                               pulse size
+      [1] array(4)                        FreeVars
+          [0] set of Credential           fvAddrsRew          (140 here)
+          [1] 54003425994184880           fvTotalStake
+          [2] array(2) [10, 0]            fvProtocolVersion
+          [3] map(1) hash28 -> array(5)   fvPoolRewardInfo
+      [2] map(19)  Credential -> [stake, poolId]   balance    <- the WORK QUEUE
+      [3] array(2) [map, map]             RewardAns           <- answer so far
+```
+
+**`FreeVars` is FOUR fields, not the large record it looks like from the byte
+count** — the 7.4 KB is almost entirely `rewLikelihoods` (2 pools x 100 f32)
+and `fvAddrsRew` (140 credentials).
+
+**Note the two same-shaped credential collections again**: `fvAddrsRew` holds
+**140** and `balance` holds **19**. Only the COUNTS separate them, which is the
+trap recorded in CLAUDE.md — an assertion pointed at the wrong one passes
+forever.
+
+### Every field maps to state dugite already has
+
+| upstream | dugite |
+|---|---|
+| `rewFees` | `epochs.snapshots.ss_fee` |
+| `rewProtocolVersion` | `epochs.prev_protocol_version_{major,minor}` |
+| `rewNonMyopic` | `epochs.non_myopic` — already encoded for #1067 |
+| `rewDeltaR1` / `rewR` / `rewDeltaT1` | `epochs.rupd_monetary` (`MonetaryStep`) |
+| `rewLikelihoods` | `build_new_likelihoods` — computed, **not yet stored at the mark** |
+| `rewLeaders` | leader rewards from the fold — **not yet stored at the mark** |
+| `fvAddrsRew` | `epochs.rupd_addrs_rew` |
+| `fvTotalStake` | `rupd_monetary.total_stake` (this fixture: 54003425994184880) |
+| `fvPoolRewardInfo` | `rupd_fold.table` (`PoolRewardInfo`, 5 fields) |
+| `balance` | `RewardFold::remaining()` |
+| `RewardAns` | `RewardFold`'s accumulator |
+
+So #1071 is an ENCODER job plus relocating two computations to `startStep`,
+not an architectural one. It still needs:
+
+1. `rewLikelihoods` and `rewLeaders` computed at the 4k/f mark and persisted,
+   which means a SNAPSHOT_VERSION bump.
+2. The `SNothing -> Pulsing -> Complete` transition instants validated against a
+   live cardano-node across a full epoch. dugite's pulse cadence must match
+   Haskell's for the arms to be right at the moment they switch, and emitting
+   `Complete` where cardano-node emits `Pulsing` would be a confidently wrong
+   answer replacing an honestly wrong one (#979). The fixtures already bracket
+   the transition: Pulsing at offsets 322/331/345, Complete at 365.
