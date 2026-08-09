@@ -525,7 +525,7 @@ impl QueryHandler {
             4 => protocol::handle_proposed_pparams_updates(),
             5 => protocol::handle_stake_distribution(&self.state),
             6 => utxo::handle_utxo_by_address(&self.state, &self.utxo_provider, decoder),
-            7 => utxo::handle_utxo_whole(&self.utxo_provider),
+            7 => utxo::handle_utxo_whole(&self.state, &self.utxo_provider),
             8 => protocol::handle_debug_epoch_state(&self.state),
             9 => self.handle_get_cbor(decoder),
             10 => stake::handle_filtered_delegations(&self.state, decoder),
@@ -537,7 +537,7 @@ impl QueryHandler {
             12 => protocol::handle_debug_new_epoch_state(&self.state),
             13 => protocol::handle_debug_chain_dep_state(&self.state),
             14 => protocol::handle_reward_provenance(&self.state),
-            15 => utxo::handle_utxo_by_txin(&self.utxo_provider, decoder),
+            15 => utxo::handle_utxo_by_txin(&self.state, &self.utxo_provider, decoder),
             16 => stake::handle_stake_pools(&self.state),
             17 => stake::handle_stake_pool_params(&self.state, decoder),
             18 => stake::handle_reward_info_pools(&self.state),
@@ -1233,8 +1233,12 @@ mod tests {
     fn test_query_handler_utxo_by_address_with_provider() {
         struct MockProvider;
         impl UtxoQueryProvider for MockProvider {
-            fn utxos_at_address_bytes(&self, _addr_bytes: &[u8]) -> Vec<UtxoSnapshot> {
-                vec![UtxoSnapshot {
+            fn utxos_at_address_bytes(
+                &self,
+                _addr_bytes: &[u8],
+                _at: &dugite_network::UtxoViewPoint,
+            ) -> Option<Vec<UtxoSnapshot>> {
+                Some(vec![UtxoSnapshot {
                     tx_hash: vec![0xaa; 32],
                     output_index: 0,
                     address_bytes: vec![0x01; 57],
@@ -1244,7 +1248,7 @@ mod tests {
                     inline_datum: None,
                     script_ref: None,
                     raw_cbor: None,
-                }]
+                }])
             }
         }
 

@@ -2356,6 +2356,9 @@ impl Node {
         let mut qh = QueryHandler::new(args.config.max_major_protocol_version() as u32);
         qh.set_utxo_provider(Arc::new(serve::LedgerUtxoProvider {
             ledger: ledger_state.clone(),
+            // #1068: the volatile window is what makes a pinned UTxO view
+            // reconstructible without copying the whole set.
+            ledger_seq: ledger_seq.clone(),
         }));
         qh.set_chain_db(chain_db.clone());
         let query_handler = Arc::new(RwLock::new(qh));
