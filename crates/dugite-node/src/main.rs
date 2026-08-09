@@ -1332,17 +1332,76 @@ fn build_epoch_snapshot(
         },
     });
 
-    // Pending reward update.
-    let rupd_next: serde_json::Value = match &ledger.epochs.pending_reward_update {
+    // `rupdNext` — the reward update this epoch will apply at its NEXT
+    // boundary, forced to completion exactly as cardano-streamer forces its
+    // own pulser before dumping.
+    //
+    // This read `ledger.epochs.pending_reward_update` until #1071. That field
+    // has NO writer on the modern path — every occurrence is a `None`
+    // initializer plus one `take()` — so `rupdNext` was unconditionally
+    // `null` while cardano-streamer populated it at every epoch, and the
+    // single most important field of a reward cross-validation dataset
+    // compared vacuously. It is also six fields upstream, not three: the
+    // `Some` arm emitted `deltaR1`/`deltaT1`/`totalDistributed` and, worse,
+    // put dugite's NET signed `delta_reserves` under the name `deltaR1`,
+    // which is the gross expansion.
+    //
+    // Computed ONCE — this runs the whole member fold, which is ~2.55 s at
+    // mainnet scale, so a second call to populate `eta`/`expectedBlocks` would
+    // double every epoch's dump cost.
+    let forced = dugite_ledger::forced_reward_update(ledger);
+    let rupd_next: serde_json::Value = match forced {
         None => serde_json::Value::Null,
-        Some(pu) => {
-            let total_distributed: u64 = pu.rewards.values().map(|v| v.0).sum();
-            serde_json::json!({
-                "deltaR1": pu.delta_reserves,
-                "deltaT1": pu.delta_treasury,
-                "totalDistributed": total_distributed,
-            })
+        Some(r) => serde_json::json!({
+            "deltaR1": r.delta_r1,
+            "deltaR2": r.delta_r2,
+            "deltaT1": r.delta_t1,
+            "rPot": r.r_pot,
+            "rewardPot": r.reward_pot,
+            "totalDistributed": r.total_distributed,
+        }),
+    };
+
+    // `expectedBlocks` and `eta` are siblings of `rupdNext` in cardano-streamer's
+    // schema and fall out of the same frozen monetary step, so they are emitted
+    // from it rather than recomputed.
+    let expected_blocks = forced.map(|r| r.expected_blocks).unwrap_or(0);
+
+    // Era-dependent, per cardano-streamer's schema: "`null` for the neutral
+    // nonce or Byron era".
+    //
+    // Byron has no epoch nonce at all — it is a (T)Praos concept — so emitting
+    // dugite's zero-initialised `Hash32` there would manufacture a difference
+    // against an oracle that correctly says nothing. dugite spells
+    // `NeutralNonce` as all-zero (the ledger logs it `NeutralNonce (ZERO)`),
+    // which is the same case one layer up, so both render as null rather than
+    // as 64 zeros.
+    let epoch_nonce: serde_json::Value = {
+        let n = ledger.consensus.epoch_nonce.0;
+        if ledger.era == dugite_primitives::era::Era::Byron || n.iter().all(|b| *b == 0) {
+            serde_json::Value::Null
+        } else {
+            serde_json::Value::String(hex::encode(n))
         }
+    };
+    let blocks_made: u64 = ledger.epochs.snapshots.bprev_blocks_by_pool.values().sum();
+    let eta: serde_json::Value = match forced {
+        // `expected_blocks == 0` is start_step_monetary's marker for the
+        // `d >= 4/5` branch, where Haskell sets eta = 1 outright.
+        Some(_) if expected_blocks == 0 => serde_json::json!({
+            "numerator": 1, "denominator": 1
+        }),
+        Some(_) => {
+            // eta = min(1, blocksMade / expectedBlocks), as an exact rational.
+            let (num, den) = if blocks_made >= expected_blocks {
+                (1u64, 1u64)
+            } else {
+                let g = gcd(blocks_made.max(1), expected_blocks);
+                (blocks_made / g, expected_blocks / g)
+            };
+            serde_json::json!({ "numerator": num, "denominator": den })
+        }
+        None => serde_json::Value::Null,
     };
 
     // RC4: full mark/set/go stake snapshots for cross-validation.
@@ -1420,7 +1479,9 @@ fn build_epoch_snapshot(
             "Constitution": ledger.gov.governance.enacted_constitution.as_ref()
                 .map(|id| format!("{}#{}", id.transaction_id.to_hex(), id.action_index)),
         },
-        "epochNonce": hex::encode(ledger.consensus.epoch_nonce.0),
+        "epochNonce": epoch_nonce,
+        "eta": eta,
+        "expectedBlocks": expected_blocks,
         "deposits": {
             "stakeKey": deposit_stake_key,
             "pool": deposit_pool,

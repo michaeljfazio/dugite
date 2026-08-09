@@ -1189,6 +1189,129 @@ impl LedgerState {
     }
 }
 
+/// The monetary decomposition of a reward update, in the shape
+/// `cardano-streamer` reports as `rupdNext`.
+///
+/// dugite's own [`PendingRewardUpdate`](super::PendingRewardUpdate) carries
+/// only the NET terms it needs to apply (`delta_treasury`, a signed
+/// `delta_reserves`). The cross-validation dataset wants the decomposition
+/// each of those nets out of, so the stages can be compared individually —
+/// a matching net with two compensating errors inside it is exactly what a
+/// single number cannot distinguish.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ForcedRewardUpdate {
+    /// `deltaR1` — monetary expansion drawn from reserves, `rho * reserves`
+    /// scaled by `eta`.
+    pub delta_r1: u64,
+    /// `deltaR2` — the undistributed remainder returned to reserves,
+    /// `rewardPot - totalDistributed`.
+    pub delta_r2: u64,
+    /// `deltaT1` — the treasury cut, `floor(tau * rPot)`.
+    pub delta_t1: u64,
+    /// `rPot = epochFees + deltaR1`, the pot before the treasury cut.
+    pub r_pot: u64,
+    /// `rewardPot = rPot - deltaT1`, what is available to distribute.
+    pub reward_pot: u64,
+    /// Total actually distributed to stake credentials.
+    pub total_distributed: u64,
+    /// `expectedBlocks = (1 - d) * f * epochLength`, clamped to >= 1; `0` when
+    /// the `d >= 4/5` branch made it irrelevant.
+    pub expected_blocks: u64,
+}
+
+/// Force a complete reward update from the CURRENT epoch state — dugite's
+/// equivalent of `cardano-streamer` forcing its pulser before dumping.
+///
+/// # Why this is well-defined at an epoch-boundary dump point
+///
+/// Every input `startStep` freezes already has its final value for the whole
+/// of the epoch by the time its first block lands:
+///
+/// * `nesBprev` (blocks made) was rotated AT the boundary,
+/// * `ssFee` was frozen by SNAP AT the boundary,
+/// * `casReserves` moved at the boundary and is immobile mid-epoch,
+/// * the `go` snapshot rotated at the boundary, and the RUPD computed during
+///   this epoch is the one that reads it (`compute_reward_update` runs before
+///   SNAP).
+///
+/// So forcing the fold at the first block of epoch N yields the SAME answer
+/// the pulser reaches at epoch N's `4k/f` mark. That is what makes a
+/// boundary-time dump comparable against cardano-streamer's, which forces its
+/// own pulser at the identical instant.
+///
+/// This is deliberately NOT how production computes rewards — production
+/// pulses incrementally across the epoch ([`pulse_rupd_member_fold`]) and
+/// applies the result at the next boundary. This is a read-only observation
+/// of what that pulser is going to conclude, for cross-validation only.
+///
+/// Returns `None` before there is a `go` snapshot to fold over (Byron, and the
+/// first Shelley epochs).
+pub fn forced_reward_update(state: &LedgerState) -> Option<ForcedRewardUpdate> {
+    let go = state.epochs.snapshots.go.as_ref()?;
+    let pp = &state.epochs.prev_protocol_params;
+    let blocks: u64 = state.epochs.snapshots.bprev_blocks_by_pool.values().sum();
+
+    // Identical call to the one `apply.rs` makes at the 4k/f mark — the shared
+    // `start_step_monetary` rather than a second copy of the arithmetic, which
+    // is the N-copies trap that produced #985/#1015/#977.
+    let monetary = crate::state::reward_pulser::start_step_monetary(
+        (pp.rho.numerator, pp.rho.denominator),
+        (pp.tau.numerator, pp.tau.denominator),
+        (
+            state.epochs.prev_d.numerator,
+            state.epochs.prev_d.denominator,
+        ),
+        pp.active_slot_coeff_rational(),
+        state.epochs.reserves.0,
+        state.epochs.snapshots.ss_fee.0,
+        blocks,
+        state.epoch_length,
+        state.max_lovelace_supply,
+    );
+
+    let reward_accounts: HashMap<Hash32, Lovelace> = state
+        .certs
+        .reward_accounts
+        .iter()
+        .map(|(k, v)| (*k, *v))
+        .collect();
+
+    // `prepulsed: None` forces a full fold here rather than consuming the
+    // in-flight pulse state: this is an observation, and draining the
+    // production fold would change what the next boundary applies.
+    let rupd = compute_reward_update(
+        pp,
+        &state.epochs.prev_d,
+        state.epochs.prev_protocol_version_major,
+        Some(go),
+        &state.epochs.snapshots.bprev_blocks_by_pool,
+        state.epochs.snapshots.ss_fee,
+        state.epochs.reserves,
+        state.epochs.treasury,
+        &reward_accounts,
+        state.epochs.rupd_addrs_rew.as_deref(),
+        state.epoch_length,
+        state.shelley_transition_epoch,
+        state.max_lovelace_supply,
+        &state.epochs.non_myopic,
+        Some(monetary),
+        None,
+    );
+
+    let total_distributed: u64 = rupd.rewards.values().map(|v| v.0).sum();
+    Some(ForcedRewardUpdate {
+        delta_r1: monetary.delta_r1,
+        delta_r2: monetary.r.saturating_sub(total_distributed),
+        delta_t1: monetary.delta_t1,
+        r_pot: monetary
+            .delta_r1
+            .saturating_add(state.epochs.snapshots.ss_fee.0),
+        reward_pot: monetary.r,
+        total_distributed,
+        expected_blocks: monetary.expected_blocks,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::{apply_reserves_delta, Rat};
@@ -1204,6 +1327,104 @@ mod tests {
             numerator,
             denominator,
         }
+    }
+
+    /// #1071 / #1073: the cstreamer-format dump's `rupdNext` read
+    /// `EpochSubState::pending_reward_update`, which has NO writer on the
+    /// modern path — so it was unconditionally `null` while cardano-streamer
+    /// populated it at every epoch, and the single most important field of a
+    /// reward cross-validation dataset compared vacuously.
+    ///
+    /// The load-bearing assertion is `is_some()`: a `None` here is exactly the
+    /// old always-null behaviour wearing a new name. The identities are
+    /// asserted alongside because `deltaR1` previously carried dugite's NET
+    /// signed `delta_reserves` under the name of the GROSS expansion, and a
+    /// non-null value with the wrong term inside it is worse than a null.
+    #[test]
+    fn forced_reward_update_is_non_vacuous_and_internally_consistent() {
+        use crate::state::LedgerState;
+        use dugite_primitives::protocol_params::ProtocolParameters;
+
+        let mut params = ProtocolParameters::mainnet_defaults();
+        params.rho = rat(3, 1000);
+        params.tau = rat(20, 100);
+        params.n_opt = 150;
+
+        let mut state = LedgerState::new(params.clone());
+        state.epoch_length = 432_000;
+        state.max_lovelace_supply = 45_000_000_000_000_000;
+        state.epochs.prev_protocol_params = params;
+        state.epochs.prev_d = rat(0, 1);
+        state.epochs.prev_protocol_version_major = 6;
+        state.epochs.reserves = Lovelace(13_000_000_000_000_000);
+        state.epochs.treasury = Lovelace(1_000_000_000_000);
+        state.epochs.snapshots.ss_fee = Lovelace(50_000_000_000);
+
+        // A `go` snapshot with one pool that actually minted blocks — without
+        // this the fold has nothing to distribute and the test would pass
+        // vacuously on an empty result. The pool must appear in `bprev` too,
+        // or the reward-distribution loop skips it as a zero-block pool.
+        let pool = Hash28::from_bytes([7u8; 28]);
+        let cred = Hash32::from_bytes([9u8; 32]);
+        let mut pool_stake = HashMap::new();
+        pool_stake.insert(pool, Lovelace(10_000_000_000_000));
+        let mut delegations = HashMap::new();
+        delegations.insert(cred, pool);
+        let mut stake_distribution = HashMap::new();
+        stake_distribution.insert(cred, Lovelace(10_000_000_000_000));
+        let mut pool_params = HashMap::new();
+        pool_params.insert(pool, pool_reg(pool, 0, 340_000_000, (1, 100), vec![], 9));
+        // pv 6 applies the `fvAddrsRew` prefilter (mainnet epochs 208-271 are
+        // pv 2-4, so this IS the reachable path). With `rupd_addrs_rew` unset
+        // the fold falls back to the boundary accounts, so the credential has
+        // to be registered or every member reward is filtered out and the
+        // test measures nothing.
+        state.certs.reward_accounts.insert(cred, Lovelace(0));
+        state.epochs.snapshots.go = Some(StakeSnapshot {
+            epoch: EpochNo(10),
+            delegations: Arc::new(delegations),
+            pool_stake,
+            pool_params: Arc::new(pool_params),
+            stake_distribution: Arc::new(stake_distribution),
+            epoch_fees: Lovelace(50_000_000_000),
+            epoch_block_count: 21_000,
+            epoch_blocks_by_pool: Arc::new(HashMap::new()),
+        });
+        let mut bprev = HashMap::new();
+        bprev.insert(pool, 21_000u64);
+        state.epochs.snapshots.bprev_blocks_by_pool = Arc::new(bprev);
+
+        let r = super::forced_reward_update(&state)
+            .expect("a go snapshot is present, so a reward update must be computable");
+
+        // The decomposition cardano-streamer reports, checked as identities
+        // rather than as literals — the literals depend on the fold, the
+        // identities are what make the six fields a decomposition at all.
+        assert_eq!(
+            r.r_pot,
+            r.delta_r1 + state.epochs.snapshots.ss_fee.0,
+            "rPot = deltaR1 + epochFees"
+        );
+        assert_eq!(
+            r.reward_pot,
+            r.r_pot - r.delta_t1,
+            "rewardPot = rPot - deltaT1"
+        );
+        assert_eq!(
+            r.delta_r2,
+            r.reward_pot - r.total_distributed,
+            "deltaR2 = rewardPot - totalDistributed"
+        );
+        assert!(
+            r.delta_r1 > 0,
+            "rho * reserves must be non-zero for a 13e15 reserve — a zero here \
+             means the monetary step never ran"
+        );
+        assert!(
+            r.total_distributed > 0,
+            "the fold must actually reward the seeded credential; zero means it \
+             skipped every pool and the test is measuring nothing"
+        );
     }
 
     // -----------------------------------------------------------------------
