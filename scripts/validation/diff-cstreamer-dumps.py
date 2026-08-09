@@ -105,8 +105,31 @@ EXCLUDED_SUFFIXES = {
 
 LARGE_MAP_THRESHOLD = 500
 
+def _fold_numbers(v):
+    """Render an integral float as an int, recursively.
+
+    Python evaluates `0.0 == 0` as True, so a structural comparison sees no
+    difference — but `json.dumps` writes `0.0` and `0`. The DIGEST path is
+    string-based, so it diverged on the 50 of 737 mainnet pools whose `margin`
+    is zero (dugite emits `0.0`, cstreamer `0`) while the deep-diff path called
+    the very same pools equal. One value, two spellings, visible only to the
+    comparison that hashes.
+
+    Non-integral floats are untouched, so a real margin of 0.02 still compares
+    as itself. `bool` subclasses `int`, not `float`, so it is unaffected.
+    """
+    if isinstance(v, float) and v.is_integer():
+        return int(v)
+    if isinstance(v, dict):
+        return {k: _fold_numbers(x) for k, x in v.items()}
+    if isinstance(v, list):
+        return [_fold_numbers(x) for x in v]
+    return v
+
+
 def _canon(v):
-    return json.dumps(v, sort_keys=True, separators=(",", ":"), default=str)
+    return json.dumps(_fold_numbers(v), sort_keys=True, separators=(",", ":"),
+                      default=str)
 
 
 def digest_of_map(m: dict) -> dict:
@@ -201,7 +224,16 @@ def summarise(obj, key=None):
             for k in sorted(obj):
                 h.update(_canon(k).encode())
                 h.update(b"=")
-                h.update(_canon(obj[k]).encode())
+                # RECURSE, do not hash the raw value. The relay canonicalisation
+                # above only fires when `summarise` is called ON a relay dict, so
+                # hashing `obj[k]` directly skipped every nested value in exactly
+                # the maps big enough to be digested — which is where the comment
+                # above says it matters most. It cost 248 false divergences:
+                # `snapshots.{mark,set,go}.poolParams.__digest__` differed at
+                # every epoch while `__count__` matched at every epoch, because
+                # 726 of 737 mainnet pools spell `relays` differently on the two
+                # sides and nothing else in a pool differed at all.
+                h.update(_canon(summarise(obj[k], k)).encode())
                 h.update(b";")
             rec = {"__count__": len(obj), "__digest__": h.hexdigest()}
             if total is not None:
@@ -211,7 +243,10 @@ def summarise(obj, key=None):
     if isinstance(obj, list):
         if len(obj) > LARGE_MAP_THRESHOLD:
             h = hashlib.sha256()
-            for e in sorted((_canon(x) for x in obj)):
+            # Recurse for the same reason as the large-map branch above: a long
+            # list of relays would otherwise be hashed in whichever spelling its
+            # side happens to use.
+            for e in sorted((_canon(summarise(x)) for x in obj)):
                 h.update(e.encode())
                 h.update(b";")
             return {"__count__": len(obj), "__digest__": h.hexdigest()}
@@ -258,6 +293,27 @@ RELAY_VARIANTS = {
 }
 
 
+def _relay_fields(d, skip=()):
+    """Relay field names, lowercased.
+
+    The two sides also disagree on CASE inside a relay — dugite writes
+    `ipv4`/`ipv6`, cstreamer writes `IPv4`/`IPv6` — which left 426 of 737 pools
+    divergent even after the wrapper was normalised. Values are untouched; only
+    the key spelling is folded. A collision would mean one relay carried two
+    fields differing only in case, which is not a thing either side emits, so
+    it is raised rather than silently resolved.
+    """
+    out = {}
+    for k in sorted(d):
+        if k in skip:
+            continue
+        lk = str(k).lower()
+        if lk in out:
+            raise ValueError(f"relay field case collision on {lk!r}: {sorted(d)}")
+        out[lk] = d[k]
+    return out
+
+
 def canon_relay(v):
     """Map either side's relay spelling to one shape, or return None."""
     if not isinstance(v, dict):
@@ -267,14 +323,13 @@ def canon_relay(v):
         (k, inner), = v.items()
         tag = RELAY_VARIANTS.get(str(k).strip().lower())
         if tag and isinstance(inner, dict):
-            return {"__relay__": tag, **{kk: inner[kk] for kk in sorted(inner)}}
+            return {"__relay__": tag, **_relay_fields(inner)}
         return None
     # dugite: flat, with a `type` discriminator.
     if "type" in v:
         tag = RELAY_VARIANTS.get(str(v["type"]).strip().lower())
         if tag:
-            return {"__relay__": tag,
-                    **{kk: v[kk] for kk in sorted(v) if kk != "type"}}
+            return {"__relay__": tag, **_relay_fields(v, skip=("type",))}
     return None
 
 
