@@ -247,6 +247,17 @@ land on the oracle's database.
 **Validated end to end already**: dugite replayed the cloned cn chain,
 6,547,320 blocks, Byron→Alonzo, in 27 minutes with zero read errors.
 
+**The oracle dumps MUST be reduced in flight or the run dies on a full disk.**
+Measured: 0.0 MB at epoch 208, 42 MB at 227, 108 MB at 247, 374 MB at 273 —
+superlinear in the delegator count, 8.3 GB for 66 epochs, so several hundred GB
+to tip against ~230 GB free. It would have died past epoch 400, hours in, with
+no partial result. `stake`/`delegations` are ~98% of each file and the
+comparator digests them anyway, so `reduce-cstreamer-dumps.py` (wired into the
+driver as a `--watch` sidecar, with `--all` for the final pass) takes 8.3 GB to
+262 MB with a BYTE-IDENTICAL verdict — 66 paired epochs, 12,408 comparisons, 61
+divergent, same field breakdown before and after. Extrapolate from the LAST
+epoch, not the average: the average was 126 MB while the newest was 374 MB.
+
 **The 10.7.1 cardano-streamer port is NOT needed** — mainnet is PV11 and the
 already-validated 10.6.2 branch pins `cardano-ledger-conway 1.20.0.0`, whose
 released changelog bumps `ProtVerHigh ConwayEra` to 11. Parked at `d0ebc95`.
