@@ -43,7 +43,47 @@ That is the claim Koios contradicts.
 - **Not the AVVM return.** That lands at Shelley→Allegra (236) and the shortfall
   predates it — dugite is already low relative to epoch 208.
 
-## The two open readings
+## NARROWED 2026-08-09 — it is the UTxO translation, NOT a missing treasury seed
+
+Upstream is unambiguous (`translateToShelleyLedgerStateFromUtxo`):
+
+```haskell
+casTreasury = Coin 0
+casReserves = word64ToCoin (fbtcMaxLovelaceSupply transCtxt) <-> sumCoinUTxO utxoShelley
+```
+
+Treasury IS zero at the fork, so dugite's stated assumption matches the code and
+"dugite forgot to seed the treasury" — my own leading hypothesis — is REFUTED.
+
+Comparing BOTH pots reframes it entirely:
+
+| | treasury | reserves | sum |
+|---|---:|---:|---:|
+| dugite @267 | 448,318,686,397,699 | 12,341,518,536,205,146 | 12,789,837,222,602,845 |
+| Koios @267 | 1,981,939,006,583,972 | 13,000,024,015,340,562 | 14,981,963,021,924,534 |
+| delta | **-1,533,620,320,186,273** | **-658,505,479,135,416** | **-2,192,125,799,321,689** |
+
+**Reserves are LOW too.** That also kills the compounding story: if the missing
+treasury were still sitting in reserves, reserves would be HIGH. dugite's entire
+non-circulating supply is **2.19e15 short**.
+
+Since `reserves = maxLovelaceSupply - sumCoinUTxO(utxoShelley)` at the fork, a
+UTxO sum ~2.19e15 TOO LARGE produces exactly this — dugite counts lovelace into
+the Shelley UTxO that upstream excludes.
+
+**So the defect is in what dugite carries across the Byron->Shelley UTxO
+translation, not in the pot arithmetic.** The per-epoch accumulation is
+consistent with the reserves dugite has, so the inputs are wrong and the formula
+is right. That also explains the residual: dugite's ~7.6e12/epoch against
+mainnet's ~6.8e12 is `rho * reserves` on a different base.
+
+**Next**: sum dugite's UTxO at the fork and diff against
+`maxLovelaceSupply - reserves_mainnet@208`. Prime candidates are the AVVM/redeem
+UTxOs (upstream keeps them until Shelley->Allegra) and Byron genesis
+`nonAvvmBalances`.
+
+## Superseded readings (kept deliberately — both were plausible, both wrong)
+
 
 1. **dugite does not seed the treasury at the Byron→Shelley translation.**
    `translateToShelleyLedgerStateFromUtxo` would then set a non-zero treasury
