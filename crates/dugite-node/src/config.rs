@@ -1081,7 +1081,7 @@ impl NodeConfig {
         ];
 
         for (era, file_opt, hash_opt) in genesis_files {
-            if let Some(ref file_path) = file_opt {
+            let resolved = if let Some(ref file_path) = file_opt {
                 let resolved = config_dir.join(file_path);
                 if !resolved.exists() {
                     anyhow::bail!(
@@ -1090,12 +1090,53 @@ impl NodeConfig {
                         config_dir.display()
                     );
                 }
-            }
+                Some(resolved)
+            } else {
+                None
+            };
+
             if let Some(ref hash_hex) = hash_opt {
                 if hash_hex.len() != 64 || !hash_hex.chars().all(|c| c.is_ascii_hexdigit()) {
                     anyhow::bail!(
                         "{era} genesis hash is not a valid 64-character hex string: {hash_hex}"
                     );
+                }
+
+                // VERIFY the hash against the file, do not merely check that it
+                // looks like one. Until now this loop only validated the STRING,
+                // and nothing anywhere compared it to the genesis it pins —
+                // `load_with_hash` computes a hash, logs it at debug and returns
+                // it, and no caller ever checked it. So the field was decorative:
+                // any 64 hex characters were accepted, including the hash of a
+                // different network's genesis. Genesis fixes initial funds,
+                // protocol parameters and system start, so an unpinned genesis is
+                // an unpinned ledger. cardano-node refuses to start on mismatch.
+                //
+                // BYRON IS DELIBERATELY EXCLUDED. Its hash is taken over a
+                // canonical-JSON RE-SERIALISATION, not over the file bytes, which
+                // is why cardano-cli exposes `byron genesis print-genesis-hash`
+                // separately from `latest genesis hash`. dugite does not implement
+                // canonical JSON yet, so checking Byron with the generic scheme
+                // would reject the OFFICIAL configs (mainnet's real Byron hash is
+                // 5f20df93…, the raw-bytes hash of the same file is dbbdaeab…) —
+                // turning a missing check into a wrong one. Tracked in #1080; the
+                // test below pins this gap so it cannot be forgotten silently.
+                if *era != "Byron" {
+                    if let Some(ref path) = resolved {
+                        let bytes = std::fs::read(path).with_context(|| {
+                            format!("failed to read {era} genesis at {}", path.display())
+                        })?;
+                        let computed = dugite_primitives::hash::blake2b_256(&bytes).to_hex();
+                        if !computed.eq_ignore_ascii_case(hash_hex) {
+                            anyhow::bail!(
+                                "{era} genesis hash mismatch for {}: config says {hash_hex}, \
+                                 file hashes to {computed}. The genesis file does not match the \
+                                 hash pinning it — refusing to start rather than build a ledger \
+                                 from an unverified genesis.",
+                                path.display()
+                            );
+                        }
+                    }
                 }
             }
         }
@@ -1240,6 +1281,144 @@ mod tests {
         };
         let err = config.validate(Path::new(".")).unwrap_err();
         assert!(err.to_string().contains("Shelley genesis file not found"));
+    }
+
+    /// The configs dugite SHIPS must satisfy dugite's own validation.
+    ///
+    /// Genesis hashes went unverified for the entire life of the project, so
+    /// nothing ever established that the values recorded in
+    /// `config/{mainnet,preview,preprod}/config.json` describe the genesis
+    /// files sitting beside them. Now that `validate` enforces it, this asserts
+    /// the shipped set is self-consistent — a check that costs nothing and
+    /// whose absence is how a wrong hash would reach an operator.
+    ///
+    /// It is deliberately NOT a hardcoded list of expected hashes: that would
+    /// need updating in two places whenever a genesis legitimately changes, and
+    /// the second place is the one people forget.
+    #[test]
+    fn shipped_network_configs_pass_their_own_validation() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(|p| p.parent())
+            .expect("crate is two levels below the repo root")
+            .join("config");
+
+        let mut checked = 0;
+        for net in ["mainnet", "preview", "preprod"] {
+            let dir = root.join(net);
+            let cfg_path = dir.join("config.json");
+            if !cfg_path.exists() {
+                continue;
+            }
+            let cfg: NodeConfig = serde_json::from_str(
+                &std::fs::read_to_string(&cfg_path).expect("read shipped config"),
+            )
+            .unwrap_or_else(|e| panic!("{net} config does not parse: {e}"));
+            cfg.validate(&dir)
+                .unwrap_or_else(|e| panic!("shipped {net} config fails validation: {e}"));
+            checked += 1;
+        }
+
+        // Finding no configs would make this pass while testing nothing — the
+        // failure mode this whole comparison campaign keeps running into.
+        assert_eq!(
+            checked, 3,
+            "expected to validate mainnet, preview and preprod configs; \
+             validated {checked}. A config that is not found is not a config \
+             that passed."
+        );
+    }
+
+    /// A configured genesis hash must be CHECKED against the file, not merely
+    /// parsed. It was parse-only: 64 hex characters was the entire contract, so
+    /// any genesis file at all was accepted under any hash, including one
+    /// belonging to a different network. Genesis fixes initial funds, protocol
+    /// parameters and system start — an unpinned genesis is an unpinned ledger.
+    #[test]
+    fn genesis_hash_is_verified_against_the_file() {
+        let dir = std::env::temp_dir().join(format!("dugite-genesis-hash-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let body = br#"{"epochLength":432000}"#;
+        std::fs::write(dir.join("shelley-genesis.json"), body).unwrap();
+        let real = dugite_primitives::hash::blake2b_256(body).to_hex();
+
+        // Correct hash: accepted.
+        let ok = NodeConfig {
+            shelley_genesis_file: Some("shelley-genesis.json".to_string()),
+            shelley_genesis_hash: Some(real.clone()),
+            ..NodeConfig::default()
+        };
+        ok.validate(&dir)
+            .expect("the true hash of the file must be accepted");
+
+        // Wrong hash: REFUSED. Well-formed and plausible — exactly the case the
+        // old parse-only check waved through.
+        let wrong = "0".repeat(64);
+        assert_ne!(wrong, real);
+        let bad = NodeConfig {
+            shelley_genesis_file: Some("shelley-genesis.json".to_string()),
+            shelley_genesis_hash: Some(wrong),
+            ..NodeConfig::default()
+        };
+        let err = bad.validate(&dir).unwrap_err().to_string();
+        assert!(
+            err.contains("Shelley genesis hash mismatch") && err.contains(&real),
+            "the error must name the mismatch AND the value the file really \
+             hashes to, so an operator can fix the config without guessing: {err}"
+        );
+
+        // Swapping the FILE under an unchanged hash must also be caught. That is
+        // the substitution this check exists to detect, and it is a different
+        // direction from changing the hash under a fixed file.
+        std::fs::write(
+            dir.join("shelley-genesis.json"),
+            br#"{"epochLength":86400}"#,
+        )
+        .unwrap();
+        let swapped = NodeConfig {
+            shelley_genesis_file: Some("shelley-genesis.json".to_string()),
+            shelley_genesis_hash: Some(real),
+            ..NodeConfig::default()
+        };
+        assert!(
+            swapped.validate(&dir).is_err(),
+            "a genesis file swapped under an unchanged hash must be refused"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// BYRON IS NOT VERIFIED, on purpose, and this pins that gap.
+    ///
+    /// Byron hashes over a canonical-JSON re-serialisation rather than the file
+    /// bytes (hence `cardano-cli byron genesis print-genesis-hash`, separate
+    /// from `latest genesis hash`). dugite has no canonical-JSON encoder, so
+    /// checking Byron with the generic scheme would REJECT the official configs
+    /// — mainnet's true Byron hash is 5f20df93…, while the raw-bytes hash of the
+    /// same file is dbbdaeab… — turning a missing check into a wrong one.
+    ///
+    /// Asserting the gap means it cannot be forgotten silently: when canonical
+    /// hashing lands (#1080) this goes RED and forces an update. An absent test
+    /// would not.
+    #[test]
+    fn byron_genesis_hash_is_deliberately_not_verified_yet() {
+        let dir = std::env::temp_dir().join(format!("dugite-byron-hash-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("byron-genesis.json"), br#"{"protocolConsts":{}}"#).unwrap();
+
+        let cfg = NodeConfig {
+            byron_genesis_file: Some("byron-genesis.json".to_string()),
+            // Deliberately not this file's hash under ANY scheme.
+            byron_genesis_hash: Some("a".repeat(64)),
+            ..NodeConfig::default()
+        };
+        assert!(
+            cfg.validate(&dir).is_ok(),
+            "Byron verification is not implemented; if this now FAILS, canonical-JSON \
+             hashing has landed — delete this test and drop the Byron exclusion in validate()"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
