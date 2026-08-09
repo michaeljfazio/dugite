@@ -1112,30 +1112,31 @@ impl NodeConfig {
                 // protocol parameters and system start, so an unpinned genesis is
                 // an unpinned ledger. cardano-node refuses to start on mismatch.
                 //
-                // BYRON IS DELIBERATELY EXCLUDED. Its hash is taken over a
-                // canonical-JSON RE-SERIALISATION, not over the file bytes, which
-                // is why cardano-cli exposes `byron genesis print-genesis-hash`
-                // separately from `latest genesis hash`. dugite does not implement
-                // canonical JSON yet, so checking Byron with the generic scheme
-                // would reject the OFFICIAL configs (mainnet's real Byron hash is
-                // 5f20df93…, the raw-bytes hash of the same file is dbbdaeab…) —
-                // turning a missing check into a wrong one. Tracked in #1080; the
-                // test below pins this gap so it cannot be forgotten silently.
-                if *era != "Byron" {
-                    if let Some(ref path) = resolved {
-                        let bytes = std::fs::read(path).with_context(|| {
-                            format!("failed to read {era} genesis at {}", path.display())
-                        })?;
-                        let computed = dugite_primitives::hash::blake2b_256(&bytes).to_hex();
-                        if !computed.eq_ignore_ascii_case(hash_hex) {
-                            anyhow::bail!(
-                                "{era} genesis hash mismatch for {}: config says {hash_hex}, \
-                                 file hashes to {computed}. The genesis file does not match the \
-                                 hash pinning it — refusing to start rather than build a ledger \
-                                 from an unverified genesis.",
-                                path.display()
-                            );
-                        }
+                // BYRON USES A DIFFERENT SCHEME. Its hash is taken over a
+                // canonical-JSON RE-SERIALISATION, not over the file bytes,
+                // which is why cardano-cli exposes
+                // `byron genesis print-genesis-hash` separately from
+                // `latest genesis hash`. Hashing the raw bytes of the very same
+                // file gives a different value — mainnet's real Byron hash is
+                // 5f20df93…, its raw-bytes hash is dbbdaeab… — so using one
+                // scheme for both eras would reject the official configs.
+                if let Some(ref path) = resolved {
+                    let bytes = std::fs::read(path).with_context(|| {
+                        format!("failed to read {era} genesis at {}", path.display())
+                    })?;
+                    let computed = if *era == "Byron" {
+                        byron_genesis_hash(&bytes)?
+                    } else {
+                        dugite_primitives::hash::blake2b_256(&bytes).to_hex()
+                    };
+                    if !computed.eq_ignore_ascii_case(hash_hex) {
+                        anyhow::bail!(
+                            "{era} genesis hash mismatch for {}: config says {hash_hex}, \
+                             file hashes to {computed}. The genesis file does not match the \
+                             hash pinning it — refusing to start rather than build a ledger \
+                             from an unverified genesis.",
+                            path.display()
+                        );
                     }
                 }
             }
@@ -1143,6 +1144,69 @@ impl NodeConfig {
 
         Ok(())
     }
+}
+
+// ──────────────────────────────────────────────────────────────────────────
+// Canonical-JSON genesis hashing (Byron)
+// ──────────────────────────────────────────────────────────────────────────
+
+/// Append `value` to `out` as CANONICAL JSON: object keys sorted, no whitespace.
+///
+/// Keys are sorted EXPLICITLY rather than leaning on `serde_json::Map` being a
+/// `BTreeMap`. That is only true while the `preserve_order` feature is off, and
+/// cargo unifies features across the whole graph — one dependency enabling it
+/// would silently reorder every object and change every hash produced here,
+/// with no compile error and no test failure outside the vectors below.
+fn write_canonical_json(value: &serde_json::Value, out: &mut String) {
+    match value {
+        serde_json::Value::Object(map) => {
+            let mut keys: Vec<&String> = map.keys().collect();
+            keys.sort();
+            out.push('{');
+            for (i, k) in keys.iter().enumerate() {
+                if i > 0 {
+                    out.push(',');
+                }
+                out.push_str(&serde_json::Value::String((*k).clone()).to_string());
+                out.push(':');
+                write_canonical_json(&map[*k], out);
+            }
+            out.push('}');
+        }
+        serde_json::Value::Array(items) => {
+            out.push('[');
+            for (i, v) in items.iter().enumerate() {
+                if i > 0 {
+                    out.push(',');
+                }
+                write_canonical_json(v, out);
+            }
+            out.push(']');
+        }
+        // Scalars: serde_json's own compact rendering is already canonical.
+        other => out.push_str(&other.to_string()),
+    }
+}
+
+/// Hash a Byron genesis file the way cardano-node does.
+///
+/// Byron does NOT hash the file bytes. It hashes a canonical-JSON
+/// re-serialisation, which is why `cardano-cli` exposes
+/// `byron genesis print-genesis-hash` separately from `latest genesis hash`.
+/// Hashing the raw bytes of the very same file yields a different value, and
+/// dugite's shipped configs recorded that wrong value for years because nothing
+/// ever verified them (#1080).
+///
+/// Confirmed against two independent real files, not one: mainnet's published
+/// `5f20df93…` and preprod's `d4b8de7a…`, the latter being the value
+/// cardano-node itself computed when handed dugite's own copy. Both are pinned
+/// in `byron_genesis_hash_matches_cardano_node`.
+pub(crate) fn byron_genesis_hash(bytes: &[u8]) -> Result<String> {
+    let value: serde_json::Value =
+        serde_json::from_slice(bytes).context("Byron genesis is not valid JSON")?;
+    let mut canonical = String::new();
+    write_canonical_json(&value, &mut canonical);
+    Ok(dugite_primitives::hash::blake2b_256(canonical.as_bytes()).to_hex())
 }
 
 impl Default for NodeConfig {
@@ -1283,6 +1347,55 @@ mod tests {
         assert!(err.to_string().contains("Shelley genesis file not found"));
     }
 
+    #[test]
+    fn byron_genesis_hash_matches_cardano_node() {
+        // Byron hashes a canonical-JSON re-serialisation, NOT the file bytes.
+        // Two independent real files, so a rule that happens to fit one cannot
+        // pass: mainnet's value is the published one, preprod's is what
+        // cardano-node itself computed when handed dugite's own copy.
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(|p| p.parent())
+            .expect("crate is two levels below the repo root")
+            .join("config");
+
+        let vectors = [
+            (
+                "mainnet",
+                "5f20df933584822601f9e3f8c024eb5eb252fe8cefb24d1317dc3d432e940ebb",
+            ),
+            (
+                "preprod",
+                "d4b8de7a11d929a323373cbab6c1a9bdc931beffff11db111cf9d57356ee1937",
+            ),
+        ];
+
+        let mut checked = 0;
+        for (net, want) in vectors {
+            let path = root.join(net).join("byron-genesis.json");
+            if !path.exists() {
+                continue;
+            }
+            let bytes = std::fs::read(&path).expect("read byron genesis");
+            let got = super::byron_genesis_hash(&bytes).expect("hash byron genesis");
+            assert_eq!(
+                got, want,
+                "{net} Byron genesis must hash to cardano-node's value"
+            );
+
+            // And the raw-bytes hash must DIFFER, or the vector cannot tell the
+            // canonical scheme from the naive one and proves nothing.
+            let raw = dugite_primitives::hash::blake2b_256(&bytes).to_hex();
+            assert_ne!(
+                raw, want,
+                "{net} file is already canonical, so this vector cannot \
+                 distinguish the two schemes — pick a different one"
+            );
+            checked += 1;
+        }
+        assert_eq!(checked, 2, "both vectors must actually be exercised");
+    }
+
     /// The configs dugite SHIPS must satisfy dugite's own validation.
     ///
     /// Genesis hashes went unverified for the entire life of the project, so
@@ -1383,39 +1496,6 @@ mod tests {
         assert!(
             swapped.validate(&dir).is_err(),
             "a genesis file swapped under an unchanged hash must be refused"
-        );
-
-        std::fs::remove_dir_all(&dir).ok();
-    }
-
-    /// BYRON IS NOT VERIFIED, on purpose, and this pins that gap.
-    ///
-    /// Byron hashes over a canonical-JSON re-serialisation rather than the file
-    /// bytes (hence `cardano-cli byron genesis print-genesis-hash`, separate
-    /// from `latest genesis hash`). dugite has no canonical-JSON encoder, so
-    /// checking Byron with the generic scheme would REJECT the official configs
-    /// — mainnet's true Byron hash is 5f20df93…, while the raw-bytes hash of the
-    /// same file is dbbdaeab… — turning a missing check into a wrong one.
-    ///
-    /// Asserting the gap means it cannot be forgotten silently: when canonical
-    /// hashing lands (#1080) this goes RED and forces an update. An absent test
-    /// would not.
-    #[test]
-    fn byron_genesis_hash_is_deliberately_not_verified_yet() {
-        let dir = std::env::temp_dir().join(format!("dugite-byron-hash-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("byron-genesis.json"), br#"{"protocolConsts":{}}"#).unwrap();
-
-        let cfg = NodeConfig {
-            byron_genesis_file: Some("byron-genesis.json".to_string()),
-            // Deliberately not this file's hash under ANY scheme.
-            byron_genesis_hash: Some("a".repeat(64)),
-            ..NodeConfig::default()
-        };
-        assert!(
-            cfg.validate(&dir).is_ok(),
-            "Byron verification is not implemented; if this now FAILS, canonical-JSON \
-             hashing has landed — delete this test and drop the Byron exclusion in validate()"
         );
 
         std::fs::remove_dir_all(&dir).ok();
