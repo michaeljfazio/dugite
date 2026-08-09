@@ -320,3 +320,45 @@ small change and gives the category that accounts for the ~790e12.
 Do NOT write a compensating constant. Seven hypotheses have now been killed by
 measurement here; each looked right and each would have put a fabricated value
 on a consensus path.
+
+
+## ROOT CAUSE IDENTIFIED — unredeemed AVVM
+
+Byron genesis (`config/mainnet/byron-genesis.json`) is ENTIRELY `avvmDistr`:
+
+```text
+avvmDistr        31,112,484,745,000,000
+nonAvvmBalances                       0
+dugite utxo @fork 31,111,977,147,073,356  (-507,597,926,644 Byron fee burn,
+                                            matching dugite's own logged delta)
+koios circ  @208  30,003,668,989,861,693
+genesis - koios    1,108,815,755,138,307  <- the excess, to the lovelace
+```
+
+Mainnet's circulation at the fork is **1.108e15 below the genesis AVVM
+distribution** — that much was never redeemed and never entered circulation.
+
+dugite's translation identified only **318,200,635,000,000** in redeem addresses
+(465 UTxOs, logged as `redeem_sum`), missing roughly **790e12** of unredeemed
+AVVM. It therefore carries that coin into the Shelley UTxO as circulation,
+where mainnet has it outside circulation.
+
+That single misclassification produces every symptom:
+
+| symptom | explained by |
+|---|---|
+| dugite UTxO +1.108e15 at the fork | unredeemed AVVM counted as circulation |
+| dugite reserves +0.48e15 at the fork | `reserves = max - utxo`, so a too-small... (see below) |
+| treasury short 1.53e15 forever | the coin never reaches treasury |
+| delta CONSTANT across epochs | one-time misclassification, not a rate error |
+| every testnet green | all genesis post-Byron; none has an `avvmDistr` |
+
+**Next, and it is now specific**: compare dugite's AVVM redeem-address
+detection against Byron's actual redeem address set. `eras/shelley.rs` logs
+`redeem_count=465`; the real unredeemed set is far larger. The defect is in
+which addresses are classified as redeem, not in the arithmetic around them.
+
+Still do NOT write a constant. Verify the address classification and let the
+sum fall out — the fact that `genesis - koios_circulation` lands within 0.05%
+of the observed excess is what makes this a hypothesis worth testing, not a
+number worth hardcoding.
