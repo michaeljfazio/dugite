@@ -70,6 +70,7 @@
 - [poolreap-active-purge-verified-11-0-1.md](poolreap-active-purge-verified-11-0-1.md) — removeStakePoolDelegations clears delegation pointer same-transition; live since shelley 1.17.0.0
 
 ## Rewards / Epoch Transition
+- [shelley-reward-aggregation-and-unregistered-routing.md](shelley-reward-aggregation-and-unregistered-routing.md) — treasury=deltaT+frTotalUnregistered; PV2 keeps only Ord-min Reward (Leader<Member); EVERY PV consult reads prevPParams so PV2 semantics run one boundary PAST Allegra HF
 - [praos-epoch-boundary-nonce-no-extraentropy.md](praos-epoch-boundary-nonce-no-extraentropy.md) — Praos tickChainDepState is 2-term, NO extraEntropy; TICKN 3-term formula is Shelley..Alonzo ONLY (supersedes epoch-nonce-tickn-deep-dive.md/epoch-nonce-calculation.md)
 - [nonintegral-ln-algorithm.md](nonintegral-ln-algorithm.md) — ln' uses continued fraction NOT Taylor series
 - [reward-iteration-deep-dive.md](reward-iteration-deep-dive.md) — startStep iterates GO snapshot, genesis pool 2-epoch warm-up
