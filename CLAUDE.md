@@ -109,6 +109,65 @@ programme's Phases 0/1/2/4 plus Phase 3's ledger half. Open: #1068, **#1070**,
 **#1071** (needs the `Pulsing` wire arm — see below), #1008, the Dijkstra set,
 and one filed `PulsingSnapshot` divergence.
 
+### 2026-08-09 — #1070 and #1068 closed; the mainnet oracle is cardano-streamer
+
+**#1070** — `dugite-cli query ledger-state` sent Shelley tag 4
+(`GetProposedPParamsUpdates`), so it returned `82 04 81 a0` — four bytes of the
+wrong record — from every node. The mislabel lived in the METHOD NAME, so the
+call site read correctly; renaming to `query_proposed_pparams_updates` means
+nothing is called `ledger_state` and the wrong method cannot be reached by
+name. `encode_shelley_query` is split out so the bytes a named query puts on
+the wire can be pinned with no socket: nothing about the REPLY is malformed, so
+only an assertion on what goes OUT can see this.
+
+**#1068** — UTxO queries read the live ledger while every other query read the
+pinned acquisition snapshot. `UtxoSet` is a plain `HashMap`, so there is no
+cheap snapshot at mainnet scale; the pinned view is RECONSTRUCTED by undoing
+the `LedgerSeq` deltas newer than the acquired point. Two orderings decide
+correctness and each is silently wrong in one direction — within a delta
+restores must precede removals, across deltas iteration must be newest-first.
+
+**The #1068 tests did not bound what they claimed, twice.** The first drove
+`undo_into` with a hand-built slice, so reversing the PRODUCER left it green.
+Adding a producer test then exposed a SECOND ordering site: `Origin` returns
+early with its own `.rev()`, so the specific-point branch's reversal was still
+untested and disarming it also stayed green. Both now driven, with three
+deltas — with two, a reversal bug and a correct implementation differ only by
+which single element is dropped.
+
+### Mainnet byte-exactness — cardano-streamer, NOT Koios (#1073)
+
+`/Users/michaelfazio/Source/cardano-streamer`, branch `10.6.2-dump-snapshot`.
+**Both sides dump at the SAME instant** — verified, not assumed: cstreamer's
+`dumpEpochSnapshots` fires at `siFinal` when `isFirstSlotOfNewEpoch`, using
+`swbNewExtLedgerState` (post-block state of the first block of the new epoch);
+dugite's `run_dump_snapshot` writes post-`apply_block` when
+`current_epoch > last_epoch`. Both label with the NEW epoch.
+
+**cstreamer emits NOTHING for Byron** — `buildSnapshotJson` returns `Nothing`,
+because `ChainAccountState` is introduced BY the Shelley translation. Byron
+epochs are ORACLE-SILENT, never divergent. Back-projecting a Shelley shape onto
+Byron is what disqualified Koios.
+
+**`rupdNext` was ALWAYS NULL and nobody noticed** — the dump read
+`pending_reward_update`, which has no writer, so the single most important
+field of a reward cross-validation dataset compared vacuously at every epoch.
+It also emitted 3 of upstream's 6 fields and published the NET signed
+`delta_reserves` under the name `deltaR1`, the GROSS expansion.
+`forced_reward_update` now forces a complete fold, as cstreamer forces its own
+pulser. Valid at a boundary dump point because every input `startStep` freezes
+already holds its final value once the epoch's first block lands.
+
+Comparator: `scripts/validation/diff-cstreamer-dumps.py`, era-aware, bisects to
+the FIRST divergent epoch per field, counts leaf COMPARISONS rather than rows,
+and exits 3 rather than printing PASS when it compared nothing. Self-tested in
+four directions; the negative run found two defects in the script itself.
+
+dugite's side: `db-mainnet-avvm` replays genesis→271 (5,851,768 blocks) in
+~7 min. Oracle side needs a real cardano-node mainnet ImmutableDB
+(`db-cn-mainnet`) synced past 273 — cstreamer reads the immutable chain, which
+lags the tip by k.
+
 ### The pulser-alignment programme
 
 Design + full status table: `docs/superpowers/specs/2026-08-08-pulser-alignment-design.md`.
@@ -154,11 +213,23 @@ upstream's encoder force-completes, so `DRPulsing` never reaches the wire.
 Implementing it would add ledger, snapshot and rollback surface for zero
 observable difference.
 
-**Still open in Phase 3**: per-block pulse scheduling and the `nesRu` wire arms
-(#1071). The arms CANNOT ship first — decoding the captured `Pulsing` record
-shows `balance` (work remaining) and `RewardAns` (answer so far) are live fold
-state, so a node computing at the boundary has nothing to encode from. The plan
-that put the arms in Phase 2 was wrong.
+**Still open in Phase 3**: ONLY the `nesRu` wire arms (#1071). The arms could
+not ship first — decoding the captured `Pulsing` record shows `balance` (work
+remaining) and `RewardAns` (answer so far) are live fold state, so a node
+computing at the boundary has nothing to encode from. The plan that put the
+arms in Phase 2 was wrong.
+
+**CORRECTION (2026-08-09): per-block pulse scheduling IS DONE.** Both this
+file and the design spec's §Phase-3 body said it was still open while the
+spec's own status table said DONE. The tree agrees with the table:
+`apply.rs:585` freezes the monetary step at the 4k/f mark and `apply.rs:614`
+calls `pulse_rupd_member_fold` on EVERY block. `RewardFold::is_done()` and
+`remaining()` both exist, the latter documented as "directly encodable as the
+wire arm's tag-258 set". So the three-way state the arms need
+(`SNothing` / `Pulsing` / `Complete`) is fully available and #1071 is now a
+pure encoder job plus a live transition-timing validation — not architecture.
+Found by diffing the claim against the tree, which is the standing rule for a
+checkmark ([[feedback_closed_issue_is_not_evidence_work_landed]]).
 
 ### Three wrong readings of a real artefact, all caught the same way
 
