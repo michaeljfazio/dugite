@@ -79,7 +79,18 @@ impl N2CClient {
 
         // Subscribe protocol channels
         let mut handshake_channel = mux.subscribe(0, Direction::InitiatorDir, 65536);
-        let state_query_channel = mux.subscribe(7, Direction::InitiatorDir, 16_777_216);
+        // LocalStateQuery replies are bounded by LEDGER SIZE, not by a protocol
+        // constant, and the ledger only grows. 16 MiB was already too small:
+        // mainnet's `NewEpochState` (tag 12) is 16,809,984 bytes and overran it
+        // by 32 KiB, so `query ledger-state` failed on mainnet with
+        // `IngressQueueOverrun` while working everywhere smaller. cardano-cli
+        // reports that as a timeout, which is why it read as a client problem.
+        //
+        // 256 MiB is ~15x today's mainnet reply — headroom for years of growth
+        // rather than a value that needs revisiting next epoch. This buffer is
+        // per-channel and only fills while a reply is being reassembled, so the
+        // cost is bounded by what is actually in flight, not by the cap.
+        let state_query_channel = mux.subscribe(7, Direction::InitiatorDir, 268_435_456);
         let tx_submission_channel = mux.subscribe(6, Direction::InitiatorDir, 65536);
         let tx_monitor_channel = mux.subscribe(9, Direction::InitiatorDir, 65536);
         let chain_sync_channel = mux.subscribe(5, Direction::InitiatorDir, 4_194_304);
