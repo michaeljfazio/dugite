@@ -64,11 +64,23 @@ fi
 
 # ── 3. cardano-streamer replay ───────────────────────────────────────────
 mkdir -p "$OUT/cstreamer"
-log "running cardano-streamer dump-epoch-snapshots (hours: full Haskell replay from genesis)"
+# `--validate re` REAPPLIES blocks: the same ledger state transition without
+# re-verifying signatures and scripts. For a ledger-state comparison that is
+# equivalent — every block here is already on mainnet and therefore valid, and
+# `reapplyLedgerBlock` and `applyLedgerBlock` produce the identical
+# `LedgerState` for a valid block. It also MATCHES what dugite's own side did:
+# `run_dump_snapshot` replays with `BlockValidationMode::ApplyOnly`. Comparing
+# a full-validation replay against an apply-only one would be the less
+# like-for-like choice, not the more rigorous one.
+#
+# `none` would be wrong — it does not compute the ledger at all.
+VALIDATE=${VALIDATE:-re}
+log "running cardano-streamer dump-epoch-snapshots (--validate $VALIDATE)"
 caffeinate -dimsu "$CSTREAMER" \
   --chain-dir "$CN_DB" \
   --config "$CN_CFG" \
   --out-dir "$OUT/cstreamer" \
+  --validate "$VALIDATE" \
   dump-epoch-snapshots
 rc=$?
 n=$(ls "$OUT/cstreamer" 2>/dev/null | wc -l | tr -d ' ')
