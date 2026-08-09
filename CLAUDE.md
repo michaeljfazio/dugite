@@ -214,8 +214,11 @@ then matches the oracle byte-for-byte.
   the same binary at a clone of a genuine cardano-node DB, which reads fine.
   Costs dugite too — recovery granularity is coupled to chunk size, and this DB
   holds a 52 MB `.chunk.orphaned`.
-- **#1067/#1068/#1070/#1072/#1074** are fixed in-tree on
-  `worktree-nonmyopic-1067` and close on merge. **#1078/#1080 are CLOSED.**
+- **#1067/#1068/#1070/#1072/#1074/#1078** are fixed in-tree on
+  `worktree-nonmyopic-1067`, verified, and carry `Closes` trailers that fire on
+  MERGE — they are still open on GitHub until then, which is the honest state
+  rather than a checkmark ([[feedback_closed_issue_is_not_evidence_work_landed]]).
+  **#1080 is CLOSED** (closed by hand after its four items were all done).
 
 ### Mainnet tip coverage — how to finish it
 
