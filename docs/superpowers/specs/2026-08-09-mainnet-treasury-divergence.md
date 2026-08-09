@@ -398,3 +398,56 @@ at all.
 **Nine hypotheses have now been killed by measurement.** The pattern is
 consistent enough to state plainly: every reading that explained the number was
 wrong, and each was refuted by one more measurement rather than by argument.
+
+
+---
+
+## LIKELY NOT A DUGITE DEFECT — the oracle was never validated
+
+Koios reports epoch **207**, the last BYRON epoch:
+
+```text
+treasury     1,573,549,387,137,031
+reserves    13,413,137,965,660,715
+circulation 30,003,667,771,645,293
+```
+
+**Byron has no treasury and no reserves.** Those ledger fields do not exist
+before Shelley — `ChainAccountState` is introduced BY the Shelley translation,
+which is the very code (`translateToShelleyLedgerStateFromUtxo`) that sets
+`casTreasury = Coin 0`.
+
+So Koios's `treasury`/`reserves`/`circulation` for Byron-era epochs are a
+back-projected Shelley-shaped model, not ledger state. `circulation` sits
+1,108,816,973,354,707 below the Byron genesis `avvmDistr` throughout Byron —
+constant, and equal to the "gap" this whole investigation chased.
+
+dugite's fork UTxO reconciles independently:
+
+```text
+byron avvmDistr    31,112,484,745,000,000
+- Byron fee burn          507,597,926,644   (dugite's own logged delta)
+= dugite utxo      31,111,977,147,073,356   exact
+```
+
+**dugite's number is internally consistent and derived from genesis. Koios's is
+a model.** The most probable conclusion is that there is NO dugite defect here
+and the entire 2.19e15 "divergence" is a definitional mismatch — exactly the
+failure this repo's own rule warns about: a cardano-node dump beats Koios, and
+Koios is sanity-only.
+
+**This is not yet proven.** It requires one cardano-node `debug log-epoch-state`
+at epoch 208 to confirm dugite's pots match a real Haskell node. But the burden
+has shifted: the evidence now favours dugite being correct, and the finding is
+about the METHOD, not the ledger.
+
+### What this cost, and the lesson
+
+Ten hypotheses, nine of them about dugite's ledger, all wrong. The tenth — that
+the ORACLE was wrong — was available from the first minute at the cost of one
+query (`koios_totals` for a Byron epoch, observing that Byron cannot have a
+treasury). Verifying what an oracle's columns MEAN must precede using it as
+ground truth, because a definitional mismatch and a consensus defect are
+indistinguishable from the number alone.
+
+Recorded as [[feedback_verify_the_oracles_column_definitions]].
