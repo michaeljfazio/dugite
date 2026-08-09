@@ -576,19 +576,23 @@ impl N2CClient {
         self.send_shelley_query(29).await
     }
 
-    /// Query ledger state (`DebugLedgerState` -- Shelley query tag 4).
+    /// Query the proposed protocol-parameter updates
+    /// (`GetProposedPParamsUpdates` -- Shelley query tag 4).
     ///
-    /// Returns raw MsgResult CBOR payload.
+    /// Returns raw MsgResult CBOR payload. Deprecated at N2C V20+ (Conway
+    /// governance replaces it); a real cardano-node 11.0.1 answers it with
+    /// `82 04 81 a0` — an empty proposed-update map, four bytes.
     ///
-    /// NOTE: tag 4 is `GetProposedPParamsUpdates` in the consensus query
-    /// numbering, not the ledger state — a real cardano-node answers this with
-    /// `82 04 81 a0` (an empty proposed-update map). The query that carries
-    /// `NewEpochState`, and the one `cardano-cli query ledger-state` issues, is
-    /// [`Self::query_debug_new_epoch_state`] (tag 12). Tracked separately; not
-    /// changed here because it alters `dugite-cli query ledger-state`'s output
-    /// and needs its own validation round.
-    pub async fn query_ledger_state(&mut self) -> Result<Vec<u8>, NetworkError> {
-        self.send_shelley_query(4).await
+    /// This method used to be called `query_ledger_state`, and
+    /// `dugite-cli query ledger-state` called it — so that command returned
+    /// four bytes of the wrong record from every node, dugite's and
+    /// cardano-node's alike. The name is now the tag's real meaning so the
+    /// mix-up cannot be written again: nothing here is called
+    /// "ledger_state", and the query that actually carries `NewEpochState` is
+    /// [`Self::query_debug_new_epoch_state`] (tag 12).
+    pub async fn query_proposed_pparams_updates(&mut self) -> Result<Vec<u8>, NetworkError> {
+        self.send_shelley_query(SHELLEY_TAG_PROPOSED_PPARAMS_UPDATES)
+            .await
     }
 
     /// Query the full `NewEpochState` (`DebugNewEpochState` -- Shelley query
@@ -599,7 +603,8 @@ impl N2CClient {
     ///
     /// Returns raw MsgResult CBOR payload.
     pub async fn query_debug_new_epoch_state(&mut self) -> Result<Vec<u8>, NetworkError> {
-        self.send_shelley_query(12).await
+        self.send_shelley_query(SHELLEY_TAG_DEBUG_NEW_EPOCH_STATE)
+            .await
     }
 
     /// Query protocol state (`DebugProtocolState` -- Shelley query tag 8).
@@ -947,17 +952,40 @@ impl N2CClient {
     /// - Layer 3: era NS index 6 (Conway)
     /// - Layer 4: `[shelley_tag]`
     async fn send_shelley_query(&mut self, shelley_tag: u32) -> Result<Vec<u8>, NetworkError> {
-        let mut inner = Vec::new();
-        let mut enc = minicbor::Encoder::new(&mut inner);
-        enc.array(1).map_err(cbor_err)?;
-        enc.u32(shelley_tag).map_err(cbor_err)?;
-        let buf = encode_conway_block_query(&inner)?;
+        let buf = encode_shelley_query(shelley_tag)?;
         self.send_query(buf).await?;
         self.recv_query().await
     }
 }
 
 // ── Free-standing helpers ────────────────────────────────────────────────
+
+/// `GetProposedPParamsUpdates` — Shelley LocalStateQuery tag 4.
+///
+/// Deprecated at N2C V20+. Emphatically NOT the ledger state; see
+/// [`N2CClient::query_proposed_pparams_updates`].
+pub const SHELLEY_TAG_PROPOSED_PPARAMS_UPDATES: u32 = 4;
+
+/// `DebugNewEpochState` — Shelley LocalStateQuery tag 12.
+///
+/// The query carrying `NewEpochState`; what `cardano-cli query ledger-state`
+/// issues.
+pub const SHELLEY_TAG_DEBUG_NEW_EPOCH_STATE: u32 = 12;
+
+/// Build the `MsgQuery` body for a Shelley-era `BlockQuery`, without sending
+/// it.
+///
+/// Split out of [`N2CClient::send_shelley_query`] so the bytes a named query
+/// puts on the wire can be pinned by a test with no socket — the defect this
+/// guards (#1070) was a call site wired to the wrong tag, which is invisible
+/// to any test that only inspects the reply.
+fn encode_shelley_query(shelley_tag: u32) -> Result<Vec<u8>, NetworkError> {
+    let mut inner = Vec::new();
+    let mut enc = minicbor::Encoder::new(&mut inner);
+    enc.array(1).map_err(cbor_err)?;
+    enc.u32(shelley_tag).map_err(cbor_err)?;
+    encode_conway_block_query(&inner)
+}
 
 /// Convert a minicbor encode error into a `NetworkError`.
 fn cbor_err<T: std::fmt::Display>(e: T) -> NetworkError {
@@ -2046,6 +2074,36 @@ fn decode_txin(decoder: &mut minicbor::Decoder<'_>) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #1070: `dugite-cli query ledger-state` sent Shelley tag 4
+    /// (`GetProposedPParamsUpdates`) and so returned `82 04 81 a0` — four
+    /// bytes of the wrong record — from dugite's node and cardano-node alike.
+    ///
+    /// The two tags are pinned here as raw bytes because the defect was a call
+    /// site choosing the wrong one: nothing about the *reply* is malformed, so
+    /// only an assertion on what goes out on the wire can see it. Tag 4 is
+    /// kept alongside deliberately — asserting 12 alone would still pass if
+    /// the two constants were swapped.
+    #[test]
+    fn shelley_query_tags_are_pinned_to_their_wire_bytes() {
+        // MsgQuery [3, [0, [0, [6, [tag]]]]]
+        //   82 03  82 00  82 00  82 06  81 <tag>
+        assert_eq!(
+            encode_shelley_query(SHELLEY_TAG_DEBUG_NEW_EPOCH_STATE).unwrap(),
+            vec![0x82, 0x03, 0x82, 0x00, 0x82, 0x00, 0x82, 0x06, 0x81, 0x0c],
+            "DebugNewEpochState must go out as tag 12 — this is the query that \
+             carries NewEpochState"
+        );
+        assert_eq!(
+            encode_shelley_query(SHELLEY_TAG_PROPOSED_PPARAMS_UPDATES).unwrap(),
+            vec![0x82, 0x03, 0x82, 0x00, 0x82, 0x00, 0x82, 0x06, 0x81, 0x04],
+            "GetProposedPParamsUpdates must go out as tag 4"
+        );
+        assert_ne!(
+            SHELLEY_TAG_DEBUG_NEW_EPOCH_STATE, SHELLEY_TAG_PROPOSED_PPARAMS_UPDATES,
+            "the two tags #1070 confused must stay distinct"
+        );
+    }
 
     /// #873: a declared CBOR length must be clamped to the bytes actually
     /// available, so a tiny crafted header cannot drive a billions-iteration
