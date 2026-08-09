@@ -290,3 +290,33 @@ one-time MIR-like credit in epoch 208. Establish which BEFORE writing code; a
 
 **Do not tag v2.8.0 until this is resolved.** The devnet gate and preprod soak
 are both clean and neither can see this: every testnet genesises post-Byron.
+
+
+## Final narrowing of this session
+
+`maxLovelaceSupply` is confirmed 45e15 in `config/mainnet/shelley-genesis.json`,
+matching dugite's constant — so a mis-configured supply is ruled out too.
+
+The target is therefore **~1.11e15 of dugite's Byron UTxO that mainnet does not
+count as circulation**:
+
+```text
+dugite utxo @fork   31,111,977,147,073,356
+koios circ  @208    30,003,668,989,861,693
+excess               1,108,308,157,211,663   <- what dugite over-counts
+AVVM redeem logged     318,200,635,000,000   <- only 29% of it
+```
+
+The AVVM redeem set is NOT the whole answer. Something else in dugite's Byron
+UTxO — ~790e12 beyond the redeem addresses — is counted as circulation where
+mainnet places it in treasury/reserves.
+
+**Next session, first task**: enumerate dugite's Byron UTxO by address type at
+the fork and diff the categories against Byron genesis (`avvmDistr` vs
+`nonAvvmBalances` vs `bootStakeholders`). `eras/shelley.rs` already logs
+`redeem_sum`/`nonredeem_sum`/`scan_count`, so extending that breakdown is a
+small change and gives the category that accounts for the ~790e12.
+
+Do NOT write a compensating constant. Seven hypotheses have now been killed by
+measurement here; each looked right and each would have put a fabricated value
+on a consensus path.
