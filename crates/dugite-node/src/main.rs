@@ -1049,29 +1049,6 @@ fn gcd(mut a: u64, mut b: u64) -> u64 {
 ///
 /// `scripts/validation/diff-cstreamer-dumps.py` reproduces this byte for byte
 /// and `digest_of_map_matches_the_comparator` pins the two together.
-/// Render cardano-ledger's on-wire IPv6 bytes as a standard address.
-///
-/// The 16 bytes are NOT a network-order address: cardano-ledger encodes an
-/// `IPv6` as its four `Word32`s in LITTLE-ENDIAN order, so each 4-byte group
-/// arrives reversed. dugite stores them verbatim, which is right — but
-/// hex-dumping them printed `f804012a2c41910100000000030000 00` where
-/// cardano-node prints `2a01:4f8:191:412c::3`
-/// (`instance ToJSON IPv6 where toJSON = toJSON . show`,
-/// cardano-ledger-core `Cardano/Ledger/Orphans.hs`). Same datum, and the
-/// difference is a per-4-byte-group reversal — verified against every IPv6
-/// relay on mainnet epochs 208-215, 6 of 6 reproduced exactly.
-///
-/// Note the sibling `ipv4` was already rendered as dotted-quad text in the same
-/// expression, so the dump was internally inconsistent as well as wrong.
-fn ipv6_from_ledger_bytes(b: &[u8; 16]) -> std::net::Ipv6Addr {
-    let mut be = [0u8; 16];
-    for i in 0..4 {
-        let w = u32::from_le_bytes([b[i * 4], b[i * 4 + 1], b[i * 4 + 2], b[i * 4 + 3]]);
-        be[i * 4..i * 4 + 4].copy_from_slice(&w.to_be_bytes());
-    }
-    std::net::Ipv6Addr::from(be)
-}
-
 fn digest_of_map(m: &serde_json::Map<String, serde_json::Value>) -> serde_json::Value {
     use sha2::{Digest, Sha256};
 
@@ -1195,7 +1172,7 @@ fn serialize_stake_snapshot(
                         "type": "SingleHostAddr",
                         "port": port,
                         "ipv4": ipv4.map(|ip| format!("{}.{}.{}.{}", ip[0], ip[1], ip[2], ip[3])),
-                        "ipv6": ipv6.map(|b| ipv6_from_ledger_bytes(&b).to_string()),
+                        "ipv6": ipv6.map(|b| dugite_primitives::transaction::ipv6_from_ledger_bytes(&b).to_string()),
                     }),
                     Relay::SingleHostName { port, dns_name } => serde_json::json!({
                         "type": "SingleHostName",
@@ -2011,7 +1988,7 @@ async fn run_node(args: RunArgs, log_handle: Option<logging::LogHandle>) -> Resu
 
 #[cfg(test)]
 mod digest_tests {
-    use super::{digest_of_map, ipv6_from_ledger_bytes};
+    use super::digest_of_map;
 
     /// The Rust and Python digests MUST agree byte for byte.
     ///
@@ -2025,36 +2002,6 @@ mod digest_tests {
     /// These vectors were produced by the Python implementation and pasted
     /// here. Regenerate with
     /// `scripts/validation/diff-cstreamer-dumps.py`'s `digest_of_map`.
-    /// cardano-ledger encodes an `IPv6` as four LITTLE-ENDIAN `Word32`s, so the
-    /// wire bytes are the address with each 4-byte group reversed.
-    ///
-    /// The vector is a REAL mainnet relay — the fifth entry of pool
-    /// `bcc34d3c45cd3b8770c75c91c3023a9146aa505c4bd5cf094dae9acc` at epoch 212,
-    /// whose address cardano-streamer renders as `2a01:4f8:191:412c::3`. A
-    /// synthetic address would not have caught this: the bug is a byte ORDER,
-    /// and a palindromic or all-zero test value is invariant under it.
-    #[test]
-    fn ipv6_renders_ledger_little_endian_words_as_an_address() {
-        let wire: [u8; 16] = [
-            0xf8, 0x04, 0x01, 0x2a, 0x2c, 0x41, 0x91, 0x01, 0x00, 0x00, 0x00, 0x00, 0x03, 0x00,
-            0x00, 0x00,
-        ];
-        assert_eq!(
-            ipv6_from_ledger_bytes(&wire).to_string(),
-            "2a01:4f8:191:412c::3",
-            "IPv6 relay must render as cardano-node's `show`, not as raw hex"
-        );
-
-        // The naive reading — treat the wire bytes as a network-order address —
-        // must NOT produce the same string, or the test would pass without the
-        // conversion doing anything.
-        assert_ne!(
-            std::net::Ipv6Addr::from(wire).to_string(),
-            "2a01:4f8:191:412c::3",
-            "if these agree the vector is order-invariant and proves nothing"
-        );
-    }
-
     #[test]
     fn digest_of_map_matches_the_comparator() {
         let mut stake = serde_json::Map::new();

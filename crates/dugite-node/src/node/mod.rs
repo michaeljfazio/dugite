@@ -4922,18 +4922,43 @@ impl Node {
                                     dugite_primitives::transaction::Relay::SingleHostAddr {
                                         port,
                                         ipv4,
-                                        ..
+                                        ipv6,
                                     } => {
-                                        if let (Some(port), Some(ipv4)) = (port, ipv4) {
-                                            let host = format!(
-                                                "{}.{}.{}.{}",
-                                                ipv4[0], ipv4[1], ipv4[2], ipv4[3]
-                                            );
-                                            relays.push(LedgerRelay {
-                                                host,
-                                                port: *port,
-                                                is_blp,
-                                            });
+                                        // A relay may declare v4, v6 or both.
+                                        // Taking only v4 made an IPv6-ONLY pool
+                                        // contribute no ledger peer at all —
+                                        // invisible, not deprioritised (#1078).
+                                        if let Some(port) = port {
+                                            if let Some(ipv4) = ipv4 {
+                                                relays.push(LedgerRelay {
+                                                    host: format!(
+                                                        "{}.{}.{}.{}",
+                                                        ipv4[0], ipv4[1], ipv4[2], ipv4[3]
+                                                    ),
+                                                    port: *port,
+                                                    is_blp,
+                                                });
+                                            }
+                                            if let Some(ipv6) = ipv6 {
+                                                // MUST go through the shared
+                                                // converter: the stored bytes are
+                                                // four LITTLE-ENDIAN words, so
+                                                // reinterpreting them directly
+                                                // would dial a different address
+                                                // than the operator registered.
+                                                let addr =
+                                                    dugite_primitives::transaction::ipv6_from_ledger_bytes(
+                                                        ipv6,
+                                                    );
+                                                // Bracketed, because a bare v6
+                                                // literal with a port is
+                                                // ambiguous to every parser.
+                                                relays.push(LedgerRelay {
+                                                    host: format!("[{addr}]"),
+                                                    port: *port,
+                                                    is_blp,
+                                                });
+                                            }
                                         }
                                     }
                                     dugite_primitives::transaction::Relay::SingleHostName {
