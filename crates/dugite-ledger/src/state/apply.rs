@@ -600,20 +600,28 @@ impl LedgerState {
             }
         }
 
-        // Phase 3: one pulse of the member fold per block, spreading the ~2.55 s
-        // mainnet-scale boundary fold (Phase 0) across the pulsing window.
+        // Phase 1b: freeze `fvAddrsRew` — and freeze it BEFORE the first pulse.
         //
-        // A no-op before the mark (`rupd_monetary` is None) and idempotent once
-        // the balance is exhausted, so it is safe to call unconditionally on
-        // every block rather than replicating the window classification here —
-        // a second copy of that condition is the N-copies trap (#985/#1015).
-        if block.era != Era::Byron {
-            let prev_d = self.epochs.prev_d.clone();
-            let pv = self.epochs.prev_protocol_version_major;
-            let k = self.security_param;
-            crate::state::rewards::pulse_rupd_member_fold(&mut self.epochs, &prev_d, pv, k);
-        }
-
+        // Upstream cannot get this order wrong because it has no order to get
+        // wrong: `startStep` builds the pulser and its `FreeVars` — including
+        // `fvAddrsRew = Map.keysSet (accounts ^. accountsMapL)` — in ONE
+        // expression (PulsingReward.hs:89-212, fvAddrsRew at :201), so no pulse
+        // can possibly precede the capture. dugite splits creation from pulsing
+        // into two statements, which makes their order load-bearing.
+        //
+        // It was the wrong way round, and that is #1074: the trigger block's
+        // FIRST pulse folded `ceil(N/8640)` queue-head credentials while
+        // `rupd_addrs_rew` was still `None`, i.e. with NO pv<=6 member
+        // prefilter. On mainnet one credential deregistered before epoch 233's
+        // mark was paid a member reward `rewardOnePoolMember` never creates
+        // (Rewards.hs:315), and being unregistered at apply it was routed to
+        // TREASURY — where Haskell leaves it in `deltaR2`, i.e. RESERVES.
+        // Treasury high / reserves low by 70,698 / 163,916 / 62,209 lovelace at
+        // boundaries 233->234, 234->235, 235->236, the first two exact.
+        //
+        // The `> startstep_slot` comparison matches `RewardWindow::classify`'s
+        // `<= start_after => TooEarly`, so the capture lands on the same block
+        // that starts the pulser — the instant Haskell freezes at.
         if block.era != Era::Byron
             && self.epochs.prev_protocol_version_major <= 6
             && self.epochs.rupd_addrs_rew.is_none()
@@ -626,6 +634,24 @@ impl LedgerState {
                     self.certs.reward_accounts.keys().copied().collect();
                 self.epochs.rupd_addrs_rew = Some(std::sync::Arc::new(frozen));
             }
+        }
+
+        // Phase 3: one pulse of the member fold per block, spreading the ~2.55 s
+        // mainnet-scale boundary fold (Phase 0) across the pulsing window.
+        //
+        // A no-op before the mark (`rupd_monetary` is None) and idempotent once
+        // the balance is exhausted, so it is safe to call unconditionally on
+        // every block rather than replicating the window classification here —
+        // a second copy of that condition is the N-copies trap (#985/#1015).
+        //
+        // MUST run after the `fvAddrsRew` capture above. Both read state as it
+        // stands before this block's certificates are applied, so the captured
+        // set is identical either way; only the pulse's view of it changes.
+        if block.era != Era::Byron {
+            let prev_d = self.epochs.prev_d.clone();
+            let pv = self.epochs.prev_protocol_version_major;
+            let k = self.security_param;
+            crate::state::rewards::pulse_rupd_member_fold(&mut self.epochs, &prev_d, pv, k);
         }
 
         // #804: adopt any `GenesisKeyDelegation` certs that matured by this
