@@ -213,7 +213,18 @@ then matches the oracle byte-for-byte.
   a uniform ~2 MB, dugite's are 235 MB / 146 MB / 59 MB. Isolated by pointing
   the same binary at a clone of a genuine cardano-node DB, which reads fine.
   Costs dugite too — recovery granularity is coupled to chunk size, and this DB
-  holds a 52 MB `.chunk.orphaned`.
+  holds a 52 MB `.chunk.orphaned`. **Gate exists**:
+  `scripts/validation/check-immutable-chunk-invariant.py` checks
+  `slot // chunkSize == chunkIndex` straight off the secondary index — no node,
+  seconds per run. cardano-node's DB PASSES (2357 chunks); dugite's preview
+  fails 14 of 27578 and preprod 19 of 5930, **tail only**, and the drift is
+  BIDIRECTIONAL (preview 27564 holds a block BELOW its range), so a fix that
+  merely bounds chunk size would leave the low-side violations. Its own control
+  run caught a bug in the checker: `blockOrEBB` is a UNION and holds the EPOCH
+  NUMBER for a Byron EBB, so `slot == idx` is the EBB case — without the control
+  it would have condemned every correct database. TWO of my hypotheses on this
+  issue were falsified by measurement; both are recorded there so they are not
+  re-derived.
 - **#1067/#1068/#1070/#1072/#1074/#1078** are fixed in-tree on
   `worktree-nonmyopic-1067`, verified, and carry `Closes` trailers that fire on
   MERGE — they are still open on GitHub until then, which is the honest state
