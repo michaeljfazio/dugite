@@ -18,5 +18,7 @@
   "TargetNumberOfRootPeers": 60,
   "ExperimentalHardForksEnabled": true,
   "LogDirective": "info",
-  "MetricsPort": 12796
+  "MetricsPort": 12796,
+  "AlonzoGenesisHash": "7e94a15f55d1e82d10f09203fa1d40f8eede58fd8066542cf6566008068ed874",
+  "ConwayGenesisHash": "9cc5084f02e27210eacba47af0872e3dba8946ad9460b6072d793e1d2f3987ef"
 }
