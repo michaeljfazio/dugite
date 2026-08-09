@@ -16,7 +16,14 @@
 set -uo pipefail
 
 DUGITE_ROOT=${DUGITE_ROOT:-/Users/michaelfazio/Source/dugite}
-CSTREAMER=${CSTREAMER:-/Users/michaelfazio/Source/cardano-streamer/dist-newstyle/build/aarch64-osx/ghc-9.6.7/cardano-streamer-0.1.0.0/x/cstreamer/build/cstreamer/cstreamer}
+# Resolve the NEWEST built cstreamer rather than pinning a GHC version in the
+# path. `cabal build` writes under `dist-newstyle/build/<arch>/ghc-<version>/`,
+# so rebuilding with a different toolchain than the original produces a second
+# binary and leaves the pinned one STALE. That happened here: the tree was
+# built with 9.6.7, a patch was rebuilt with ghcup's default 9.6.5, and the
+# hard-coded 9.6.7 path would have re-run the unpatched binary while the patch
+# looked applied.
+CSTREAMER=${CSTREAMER:-$(ls -t /Users/michaelfazio/Source/cardano-streamer/dist-newstyle/build/*/*/cardano-streamer-*/x/cstreamer/build/cstreamer/cstreamer 2>/dev/null | head -1)}
 CN_DB=${CN_DB:-$DUGITE_ROOT/db-cn-mainnet}
 CN_CFG=${CN_CFG:-$DUGITE_ROOT/cn-mainnet-config/config.json}
 OUT=${OUT:-$DUGITE_ROOT/reports/mainnet-exactness}
@@ -24,6 +31,15 @@ TARGET_EPOCH=${TARGET_EPOCH:-273}
 export CARDANO_NODE_SOCKET_PATH=${CARDANO_NODE_SOCKET_PATH:-/tmp/cn.sock}
 
 log() { echo "[$(date -u +%H:%M:%S)] $*"; }
+
+if [ -z "$CSTREAMER" ] || [ ! -x "$CSTREAMER" ]; then
+  log "ERROR no cstreamer binary found — build it with 'cabal build cstreamer'"
+  exit 1
+fi
+# Print WHICH binary and how old it is. A stale binary is the failure mode this
+# comparison is most likely to hit twice, and it is invisible from the output.
+log "cstreamer: $CSTREAMER"
+log "cstreamer built: $(stat -f '%Sm' -t '%Y-%m-%d %H:%M' "$CSTREAMER")"
 
 # ── 1. wait ──────────────────────────────────────────────────────────────
 log "waiting for oracle to reach epoch $TARGET_EPOCH"
