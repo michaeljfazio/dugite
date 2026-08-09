@@ -1034,6 +1034,72 @@ fn gcd(mut a: u64, mut b: u64) -> u64 {
 /// Cstreamer includes full delegation maps, pool parameters, individual stake, and
 /// per-pool block counts so that the cross-validation script can catch divergences in
 /// snapshot rotation, staking, and pool parameter tracking.
+/// Reduce a flat `key -> scalar` JSON map to `{count, sum, digest}`.
+///
+/// The canonical form is deliberately NOT JSON: entries are sorted by key and
+/// joined as `key:value;`, with the value rendered as a bare integer or bare
+/// string. JSON would drag in key-ordering, float formatting and escaping —
+/// three ways for two implementations to disagree about identical data. Both
+/// maps this is applied to are hex-keyed with integer or hex-string values, so
+/// this form is unambiguous and trivially reproducible.
+///
+/// `sum` is emitted only when every value is an integer; for `delegations`
+/// (values are pool-id strings) it is absent rather than zero, because a zero
+/// there would read as a real total.
+///
+/// `scripts/validation/diff-cstreamer-dumps.py` reproduces this byte for byte
+/// and `digest_of_map_matches_the_comparator` pins the two together.
+fn digest_of_map(m: &serde_json::Map<String, serde_json::Value>) -> serde_json::Value {
+    use sha2::{Digest, Sha256};
+
+    let mut keys: Vec<&String> = m.keys().collect();
+    keys.sort_unstable();
+
+    let mut hasher = Sha256::new();
+    let mut sum: Option<u128> = Some(0);
+    for k in &keys {
+        let v = &m[*k];
+        let rendered = match v {
+            serde_json::Value::Number(n) => {
+                if let (Some(acc), Some(u)) = (sum, n.as_u64()) {
+                    sum = acc.checked_add(u as u128);
+                } else {
+                    sum = None;
+                }
+                n.to_string()
+            }
+            serde_json::Value::String(s) => {
+                sum = None;
+                s.clone()
+            }
+            other => {
+                sum = None;
+                other.to_string()
+            }
+        };
+        hasher.update(k.as_bytes());
+        hasher.update(b":");
+        hasher.update(rendered.as_bytes());
+        hasher.update(b";");
+    }
+
+    let mut out = serde_json::Map::new();
+    out.insert(
+        "__count__".into(),
+        serde_json::Value::Number(m.len().into()),
+    );
+    if let Some(s) = sum {
+        if let Ok(v) = u64::try_from(s) {
+            out.insert("__sum__".into(), serde_json::Value::Number(v.into()));
+        }
+    }
+    out.insert(
+        "__digest__".into(),
+        serde_json::Value::String(hex::encode(hasher.finalize())),
+    );
+    serde_json::Value::Object(out)
+}
+
 fn serialize_stake_snapshot(
     name: &str,
     snapshot: &dugite_ledger::state::StakeSnapshot,
@@ -1162,6 +1228,30 @@ fn serialize_stake_snapshot(
     //   - go.blocks   = nesBprev (blocks from previous epoch)
     //   - set.blocks   = not included (None/omitted)
     // Callers pass the appropriate block source, or None to omit.
+    // `DUGITE_DUMP_DIGEST=1` replaces the two credential-scale maps with a
+    // digest record. At mainnet epoch 271 they are 98% of the file:
+    //
+    //   snapshots.*.delegations   3 x ~78 MB   (628,263 entries)
+    //   snapshots.*.stake         3 x ~47 MB   (612,174 entries)
+    //   snapshots.*.poolParams    3 x  2.1 MB  (2,736 entries — left as-is)
+    //   ------------------------------------------------------------------
+    //   total                         384 MB  ->  ~8 MB
+    //
+    // Without this a genesis->tip comparison is 1-2 TB of dumps, which is the
+    // blocker on extending past Mary, not sync time. It costs no detection
+    // power: the digest covers every entry, and the comparison's own negative
+    // test catches a ONE lovelace change to ONE credential in a 37,819-entry
+    // map through the digest alone.
+    let digest_mode = std::env::var("DUGITE_DUMP_DIGEST").as_deref() == Ok("1");
+    let (delegations, stake) = if digest_mode {
+        (digest_of_map(&delegations), digest_of_map(&stake))
+    } else {
+        (
+            serde_json::Value::Object(delegations),
+            serde_json::Value::Object(stake),
+        )
+    };
+
     let mut result = serde_json::json!({
         "name": name,
         "epoch": snapshot.epoch.0,
@@ -1880,4 +1970,85 @@ async fn run_node(args: RunArgs, log_handle: Option<logging::LogHandle>) -> Resu
     node.run().await?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod digest_tests {
+    use super::digest_of_map;
+
+    /// The Rust and Python digests MUST agree byte for byte.
+    ///
+    /// dugite emits `{__count__, __sum__, __digest__}` directly under
+    /// `DUGITE_DUMP_DIGEST=1`; cardano-streamer emits the raw map and
+    /// `scripts/validation/diff-cstreamer-dumps.py` reduces it. If the two
+    /// canonical forms drift, every `stake` and `delegations` path — 98% of the
+    /// payload — reports as divergent while the data is identical, and the
+    /// noise would mask a real difference behind a field that is already red.
+    ///
+    /// These vectors were produced by the Python implementation and pasted
+    /// here. Regenerate with
+    /// `scripts/validation/diff-cstreamer-dumps.py`'s `digest_of_map`.
+    #[test]
+    fn digest_of_map_matches_the_comparator() {
+        let mut stake = serde_json::Map::new();
+        stake.insert(format!("keyHash-{}", "aa".repeat(28)), 5.into());
+        stake.insert(format!("keyHash-{}", "bb".repeat(28)), 7.into());
+        stake.insert(format!("scriptHash-{}", "cc".repeat(28)), 11.into());
+        let got = digest_of_map(&stake);
+        assert_eq!(got["__count__"], 3);
+        assert_eq!(got["__sum__"], 23, "integer maps must carry a total");
+        assert_eq!(
+            got["__digest__"],
+            "007b710d3b7632b2323a3b1e648e8608ee70810a15d432d9cc8ae4a45a83a6cb"
+        );
+
+        // String values (delegations: credential -> pool id) must NOT produce a
+        // `__sum__`. A zero there would read as a real total of zero stake.
+        let mut dele = serde_json::Map::new();
+        dele.insert(
+            format!("keyHash-{}", "aa".repeat(28)),
+            serde_json::Value::String("cc".repeat(28)),
+        );
+        dele.insert(
+            format!("keyHash-{}", "bb".repeat(28)),
+            serde_json::Value::String("dd".repeat(28)),
+        );
+        let got = digest_of_map(&dele);
+        assert_eq!(got["__count__"], 2);
+        assert!(
+            got.get("__sum__").is_none(),
+            "a non-integer map must omit __sum__, not report 0"
+        );
+        assert_eq!(
+            got["__digest__"],
+            "3888cb0e8d7ffb2154ae738ae35a885928a41432ac1d9c9df804e7204dcbdcd1"
+        );
+    }
+
+    /// Key ORDER must not change the digest, and a one-lovelace change MUST.
+    ///
+    /// The first is why the canonical form sorts; the second is the whole
+    /// reason a digest is an acceptable substitute for the raw map.
+    #[test]
+    fn digest_is_order_independent_but_value_sensitive() {
+        let mut a = serde_json::Map::new();
+        a.insert("keyHash-02".into(), 2.into());
+        a.insert("keyHash-01".into(), 1.into());
+        let mut b = serde_json::Map::new();
+        b.insert("keyHash-01".into(), 1.into());
+        b.insert("keyHash-02".into(), 2.into());
+        assert_eq!(
+            digest_of_map(&a)["__digest__"],
+            digest_of_map(&b)["__digest__"]
+        );
+
+        let mut c = serde_json::Map::new();
+        c.insert("keyHash-01".into(), 1.into());
+        c.insert("keyHash-02".into(), 3.into());
+        assert_ne!(
+            digest_of_map(&a)["__digest__"],
+            digest_of_map(&c)["__digest__"],
+            "a one-unit change in one entry must change the digest"
+        );
+    }
 }
