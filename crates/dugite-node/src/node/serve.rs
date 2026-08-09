@@ -8,6 +8,7 @@ use tokio::sync::RwLock;
 use dugite_ledger::LedgerState;
 use dugite_network::{
     BlockProvider, TipInfo, TxValidationError, TxValidator, UtxoQueryProvider, UtxoSnapshot,
+    UtxoViewPoint,
 };
 use dugite_storage::ChainDB;
 
@@ -213,13 +214,140 @@ impl BlockProvider for ChainDBBlockProvider {
 
 // ─── LedgerUtxoProvider ──────────────────────────────────────────────────────
 
-/// Provides UTxO lookups from the live ledger state.
+/// Provides UTxO lookups as of an LSQ acquisition's pinned chain point.
+///
+/// The live ledger is the only materialised UTxO set — `UtxoSet` is a plain
+/// `HashMap`, so at mainnet scale (~10M entries) there is no cheap snapshot to
+/// take and copying one per acquisition is not an option. The pinned view is
+/// therefore RECONSTRUCTED: read the live set, then undo the `LedgerSeq` deltas
+/// applied strictly after the acquired point. Those deltas already exist for
+/// rollback, and `UtxoDiff::deletes` preserves the spent output precisely so it
+/// can be restored, so this reuses the machinery rather than adding a second
+/// UTxO history.
+///
+/// This is upstream's shape, not an invention: `LedgerDB` retains the last `k`
+/// ledger states and an acquisition reads one of them.
 pub(crate) struct LedgerUtxoProvider {
     pub ledger: Arc<RwLock<LedgerState>>,
+    /// Volatile window of per-block `UtxoDiff`s, used to undo forward.
+    ///
+    /// **Lock ordering**: `ledger` before `ledger_seq`, per `Node`'s docs.
+    pub ledger_seq: Arc<RwLock<dugite_ledger::ledger_seq::LedgerSeq>>,
+}
+
+impl LedgerUtxoProvider {
+    /// Deltas applied strictly after `at`, NEWEST FIRST.
+    ///
+    /// `None` means the pinned point is not reachable in the volatile window,
+    /// so no honest answer is available. Unreachable in practice — `acquire`
+    /// only ever pins the current tip, and the window is `k` blocks — but
+    /// answering from the live set anyway would be the silent tear this exists
+    /// to remove.
+    fn undo_diffs(
+        seq: &dugite_ledger::ledger_seq::LedgerSeq,
+        at: &UtxoViewPoint,
+    ) -> Option<Vec<dugite_ledger::UtxoDiff>> {
+        use dugite_primitives::block::Point;
+
+        let target = match at {
+            UtxoViewPoint::Origin => Point::Origin,
+            UtxoViewPoint::Specific { slot, hash } => Point::Specific(
+                dugite_primitives::time::SlotNo(*slot),
+                dugite_primitives::hash::Hash32::from_bytes(*hash),
+            ),
+        };
+
+        // The anchor is the oldest reachable point; everything after it is a
+        // delta. `denotes_origin` because Origin has two spellings and
+        // comparing points with `==` across that seam is #1057's half 3.
+        if target.denotes_origin() && seq.anchor_point().denotes_origin() {
+            return Some(
+                seq.deltas()
+                    .iter()
+                    .rev()
+                    .map(|d| d.utxo_diff.clone())
+                    .collect(),
+            );
+        }
+        if seq.anchor_point() == &target {
+            return Some(
+                seq.deltas()
+                    .iter()
+                    .rev()
+                    .map(|d| d.utxo_diff.clone())
+                    .collect(),
+            );
+        }
+
+        let mut after = Vec::new();
+        let mut found = false;
+        for delta in seq.deltas().iter() {
+            if found {
+                after.push(delta.utxo_diff.clone());
+            } else if Point::Specific(delta.slot, delta.hash) == target {
+                found = true;
+            }
+        }
+        if !found {
+            return None;
+        }
+        after.reverse();
+        Some(after)
+    }
+
+    /// Read the live ledger and the undo plan under the documented lock order.
+    fn with_pinned<T>(
+        &self,
+        at: &UtxoViewPoint,
+        f: impl FnOnce(&LedgerState, &[dugite_ledger::UtxoDiff]) -> T,
+    ) -> Option<T> {
+        tokio::task::block_in_place(|| {
+            let ledger = self.ledger.blocking_read();
+            let seq = self.ledger_seq.blocking_read();
+            let undo = Self::undo_diffs(&seq, at)?;
+            if !undo.is_empty() {
+                tracing::debug!(
+                    blocks = undo.len(),
+                    "UTxO query: undoing blocks applied after the acquired point"
+                );
+            }
+            Some(f(&ledger, &undo))
+        })
+    }
+}
+
+/// Apply the undo plan to a set of live UTxO entries keyed by input.
+///
+/// Within ONE delta the restores must be applied BEFORE the removals: an output
+/// created and spent by the same block appears in both `inserts` and `deletes`,
+/// and it must end up ABSENT at the pinned point. Restoring first and then
+/// removing gets that right; the other order leaves it present.
+///
+/// Across deltas the iteration must be NEWEST FIRST. Oldest-first re-adds an
+/// output that a later block spent and never removes it again.
+fn undo_into(
+    live: &mut std::collections::HashMap<
+        dugite_primitives::transaction::TransactionInput,
+        dugite_primitives::transaction::TransactionOutput,
+    >,
+    undo: &[dugite_ledger::UtxoDiff],
+) {
+    for diff in undo {
+        for (input, output) in &diff.deletes {
+            live.insert(input.clone(), output.clone());
+        }
+        for (input, _) in &diff.inserts {
+            live.remove(input);
+        }
+    }
 }
 
 impl UtxoQueryProvider for LedgerUtxoProvider {
-    fn utxos_at_address_bytes(&self, addr_bytes: &[u8]) -> Vec<UtxoSnapshot> {
+    fn utxos_at_address_bytes(
+        &self,
+        addr_bytes: &[u8],
+        at: &UtxoViewPoint,
+    ) -> Option<Vec<UtxoSnapshot>> {
         let addr = match dugite_primitives::address::Address::from_bytes(addr_bytes) {
             Ok(a) => a,
             Err(e) => {
@@ -227,17 +355,43 @@ impl UtxoQueryProvider for LedgerUtxoProvider {
                     "UTxO query: address decode failed: {e} (bytes len={})",
                     addr_bytes.len()
                 );
-                return vec![];
+                return Some(vec![]);
             }
         };
-        // Use block_in_place + blocking_read so this works correctly even when
-        // called from within a tokio async runtime (avoids "cannot block" panic).
-        tokio::task::block_in_place(|| {
-            let ledger = self.ledger.blocking_read();
-            let results: Vec<_> = ledger
+        // block_in_place + blocking_read so this works when called from within
+        // a tokio async runtime (avoids the "cannot block" panic).
+        self.with_pinned(at, |ledger, undo| {
+            let mut set: std::collections::HashMap<_, _> = ledger
                 .utxo
                 .utxo_set
                 .utxos_at_address(&addr)
+                .into_iter()
+                .collect();
+            if !undo.is_empty() {
+                // The undo plan is chain-wide, so it is filtered to this
+                // address here. A restore whose output sits at another address
+                // must not appear in this answer, and a removal for another
+                // address is simply absent from `set`.
+                let mut scoped: Vec<dugite_ledger::UtxoDiff> = Vec::with_capacity(undo.len());
+                for d in undo {
+                    scoped.push(dugite_ledger::UtxoDiff {
+                        inserts: d
+                            .inserts
+                            .iter()
+                            .filter(|(_, o)| o.address == addr)
+                            .cloned()
+                            .collect(),
+                        deletes: d
+                            .deletes
+                            .iter()
+                            .filter(|(_, o)| o.address == addr)
+                            .cloned()
+                            .collect(),
+                    });
+                }
+                undo_into(&mut set, &scoped);
+            }
+            let results: Vec<_> = set
                 .into_iter()
                 .map(|(input, output)| utxo_to_snapshot(&input, &output))
                 .collect();
@@ -251,34 +405,53 @@ impl UtxoQueryProvider for LedgerUtxoProvider {
         })
     }
 
-    fn utxos_by_tx_inputs(&self, inputs: &[(Vec<u8>, u32)]) -> Vec<UtxoSnapshot> {
-        tokio::task::block_in_place(|| {
-            let ledger = self.ledger.blocking_read();
+    fn utxos_by_tx_inputs(
+        &self,
+        inputs: &[(Vec<u8>, u32)],
+        at: &UtxoViewPoint,
+    ) -> Option<Vec<UtxoSnapshot>> {
+        self.with_pinned(at, |ledger, undo| {
             let mut results = Vec::new();
             for (tx_hash_bytes, idx) in inputs {
-                if tx_hash_bytes.len() == 32 {
-                    let mut hash_arr = [0u8; 32];
-                    hash_arr.copy_from_slice(tx_hash_bytes);
-                    let tx_input = dugite_primitives::transaction::TransactionInput {
-                        transaction_id: dugite_primitives::hash::Hash32::from_bytes(hash_arr),
-                        index: *idx,
-                    };
-                    if let Some(output) = ledger.utxo.utxo_set.lookup(&tx_input) {
-                        results.push(utxo_to_snapshot(&tx_input, &output));
+                if tx_hash_bytes.len() != 32 {
+                    continue;
+                }
+                let mut hash_arr = [0u8; 32];
+                hash_arr.copy_from_slice(tx_hash_bytes);
+                let tx_input = dugite_primitives::transaction::TransactionInput {
+                    transaction_id: dugite_primitives::hash::Hash32::from_bytes(hash_arr),
+                    index: *idx,
+                };
+                // Resolve this ONE input against the pinned view — exactly
+                // `undo_into`'s semantics restricted to a single key, and it
+                // must run over EVERY delta rather than stopping at the first
+                // that mentions the input. An output created in one block and
+                // spent in a later one appears in both; stopping at the newest
+                // delta would see only the spend, restore it, and report a
+                // UTxO that did not exist at the pinned point.
+                let mut output = ledger.utxo.utxo_set.lookup(&tx_input);
+                for diff in undo {
+                    if let Some((_, o)) = diff.deletes.iter().find(|(i, _)| *i == tx_input) {
+                        output = Some(o.clone());
                     }
+                    if diff.inserts.iter().any(|(i, _)| *i == tx_input) {
+                        output = None;
+                    }
+                }
+                if let Some(output) = output {
+                    results.push(utxo_to_snapshot(&tx_input, &output));
                 }
             }
             results
         })
     }
 
-    fn utxos_all(&self) -> Vec<UtxoSnapshot> {
-        tokio::task::block_in_place(|| {
-            let ledger = self.ledger.blocking_read();
-            let results: Vec<_> = ledger
-                .utxo
-                .utxo_set
-                .iter()
+    fn utxos_all(&self, at: &UtxoViewPoint) -> Option<Vec<UtxoSnapshot>> {
+        self.with_pinned(at, |ledger, undo| {
+            let mut set: std::collections::HashMap<_, _> =
+                ledger.utxo.utxo_set.iter().into_iter().collect();
+            undo_into(&mut set, undo);
+            let results: Vec<_> = set
                 .into_iter()
                 .map(|(input, output)| utxo_to_snapshot(&input, &output))
                 .collect();
@@ -1733,6 +1906,201 @@ mod tests {
     use dugite_primitives::time::EpochNo;
     use dugite_primitives::transaction::{Anchor, GovAction, GovActionId, ProposalProcedure};
     use dugite_primitives::value::Lovelace;
+
+    // ── #1068: reconstructing a pinned UTxO view ─────────────────────────
+
+    fn txin(n: u8) -> dugite_primitives::transaction::TransactionInput {
+        dugite_primitives::transaction::TransactionInput {
+            transaction_id: Hash32::from_bytes([n; 32]),
+            index: 0,
+        }
+    }
+
+    fn txout(lovelace: u64) -> dugite_primitives::transaction::TransactionOutput {
+        dugite_primitives::transaction::TransactionOutput {
+            address: dugite_primitives::address::Address::from_bytes(&[0x61u8; 29])
+                .expect("29-byte enterprise address"),
+            value: dugite_primitives::value::Value::lovelace(lovelace),
+            datum: dugite_primitives::transaction::OutputDatum::None,
+            script_ref: None,
+            is_legacy: false,
+            raw_cbor: None,
+        }
+    }
+
+    fn diff(inserts: Vec<(u8, u64)>, deletes: Vec<(u8, u64)>) -> dugite_ledger::UtxoDiff {
+        dugite_ledger::UtxoDiff {
+            inserts: inserts
+                .into_iter()
+                .map(|(n, v)| (txin(n), txout(v)))
+                .collect(),
+            deletes: deletes
+                .into_iter()
+                .map(|(n, v)| (txin(n), txout(v)))
+                .collect(),
+        }
+    }
+
+    /// The undo has TWO orderings that are each wrong in one direction, and a
+    /// naive implementation gets one of them wrong silently — the answer is
+    /// still a plausible UTxO set, just not the one at the pinned point.
+    ///
+    /// Case A pins the WITHIN-delta order: an output created and spent by the
+    /// SAME block is in both `inserts` and `deletes`, and must end up ABSENT.
+    /// Restoring deletes before removing inserts gets that right; the reverse
+    /// order leaves it present.
+    ///
+    /// Case B pins the ACROSS-delta order: an output created in one block and
+    /// spent in a LATER one must also end up absent. Oldest-first re-adds it
+    /// from the later block's `deletes` and never removes it again.
+    #[test]
+    fn undo_reconstructs_the_pinned_view_in_both_orderings() {
+        // Case A — created and spent inside one block (newest, index 0).
+        let mut live = std::collections::HashMap::new();
+        undo_into(&mut live, &[diff(vec![(1, 100)], vec![(1, 100)])]);
+        assert!(
+            !live.contains_key(&txin(1)),
+            "an output created AND spent by the same block did not exist at the \
+             pinned point; restoring deletes must precede removing inserts"
+        );
+
+        // Case B — created in the older block, spent in the newer one. The
+        // slice is NEWEST FIRST, which is the order `undo_diffs` returns.
+        let mut live = std::collections::HashMap::new();
+        undo_into(
+            &mut live,
+            &[
+                diff(vec![], vec![(2, 200)]), // newer block spent it
+                diff(vec![(2, 200)], vec![]), // older block created it
+            ],
+        );
+        assert!(
+            !live.contains_key(&txin(2)),
+            "an output created after the pinned point and later spent still did \
+             not exist at that point; the undo must run newest-first"
+        );
+
+        // Case C — existed at the pinned point, spent afterwards: restored.
+        let mut live = std::collections::HashMap::new();
+        undo_into(&mut live, &[diff(vec![], vec![(3, 300)])]);
+        assert_eq!(
+            live.get(&txin(3)).map(|o| o.value.coin.0),
+            Some(300),
+            "an output spent after the pinned point was still present at it"
+        );
+
+        // Case D — created after the pinned point and still live: removed.
+        let mut live = std::collections::HashMap::new();
+        live.insert(txin(4), txout(400));
+        undo_into(&mut live, &[diff(vec![(4, 400)], vec![])]);
+        assert!(
+            !live.contains_key(&txin(4)),
+            "an output created after the pinned point must not appear in it"
+        );
+
+        // Case E — untouched by any delta: passes through unchanged.
+        let mut live = std::collections::HashMap::new();
+        live.insert(txin(5), txout(500));
+        undo_into(&mut live, &[diff(vec![(9, 900)], vec![(8, 800)])]);
+        assert_eq!(live.get(&txin(5)).map(|o| o.value.coin.0), Some(500));
+    }
+
+    /// `undo_diffs` must EMIT the deltas newest-first.
+    ///
+    /// The ordering test above drives `undo_into` with a hand-built slice, so
+    /// it bounds that function and nothing else — reversing the producer left
+    /// it green. This drives the real producer, which is the only thing that
+    /// can catch the reversal in production. A RED-proven unit test bounds the
+    /// function, not the system (#1057).
+    #[test]
+    fn undo_diffs_are_emitted_newest_first() {
+        use dugite_ledger::ledger_seq::{LedgerDelta, LedgerSeq};
+        use dugite_primitives::time::{BlockNo, SlotNo};
+
+        let anchor = dugite_ledger::LedgerState::new(ProtocolParameters::mainnet_defaults());
+        let mut seq = LedgerSeq::with_defaults(anchor, 2160);
+
+        // Pushed oldest-first, as production does.
+        let mut older = LedgerDelta::new(SlotNo(10), Hash32::from_bytes([10u8; 32]), BlockNo(1));
+        older.utxo_diff = diff(vec![(1, 100)], vec![]);
+        seq.push(older);
+
+        let mut newer = LedgerDelta::new(SlotNo(20), Hash32::from_bytes([20u8; 32]), BlockNo(2));
+        newer.utxo_diff = diff(vec![(2, 200)], vec![]);
+        seq.push(newer);
+
+        let plan = LedgerUtxoProvider::undo_diffs(&seq, &UtxoViewPoint::Origin)
+            .expect("the anchor is Origin, so the whole window is reachable");
+        assert_eq!(plan.len(), 2, "both post-anchor blocks must be undone");
+        assert_eq!(
+            plan[0].inserts[0].0,
+            txin(2),
+            "the NEWEST block must be undone first; oldest-first re-adds an \
+             output a later block spent and never removes it again"
+        );
+        assert_eq!(plan[1].inserts[0].0, txin(1));
+
+        // The SPECIFIC-point path is a SECOND ordering site: the Origin branch
+        // reverses inline, the specific-point branch builds forward and
+        // reverses at the end. Disarming one leaves the other green, so both
+        // are driven here. Pinning the OLDER block must yield only the newer
+        // one — the older block is at the pinned point, not after it.
+        let at_older = UtxoViewPoint::Specific {
+            slot: 10,
+            hash: [10u8; 32],
+        };
+        let plan = LedgerUtxoProvider::undo_diffs(&seq, &at_older)
+            .expect("the older block is inside the volatile window");
+        assert_eq!(
+            plan.len(),
+            1,
+            "only blocks applied STRICTLY AFTER the pinned point are undone"
+        );
+        assert_eq!(plan[0].inserts[0].0, txin(2));
+
+        // Three deltas, pinned at the oldest, exercises the reversal on the
+        // specific-point path with enough elements for order to be observable
+        // — with two, a reversal bug and a correct one differ only by which
+        // single element is dropped.
+        let mut third = LedgerDelta::new(SlotNo(30), Hash32::from_bytes([30u8; 32]), BlockNo(3));
+        third.utxo_diff = diff(vec![(3, 300)], vec![]);
+        seq.push(third);
+        let plan = LedgerUtxoProvider::undo_diffs(&seq, &at_older).expect("still in window");
+        assert_eq!(
+            plan.iter()
+                .map(|d| d.inserts[0].0.clone())
+                .collect::<Vec<_>>(),
+            vec![txin(3), txin(2)],
+            "the specific-point path must also emit newest-first"
+        );
+
+        // A point that is not in the window is not reconstructible, and must
+        // say so rather than silently answering from the live set.
+        let unknown = UtxoViewPoint::Specific {
+            slot: 99,
+            hash: [0xab; 32],
+        };
+        assert!(
+            LedgerUtxoProvider::undo_diffs(&seq, &unknown).is_none(),
+            "an unreachable pinned point must refuse, not fall back to live"
+        );
+    }
+
+    /// An empty undo plan must be the identity — the overwhelmingly common
+    /// case, since `acquire` pins the current tip and most acquisitions see no
+    /// block at all. If this were not exact, #1068's fix would have changed
+    /// every UTxO answer rather than only the torn ones.
+    #[test]
+    fn undo_with_no_deltas_is_the_identity() {
+        let mut live = std::collections::HashMap::new();
+        live.insert(txin(1), txout(111));
+        live.insert(txin(2), txout(222));
+        let before = live.clone();
+        undo_into(&mut live, &[]);
+        assert_eq!(live.len(), before.len());
+        assert_eq!(live.get(&txin(1)).map(|o| o.value.coin.0), Some(111));
+        assert_eq!(live.get(&txin(2)).map(|o| o.value.coin.0), Some(222));
+    }
 
     /// Verifies that `LedgerState::mempool_validation_context` projects the
     /// live Conway governance fields into the shapes expected by

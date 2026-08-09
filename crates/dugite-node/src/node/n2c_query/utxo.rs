@@ -4,12 +4,13 @@ use std::sync::Arc;
 use tracing::debug;
 
 use super::types::{NodeStateSnapshot, QueryResult, UtxoQueryProvider};
+use dugite_network::UtxoViewPoint;
 
 /// Handle GetUTxOByAddress (tag 6).
 ///
 /// Argument: tag(258) Set<Address> or single address bytes
 pub(crate) fn handle_utxo_by_address(
-    _state: &NodeStateSnapshot,
+    state: &NodeStateSnapshot,
     utxo_provider: &Option<Arc<dyn UtxoQueryProvider>>,
     decoder: &mut minicbor::Decoder<'_>,
 ) -> QueryResult {
@@ -40,14 +41,54 @@ pub(crate) fn handle_utxo_by_address(
         }
     }
     if let Some(provider) = utxo_provider {
+        let at = acquired_point(state);
         let mut all_utxos = Vec::new();
         for addr in &addresses {
-            all_utxos.extend(provider.utxos_at_address_bytes(addr));
+            match provider.utxos_at_address_bytes(addr, &at) {
+                Some(found) => all_utxos.extend(found),
+                None => return unpinnable("GetUTxOByAddress", &at),
+            }
         }
         QueryResult::UtxoByAddress(all_utxos)
     } else {
         QueryResult::UtxoByAddress(vec![])
     }
+}
+
+/// The chain point this acquisition pinned.
+///
+/// Taken from the ACQUIRED snapshot, which `handle_query` supplies as the
+/// shadow handler's `state` — not from the live ledger. That is the whole
+/// point of #1068: every query in one `MsgAcquire..MsgRelease` session must
+/// answer from the same ledger point.
+pub(crate) fn acquired_point(state: &NodeStateSnapshot) -> UtxoViewPoint {
+    match &state.tip.point {
+        dugite_primitives::block::Point::Origin => UtxoViewPoint::Origin,
+        dugite_primitives::block::Point::Specific(slot, hash) => UtxoViewPoint::Specific {
+            slot: slot.0,
+            hash: *hash.as_bytes(),
+        },
+    }
+}
+
+/// The acquired point is no longer reconstructible.
+///
+/// Upstream cannot reach this state — its `LedgerDB` retains the acquired
+/// state for the acquisition's life — and neither can dugite in practice,
+/// since `acquire` only pins the current tip and the volatile window is `k`
+/// blocks. Answering from the live set instead would be precisely the silent
+/// torn read #1068 removes, so this refuses rather than guesses.
+fn unpinnable(query: &str, at: &UtxoViewPoint) -> QueryResult {
+    tracing::warn!(
+        query,
+        ?at,
+        "UTxO query: the acquired chain point has fallen out of the volatile \
+         window; refusing to answer from a different ledger point"
+    );
+    QueryResult::Error(format!(
+        "{query}: the acquired chain point is no longer available; \
+         re-acquire and retry"
+    ))
 }
 
 /// Hard cap on the number of UTxO entries returned by `GetUTxOWhole` (C2 fix).
@@ -70,10 +111,16 @@ pub const MAX_UTXO_QUERY_ENTRIES: usize = 500_000;
 ///
 /// C2: enforces `MAX_UTXO_QUERY_ENTRIES` to prevent a single N2C client from
 /// holding the ledger read lock for multiple seconds at mainnet scale.
-pub(crate) fn handle_utxo_whole(utxo_provider: &Option<Arc<dyn UtxoQueryProvider>>) -> QueryResult {
+pub(crate) fn handle_utxo_whole(
+    state: &NodeStateSnapshot,
+    utxo_provider: &Option<Arc<dyn UtxoQueryProvider>>,
+) -> QueryResult {
     debug!("Query: GetUTxOWhole");
     if let Some(provider) = utxo_provider {
-        let entries = provider.utxos_all();
+        let at = acquired_point(state);
+        let Some(entries) = provider.utxos_all(&at) else {
+            return unpinnable("GetUTxOWhole", &at);
+        };
         if entries.len() > MAX_UTXO_QUERY_ENTRIES {
             // Return an error result rather than materializing gigabytes of data.
             // Clients that genuinely need the full UTxO set should use a dedicated
@@ -95,6 +142,7 @@ pub(crate) fn handle_utxo_whole(utxo_provider: &Option<Arc<dyn UtxoQueryProvider
 ///
 /// Argument: Set<TxIn> where TxIn = [tx_hash, output_index]
 pub(crate) fn handle_utxo_by_txin(
+    state: &NodeStateSnapshot,
     utxo_provider: &Option<Arc<dyn UtxoQueryProvider>>,
     decoder: &mut minicbor::Decoder<'_>,
 ) -> QueryResult {
@@ -117,7 +165,11 @@ pub(crate) fn handle_utxo_by_txin(
         }
     }
     if let Some(provider) = utxo_provider {
-        QueryResult::UtxoByAddress(provider.utxos_by_tx_inputs(&inputs))
+        let at = acquired_point(state);
+        match provider.utxos_by_tx_inputs(&inputs, &at) {
+            Some(found) => QueryResult::UtxoByAddress(found),
+            None => unpinnable("GetUTxOByTxIn", &at),
+        }
     } else {
         QueryResult::UtxoByAddress(vec![])
     }
@@ -135,31 +187,37 @@ mod tests {
         fn utxos_at_address_bytes(
             &self,
             addr_bytes: &[u8],
-        ) -> Vec<super::super::types::UtxoSnapshot> {
-            self.utxos
-                .iter()
-                .filter(|u| u.address_bytes == addr_bytes)
-                .cloned()
-                .collect()
+            _at: &UtxoViewPoint,
+        ) -> Option<Vec<super::super::types::UtxoSnapshot>> {
+            Some(
+                self.utxos
+                    .iter()
+                    .filter(|u| u.address_bytes == addr_bytes)
+                    .cloned()
+                    .collect(),
+            )
         }
 
         fn utxos_by_tx_inputs(
             &self,
             inputs: &[(Vec<u8>, u32)],
-        ) -> Vec<super::super::types::UtxoSnapshot> {
-            self.utxos
-                .iter()
-                .filter(|u| {
-                    inputs
-                        .iter()
-                        .any(|(h, i)| h == &u.tx_hash && *i == u.output_index)
-                })
-                .cloned()
-                .collect()
+            _at: &UtxoViewPoint,
+        ) -> Option<Vec<super::super::types::UtxoSnapshot>> {
+            Some(
+                self.utxos
+                    .iter()
+                    .filter(|u| {
+                        inputs
+                            .iter()
+                            .any(|(h, i)| h == &u.tx_hash && *i == u.output_index)
+                    })
+                    .cloned()
+                    .collect(),
+            )
         }
 
-        fn utxos_all(&self) -> Vec<super::super::types::UtxoSnapshot> {
-            self.utxos.clone()
+        fn utxos_all(&self, _at: &UtxoViewPoint) -> Option<Vec<super::super::types::UtxoSnapshot>> {
+            Some(self.utxos.clone())
         }
     }
 
@@ -271,7 +329,7 @@ mod tests {
 
     #[test]
     fn test_utxo_whole_no_provider() {
-        let result = handle_utxo_whole(&None);
+        let result = handle_utxo_whole(&super::super::types::NodeStateSnapshot::default(), &None);
         match result {
             QueryResult::UtxoByAddress(utxos) => assert!(utxos.is_empty()),
             _ => panic!("Expected UtxoByAddress"),
@@ -284,7 +342,10 @@ mod tests {
             make_utxo(vec![1u8; 32], 0, vec![0x61; 29], 5_000_000),
             make_utxo(vec![2u8; 32], 1, vec![0x62; 29], 3_000_000),
         ]);
-        let result = handle_utxo_whole(&provider);
+        let result = handle_utxo_whole(
+            &super::super::types::NodeStateSnapshot::default(),
+            &provider,
+        );
         match result {
             QueryResult::UtxoByAddress(utxos) => {
                 assert_eq!(utxos.len(), 2);
@@ -296,7 +357,10 @@ mod tests {
     #[test]
     fn test_utxo_whole_empty_store() {
         let provider = make_provider(vec![]);
-        let result = handle_utxo_whole(&provider);
+        let result = handle_utxo_whole(
+            &super::super::types::NodeStateSnapshot::default(),
+            &provider,
+        );
         match result {
             QueryResult::UtxoByAddress(utxos) => assert!(utxos.is_empty()),
             _ => panic!("Expected UtxoByAddress"),
@@ -316,7 +380,10 @@ mod tests {
             })
             .collect();
         let provider = make_provider(utxos);
-        let result = handle_utxo_whole(&provider);
+        let result = handle_utxo_whole(
+            &super::super::types::NodeStateSnapshot::default(),
+            &provider,
+        );
         match result {
             QueryResult::UtxoByAddress(entries) => {
                 assert_eq!(entries.len(), MAX_UTXO_QUERY_ENTRIES);
@@ -337,7 +404,10 @@ mod tests {
             })
             .collect();
         let provider = make_provider(utxos);
-        let result = handle_utxo_whole(&provider);
+        let result = handle_utxo_whole(
+            &super::super::types::NodeStateSnapshot::default(),
+            &provider,
+        );
         match result {
             QueryResult::Error(msg) => {
                 assert!(
@@ -372,7 +442,11 @@ mod tests {
         enc.u32(0).ok();
         let mut dec = minicbor::Decoder::new(&buf);
 
-        let result = handle_utxo_by_txin(&provider, &mut dec);
+        let result = handle_utxo_by_txin(
+            &super::super::types::NodeStateSnapshot::default(),
+            &provider,
+            &mut dec,
+        );
         match result {
             QueryResult::UtxoByAddress(utxos) => {
                 assert_eq!(utxos.len(), 1);
@@ -388,7 +462,11 @@ mod tests {
         minicbor::Encoder::new(&mut buf).array(0).ok();
         let mut dec = minicbor::Decoder::new(&buf);
 
-        let result = handle_utxo_by_txin(&None, &mut dec);
+        let result = handle_utxo_by_txin(
+            &super::super::types::NodeStateSnapshot::default(),
+            &None,
+            &mut dec,
+        );
         match result {
             QueryResult::UtxoByAddress(utxos) => assert!(utxos.is_empty()),
             _ => panic!("Expected UtxoByAddress"),
@@ -412,7 +490,11 @@ mod tests {
         enc.u32(99).ok();
         let mut dec = minicbor::Decoder::new(&buf);
 
-        let result = handle_utxo_by_txin(&provider, &mut dec);
+        let result = handle_utxo_by_txin(
+            &super::super::types::NodeStateSnapshot::default(),
+            &provider,
+            &mut dec,
+        );
         match result {
             QueryResult::UtxoByAddress(utxos) => assert!(utxos.is_empty()),
             _ => panic!("Expected UtxoByAddress"),
@@ -439,7 +521,11 @@ mod tests {
         enc.u32(1).ok();
         let mut dec = minicbor::Decoder::new(&buf);
 
-        let result = handle_utxo_by_txin(&provider, &mut dec);
+        let result = handle_utxo_by_txin(
+            &super::super::types::NodeStateSnapshot::default(),
+            &provider,
+            &mut dec,
+        );
         match result {
             QueryResult::UtxoByAddress(utxos) => {
                 assert_eq!(utxos.len(), 2);

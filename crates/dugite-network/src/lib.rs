@@ -1139,20 +1139,60 @@ impl std::error::Error for TxValidationError {}
 ///
 /// The node crate implements this over its UTxO store so that the network layer
 /// can answer UTxO queries from N2C clients without depending on ledger internals.
-pub trait UtxoQueryProvider: Send + Sync {
-    /// Look up all UTxOs at a given address (raw address bytes).
-    fn utxos_at_address_bytes(&self, addr_bytes: &[u8]) -> Vec<UtxoSnapshot>;
+/// The chain point an LSQ acquisition pinned, threaded into every UTxO query
+/// so its answer comes from the same ledger state as every other query in that
+/// acquisition (#1068).
+///
+/// An acquisition is a point-in-time view by construction upstream:
+/// `ouroboros-consensus` resolves `MsgAcquire` to one `ExtLedgerState` and runs
+/// `answerQuery` against it, with no live side-channel for any query. dugite
+/// pins a `NodeStateSnapshot` for everything else but read the LIVE ledger for
+/// UTxO, so one `MsgAcquire..MsgRelease` session could answer from two ledger
+/// points — the UTxO set from the current tip and everything else from a
+/// snapshot up to one block older.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UtxoViewPoint {
+    /// The acquisition pinned the origin of the chain.
+    Origin,
+    /// The acquisition pinned a specific block.
+    Specific {
+        /// Slot number of the pinned block.
+        slot: u64,
+        /// Header hash of the pinned block.
+        hash: [u8; 32],
+    },
+}
 
-    /// Look up UTxOs by specific transaction inputs (tx_hash, output_index).
-    /// Default implementation returns empty — override if the store supports it.
-    fn utxos_by_tx_inputs(&self, _inputs: &[(Vec<u8>, u32)]) -> Vec<UtxoSnapshot> {
-        vec![]
+/// Serves UTxO lookups for an LSQ acquisition.
+///
+/// Every method takes the acquisition's pinned point and returns `None` when it
+/// cannot honour it — the caller turns that into a query error rather than
+/// silently answering from a different ledger point, which is the defect
+/// (#1068) this signature exists to make inexpressible. The point is a required
+/// parameter, not a defaulted one, so an implementation cannot quietly ignore
+/// it the way `_state: &NodeStateSnapshot` did.
+pub trait UtxoQueryProvider: Send + Sync {
+    /// Look up all UTxOs at a given address (raw address bytes), as of `at`.
+    fn utxos_at_address_bytes(
+        &self,
+        addr_bytes: &[u8],
+        at: &UtxoViewPoint,
+    ) -> Option<Vec<UtxoSnapshot>>;
+
+    /// Look up UTxOs by specific transaction inputs (tx_hash, output_index),
+    /// as of `at`. Default returns empty — override if the store supports it.
+    fn utxos_by_tx_inputs(
+        &self,
+        _inputs: &[(Vec<u8>, u32)],
+        _at: &UtxoViewPoint,
+    ) -> Option<Vec<UtxoSnapshot>> {
+        Some(vec![])
     }
 
-    /// Return the entire UTxO set (GetUTxOWhole).
-    /// Default implementation returns empty — override if the store supports it.
-    fn utxos_all(&self) -> Vec<UtxoSnapshot> {
-        vec![]
+    /// Return the entire UTxO set (GetUTxOWhole) as of `at`.
+    /// Default returns empty — override if the store supports it.
+    fn utxos_all(&self, _at: &UtxoViewPoint) -> Option<Vec<UtxoSnapshot>> {
+        Some(vec![])
     }
 }
 
