@@ -127,6 +127,131 @@ dugite-lsm (LSM-tree on-disk storage for UTxO-HD)
 - 28-byte hash types (DRep keys, pool voter keys, required signers) must be padded to 32 bytes via `Hash28::to_hash32_padded()` — do not use `Hash<32>::from()` directly on 28-byte hashes
 
 ## Current Focus
+
+### 2026-08-10 — mainnet Shelley→Mary is byte-exact; the endgame is a 40h sync
+
+**Epochs 208-273 vs cardano-streamer: 66 paired, 12,408 leaf comparisons,
+61 divergent — and ZERO of them are real dugite value divergences.** 50 are the
+ORACLE's own defect (#1077) and 11 are definitional. Report:
+`reports/mainnet-exactness/report-alonzo.json`.
+
+Getting there took eight defects, and **six were in the measuring apparatus,
+not the node.** That ratio is the finding of this wave.
+
+| stage | divergent |
+|---|---:|
+| start | 961 |
+| #1074 (ledger, CONSENSUS) | 376 |
+| 4 comparator defects | 311 |
+| 2 dump defects | 66 |
+| the last-boundary overwrite | **61** — 11 dugite's |
+
+**#1074 (CONSENSUS, mainnet-only) — a statement ORDER was the bug.** Upstream's
+`startStep` builds the pulser and its `FreeVars` — including `fvAddrsRew` — in
+ONE expression (PulsingReward.hs:89-212), so no pulse can precede the capture.
+dugite split that across two statements in `apply.rs` and ran them backwards, so
+the trigger block's FIRST pulse folded `ceil(N/8640)` queue-head credentials with
+`rupd_addrs_rew` still `None` — and the predicate `is_none_or` reads a missing
+set as "everyone is registered". A credential deregistered before epoch 233's
+mark was paid a member reward `rewardOnePoolMember` never creates; unregistered
+at apply, it went to TREASURY where Haskell leaves it in `deltaR2`, i.e.
+RESERVES. 70,698 / 163,916 / 62,209 lovelace, treasury high.
+
+*Invisible everywhere except mainnet*: `hardforkBabbageForgoRewardPrefilter`
+forgoes the prefilter at pv>=7, so permissive IS correct on devnet, preview and
+preprod. And the differential proptest ran `registered: |_| true, pv_major: 11`
+— `ctx.registered` had never once been consulted by any test in the tree.
+
+*Decomposing an atomic upstream expression creates a consensus surface with no
+upstream counterpart to check against.* No Haskell line says "capture before
+pulse"; the question cannot arise there. Test drives real `apply_block` calls —
+a unit test on either statement is green under the bug.
+
+**Three wrong diagnoses preceded the right one**, including two of mine, and the
+Allegra-fork alignment of the window is a COINCIDENCE (the window is that
+credential's deregistration and its exit from the GO snapshot). The independent
+Fable pass is what killed them.
+
+### The measuring apparatus, and why fixing it mattered
+
+Four comparator defects, all one shape: **a digest bypasses every rule above
+it.** The large-map/list branches hashed raw values, so relay canonicalisation
+never reached a map big enough to be digested; `EXCLUDED_SUFFIXES` was honoured
+only by `walk`; `_canon` rendered `0.0` where the other side wrote `0`; and a
+SCHEMA GAP (`rc = 2`) was unconditionally overwritten by a divergence
+(`rc = 1`), so a gap only ever surfaced when nothing else diverged — backwards,
+since a gap means a field was never compared at all.
+
+Two dump defects: `epochFees` reported a total the dump DRIVER accumulated
+rather than the ledger's `ssFee` (62 of 64 epochs "divergent", measuring
+nothing), and IPv6 relays were hex-dumped in wire form.
+
+**Clearing the noise is what EXPOSED #1078** — 726 pools differed only by relay
+spelling, so a real difference in that same field could never have been seen.
+
+**`dump-snapshot` overwrote each run's LAST boundary snapshot** with in-progress
+state, producing three false signals at once, one of which I filed as a ledger
+defect (#1079, retracted). Settled by running past the boundary: the same epoch
+then matches the oracle byte-for-byte.
+
+### Open, with mechanisms established
+
+- **#1071** — `nesRu` wire arms. Per-block pulsing IS done; what remains is
+  relocating `rewLikelihoods`/`rewLeaders` to the mark (ledger + SNAPSHOT), the
+  three encoder arms, and a LIVE transition-timing validation on a devnet seeded
+  with ~120 credentials. Not started: `tests/fixtures/nesru/README.md` is
+  explicit that emitting `Complete` where cardano-node emits `Pulsing` replaces
+  an honest gap with a confident wrong answer (#979).
+- **#1077** (oracle-side) — cardano-streamer's `sumRs` folds every `Set Reward`
+  element and never applies `filterRewards`, so its `totalDistributed`
+  over-counts at pv<=2. Window is exactly epochs 212-236 and the two diffs
+  cancel to zero in all 25. Fix: `sumRewards rewProtocolVersion`.
+- **#1081** — a dugite-written ImmutableDB is UNREADABLE by cardano-node.
+  cardano-node rolls chunks on a fixed 21600-slot range; dugite rolls one per
+  write-open (`next_chunk = current_epoch.max(last + 1)`, and on a
+  Mithril-bootstrapped DB the clamp always wins). Measured: imported chunks are
+  a uniform ~2 MB, dugite's are 235 MB / 146 MB / 59 MB. Isolated by pointing
+  the same binary at a clone of a genuine cardano-node DB, which reads fine.
+  Costs dugite too — recovery granularity is coupled to chunk size, and this DB
+  holds a 52 MB `.chunk.orphaned`.
+- **#1067/#1068/#1070/#1072/#1074** are fixed in-tree on
+  `worktree-nonmyopic-1067` and close on merge. **#1078/#1080 are CLOSED.**
+
+### Mainnet tip coverage — how to finish it
+
+`scripts/validation/mainnet-exactness-run.sh` is now the whole pipeline: wait →
+stop → clone → dugite replay → cstreamer replay → diff, each step skippable
+(`SKIP_WAIT/SKIP_STOP/SKIP_CLONE/SKIP_DUGITE`). Set `TARGET_EPOCH` to the tip.
+
+**The chain is cloned, not copied.** dugite's ChainDB reads cardano-node's
+chunk format natively, and the volume is APFS, so `cp -c` gives dugite an
+independent writable view for ~0 disk (measured: 13 GB cloned, free space
+unchanged). It must be a CLONE, not hardlinks — dugite's open path may
+reconcile the index or quarantine a chunk (#926-#929), and those repairs would
+land on the oracle's database.
+
+**Validated end to end already**: dugite replayed the cloned cn chain,
+6,547,320 blocks, Byron→Alonzo, in 27 minutes with zero read errors.
+
+**The 10.7.1 cardano-streamer port is NOT needed** — mainnet is PV11 and the
+already-validated 10.6.2 branch pins `cardano-ledger-conway 1.20.0.0`, whose
+released changelog bumps `ProtVerHigh ConwayEra` to 11. Parked at `d0ebc95`.
+The oracle binary is pinned at `oracle-bin/cstreamer-10.6.2` with its sha256,
+because both branches build to ghc-9.6.5 and share one dist-newstyle directory.
+
+**Still owed before the tip run can be trusted**: `conwayGov` schema
+reconciliation. dugite emits `drepDistr`/`proposals`/`enactedRoots` at top level;
+cardano-streamer nests a different set under `conwayGov`. Until they agree, ~140
+Conway epochs would compare VACUOUSLY and the final answer would be a false
+PASS. It needs real Conway oracle output to align against — the preprod shortcut
+for that is blocked by #1081.
+
+**Sync status**: cardano-node at epoch 313/648 (Alonzo), ~1.2 %/hour and
+decaying, so **40-45+ hours remain**. Measure the rate over hours before
+quoting an ETA; a single window is how "4.0 days" and "~11 hours" both got said
+in this campaign and both were wrong.
+
+### Superseded: the v2.8.0 release wave (2026-08-08)
 **v2.8.0 (2026-08-08) — the NonMyopic record becomes real, and the RUPD pulser
 grows up.**
 **RE-SYNC RELEASE: SNAPSHOT_VERSION 37 -> 38**, so existing DBs replay chunks on
