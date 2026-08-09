@@ -109,7 +109,57 @@ def _canon(v):
     return json.dumps(v, sort_keys=True, separators=(",", ":"), default=str)
 
 
-def summarise(obj):
+def digest_of_map(m: dict) -> dict:
+    """Reduce a flat `key -> scalar` map to `{count, sum, digest}`.
+
+    MUST stay byte-identical to `digest_of_map` in
+    `crates/dugite-node/src/main.rs` — dugite emits this form directly under
+    `DUGITE_DUMP_DIGEST=1`, and cardano-streamer emits the raw map, so the two
+    are only comparable if both reduce the same way.
+
+    Canonical form is deliberately NOT JSON: sorted by key, joined as
+    `key:value;`, values rendered bare. JSON would drag in key ordering, float
+    formatting and escaping — three ways for two implementations to disagree
+    about identical data.
+
+    `sum` is omitted (not zeroed) when any value is non-integer, because a zero
+    total would read as a real measurement.
+    """
+    h = hashlib.sha256()
+    total = 0
+    summable = True
+    for k in sorted(m):
+        v = m[k]
+        if isinstance(v, bool):
+            summable = False
+            rendered = str(v)
+        elif isinstance(v, int):
+            if summable:
+                total += v
+            rendered = str(v)
+        elif isinstance(v, str):
+            summable = False
+            rendered = v
+        else:
+            summable = False
+            rendered = json.dumps(v, sort_keys=True, separators=(",", ":"))
+        h.update(k.encode())
+        h.update(b":")
+        h.update(rendered.encode())
+        h.update(b";")
+    out = {"__count__": len(m), "__digest__": h.hexdigest()}
+    if summable:
+        out["__sum__"] = total
+    return out
+
+
+# Paths dugite may emit pre-digested. When one side is a digest record and the
+# other is the raw map, the raw side is reduced with the SAME function so the
+# comparison is digest-to-digest rather than silently skipped.
+DIGESTABLE_KEYS = {"stake", "delegations"}
+
+
+def summarise(obj, key=None):
     """Reduce one epoch's tree so two of them fit in memory at once.
 
     Mainnet dumps reach 416 MB per epoch — the mark/set/go snapshots carry one
@@ -124,6 +174,25 @@ def summarise(obj):
     epoch at a time.
     """
     if isinstance(obj, dict):
+        # Canonicalise relays HERE, before any digesting: poolParams is a large
+        # map and gets hashed, so a wrapper difference inside it would be baked
+        # into the digest and be undiagnosable from the summary.
+        r = canon_relay(obj)
+        if r is not None:
+            return r
+        # Already a digest record (dugite under DUGITE_DUMP_DIGEST=1) — pass
+        # it through untouched so it can be compared against the other side's.
+        if "__digest__" in obj:
+            return obj
+        # `stake` and `delegations` reduce with the SHARED digest, whatever
+        # their size, so a digest-mode dump and a raw dump are comparable.
+        # Using the generic JSON-based digest below for these would produce a
+        # different hash for identical data — a false divergence on 98% of the
+        # payload.
+        if key in DIGESTABLE_KEYS and all(
+            isinstance(v, (int, str)) and not isinstance(v, bool) for v in obj.values()
+        ):
+            return digest_of_map(obj)
         if len(obj) > LARGE_MAP_THRESHOLD:
             vals = list(obj.values())
             total = sum(vals) if all(isinstance(v, (int, float)) and not isinstance(v, bool)
@@ -138,7 +207,7 @@ def summarise(obj):
             if total is not None:
                 rec["__sum__"] = total
             return rec
-        return {k: summarise(v) for k, v in obj.items()}
+        return {k: summarise(v, k) for k, v in obj.items()}
     if isinstance(obj, list):
         if len(obj) > LARGE_MAP_THRESHOLD:
             h = hashlib.sha256()
@@ -166,6 +235,47 @@ class Result:
 
 
 _MISSING = object()
+
+
+# A pool relay is the same ledger datum on both sides, written two ways:
+#
+#   dugite     {"dnsName": "x", "port": 3001, "type": "SingleHostName"}
+#   cstreamer  {"single host name": {"dnsName": "x", "port": 3001}}
+#
+# Measured at mainnet epoch 210: 648 / 557 / 2 of each variant on BOTH sides,
+# an exact 1:1 correspondence — yet 726 of 737 pools compared as divergent
+# purely because of the wrapper. Left unnormalised this is a presentation
+# difference masquerading as a ledger difference, and worse, it would MASK a
+# real poolParams divergence behind noise that is already red.
+RELAY_VARIANTS = {
+    "single host address": "singlehostaddr",
+    "single host name": "singlehostname",
+    "multi host name": "multihostname",
+    "singlehostaddr": "singlehostaddr",
+    "singlehostaddress": "singlehostaddr",
+    "singlehostname": "singlehostname",
+    "multihostname": "multihostname",
+}
+
+
+def canon_relay(v):
+    """Map either side's relay spelling to one shape, or return None."""
+    if not isinstance(v, dict):
+        return None
+    # cstreamer: a single-key wrapper naming the variant.
+    if len(v) == 1:
+        (k, inner), = v.items()
+        tag = RELAY_VARIANTS.get(str(k).strip().lower())
+        if tag and isinstance(inner, dict):
+            return {"__relay__": tag, **{kk: inner[kk] for kk in sorted(inner)}}
+        return None
+    # dugite: flat, with a `type` discriminator.
+    if "type" in v:
+        tag = RELAY_VARIANTS.get(str(v["type"]).strip().lower())
+        if tag:
+            return {"__relay__": tag,
+                    **{kk: v[kk] for kk in sorted(v) if kk != "type"}}
+    return None
 
 
 def norm(v):
