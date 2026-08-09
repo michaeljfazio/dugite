@@ -76,3 +76,6 @@ dump-snapshot-*/
 epoch-dumps-*
 .claude/scheduled_tasks.lock
 target-replay/
+
+# Python bytecode from the validation scripts
+__pycache__/
