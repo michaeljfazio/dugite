@@ -484,3 +484,32 @@ What remains is positive confirmation that dugite's Shelley-era pots match a
 real Haskell node, which needs one cardano-node `debug log-epoch-state`. That
 is a confirmation step, not an open defect: the evidence now points to dugite
 being correct, and no code change is indicated.
+
+
+### LEDGER-STATE DUMP COMPARISON — COMPLETED, exact match
+
+`capture_pots` reads `NewEpochState[3][0]` (`ChainAccountState`) straight off
+the wire, bypassing cardano-cli entirely (which cannot render a 16 MB reply).
+Against the Prometheus gauges at the same epoch:
+
+```text
+ledger  treasury 470,492,171,438,566   reserves 12,318,321,699,924,314
+gauge   treasury 470,492,171,438,566   reserves 12,318,321,699,924,314
+        match: treasury=True           reserves=True
+```
+
+**Byte-identical.** So:
+
+* the "stale gauge" hypothesis is now formally dead — the metric IS ledger
+  state, and every pot number quoted in this document is a real ledger value,
+  not a reporting artefact;
+* the earlier identical 267/269 readings were, as suspected, two samples inside
+  one ledger epoch — confirmed rather than assumed;
+* this measurement was only possible after the LSQ ingress cap fix; before it,
+  the query failed with `IngressQueueOverrun` and no ledger-sourced value could
+  be obtained on mainnet at all.
+
+Remaining for full byte-exactness: the same two values from a cardano-node
+synced to the same point. That requires a mainnet cardano-node, which this
+machine does not have — it is a comparison against an external implementation,
+not a gap in dugite's instrumentation.
