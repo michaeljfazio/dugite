@@ -600,3 +600,95 @@ comparisons on the same corpus.
 
 dugite's side: genesis to 271, 5,851,768 blocks, ~7 minutes.
 cardano-streamer's side: a full Haskell ledger replay from genesis — hours.
+
+---
+
+## RESULT — the comparison ran, and it answers the question (2026-08-09)
+
+**64 epochs paired (208-271), 12,257 leaf comparisons.**
+`reports/mainnet-exactness/report.json`.
+
+### The original question is CLOSED: there is no 2.19e15 divergence
+
+At epoch 208 — the Byron->Shelley translation this whole document chased —
+dugite and cardano-streamer agree exactly:
+
+```text
+treasury    0
+reserves    13,888,022,852,926,644
+totalStake  31,111,977,147,073,356
+```
+
+and `treasury` / `reserves` remain byte-exact through **epoch 233**. Ten
+hypotheses were raised against a number that came from Koios back-projecting a
+Shelley-shaped model onto Byron epochs. The fork-time state was right all along.
+
+Also matching at every one of the 64 epochs: `epochNonce`, `snapshotEraName`,
+`activeStake`, every `protocolParams` field, every `deposits` field.
+
+### What it FOUND instead: #1074
+
+From epoch **234** the pots diverge and never recover. Both sides compute the
+identical `deltaT1` at every boundary, so subtracting it isolates the
+undistributed-reward remainder — and the difference is confined to THREE
+consecutive boundaries:
+
+| boundary | diff |
+|---|---:|
+| 233->234 | 70,698 |
+| 234->235 | 163,916 |
+| 235->236 | 62,277 |
+| 236->237 | -1 |
+| every other boundary 228-240 | **0** |
+
+~296,890 lovelace routed to TREASURY by dugite that cardano-node leaves in
+RESERVES. Epochs 234-236 are the last three Shelley epochs before Allegra
+(PV2 -> PV3 at 236).
+
+It then COMPOUNDS, because `deltaR1 = rho * reserves`: +70,698 at epoch 234
+becomes +198,194,096 by epoch 271, and is still growing.
+
+This is exactly the shape the bisection was built for. A single end-state
+number — the entire method before this — cannot distinguish a three-boundary
+misrouting that compounds from a per-epoch formula error, and those have
+completely different causes.
+
+### Two defects in the ORACLE, found by running it
+
+1. **cardano-streamer cannot cross the Byron->Shelley seam.**
+   `isFirstSlotOfNewEpoch` routed through `isTrueNextEnum`, which demands
+   contiguity (`succ prev == cur`). Byron's ledger state does not track epochs
+   and reports `EpochNo 0` for the whole era, so the first Shelley block moves
+   0 -> 208 and the check `error`s. It died after 14 minutes with ZERO epochs
+   dumped. Patched locally to "any forward move is a new epoch", leaving
+   `isTrueNextEnum` enforcing contiguity for the era check where it is real.
+
+2. **`--validate full` is the wrong default here** and costs hours.
+   `--validate re` reapplies: identical `LedgerState` for a valid block, and it
+   MATCHES dugite's own side, which replays with
+   `BlockValidationMode::ApplyOnly`. Full-validation-vs-apply-only would have
+   been the mismatch, not the rigour. Genesis->273 in **38.5 minutes**.
+
+### Version question, settled
+
+cardano-streamer implements no ledger rules; it links the same
+`ouroboros-consensus` + `cardano-ledger` cardano-node links. For HISTORICAL
+mainnet epochs any version that can sync mainnet must compute identical ledger
+state, or it would fork. So the 10.6.2 pin is sound for 208-271. It is NOT
+sound for Conway (507+), where `lehins/cardano-streamer` 10.7.1 would be
+needed — and note 10.7.1 does **not** carry the `dump-epoch-snapshots` command,
+which is a local addition on the disassembler fork.
+
+### This does NOT reach tip, and the blocker is volume
+
+Mainnet tip is ~epoch 648. Dump size grows with the credential count:
+10 MB at epoch 210, 161 MB at 250, **396 MB at 271**. At tip's ~1.3M
+credentials each epoch is several GB and the remaining ~377 epochs are 1-2 TB,
+against 200 GB free.
+
+The fix is not more disk: neither side should MATERIALISE the per-credential
+maps. The differ already reduces them to `{count, sum, sha256}` and still
+catches a one-lovelace change in a 37,819-entry map. Emitting that directly
+turns each epoch from GB into KB. That is the prerequisite for Alonzo, Babbage
+and Conway coverage — currently 3 of 7 eras are validated, and `conwayGov` has
+never been non-null in any comparison run.
