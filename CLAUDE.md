@@ -40,6 +40,32 @@ cargo build --release
 
 The storage layer is pure Rust with no system dependencies. cardano-lsm (used for the on-disk UTxO set) supports `--features io-uring` for async I/O on Linux.
 
+## Divergence Fixes — Non-Negotiable Process
+
+Any change made to address a divergence from cardano-node MUST be:
+
+1. **Grounded in canonical Haskell source.** Quote the IntersectMBO code that
+   defines the behaviour, with file and revision, so dugite implements it *the
+   way Haskell implements it* — not a change that merely produces the same
+   number.
+2. **Analysed INDEPENDENTLY by a separate agent on the FABLE model.** Not by
+   the context that found the divergence and already has a favourite
+   explanation. Hand it the EVIDENCE — the bisection, the amounts, the
+   boundaries — and the question, withholding the hypothesis so the analysis is
+   not anchored.
+
+**Never invent a change to satisfy a number.** A constant, a fudge, or a
+plausible rule chosen because it closes a gap is worse than the gap: it puts a
+fabricated value on a consensus path and makes the next investigation start
+from a false premise.
+
+The justification is measured, not theoretical. The mainnet treasury
+investigation raised **ten** hypotheses, nine about dugite's ledger, and every
+one was wrong; the tenth — that the ORACLE was wrong — was correct. Several of
+the nine would have produced a confident wrong change to a consensus path. And
+#1072's fix, written from a correct diagnosis, still introduced **two new
+consensus bugs three lines from the one it fixed**.
+
 ## Hard Requirements
 - **Zero warnings** — All code must compile with `RUSTFLAGS="-D warnings"`
 - **Clippy clean** — `cargo clippy --all-targets -- -D warnings` must pass
