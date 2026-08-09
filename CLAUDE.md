@@ -128,12 +128,22 @@ dugite-lsm (LSM-tree on-disk storage for UTxO-HD)
 
 ## Current Focus
 
-### 2026-08-10 — mainnet Shelley→Mary is byte-exact; the endgame is a 40h sync
+### 2026-08-10 — mainnet is byte-exact through ALONZO; the endgame is a 40h sync
 
-**Epochs 208-273 vs cardano-streamer: 66 paired, 12,408 leaf comparisons,
+**Epochs 208-316 vs cardano-streamer: 109 paired, 14,988 leaf comparisons,
 61 divergent — and ZERO of them are real dugite value divergences.** 50 are the
-ORACLE's own defect (#1077) and 11 are definitional. Report:
-`reports/mainnet-exactness/report-alonzo.json`.
+ORACLE's own defect (#1077) and 11 are definitional. Era coverage: Shelley 28,
+Allegra 15, Mary 39, **Alonzo 27**. Report:
+`reports/mainnet-exactness/report-208-316-alonzo.json`.
+
+Extending 273 → 316 added **43 epochs and zero new divergences**, on a FRESH
+dugite replay with the current binary — so the `epochFees`→`ssFee` and IPv6
+fixes were exercised end to end rather than assumed, and `treasury`, `reserves`,
+`totalStake`, `activeStake`, `epochFees`, both poolParams/poolDistribution
+digests and the rupdNext monetary terms are all 0-divergent across 109 epochs.
+The verdict is still exit 2 (SCHEMA GAP), not a pass, because `conwayGov`,
+`instantaneousRewards` and `rupdApplied` are uncompared — which is the whole
+point of having fixed the exit-code precedence.
 
 Getting there took eight defects, and **six were in the measuring apparatus,
 not the node.** That ratio is the finding of this wave.
