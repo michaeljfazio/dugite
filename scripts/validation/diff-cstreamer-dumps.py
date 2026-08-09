@@ -96,6 +96,14 @@ def era_applicable(top_key: str, era: str) -> bool:
 
 # Leaf paths deliberately not compared, each with a stated reason. Anything NOT
 # listed here IS compared — there is no silent skip.
+#
+# Honoured in TWO places, and both are needed: `walk` skips them on the
+# leaf-comparison path, and `summarise` drops them before anything is digested.
+# Only `walk` did, so an excluded field still went into every digest — and
+# `poolDistribution` is 734 entries, over LARGE_MAP_THRESHOLD, so it is always
+# digested. Result: 62 epochs reported divergent because 178 pools' display-only
+# `stakePercent` differed in its last ULP (0.05076962733815808 vs
+# 0.050769627338158076), the exact thing the exclusion exists to ignore.
 EXCLUDED_SUFFIXES = {
     # Display-only float, derived from stakeLovelace, which IS compared. Two
     # correct implementations can differ in its last bit for no ledger reason.
@@ -239,7 +247,8 @@ def summarise(obj, key=None):
             if total is not None:
                 rec["__sum__"] = total
             return rec
-        return {k: summarise(v, k) for k, v in obj.items()}
+        return {k: summarise(v, k) for k, v in obj.items()
+                if k not in EXCLUDED_SUFFIXES}
     if isinstance(obj, list):
         if len(obj) > LARGE_MAP_THRESHOLD:
             h = hashlib.sha256()

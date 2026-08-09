@@ -1,0 +1,4685 @@
+{
+  "dugite_epochs": 271,
+  "cstreamer_epochs": 66,
+  "paired": 64,
+  "byron_oracle_silent": 207,
+  "leaf_comparisons": 12287,
+  "match": {
+    "activeStake": 64,
+    "deposits.dRep": 64,
+    "deposits.pool": 63,
+    "deposits.proposal": 64,
+    "deposits.stakeKey": 63,
+    "deposits.total": 63,
+    "epoch": 64,
+    "epochFees": 2,
+    "epochNonce": 64,
+    "expectedBlocks": 62,
+    "protocolParams.a0": 64,
+    "protocolParams.d": 64,
+    "protocolParams.minPoolCost": 64,
+    "protocolParams.nOpt": 64,
+    "protocolParams.protocolVersion.major": 64,
+    "protocolParams.protocolVersion.minor": 64,
+    "protocolParams.rho": 64,
+    "protocolParams.tau": 64,
+    "reserves": 64,
+    "snapshotEraName": 64,
+    "snapshots.go.delegations.__count__": 64,
+    "snapshots.go.delegations.__digest__": 64,
+    "snapshots.go.delegations.__sum__": 3,
+    "snapshots.go.name": 64,
+    "snapshots.go.stake.__count__": 64,
+    "snapshots.go.stake.__digest__": 64,
+    "snapshots.go.stake.__sum__": 64,
+    "snapshots.mark.delegations.__count__": 64,
+    "snapshots.mark.delegations.__digest__": 64,
+    "snapshots.mark.delegations.__sum__": 1,
+    "snapshots.mark.name": 64,
+    "snapshots.mark.stake.__count__": 64,
+    "snapshots.mark.stake.__digest__": 64,
+    "snapshots.mark.stake.__sum__": 64,
+    "totalPools": 64,
+    "totalStake": 64,
+    "treasury": 64,
+    "snapshots.mark.poolParams.__count__": 63,
+    "snapshots.mark.poolParams.__digest__": 1,
+    "snapshots.set.delegations.__count__": 63,
+    "snapshots.set.delegations.__digest__": 63,
+    "snapshots.set.delegations.__sum__": 1,
+    "snapshots.set.name": 63,
+    "snapshots.set.stake.__count__": 63,
+    "snapshots.set.stake.__digest__": 63,
+    "snapshots.set.stake.__sum__": 63,
+    "eta": 58,
+    "poolDistribution.__count__": 62,
+    "poolDistribution.__digest__": 62,
+    "rupdNext.deltaR1": 62,
+    "rupdNext.deltaR2": 36,
+    "rupdNext.deltaT1": 62,
+    "rupdNext.rPot": 62,
+    "rupdNext.rewardPot": 62,
+    "rupdNext.totalDistributed": 36,
+    "snapshots.set.poolParams.__count__": 62,
+    "snapshots.set.poolParams.__digest__": 1,
+    "snapshots.go.poolParams.__count__": 61,
+    "snapshots.go.poolParams.__digest__": 1,
+    "snapshots.go.blocks.00000036d515e12e18cd3c88c74f09a67984c2c279a5296aa96efe89": 21,
+    "snapshots.go.blocks.000000f66e28b0f18aef20555f4c4954234e3270dfbbdcc13f54e799": 21,
+    "snapshots.go.blocks.00000110093effbf3ce788aebd3e7506b80322bd3995ad432e61fad5": 21,
+    "snapshots.go.blocks.000001b844f4e4c900ae0dfdc84a8845f71090b82fb473e6c70a31ee": 21,
+    "snapshots.go.blocks.000001eeedc50bb34888dcee3f8b4679ff575408846406d1370c0e8c": 8,
+    "snapshots.go.blocks.00000368a25a58d3c46bea611ddabf77679b8d1fd854c75a41ea399c": 11,
+    "snapshots.go.blocks.00000aedaa1a5abf500cbc4c5c23761a2dff570bc4a299983c893f8e": 21,
+    "snapshots.go.blocks.00004614332ac81201d8302d4cb8262502af229256e143dc2156156e": 21,
+    "snapshots.go.blocks.0000fc522cea692e3e714b392d90cec75e4b87542c5f9638bf9a363a": 21,
+    "snapshots.go.blocks.0001a003afb844ce6d9409fc49e049db654a78dc77f1151cb6cd548f": 21,
+    "snapshots.go.blocks.0014cda8c1c48b64d542ae26e8b65d9e1953c0d5562ee620d6900f4c": 21,
+    "snapshots.go.blocks.0019cb5ac91c786a809f4d87622a29d2c7f57f4697f8c8e8457f4de4": 21,
+    "snapshots.go.blocks.00beef0a9be2f6d897ed24a613cf547bb20cd282a04edfc53d477114": 21,
+    "snapshots.go.blocks.00beef284975ef87856c1343f6bf50172253177fdebc756524d43fc1": 21,
+    "snapshots.go.blocks.00beef8710427e328a29555283c74b202b40bec9a62630a9f03b1e18": 21,
+    "snapshots.go.blocks.00beef9385526062d41cd7293746048c6a9a13ab8b591920cf40c706": 21,
+    "snapshots.go.blocks.01df29429173d263c7533a22742dae19f16a08798b7a57873c34cf58": 10,
+    "snapshots.go.blocks.03ba735795ea8294bccd63efd305168ac8367e9d6fd5f0a6225e12b0": 21,
+    "snapshots.go.blocks.03f79dedaead96339d36df69158116e83208b938afb5fcd0a30e5b5c": 21,
+    "snapshots.go.blocks.04c60c78417132a195cbb74975346462410f72612952a7c4ade7e438": 21,
+    "snapshots.go.blocks.06b4d54e25e33f3adfa22098749005f7b610721e3c24d547450267ec": 21,
+    "snapshots.go.blocks.0960deeaabd7ca77a970e2932d06ec594c902301973041c6d9b1dc2e": 21,
+    "snapshots.go.blocks.09612bc8cf646ded39886839e962d050fb53b81fbe3487eed973554b": 21,
+    "snapshots.go.blocks.0b38a13726b9dc3aa11be08af93003e775d9d62091765e0e1e3d027b": 21,
+    "snapshots.go.blocks.0c2e0c5a062389a3fd6fafddae26344d490866d7a34cad981b20f96b": 21,
+    "snapshots.go.blocks.0d1a3b53c2ea10985096a337585f77b9f5814b487ca3debca3680be9": 6,
+    "snapshots.go.blocks.0e95ebdf3855fba77340fc7dec46ecaee4d569deffde6239591227cd": 10,
+    "snapshots.go.blocks.0ec6869e13bb1f39c8be3611e7cc00ba1ec2a22d7e4b197cec9aa2e3": 21,
+    "snapshots.go.blocks.0f292fcaa02b8b2f9b3c8f9fd8e0bb21abedb692a6d5058df3ef2735": 21,
+    "snapshots.go.blocks.1408010df5450238cd9e626c7fb711e25e6fcb072256d8002630024c": 9,
+    "snapshots.go.blocks.153806dbcd134ddee69a8c5204e38ac80448f62342f8c23cfe4b7edf": 21,
+    "snapshots.go.blocks.15f99adf570f4150897548f9eb3aecc186f0bbb6ecc6231351ec9282": 2,
+    "snapshots.go.blocks.17a6a1f2fb36d9ef275805db17409af7ab753b9d27bdd41b89510bb9": 21,
+    "snapshots.go.blocks.19cb138eab81d3559e70094df2b6cb1742bf275e920300d5c3972253": 19,
+    "snapshots.go.blocks.1b268f4cba3faa7e36d8a0cc4adca2096fb856119412ee7330f692b5": 21,
+    "snapshots.go.blocks.1b5f8eb4c3de5274fca5cab708ac8b100feaed5db8fbdc9923b8663d": 13,
+    "snapshots.go.blocks.1cb5d0e006c33ace982a527d4140bc086f99f7d35c27c5ab29600a74": 21,
+    "snapshots.go.blocks.1d8988c2057d6efd6a094e468840a51942ab03b5b69b07a2bca71b53": 21,
+    "snapshots.go.blocks.1e255b3a33c852170f5052c48044d1cedd5a4caea1dfa8c8a7bc4e38": 21,
+    "snapshots.go.blocks.1edd8fef3c5e1adf25f0b2f1963bbacbba1b9b2246416a5f0983981b": 9,
+    "snapshots.go.blocks.20b95f87c93f3be9e5094c8fbdb924f9ab8b5e1c7bfb542d3a8bc7fc": 20,
+    "snapshots.go.blocks.21ae98f98fa835820d27ed51aa9a1b6642e4516a161e0c038097c37a": 21,
+    "snapshots.go.blocks.2523d71a1bd6376804e0bace048289a63455eb6340db81e616a11f9c": 15,
+    "snapshots.go.blocks.288ecda1ab853f05d8e2a7f07da051e9e5742218824b82219c13d8be": 21,
+    "snapshots.go.blocks.291173f43cc28027f0b61d5d22825189aeef3e7e128fa37fef46beb4": 5,
+    "snapshots.go.blocks.2b830258888a09e846b63474c642ad4e18aecd08dafb1f2a4d653e80": 20,
+    "snapshots.go.blocks.2cc6046dce11cdc2c4bcf8616e588a002828e99592e6ec434500fc62": 21,
+    "snapshots.go.blocks.2d10d9ee5a86c5cedb75cacd033a2945cfd80315eb978858244cec1c": 21,
+    "snapshots.go.blocks.2e65f9aa580a28d0df07dd2773c09da9604c40127b158919da9db85d": 21,
+    "snapshots.go.blocks.2eac123f4a385bfdbc01cb6139cf0b1f2643470c5bf88efc72af55b3": 19,
+    "snapshots.go.blocks.2f09336a66c36d0df40dc42f2454fe4f4311c23d312e3683be434081": 21,
+    "snapshots.go.blocks.2f73a35c508608125faf8404c2bcce942ea7dcd9c1a41c009385d3d7": 19,
+    "snapshots.go.blocks.30c6319d1f680470c8d2d48f8d44fd2848fa9b8cd6ac944d4dfc0c54": 21,
+    "snapshots.go.blocks.31af0509d4376a8a55b40e952aea7f009c13cadf0338c57512ff42e9": 21,
+    "snapshots.go.blocks.31f92814e82bdb8bb8f6673dc3c8535b6faa6b91f692cf0d9a564f59": 21,
+    "snapshots.go.blocks.32ae538b59a19834504e8b22dff0f703572d7ee1d0e2ea233e1b300c": 21,
+    "snapshots.go.blocks.32de28d12fdc3465d06783aeb6a8d826c0665aaad9d36a00e99b8f79": 6,
+    "snapshots.go.blocks.3525f31818cd5161d6bea81e8c437caf9c904965dda0c53a27e48224": 1,
+    "snapshots.go.blocks.35df6cdd839eabd135a1fa53a42498c1f58960728685f14d386da29d": 4,
+    "snapshots.go.blocks.380aae10d12fa3c8817aaccc9387dc850e87588b1cdf88e5aae94b0a": 2,
+    "snapshots.go.blocks.39654d8b4eebd091f6ce64d4be8fc05c5e50187b821b9a334076ce55": 21,
+    "snapshots.go.blocks.398964318c3664acd3a17d6d0f29a74b6d9a8200cde2f875629906b9": 18,
+    "snapshots.go.blocks.3a8bcab8c27ddbd5c30f8604d78e31d29c6b1d40f827893a9681bd34": 16,
+    "snapshots.go.blocks.3b0a33f53dfde8ffd7f05e16aeb9b888a019b383c43cbad26c517985": 21,
+    "snapshots.go.blocks.3bc296e50585d6de57d7c49ae55b06b8bc3d04519705991f766c98b9": 19,
+    "snapshots.go.blocks.3c647453fb1929284f9dd6dd495dcdee1d7b0e604851da958f0234e9": 5,
+    "snapshots.go.blocks.3dec052cf085697aa6c32a934527f7c5761165a6a6f02a9af30c9ed1": 13,
+    "snapshots.go.blocks.4044aa415dec3609dcab41faa19b643719b9521ef16eb35945a64bd9": 17,
+    "snapshots.go.blocks.4194112bdb4702d01263a5614f48790e23351c867bbe67ca840dbb4a": 19,
+    "snapshots.go.blocks.42c3740db23c3fc36cb9f63aa8070ec01417b4d22893463c8c8a21d4": 21,
+    "snapshots.go.blocks.43a7cf27c04747c306e744e3c51c01bb01c64e5a8e7e46c46f9cdbdc": 21,
+    "snapshots.go.blocks.4511bcca3896bcb6d43b66fb89fe079f00f44bed505c9ca232704dc9": 21,
+    "snapshots.go.blocks.452cf4da07afbac289bd221f4bae723b8cfedfd2dcdce07d7a88e4d1": 9,
+    "snapshots.go.blocks.463e481957f266d93e4decbfb73003380ab17223e0e569f71c7a525a": 21,
+    "snapshots.go.blocks.4690a6bcbfc9eedd4d8595c9d665cd9b8ebe3e6d82ebf0120d7bc7c5": 17,
+    "snapshots.go.blocks.46ebbc0d27d9169cae12d12dcf8f6cacbcf27937c67ae4350abbcaba": 11,
+    "snapshots.go.blocks.472314c0412e6cf715366ad460cc3560a6c6314cbd9787b481e9d23a": 13,
+    "snapshots.go.blocks.4a2aa209e00f2926bd0d8a286592bbdea4d35a593c05d41efe29e642": 21,
+    "snapshots.go.blocks.4f58313318902985e56ee0d63c1b3e8d71e17efa7a6add2bacd746ba": 5,
+    "snapshots.go.blocks.5271fc86fd9c25613c138c4aef6f8593b2952c95897b079facebbc9e": 21,
+    "snapshots.go.blocks.52e22df52e90370f639c99f5c760f0cd67d7f871cd0d0764fae47cd9": 21,
+    "snapshots.go.blocks.53215c471b7ac752e3ddf8f2c4c1e6ed111857bfaa675d5e31ce8bce": 21,
+    "snapshots.go.blocks.54f5f2618a3da4bb0b384895d8f3922189acbb8e9637201ebb26bc18": 19,
+    "snapshots.go.blocks.557fb2fa1a4d61d5ffc613f9f1211a5b22f5c2c3244589adc3168f3d": 7,
+    "snapshots.go.blocks.5606dd286691c8323217da1d630bbee6e3cbf48173659cfca7fcec9a": 8,
+    "snapshots.go.blocks.56b76df4f3653a6faf62f6f6838045cf9f3dde69a1eee353de526ee4": 21,
+    "snapshots.go.blocks.56f78c5478524496790461eefd4d9380f71dfb231358736902648dfe": 21,
+    "snapshots.go.blocks.5b7dc17e844b627768ea06bb09d9b70927f748fc5d933b79f3e4266c": 1,
+    "snapshots.go.blocks.5bb951ce3ad7ab55800546b43e1223caf3a3d542f4e7bab08f0525d0": 21,
+    "snapshots.go.blocks.60397646d7d1ad6fe2ddccfe7efc9cba61f6d3d94d29e8f41de73240": 21,
+    "snapshots.go.blocks.60ce4c69b0afae24a006e1562335c2ce8c75272b03430f319bc37acd": 10,
+    "snapshots.go.blocks.6184f6e7229530a2d1f9f746112406100e2696dd7439ff8c52750700": 21,
+    "snapshots.go.blocks.618ab17ec8ea7239b4ac0c826b667c599489e25524ce74841a29d510": 21,
+    "snapshots.go.blocks.6198d2070b6e70cc2a5e370a43dd49699960c88a084ffe390abe9a6a": 21,
+    "snapshots.go.blocks.64e09628015d1065e4a11f032c90f677ba1f2f583ff0f55a158450b0": 21,
+    "snapshots.go.blocks.657adbe7f383bbe0b98a9ca74b9ebd5b9e7dff1e2ffeacbbeab20d76": 1,
+    "snapshots.go.blocks.65ea43eab7c0143d6bb68f9d56c276bce09377bdc41e1a42ac9535ed": 21,
+    "snapshots.go.blocks.660f20fb9d419173ac623786ad3e6dc11a23951981e0e83e98233d29": 21,
+    "snapshots.go.blocks.66b6d414db2f4ef941ef11a91c6a7d461d4dbf65f3e7baec950d87f2": 21,
+    "snapshots.go.blocks.675304517e38e66880714b3c4816f47866c302edafceb96945fd056f": 21,
+    "snapshots.go.blocks.6828e4b3d046a3a1c9bbd8aea022031790a32748e07ff29675ce69bb": 7,
+    "snapshots.go.blocks.693cb17b244a81dfaa589c2a076ea604e35462a3915a28d6c98685c9": 19,
+    "snapshots.go.blocks.69ac9f5a2074c2809809264e42c996f7d991c5363b41ec55a1164442": 21,
+    "snapshots.go.blocks.6a51e46b9a63215eb3de48d29a2542cc853dcb6c5e5d730888a5e21a": 21,
+    "snapshots.go.blocks.6b5180a258275c671690c94c704f074190e90ea900ed565b4c29abe8": 21,
+    "snapshots.go.blocks.6b6164af70861c5537cc9c8e50fdae35139ca2c8c6fbb42e8b7e6bfb": 12,
+    "snapshots.go.blocks.6e67b485616dc8a604e02a96b1efbf4c6c49919eea39c6805901e2df": 9,
+    "snapshots.go.blocks.6ec027701fa6c9f4a593f7e7108cb2f5af54361080f7bed1c835349d": 21,
+    "snapshots.go.blocks.7095ee942c6aa5d594f08fa9f377b2f00c4abe96dd58209e2e9d18b7": 20,
+    "snapshots.go.blocks.71375058d06033230275fd28428bcf3eec6c47404654706583605f4d": 4,
+    "snapshots.go.blocks.71a659c3e71b0ddd0cf9a67bdb3f7fd656934c4a995801ee0ea4c482": 21,
+    "snapshots.go.blocks.71efddeabf5dd8211853a5ed30548391ccb54fa3b55e5828db9afee6": 21,
+    "snapshots.go.blocks.738f01580da6cdd97e844fb104a62f87296545056d955985d6604e36": 16,
+    "snapshots.go.blocks.75edaff5db48aa20512e3891747c2a8d68a44f65122142cc1d4dc393": 21,
+    "snapshots.go.blocks.767f8ab17702eccc2559af5a2e95f30e83e67b156eedb4d35e744c3f": 21,
+    "snapshots.go.blocks.76bfa1b2e6593740c3388ed881cbe851dbab8d8741652c9bad16cc94": 21,
+    "snapshots.go.blocks.77b0a93c26ac65be36e9a9f220f9a43cbc57d705fc5d8f1de5fdeea1": 21,
+    "snapshots.go.blocks.78380abbe8bb86cddda2c79190294125c594630e9535d32907b99f89": 21,
+    "snapshots.go.blocks.7862852ab4afc9ecf783ff074760ad2f3bf52669713ddd67d6794512": 16,
+    "snapshots.go.blocks.79c4d4fe108f480fee98f307adac12571df2959651f833b595141cd1": 21,
+    "snapshots.go.blocks.7b5d25dfd9825d4461f1d339afeb109b27acfc1d33db1b5cebd50662": 21,
+    "snapshots.go.blocks.7bb4d04389fdc7816d9fcd3aec5c585e61635b31c65fd9ee6c175535": 12,
+    "snapshots.go.blocks.7ca6f74bf72922e511003d78affd9f999228ff1543e1007f610c5d12": 21,
+    "snapshots.go.blocks.7e3a1ed8f2085923debacc6866aefaba941edd638ff0886061ebf521": 21,
+    "snapshots.go.blocks.7e53c234d29f6037c5e5f82dfdc8a6edf816cc406d0a3a3412cdeab7": 21,
+    "snapshots.go.blocks.80790f58f82501881d46bbb4f6b9d6536ac1a60fdd18350a0b7d50b0": 21,
+    "snapshots.go.blocks.83b259c187f8b88eda564b1f56ce2786360a9dc224f737fcdd8703c1": 21,
+    "snapshots.go.blocks.83f09b0af923a095a1c17905e802a35d1044f974b25d2a755a2d8266": 21,
+    "snapshots.go.blocks.844540411ea37a35689620b02570eec2a0e403c1207c92c1b7a4dfa0": 21,
+    "snapshots.go.blocks.849e1f8a602ce6de1827577a7c0f174e564f58581900ddcf47d3ccc7": 21,
+    "snapshots.go.blocks.86c8a19e4d6227da12d7c9c63c5fd7a83bf227a92089778f7d9ec0f9": 21,
+    "snapshots.go.blocks.87021d7881cff6817040033a3c6b0246d11421c198e69195e60a7000": 21,
+    "snapshots.go.blocks.881e3af880ac65f96cbf9b85d3f054f72aa7bb9c77fe365bbf36f4c7": 20,
+    "snapshots.go.blocks.88cc73feada202ed17343e969c373c16cda4a8902d02094ff3dfc438": 21,
+    "snapshots.go.blocks.89af15a1c2b8e379aa8ca6d4d9b0134e373122f84f6f45fac2e26c47": 21,
+    "snapshots.go.blocks.89eba2781e5cd11ccda6be56503702a39e9941e522f04cd5bba22957": 21,
+    "snapshots.go.blocks.8bd3e5cffcd9b34270500003723df8efce4e22f436b4244c55388042": 17,
+    "snapshots.go.blocks.8ceb2138f5f4201fff0232262ef99601dfb384ded858e9c00bb908af": 14,
+    "snapshots.go.blocks.8fdf253d44c9817d7dfd72f392a234aaab546d22cbcbc5984f84fc1f": 20,
+    "snapshots.go.blocks.9138b6f09e8e69c29fdee4e11b147b7ad351aab23fc73a9976907f10": 17,
+    "snapshots.go.blocks.91ab082852ea331c39eebae35a3e2a390ea26423d82a91c72a02fb85": 21,
+    "snapshots.go.blocks.921dc3fc11681ad9ccde08c9bc23041808f4b7e8ba231be557db8ab5": 20,
+    "snapshots.go.blocks.92a868fd1c016880bd6b3cd0a9ba291173d5075d3959b4252d76aef1": 21,
+    "snapshots.go.blocks.9429e7fed8869710ba128e5bd788558ef1446caa577341b4d84ccf54": 19,
+    "snapshots.go.blocks.94864d27407c1dd0569e4acb9c7fa6ec2cc19a6193d9171f2d811232": 21,
+    "snapshots.go.blocks.95954fa839905a201d8d97cc31be8bbd4ac2ad0df1d201accce3a23e": 10,
+    "snapshots.go.blocks.95c4956f7a137f7fe9c72f2e831e6038744b6307d00143b2447e6443": 21,
+    "snapshots.go.blocks.95ef4e541a1e89b38ffefe125060ff441b03c0d77dbfaff656bd1d64": 7,
+    "snapshots.go.blocks.9679eaa0fa242a9cdae4b030e714b66c0119fc9b3f7564b8f03a5316": 21,
+    "snapshots.go.blocks.96d4a78a1459a66cea6b396fd92f7abba092bd59535d21ad3c0463c7": 14,
+    "snapshots.go.blocks.991a64a6e3d866f4af4e0a2bfd61c15486a47ccc352e61e8a6b4fef8": 13,
+    "snapshots.go.blocks.9cf0db42fb01262647f968ff3ece9550323c26b73988d9489fb21e6e": 21,
+    "snapshots.go.blocks.9dff03e4b074c90bfda895a76e56611e7a67fa9373feb1db63e8ef57": 21,
+    "snapshots.go.blocks.9f1bd8718fffe41cbd70761991819fbbd9552b4c44c30e1a6fc96766": 21,
+    "snapshots.go.blocks.9ffd5ceefaf338459f086690ebca63c2cc81841f1b4429cabf8fef49": 21,
+    "snapshots.go.blocks.a0bfabd15a1e0278e97af96a2b5369183e1aad8301fc6fcd771750e9": 6,
+    "snapshots.go.blocks.a10865dae2d543ee9f13e98bff70ea81565bb6e4343b15b765f78174": 21,
+    "snapshots.go.blocks.a3ee9595fc779621978c97960b4835e14fd2dfea7fff28ccb977b56b": 15,
+    "snapshots.go.blocks.a531c8c1fa9423ffa6eff3262c87ab4f18b8c290f71df6aca310a947": 21,
+    "snapshots.go.blocks.a631b46315b1567ef0ce2b2ad4cb63faac09f32ceba6716a7e331e5e": 21,
+    "snapshots.go.blocks.a6d947298c4b1560fec35d5e4f93e46378d653a60526476bf38b1e8b": 21,
+    "snapshots.go.blocks.a8388b565c279b0a291f05f8cc926b1ec43d137d83892bc8b6a46d10": 6,
+    "snapshots.go.blocks.aa3d1049e013e84d811e684b63378790fdce0b7a16a71938c1602164": 14,
+    "snapshots.go.blocks.ab93ac9ffaabacb840a98bd7216e8bb9f87a33f88c315e7dc7f2d20b": 10,
+    "snapshots.go.blocks.abcdef77d812a5a397fb324f1d00325e2243c476ea8ecd2030719ae5": 21,
+    "snapshots.go.blocks.ad7672d51077091866aff6fb43f9f3b75d427c961f6de8a135b07219": 18,
+    "snapshots.go.blocks.ad91e2a62ca7c09606995819b26b65b70419b4ef7531fad403f9d61e": 16,
+    "snapshots.go.blocks.aef742cd720083790f58b8dced44b868e2496335061c2c5256b44e45": 21,
+    "snapshots.go.blocks.af22f95915a19cd57adb14c558dcc4a175f60c6193dc23b8bd2d8beb": 21,
+    "snapshots.go.blocks.b0c53bbb91bd03c5417c87c7488a83de68f5ea27aefb886c9fc4ff27": 21,
+    "snapshots.go.blocks.b2f23eb98a5189d3eaab04885081495ef815fd08239605c43eeb7264": 14,
+    "snapshots.go.blocks.b31af8dc07b05f799805f82853f69dd8d9de48bb89f4371bc46f5cc9": 16,
+    "snapshots.go.blocks.b3cc3005f1dccbc88230eb66d6e99c2f1bfa32273044473e17d9e10b": 21,
+    "snapshots.go.blocks.b59366e330a6db8260ad9aae8446ba8c908931d1b9cb3cca5d1d84aa": 21,
+    "snapshots.go.blocks.b62ecc8ce7e46c4443b63b91fffaeb19f869d191a7d2381087aaa768": 21,
+    "snapshots.go.blocks.b6ad3e6e873a7654e68bdfe5922c86d506cd5e9299fbc3aaab3e84bd": 15,
+    "snapshots.go.blocks.b9e907a4fab56f0c640d08cafd34f929593a901cae5cd5475d97cc17": 1,
+    "snapshots.go.blocks.bb224ee756ce73c513d9e43323560e6ab644db83fb57eff613503953": 8,
+    "snapshots.go.blocks.bbbe8bd9d3942563c7cf02e2d605516fb8376e3a49689d9b028cc2ab": 21,
+    "snapshots.go.blocks.bbe49b11205f94561ae03cda64a7009aba995c42fb819c0d90e251ca": 4,
+    "snapshots.go.blocks.bbe8aaed7d10e53102f4cd78fd3e504d8ff0c0009243da208893b970": 21,
+    "snapshots.go.blocks.bbfb301cad22e7a62f6fea6e3c93aec4e6f714aef66b0a828e792f12": 20,
+    "snapshots.go.blocks.bc00a90f9f448be5cfaa4e76dbc13353b83b59cb3f2c5e321555ca28": 21,
+    "snapshots.go.blocks.bcd7cf751b59f949170a7e6599f9ac03e49b32c19f3f1d8dad3ac210": 21,
+    "snapshots.go.blocks.bd8286b7f327621459728c0cd1f7a731eaf7b2fd0df1c6b09b2932a5": 21,
+    "snapshots.go.blocks.bdd750e173f3d606c1af13b8661da7c0b5fa43121741c593cceec822": 21,
+    "snapshots.go.blocks.be1078775557de6c9116130289c6099520a267820ba1eebd040909e4": 16,
+    "snapshots.go.blocks.bee1c394dc9670ccaf70d1d73566e9d83c40311fd1a09f1742ab0bcb": 8,
+    "snapshots.go.blocks.c08e14eb91d967a8541f2cc686d106aac49f8ea57608fc70949d561e": 21,
+    "snapshots.go.blocks.c0907ec5088c7bc95ad8495c398ce24d4002826f18ed77d79b1a34fb": 21,
+    "snapshots.go.blocks.c0c231446dc398936f0f85506072f10641b861ce5012c0fcb1051442": 21,
+    "snapshots.go.blocks.c132bb4962a7c9a55c7cb0d5dc11cf59cc54e0537fece7e717a1b4e9": 9,
+    "snapshots.go.blocks.c1cadab46b74defa9f79b59b617fe2a50bdbce6b367e472b6109a7bc": 21,
+    "snapshots.go.blocks.c2c52eab0d713209b337d8ff8fe28e1ccae2f70eb7ed1ee27e8c866a": 21,
+    "snapshots.go.blocks.c3798f717a40ee027583dee28161a9a812d84ade635d8310b878e892": 21,
+    "snapshots.go.blocks.c4a4b16b33b63da2117f4a84d3ea686f34fcf9f4603ce016af9e39aa": 21,
+    "snapshots.go.blocks.c548ffb862e41fec46a1254cf8cb8203bb138b6c6bd78f7db4b87de0": 11,
+    "snapshots.go.blocks.c63dab6d780a74cbae2a27696c9723f55b3092b2bd001256df03827f": 20,
+    "snapshots.go.blocks.c73186434c6fc6676bd67304d34518fc6fd7d5eaddaf78641b1e7dcf": 21,
+    "snapshots.go.blocks.c922da2949ca73c3300326dc5f9dc4cb39cf6c855ab8256dffdb9289": 4,
+    "snapshots.go.blocks.ca6475b755a0a31d8cf77b9d42520ff8b5274bd9a5712aed95ac14ad": 5,
+    "snapshots.go.blocks.cad3d1c69faad3a6777143009a367d07bf960a2a621d50bdf215bc0f": 21,
+    "snapshots.go.blocks.cbd910f09f2c4f4804eeed10003da6dc8be4970950eaec93b7d76fc6": 3,
+    "snapshots.go.blocks.cc1008a2bff95e4fa408a8d8d4adfac342120307e0fb3c713fce8834": 7,
+    "snapshots.go.blocks.cd29aa2b5003b8833a7bcf36b2fef2a4b96b7d07632249dbd432cac8": 21,
+    "snapshots.go.blocks.cdae4a1a08974113e77ea332cb1da97d9e3fca5cf797f9394739214b": 21,
+    "snapshots.go.blocks.cdb10209d937fc1559c635e35b9147febde5307b4a7d276f868775cd": 21,
+    "snapshots.go.blocks.ce19882fd62e79faa113fcaef93950a4f0a5913b20a0689911b6f62d": 21,
+    "snapshots.go.blocks.cfff13497008842ab170eae18ecf43be7eb4fa51bdd503821ddaaf19": 21,
+    "snapshots.go.blocks.d01a7310556c271450466996c1aa91e1e41278d89d78b2b0aae214f4": 21,
+    "snapshots.go.blocks.d248ded3c18e0e80d07a46f00a2d808075b989ccb1a0e40a76e5cee1": 21,
+    "snapshots.go.blocks.d2f12c2f3094ed0784f048fe93a62d8b061525b356e043be084470d9": 21,
+    "snapshots.go.blocks.d34d33e345f006058bf136745a2c6b6e557621cf02dbaa29e71f3a0f": 7,
+    "snapshots.go.blocks.d4b5b8d5c83e97b2cd90a0fd818f3c9d8e7388bcc7706327a92d2092": 10,
+    "snapshots.go.blocks.d5b90a198d2411b5c82fbdfee5f94b86de49a8589bfa7720b9de358f": 21,
+    "snapshots.go.blocks.d69b6b16c6a135c4157365ded9b0d772d44c7628a05b49741d3ae25c": 21,
+    "snapshots.go.blocks.d918835729aaab9d4dca82c60079a6c643d65141f909730ecfeb3aef": 21,
+    "snapshots.go.blocks.d9812f8d30b5db4b03e5b76cfd242db9cd2763da4671ed062be808a0": 21,
+    "snapshots.go.blocks.d9e2d181dfe21ab2ca7e95847b9a219e691ee1366d22569712390655": 21,
+    "snapshots.go.blocks.db827cb962df26faab4c289f72f36aeee0e42453f1c78b27ea4e22ba": 21,
+    "snapshots.go.blocks.dcf43cff10f366a4804905092fb8dda95a57bc348342ed2a5f356965": 17,
+    "snapshots.go.blocks.de3498ad820d0a44cd411893fb00a0d59ef43ee909316a2e8ebca070": 20,
+    "snapshots.go.blocks.de950fe87de4b25c5a63b5ddf89578adf92e36cdf2035f1da11797d4": 21,
+    "snapshots.go.blocks.df1750df9b2df285fcfb50f4740657a18ee3af42727d410c37b86207": 20,
+    "snapshots.go.blocks.df6d366e0d659557f7ce38f1f6015fe5022b15fac72e5c3bd28bc5ed": 21,
+    "snapshots.go.blocks.e00ff546b17eb7ed726411edc74eccdad9d176d0d338c21a3d8daf34": 20,
+    "snapshots.go.blocks.e0337098957416ab539aabdcd59568d81ad56bef6f6e83263f9f9f28": 21,
+    "snapshots.go.blocks.e10ee86a38d8a3e47793b5f99b926c1d7af276ce5118f62650f3eb15": 21,
+    "snapshots.go.blocks.e24c5c7bdd631b0a67b057018a7666bc5d218cb165cc0ce710dd4dc0": 5,
+    "snapshots.go.blocks.e2eed9f58a161573050ab9324252b4fcccbf9fe06e1a034b6f91d748": 21,
+    "snapshots.go.blocks.e455088c9164ae075f0300bc1a7234c30433556c6b88d4301a06cfe5": 21,
+    "snapshots.go.blocks.e56066e8cf0409ecb3f25aaac5cc97099af29e7a79609c6fe4d61e5d": 21,
+    "snapshots.go.blocks.e5b20e8f9661506710a159e561d40ceb54449fdea1d1130b3bdb36bb": 20,
+    "snapshots.go.blocks.e6e1f4291b1e6a29c8f7818a6572bdbd50971d1c657725de72466365": 11,
+    "snapshots.go.blocks.e75ff353a1a2e454d3fe59249f87dad63b4270b16caf4b819bae5f69": 21,
+    "snapshots.go.blocks.e8d7513c4bc6ad6148fd70c7cd494162b37c8eb4763a5a86e5a5773b": 3,
+    "snapshots.go.blocks.ea2da5590f8174fd33c7c9b83fd23b041bcad5ba0678220783a67d6e": 14,
+    "snapshots.go.blocks.ea595c6f726db925b6832af51795fd8a46e700874c735d204f7c5841": 19,
+    "snapshots.go.blocks.eaa778d97077ff7725fe4cbb70b514d840407a45a3c244ac05f6a83d": 21,
+    "snapshots.go.blocks.ec6cdcad62633e065be5d96eecea28464144a1827adc0cba98d29a23": 19,
+    "snapshots.go.blocks.ec7871705e483ac323f53c0f68f9c776a72b785967c444c9bf119393": 21,
+    "snapshots.go.blocks.ee9ef63e4d50a24ecba269de1bfe71c9b36e6f7e4534d2919f1df4c3": 21,
+    "snapshots.go.blocks.ef1083ee689025b30ce2205a0379fad275e05312c71c9f44f2efb102": 21,
+    "snapshots.go.blocks.f059ed9ef469a045d29c0f48799fb6cab08c0abbc0fd1f736a5fced5": 21,
+    "snapshots.go.blocks.f1b265f1e545da9c6e003c5d703fb5a23283c646cd40b2d619671e7f": 21,
+    "snapshots.go.blocks.f30d745ccb53957c1f05ad3265380177f028959ae6229c1980fceb48": 21,
+    "snapshots.go.blocks.f3e279601a335129bcd091bdbf1466a287e8730072c74929ebb2a2ea": 21,
+    "snapshots.go.blocks.f59e3495e638303cfa63750d5da209412a59c880680e7a8393dd5368": 12,
+    "snapshots.go.blocks.f76e3a1104a9d816a67d5826a155c9e2979a839d0d944346d47e33ab": 19,
+    "snapshots.go.blocks.f8328a36320b8719b07da68f3b28f019feb5907ac26a42420d3680b3": 21,
+    "snapshots.go.blocks.f83cb7810af45813ad4e16f2497a0d02997e2987f4a41fa3830a4d88": 21,
+    "snapshots.go.blocks.fa1b6d428dd27ec5424fc2042a661467c87fa0e7b2b3ead3cbc56b79": 9,
+    "snapshots.go.blocks.fb21d3e5ed7684742936778239a7bed2bcee1292964ddeb716d3a903": 21,
+    "snapshots.go.blocks.fc52cf8badb52e8f1dc48e62fac0ab3ae4234f85d2b2a4ffcb01cca2": 21,
+    "snapshots.go.blocks.fc88e862f18afc8ea5eaee720b003cb71f3405df2a76faafdca43f43": 21,
+    "snapshots.go.blocks.fcbfb4a3c18f890de7a51f68603b18e654f8b432abdda17c53a0d586": 21,
+    "snapshots.go.blocks.fd832d27b5fbe0489409613f50e2139b54a21e613c8a7609dcff556e": 21,
+    "snapshots.go.blocks.fe3e591c4202f0daa1484d048c9b00dcf725b259f3fd7e066826e570": 2,
+    "snapshots.go.blocks.ff069b3ecf738d4adfe83f7c20c64b82f94f7285ee41eedb2bfd297b": 16,
+    "snapshots.go.blocks.ffcd73fdf73a0a8b8a3318afe9b599654d58b276f2a70cec5bf168c3": 21,
+    "snapshots.go.blocks.ffffb02a48c007d4531ef7c38a6e354c013d47f9eb4862ac463d553d": 16,
+    "snapshots.go.blocks.000022b3f0b748a43239c5024c58f852c05593cd0a77a798f0bb3a14": 20,
+    "snapshots.go.blocks.00003e2c67a19f5cec109ffb840b4d1ac41604ec8db7fb38e80cc432": 5,
+    "snapshots.go.blocks.0000f84794067179f37ea0d80bb2216beca93d1fb8601f427bc36906": 5,
+    "snapshots.go.blocks.003e98e43df6cfe3bc2a91a9a3978a07dfa5b9ead7e91f79615d9428": 20,
+    "snapshots.go.blocks.007824d2d830f7c4e80854e7c2e21ebc94dd5b314b8543ffc3fe5382": 3,
+    "snapshots.go.blocks.024dcb42f0aa6d81a7e26ccdd525a2ed3e9665d126b38ba0f8b77b50": 20,
+    "snapshots.go.blocks.0319357f4578b716282f4c58dd6be4d613053a40346a208306a05d03": 9,
+    "snapshots.go.blocks.032f086ac6dafeaf4c75e21840f49762ebdab05ff9c25c41a8530e0f": 17,
+    "snapshots.go.blocks.04357793d81097a7d2c15ec6cd6067a58cdd2fb21aaf07e56c306ecf": 20,
+    "snapshots.go.blocks.07b960bfb24f21d474043f47034ed62f89f8ac1d3f7bf8c170a2dc7b": 1,
+    "snapshots.go.blocks.08ac812c4721d68695614f3dcde425f1bdb7e298b3da19a9805a54f5": 20,
+    "snapshots.go.blocks.0915c3599c9155abd550abdc6fab4dbbd08e80e7532bb7decd29767d": 13,
+    "snapshots.go.blocks.0a423fa44f23b13cba59474427d11746136672af66b2d80b4499dd1d": 16,
+    "snapshots.go.blocks.0dbd895b0d875c64aa8d76fefcfc8765e46f383e983b38464eeafb3c": 15,
+    "snapshots.go.blocks.10bc63e4689bd58b8a7d248a99360a45a80d047b0b4752a7b00b754b": 19,
+    "snapshots.go.blocks.13e3102cc284fd82f4554884713f2e99262c700a6929566969200546": 4,
+    "snapshots.go.blocks.19cec83f40645921cdacbe5ceb89e716356efb2071989ac17095233a": 18,
+    "snapshots.go.blocks.1c0e6221a71b41290e9cdc1ee2f02e2f1c31d99c6124c01dcc1c6d9b": 14,
+    "snapshots.go.blocks.1f142bd5512f9ba690cd143eea0742ae32e944f30ffc118650b33c92": 2,
+    "snapshots.go.blocks.1f5f27af3ce63f8837aa8ba989438771d73c67c0f72154b788faab2a": 8,
+    "snapshots.go.blocks.21f4cf72b4ad57029d1a6c6b370bd4697ffccba368760155e39f12eb": 20,
+    "snapshots.go.blocks.237795878bfa5352cca325012e073b344ce337a1dd752cd3d5ea4cdc": 20,
+    "snapshots.go.blocks.2626fb63aa91b4b745a4572a4e9c12907f30d2325e8fc0a23857e141": 2,
+    "snapshots.go.blocks.2656fab6a4b043ede4fcc2a46523e6198e7b2cbcbed9a966fe35b6be": 15,
+    "snapshots.go.blocks.2b88135bb280ef62e3193ef3a21031c19446022754679801133b7c79": 6,
+    "snapshots.go.blocks.2bfa5943dfb17ecd8e681e7ce568e22ac45340a417bdde358e3f5159": 18,
+    "snapshots.go.blocks.2f355f79ee007502d116ecb07e36f985b34cebf2d84118f5c6b455a1": 4,
+    "snapshots.go.blocks.3116c834a09b0060aef7284f63d3275456364e3309b3c19ec328af60": 20,
+    "snapshots.go.blocks.335d9516b35b276cce8a643bd1fb2d304d95de156b21b3d43bae2e40": 20,
+    "snapshots.go.blocks.33804ceb7f4add2479faee0544c802f2369a81a4c94a284bef8f6a3e": 10,
+    "snapshots.go.blocks.33c1bf1a04ba85d8fd6119a08ee7f4ad659add075e2208b28862a2a1": 20,
+    "snapshots.go.blocks.36d2b3384005b883f05f54d4461afbd59eb354725e7e553a4860fe9b": 15,
+    "snapshots.go.blocks.37c37fde7262737abd98024a96e5c25c25ab10c0d69f5b77180b1efe": 15,
+    "snapshots.go.blocks.3b3110ff3c00b32b33f6fc3c003a218150422079980240efb5205e89": 6,
+    "snapshots.go.blocks.3dc5218de6bf5a29ad6203d9da31b7128c414872e53b8f09767764d4": 19,
+    "snapshots.go.blocks.40183423c226189d508db4b21bf94b790cf4d096134a9afbc2bd5318": 20,
+    "snapshots.go.blocks.40d04c1367c25e6da2521f906f71bbb07858dc1d2209025364369173": 10,
+    "snapshots.go.blocks.411926ea7159cff212e269e5c021e99880ab3bfb98d086d5c8ba4e3f": 5,
+    "snapshots.go.blocks.43ef09ca6b7b791b063144b9d8cc33c4d0389115ed9424b6eda899b2": 17,
+    "snapshots.go.blocks.45eb8952f447ed42954d7b979ff62aadd637e267e4988a443be36054": 2,
+    "snapshots.go.blocks.490353aa6b85efb28922acd9e0ee1dcf6d0c269b9f0583718b0274ba": 20,
+    "snapshots.go.blocks.4aea697c45e39e37e5d842ec8cf6c01a714e88db33a1ba0565ab59af": 16,
+    "snapshots.go.blocks.4bfc123fbeb5521bd8c98e43dad2c5e40b0032d9900ff6a02296e98f": 3,
+    "snapshots.go.blocks.4c15ba0f7f36b581e1ce18e095070695d96f584de0f00e41b16511bd": 20,
+    "snapshots.go.blocks.4d639577c4f2907b1db017c7e6e8f1e1c94a3663b558b3db4d4c0315": 8,
+    "snapshots.go.blocks.4deb0ba979fe7af5a5a4896ef68cdae029ad116542555cb422f46348": 20,
+    "snapshots.go.blocks.4f04025065314e75684cd38357ac6af703fcef705d9b4f638e3caf46": 12,
+    "snapshots.go.blocks.4f29af22aadfd854fb33cdbc2cdcb5c3fb7594eead5bcf41455bf3f1": 15,
+    "snapshots.go.blocks.52a3f4a6c1d742de4d3108e6915303e9d2456d506dba2b7e0a758917": 2,
+    "snapshots.go.blocks.550f5dc96814537404c7544175d348262699e448d74005dfa26540d3": 6,
+    "snapshots.go.blocks.5642f146ea05d38dc3febfbed0a135c265fe0cac2fc0ef9cd273620b": 13,
+    "snapshots.go.blocks.628775f4d0a53f00f542dd108cf2f0eb33e9997c3bde49a23a9e530a": 3,
+    "snapshots.go.blocks.643808a16d63204df62860a87c5ec7e551ca11af8b8e15a6d08ad667": 20,
+    "snapshots.go.blocks.654d96593e499e70889eeae16a15ad8682f8349fd1b77726bbbf8a6d": 20,
+    "snapshots.go.blocks.655c82616621bf8495e05a13f14d944d538deb04788efde2f85e6cb5": 12,
+    "snapshots.go.blocks.6698ec8b182b44122acaf57dfcee1d3e92669512f9329dd0cca60090": 1,
+    "snapshots.go.blocks.6879ab43e837d11c606e37dbf3e743f13f303c9dff53be602f263d6d": 8,
+    "snapshots.go.blocks.699c814b5a0f3bf2d35b9b0adcfed9fa0fe891881a9ad3c15e2edf73": 19,
+    "snapshots.go.blocks.6b51a5aae5b4b5f07f38acf12816b4f8a558ee2840d0dba69040aeb2": 17,
+    "snapshots.go.blocks.6c907940885e39f6440a034665cc26481ef885a6c33ee50589e041e9": 20,
+    "snapshots.go.blocks.6cabf3837d2884000af0eb9b661870f0080233cfb4e9a239a007450c": 3,
+    "snapshots.go.blocks.6d9ce533e4874ff84f89a0f1d2f8a26c0838898ba16fcf66aa790c9e": 20,
+    "snapshots.go.blocks.6f9ecffc4bc41068db87bd193e5842577df08a464cb7c001865c8b60": 14,
+    "snapshots.go.blocks.74a10b8241fc67a17e189a58421506b7edd629ac490234933afbed97": 11,
+    "snapshots.go.blocks.765e6963038b3152067bb8a08707d0306045f0ed5b1f02641b58fff6": 17,
+    "snapshots.go.blocks.78373839385285b7a61841de8b3802d539274ac0de16c3a0bf2fe877": 15,
+    "snapshots.go.blocks.788898a81174665316af96880459dcca053f7825abb1b0db9a433630": 14,
+    "snapshots.go.blocks.7ac19e69af887439f7e0fb1b0bec30fc8dd02b0f73b4d1f41a36cff4": 14,
+    "snapshots.go.blocks.7d479a2fb245ebb087d8f56b6bf434d7d3a7970997e7da1212b73670": 17,
+    "snapshots.go.blocks.7e82a949dc775005761ec3446a9358261416cbdd8de2c6530cb3270b": 20,
+    "snapshots.go.blocks.7f6c103302f96390d478a170fe80938b76fccd8a23490e3b6ddebcf7": 20,
+    "snapshots.go.blocks.7fe4d9c44e85fcc958c9d2d547d551fd004a9fc63c60bf6cfda46461": 19,
+    "snapshots.go.blocks.80cb48c2953a78d25f69dbcea305fbcce0c520c25d401cd75a259cf1": 11,
+    "snapshots.go.blocks.8253f8a94044070ddb196884eb3e912e9b6dca9a0e3210325a09a335": 4,
+    "snapshots.go.blocks.83ed61f50d38d4621370d1dff2e72dad62c8e789df464b0649ba87ac": 20,
+    "snapshots.go.blocks.85a0503824424acda33cbd675ec611d5a34c44131782da800c750eaa": 11,
+    "snapshots.go.blocks.8871f659c6ce6a29afc0c52963cc872898db31235bead5b4a514b746": 20,
+    "snapshots.go.blocks.89f2aa94572fcb1e8a095053e712e627482c19b780d116002936b54c": 1,
+    "snapshots.go.blocks.8b8417759d9a4361d475945e1f8ff8d367a09d4afd96a509bffec9e0": 15,
+    "snapshots.go.blocks.8b9c6073d09171c9e3b1460ffe4c0b11f34e4ca1b8ee0a28fe7a79fd": 17,
+    "snapshots.go.blocks.8d9bab6b4318ef0bd605098aa0189b80ed2c48918ebe141deb5c4ffb": 20,
+    "snapshots.go.blocks.8e9c37a1516b8adee6dc20168b475a611db86b79cc0280ee376a3860": 20,
+    "snapshots.go.blocks.96840eba5a4d0ff0d42f7ad5ac83343a0c6a87b1c71bf106cc544855": 20,
+    "snapshots.go.blocks.99541bed40b1015a1d81083184973b59a3f50bce4392492e99ff0bef": 6,
+    "snapshots.go.blocks.9a9e68c028c4bcab3fa2f9e8832fca0086ac83d01d22bfedcd41dc31": 1,
+    "snapshots.go.blocks.9addc1ee114be55b0334724282e2ffec09f0bffbe3bcadd533d6993e": 11,
+    "snapshots.go.blocks.9e0ecc753046778548dedec598c021edbb71fea2a001de3b4298cb19": 1,
+    "snapshots.go.blocks.9f0daee27f33dbcf42054dd0a0de5fe8327f7eaec707f9d07a4bec73": 18,
+    "snapshots.go.blocks.a076d1ea6e8a35bdafc3ca3290abe334672edde80ba1306fc5ae2ae8": 10,
+    "snapshots.go.blocks.a1fa8385fa06ebd0b7d47e6d90eb399970dfb41005635ffd5b0bc964": 11,
+    "snapshots.go.blocks.a6d3691e1ff660bc6f6da75feea466a26b7f8a21c0f41d74940a7639": 19,
+    "snapshots.go.blocks.aa3bedaaecd10e5e564c29127da5475ca0ff1e558fe97a89013003e0": 6,
+    "snapshots.go.blocks.ab30718787e719f54a703a220ffffb3d794b2769b0e96795824cbe43": 8,
+    "snapshots.go.blocks.abacadaba9f12a8b5382fc370e4e7e69421fb59831bb4ecca3a11d9b": 15,
+    "snapshots.go.blocks.ac2d2d66a30cbb3163e68a7073bcd3f9cdd4a11a8af6e2c5653402c7": 5,
+    "snapshots.go.blocks.adfd8912df98d2a27f9a428472ce82c5b2408dd1d7e0b77beea59807": 3,
+    "snapshots.go.blocks.b2d1c479ce496d5be21cb68e95dae7342937c631488c47161d408f39": 15,
+    "snapshots.go.blocks.b40683f4baad755ff60f26dc73c3e371ac4c5e422feef2fc1f5f29bf": 20,
+    "snapshots.go.blocks.b49a54a4bca1160af57d6314d4c1110b0c071db47eaaa08b619c4fa1": 20,
+    "snapshots.go.blocks.b5d030e4abece7e239210b1af14eba911af89013ee7a53de77072797": 16,
+    "snapshots.go.blocks.b833bde8de6d5c729250713138af16167ddf6f0e2a2b43877c4209e9": 6,
+    "snapshots.go.blocks.bb51f636269d36f47c068fcf827a3d937e614fc25fd827708bbc8b4b": 16,
+    "snapshots.go.blocks.bbc236d1986b35cb7ae8f896dc0121a6052019a469ac6b36e838c765": 5,
+    "snapshots.go.blocks.bca52a1ea803c93025fa43e3aed7af82c3b2bfb01b530b07b0048c9a": 19,
+    "snapshots.go.blocks.bcc34d3c45cd3b8770c75c91c3023a9146aa505c4bd5cf094dae9acc": 18,
+    "snapshots.go.blocks.bd6bc05d7ca20d7adac9746cd6cb68acf88aa5d3c5fbf91e4fadbcc9": 6,
+    "snapshots.go.blocks.bf02fa6c6f453808cd0a336a0084f16dd24840c3e727d0aee4e6d943": 13,
+    "snapshots.go.blocks.c12fda4a04d21fa768a55babd711527790693fa2dc4e416563f0bf0f": 6,
+    "snapshots.go.blocks.c1c4f3834cc1718be3130f7d5d79578f75229ce7893f82e0fc623cab": 1,
+    "snapshots.go.blocks.c1ede3cc9133209466774d4826044e408db13d6fe6df751a73500f16": 13,
+    "snapshots.go.blocks.c2a9551cf5a0f7e80558974b2476e11d2dffa8b01c9a215cf50f0f5e": 12,
+    "snapshots.go.blocks.c2f104187bec08c887db13869e11c4f2e3371456387f0384d4517ac4": 1,
+    "snapshots.go.blocks.c34a7f59c556633dc88ec25c9743c5ebca3705e179a54db5638941cb": 20,
+    "snapshots.go.blocks.c5293f2ba88ac474787358b9c2f4fae7b3c4408f79cdf89a12c9ece4": 20,
+    "snapshots.go.blocks.c9d833d3b3b14a8d24ca1f972cfd5bbaa444843301353d84ec1bfa32": 14,
+    "snapshots.go.blocks.c9ee494fe00ee83f3b3419496d4df6e5dfff24ae53424f86fae564b8": 10,
+    "snapshots.go.blocks.ca3933242172d1f2722b3eabc07b4478b8fa43c1937b1c9505a4ddf7": 11,
+    "snapshots.go.blocks.ca44cdacdfacca2393f9458b2be178ff2b517acf020ead85560a88b0": 1,
+    "snapshots.go.blocks.cb11e3e5013a120ee55e8d99bdb7395366bd3164d3da1737300a2b7e": 20,
+    "snapshots.go.blocks.cba1419077fd3a23e5036727a3994e6dd0c5dcd259bdb89df6863431": 11,
+    "snapshots.go.blocks.cd95ba0b846830803230a6ff7a51633a03ed1386cd6f2ac3c659bb22": 10,
+    "snapshots.go.blocks.ce29f6348d2b5170e442c81229d4e463a354a75cd6cabfdde7b4a5d3": 2,
+    "snapshots.go.blocks.ceb171ac6a0d0986043c266263a88b09ea4c39e1cc342dd9c5f2b811": 14,
+    "snapshots.go.blocks.d026c269eea21d619fc0207ae548689b5637e36eef19a7ed41a7cc20": 3,
+    "snapshots.go.blocks.d154d3001887584db84a3bab55aa5724a7db3255fc50e129a01f47bc": 4,
+    "snapshots.go.blocks.d366f39bad506a5ed9c7be9d2c0cab997f9d48c46475a2486cb85223": 2,
+    "snapshots.go.blocks.e151c6e13d6e6ffe8ed7a99ab40d31164592f8fb1ceeb1b24db49d2f": 16,
+    "snapshots.go.blocks.e459e81629534ba3f4f6c674242778b24d4d7c9a56a56dff52679687": 15,
+    "snapshots.go.blocks.e602442ead829084d3eb38a96111937386f4206b04fef0a3aee369f8": 15,
+    "snapshots.go.blocks.e6ac159ee8063742eadcb48be45f29d9a67b4158439070032f42d10c": 13,
+    "snapshots.go.blocks.ea9f41f217c35c500d6de75a4f7f4ac3153aadcc4f2e91194470e5f6": 9,
+    "snapshots.go.blocks.ed272b8d1587aac41273ee5f7badf5723784fa9676671d7b52b8c746": 4,
+    "snapshots.go.blocks.edffe7d318ed16e6a77bfbed0e1b4fd2cecdf33be15909a6282d77bf": 8,
+    "snapshots.go.blocks.ee98a72dfb3ba43e9de2e39ef825a69d5d45627d2e918ea3e260f2dd": 20,
+    "snapshots.go.blocks.f0e708ba4407cb2414d6138b739d2fb416dd1621deb8371b6ccc8088": 20,
+    "snapshots.go.blocks.f3cc723ca0ffafd9cb569b505cc3f2340d951592c7de4d2c6e39d8c6": 3,
+    "snapshots.go.blocks.fb4b7b76ea6d857f442cb9569d186f328fc846bb83222c3150ec3346": 20,
+    "snapshots.go.blocks.fcedaf183e9430acc484e4e290f40cb19e98e0e07efea2a327a71b94": 13,
+    "snapshots.go.blocks.fec0c5f77fb6eac6e01124a0a11af032b322157d4c35a14361732d19": 3,
+    "snapshots.go.blocks.0000010af532160ab54da40c2be5b1271714462bb65197afaa470bd8": 1,
+    "snapshots.go.blocks.0000066c3b2b15f7aece355a112ef141e9fe84d2e2152d4398986e40": 10,
+    "snapshots.go.blocks.00000722842ca5ae6575eecd1ddb629e7a61fef816c22a75bbfb1ad4": 7,
+    "snapshots.go.blocks.0a156f7c3a768ecfb1a4c710a26391dd86b78aa959ba4aa0e2c5e47f": 2,
+    "snapshots.go.blocks.0cc4e441026e975f1cf048fcd3489c86424014dd34c244e268cb8095": 16,
+    "snapshots.go.blocks.0ef51a2647859b6bbfecbaf044757922eb35d512a0fa151c400e7c36": 1,
+    "snapshots.go.blocks.1b6f9f775b3605816ccb3a8d5a8d46aad8cd2f675c0712cd9fa0bca6": 3,
+    "snapshots.go.blocks.2397e90130d990f207f6e576b6b97bafb430f942d26702eef9627dcf": 7,
+    "snapshots.go.blocks.23fe0d0e58b18df247484c5cd81852120bed80b82bf93ec58901c3cf": 19,
+    "snapshots.go.blocks.28e31e89ea8a27199c2a3469703df2534d83b1df9be7d98709e3307f": 16,
+    "snapshots.go.blocks.29df06255834d24d6a149224cf114a371bea08b64e7537e224a561a5": 3,
+    "snapshots.go.blocks.2a46b8dba635aac1d4d174fbd0cd7c7f3ef6c330e7bce483bd76297a": 13,
+    "snapshots.go.blocks.2b0217f1b7d017ca35856ba10eec105acde17a65dfd4ecb75e93c2db": 7,
+    "snapshots.go.blocks.2d790b2ae76601a238e53429d80d8e5290f3db0927946224739d91a0": 9,
+    "snapshots.go.blocks.2df92e9f9cbe0a719bb26f2fe264c829d435c40cd43ee0a623f7114b": 10,
+    "snapshots.go.blocks.2f17551ea621427535afc23e233b2d6a40ef44999ced2b6b7b0ea8fc": 9,
+    "snapshots.go.blocks.30432a0b85b6f80b3e9cd356d8b76b9793f5530c91050c1688da4922": 17,
+    "snapshots.go.blocks.39fca98bb733eea4fa54384c39d072cd9733cfa70d7bb63ce651a470": 2,
+    "snapshots.go.blocks.4042098128e6161d238f01ff474ae4cbe6451c82498b1bd8713d7098": 18,
+    "snapshots.go.blocks.4ad28817e17febf7f91f66763170fa081861b05099e9fc46fd5dfe0a": 1,
+    "snapshots.go.blocks.4c42b9e5820a1d23455d17a9cf4d77a151601b34bd01f69f5d3b36f9": 9,
+    "snapshots.go.blocks.50a251d84927d932b9393cb462f300d215faedd5e8a5e791e869f32c": 7,
+    "snapshots.go.blocks.5254329935732eb7c5e674ae1930942056357a801a81823666a7a563": 9,
+    "snapshots.go.blocks.54c55cc110c9b42680a07a9e7438a2b346b8a6aa18ed948ba6074021": 7,
+    "snapshots.go.blocks.660f2b816e90e4e826daebf33357d76ab89414f88d57dd7d9f7898fe": 15,
+    "snapshots.go.blocks.6677b2ac1ef702d2ef4e5f3d96b8ee5cb9126e7c015c2ac7099c680b": 9,
+    "snapshots.go.blocks.683e89fa1bcde139504b11fbfd914f8ebe9b8db2678b3da0abdcb2f1": 18,
+    "snapshots.go.blocks.6be95b4a93d8a6f66f102453924e9acdf309bef2ef67cc772154fc01": 1,
+    "snapshots.go.blocks.6ea2bd81ea5a176f11ba469412deb5754c06a04521e56de0625a77b0": 1,
+    "snapshots.go.blocks.6fdd7d5c6f9e6b9828c208db7dc7f1fba8603a7f19c188c799413b4e": 14,
+    "snapshots.go.blocks.738585e4df0f9fb93dec66a9bfddd770f309d0f029bd2fd570732c8f": 18,
+    "snapshots.go.blocks.756d13b231bedef4d4e7fe498278d51fbd8d091d329d17baeb1d935e": 6,
+    "snapshots.go.blocks.81857936f8c1fcaa8936e2eb23429f39bdc6cd0904f1d5d64cfbe14b": 16,
+    "snapshots.go.blocks.828194edf77d6a55b5d0bf9da43bdb996676c5d538b9387ccde8be94": 6,
+    "snapshots.go.blocks.878b802dd6a4155fe216cf9f5c58deb283d44cf7c168333091325bdd": 7,
+    "snapshots.go.blocks.8be06c73a6ba898ae2f0d1f1594321ab3c24dd0d0717bd3e686b1658": 17,
+    "snapshots.go.blocks.90f35b86d1bb85f15f559a612b5f3a406af7ea04530f65807950177f": 14,
+    "snapshots.go.blocks.91e73016519a2fad516434136924df004727a560a76513efe6f41979": 2,
+    "snapshots.go.blocks.9e0b4cfe5fa6480347abc506a2c2771d22bb0587b1ec3e668287281f": 3,
+    "snapshots.go.blocks.9f374e976c13d419e323be9a73370c6fabeafca1ad6561bac780c42f": 4,
+    "snapshots.go.blocks.a087620de93bee6faeb0c33ca5e647f9c4e1e037d8f28e95dc583179": 14,
+    "snapshots.go.blocks.a2ccd8e93f5a518d4400790cb081673e79ed41e4bf1132f740f26a28": 6,
+    "snapshots.go.blocks.a7b2a175b2e439acc125decd1f4d3a8e42a4744dcfe74dddf527c386": 10,
+    "snapshots.go.blocks.a915178a0195af9166fccd42a69407f1af109faf64c3c409ab2790ec": 4,
+    "snapshots.go.blocks.ab76647cdc91c4e367afe0b3e9ccb8ffe2670672f468a4565de57576": 4,
+    "snapshots.go.blocks.ade06ea849709842cf0d93a6679ad8fae5b691b9e90c9973d0e73997": 3,
+    "snapshots.go.blocks.b4612c2a040b16344f3e463dbfa1940a78a0cea26fc962157630b78b": 12,
+    "snapshots.go.blocks.b52214d5c29ab51c3cf98b87142d736a738d9535e0b3646178316be6": 4,
+    "snapshots.go.blocks.b5b762b66218e4b9c3325ac8dce360d44d5686df9f9e44ff2dee5b39": 12,
+    "snapshots.go.blocks.b71410e0d4123b029ee91fd5132fb63f14e946f0246e8f9ae8298350": 6,
+    "snapshots.go.blocks.bcbf6dac1ce76696339b4ba1c8968868f6b8eacdebcda739c1156c0c": 1,
+    "snapshots.go.blocks.c3873de6c0d392ba68347d1f4c20b93839fe0c75b974e9b677281308": 2,
+    "snapshots.go.blocks.d06d19e148f50ef63b839f97a02648cf9f8c1c9f602cb7e26284ecbc": 15,
+    "snapshots.go.blocks.d35efae280f5bce2254a8d9185ab4296032003efa8d9331d8bc3d74c": 8,
+    "snapshots.go.blocks.d698c67ed52ea02dae75e0b4e4601a6c86495bcf40c3d0bd44312019": 9,
+    "snapshots.go.blocks.d7513627b3d50819c1c84687bfd15f02f00cd11c37d7935a67540089": 11,
+    "snapshots.go.blocks.d79955b6cdaccd10a079deb3f1340ecfefda701e1f817668f7cd22dd": 2,
+    "snapshots.go.blocks.e594951faeec31cb8efc70c3e36887f18f8bc62c718f25ec64807dfa": 15,
+    "snapshots.go.blocks.e8e00995c7f3820fedf01e75a443c56e20f96ddcf9168b662ce2fdcd": 11,
+    "snapshots.go.blocks.e94c464e6994f92111f356c29a8c4b6b87080faea06897eb60fa2758": 8,
+    "snapshots.go.blocks.ed0e945791de06a13880fe2ad0375b9b812de39086c3bc6fe5f8f701": 1,
+    "snapshots.go.blocks.f11fc71643e98cb05abbba2d7b132a66a4014cf5e1effd1fe533811c": 1,
+    "snapshots.go.blocks.f4762ca1dce3c32c0d7a7e6d9f8a54bf40338e99ae5f3ad0172c9a2f": 13,
+    "snapshots.go.blocks.f8cd51b8ee69603e9e6578118674890646c2cc65d59824fce3c2943f": 13,
+    "snapshots.go.blocks.fce1c48fa96d810eaaf310ef4c287d028cf179b3d4f1a44515cb9932": 3,
+    "snapshots.go.blocks.000006d97fd0415d2dafdbb8b782717a3d3ff32f865792b8df7ddd00": 16,
+    "snapshots.go.blocks.000007aa46044059162dcb0250ae057e17b3ba2378d19b17d3472419": 7,
+    "snapshots.go.blocks.00000a1e448bdd902bb3884d1df7f26efaec3afadfeb719f65cf0051": 15,
+    "snapshots.go.blocks.0000558092d1645b110130bb1b9d449dced79bfccf313e2880e6cf38": 5,
+    "snapshots.go.blocks.087cb9a9dab66751853893b0de0628aee88c36f82fd0c1ee3b998548": 18,
+    "snapshots.go.blocks.0a744b89a32b0385d0788b56ec8e1fafc9c47c277feb2c6bd64a8125": 11,
+    "snapshots.go.blocks.10e00ad48c211e1c474ffe31850705c1893a86eba5c17bf450519aea": 1,
+    "snapshots.go.blocks.18652168f6def2b2184bd8e0b1b9023fcc9d31edf3008714e3a18e3c": 12,
+    "snapshots.go.blocks.18ae4e392e68ad0d958a164e1ff49b63591e3ea62f5ebddd0ab0cdeb": 1,
+    "snapshots.go.blocks.1b2523e031e0efe6e5fe0edf8c82fd51abf33a1a2feedad5456ef4d9": 7,
+    "snapshots.go.blocks.2119e61a82bde0dd3e41aaffe530229b98164831a6ea2f4875571163": 9,
+    "snapshots.go.blocks.2437ad27ae35fa49013740e9548a010c4965b77909980d9f4685ef68": 6,
+    "snapshots.go.blocks.27fb4323252932d68f0b83c9d2cf5ab44ca60f1dc5e73d8b8a600121": 11,
+    "snapshots.go.blocks.2d7b9cc48f42146174e7097239d04fe7e05722d639b8b5fa2c62f2d6": 2,
+    "snapshots.go.blocks.2dd6fd6af3442499b23b4c307e152817eaea0303ddcffd0821706fa8": 16,
+    "snapshots.go.blocks.34736425217f45cc1f6e59a88bd253e50b90f47ea206ec7f26afdfc5": 7,
+    "snapshots.go.blocks.39378894384bd8ad830f827d82f26d6fa5aaae11a1458a6bd5e4c460": 1,
+    "snapshots.go.blocks.44b79182f571bf4a473306408c6b711c50bd12016a14591353e103dd": 18,
+    "snapshots.go.blocks.4523431595deae13cb59db46a3f8c34c88cc89756c57310ea96d8df0": 1,
+    "snapshots.go.blocks.47dde3f397a5149b5f8562a3a07fba054d94f80b34445beb2adf6f79": 3,
+    "snapshots.go.blocks.52a547cce776ff015648b97080f66ff8b16dd4216ed63f455f96455c": 1,
+    "snapshots.go.blocks.5485ec90f25b4b9b44ca240dd341092734a087bf90f1118a151688d6": 8,
+    "snapshots.go.blocks.5630759483a1cdc1e5d9b425e8b0fe35b7a833103ca269acb1136827": 3,
+    "snapshots.go.blocks.593dfbc66c5b8dfc040851a2f4d87191490d4c2312c65dd4418f7b23": 15,
+    "snapshots.go.blocks.5977a2ca8bbb156c964b2def041bfd456a2f64615415cb6023e3aee0": 16,
+    "snapshots.go.blocks.5f7695d1fbbbd92dc6ba697fc860583a4c625e82d26cace7f13c06e6": 2,
+    "snapshots.go.blocks.632fe508edb2d24518baa39e40d030dcc8c89eb40ef71f4f23bff52b": 5,
+    "snapshots.go.blocks.6749c8ed350238d3673f2389491a46e8a9a260837c5630d775078aaa": 11,
+    "snapshots.go.blocks.67ca5b9dfbe393dfc9142cff88d0a681be1159293016462773630551": 1,
+    "snapshots.go.blocks.68f866aa0448d8066426be9e913c171f7f8cc07c0def4eaf92e5df2b": 14,
+    "snapshots.go.blocks.6a4a39566f5c45f0f6de34ef5e674b892e517ddeebd4eafcfd8583ef": 13,
+    "snapshots.go.blocks.76e80e1b3f622c7051f222453497b0667e12892f5d94ee565d17dc52": 9,
+    "snapshots.go.blocks.7c9bed86fb7ef639a58422c508ad23dcb6bb33bf498f307fcbee5fa6": 1,
+    "snapshots.go.blocks.7ed358aeebfc6d9ea28fd8fec077c7359c8f5fa3df2aea10438dbd26": 5,
+    "snapshots.go.blocks.828723ad5da2d2c78c304f6def21f1b975c644603074a5ea5b8b6f5a": 5,
+    "snapshots.go.blocks.85a1b1fdce83908d3fb63bb5eba68ed3eef009680b282468e27e9c81": 11,
+    "snapshots.go.blocks.8a1ab06f3a8c823b7111955c287efbe3c96ad9a68aa2359832e0bc30": 1,
+    "snapshots.go.blocks.90722261a7047faeaa946b0ee5f9815d7bd21fff076cd9f996e6e907": 7,
+    "snapshots.go.blocks.92fcdd76d1d9d13910cbe1930765543984e6f4ef9b7efed3cc6536a1": 16,
+    "snapshots.go.blocks.9a1ee42a9bb36d8d8c82bd1b8779e17d74a17a0cca0c32e3cd55a980": 5,
+    "snapshots.go.blocks.9d217694cd5d60a46d5e49b13e665d05efb0e433d62ee560eab027c1": 10,
+    "snapshots.go.blocks.9d2df92d8dba14560ee3d732905bda68721125dc641c7135e2a1009e": 6,
+    "snapshots.go.blocks.a6fc7ec669c64333e6c411b50e9c99323d8043391aacbe2b49f7cb29": 17,
+    "snapshots.go.blocks.af476f91a6b7c605dd8e45d88e67fd74ab565a9865396b17db424443": 1,
+    "snapshots.go.blocks.b3f9883d3de29971c43e05fdb985281ffee737be0e5669094810ba6b": 8,
+    "snapshots.go.blocks.b42ea10739065e30e388d4781a7f5a446c3a31343c87dcf26750f83d": 8,
+    "snapshots.go.blocks.bcfd7fb870c5c04b702e70d6d4d98b572bce999041897d0b51f3e215": 5,
+    "snapshots.go.blocks.c37dc293331bd9615cb697a77b9147265472ef97c3513b9182f0e22f": 7,
+    "snapshots.go.blocks.d073c1c581df6dac53c5c9b0307369116a7d09b4d4190bb71fb8f31c": 7,
+    "snapshots.go.blocks.de18050a35497096eecd2f93ddc2ea7e6c05cdae5575325327e223b3": 4,
+    "snapshots.go.blocks.defdd6638e3b3493eb3002d7a31b43b750320d20528852d613cc0f15": 3,
+    "snapshots.go.blocks.e29b14719f694767d0faf92f654cf66585bcefd8139bf5a33b7ed181": 9,
+    "snapshots.go.blocks.e7cc5cce7c9a06bc7310f8c222c702cd12d6fd05d5dee748f10e9218": 4,
+    "snapshots.go.blocks.f8024d90482a3f839c7ee0c2be31ed3ad4be1564f1970bb0db4078f9": 16,
+    "snapshots.go.blocks.fc2d8488ef021561a83af7b56f973b94cfcfd8100433ee6fd0b0aa45": 2,
+    "snapshots.go.blocks.11cad31f95526b86724c84b818228fc2500bca5ce9b2864a85b94058": 1,
+    "snapshots.go.blocks.16712d380315b12dfdac18ca550571c6ab040ef6be4c682e2a837f09": 16,
+    "snapshots.go.blocks.2712cdefc15797977ebce6c165c442fcd312cae1d395f5ebd1b0492c": 7,
+    "snapshots.go.blocks.3e51a258fba4b64a3c7723ad270e1ceb86216067384b75079463c725": 1,
+    "snapshots.go.blocks.3e7510d94ad31d6f4a36be66a9c1105397106b1ee4473e7a42d976b3": 2,
+    "snapshots.go.blocks.4854d852baf7751b69e3ac3fdd5ce1972a0788aab9d576000cf1d4c0": 8,
+    "snapshots.go.blocks.4ca9249724d0d5229e0538163933f31986599b4d378c7eb26ca2e88b": 1,
+    "snapshots.go.blocks.4ec969524032c26e3d47a29e5e8e3e5f5d45074701fd3da34c0e2d77": 8,
+    "snapshots.go.blocks.50ec1c61547baef8efd5fb3a0bce4759cbcdf72a62948022834d7cf2": 1,
+    "snapshots.go.blocks.58475ab22132ee593d295574d64064307b3338d4525eaaba11ce193f": 4,
+    "snapshots.go.blocks.5d1f0fab23727b9251bcae7c89868a493e1fde80ac95515ac6b15746": 5,
+    "snapshots.go.blocks.5e1e8add666098850a985512905098e5a65bcaf1cfe8d113daf0baa4": 13,
+    "snapshots.go.blocks.6523c0a727664d2ce8180e0dc3d72f1b98abc0d9ecd7cd065b0b9e5f": 11,
+    "snapshots.go.blocks.65b0f6b38938cc3c5cfee6d3d2770847c773a4e7ca5e9d54c36f334e": 17,
+    "snapshots.go.blocks.6a37c771eb33798edea1cc2b95759fc30a7765bbfc63668bdc92c633": 6,
+    "snapshots.go.blocks.6b3d0a2675d95b9c9e7861a97b2d3b84cdaea08dbcfc538d2d04ba2e": 4,
+    "snapshots.go.blocks.6bc59f7f4b3a25345355141246fb8ef427998612b95bdc75cd08ca85": 9,
+    "snapshots.go.blocks.6e244c629b648b065ca4854ea7f8fb9838be54f688a5ee005074bdba": 3,
+    "snapshots.go.blocks.6eb69ad6e9190c5b1691a09ee369e55f02cd8afc0f0f95ffa64407dd": 1,
+    "snapshots.go.blocks.7ca2ff20403531c018489930828dc42717222b2025e76df15cdcb58c": 2,
+    "snapshots.go.blocks.7ec66998491506e44d95c0bbeee93b154a019bbc11129754afb8d524": 3,
+    "snapshots.go.blocks.8ba11724b0b39f34223d166a752da604269db13562095d6386a14bb3": 8,
+    "snapshots.go.blocks.8fd23f88f776aab5087eba58d3cb869602d1c02c87c6be3c9ed10d88": 8,
+    "snapshots.go.blocks.901c5c323e73f39731a38e9cab770d538aebd38eda89166f0f4eda9c": 11,
+    "snapshots.go.blocks.9ac6f4118dccc20d978e7239d73d47e939cc594c350effa8711f5ac4": 7,
+    "snapshots.go.blocks.a40409b846e69a8c3f3b1a3aa20e5684bda0db354eb51ce02467ee13": 10,
+    "snapshots.go.blocks.a5612b0dcde1dee0eb73932ceb529d9523fab23e1544ee7d3db7aacc": 4,
+    "snapshots.go.blocks.a8c2869b1d723c29018f37fc58cefbfe7da9e874b033192b6c659a8a": 4,
+    "snapshots.go.blocks.b1327b613ed320224efa02726a6c32fedc54cfd60dd190b2eb79db87": 1,
+    "snapshots.go.blocks.b59cdd43a43adc0888b98e994f75ae7aa4a3515d861bacf3662504dd": 17,
+    "snapshots.go.blocks.ba8afcb79a251e47979fee3cbd5878e7fb7b153270986adc19063df5": 5,
+    "snapshots.go.blocks.bad3503b7459d5bca4169c281f368e8bc76399ade2c958d598b8157c": 5,
+    "snapshots.go.blocks.c65ca06828caa8fc9b0bb015af93ef71685544c6ed2abbb7c59b0e62": 16,
+    "snapshots.go.blocks.da7659a5e9c29d69e0b5698996cc916197b6556fa7460f604434368f": 11,
+    "snapshots.go.blocks.df106c9f4178749167305dda2b72d1b94cb9b535d90b814f665ec2ce": 5,
+    "snapshots.go.blocks.f54a517beb8954d6c4298b2717e745c33237a000ecbb41b664c8c2cd": 2,
+    "snapshots.go.blocks.f9f646eb4b04adea5afee58b63cc9f53e0da82118c2ab10a6557b922": 15,
+    "snapshots.go.blocks.fddc2812f7f376e2bb82f00d3dfd42a65348be3f0fa464420a04fab5": 12,
+    "snapshots.mark.blocks.bcd7cf751b59f949170a7e6599f9ac03e49b32c19f3f1d8dad3ac210": 1,
+    "snapshots.go.blocks.05bbc9d838b4c9eab301bfd151de99077899c997cf146abf8436edf2": 2,
+    "snapshots.go.blocks.0db403b246e3eafac8407b42bf2719208a4e53dfd9a9884f275ef19a": 3,
+    "snapshots.go.blocks.15a500a4ae7a375347deaf879a65d54a481de9073005734b3c85fdf3": 4,
+    "snapshots.go.blocks.20a299827005c01b614b902756d9d03ce633f696c428f478ef9ddeeb": 7,
+    "snapshots.go.blocks.211b3efbd6548e40552e79daa7a85ad55114b3ac4b01245115f9b6e1": 4,
+    "snapshots.go.blocks.2f4e768d6769a2ee28b93d198f974e9424b2b3f3fca8b1d48d90007d": 9,
+    "snapshots.go.blocks.4a955f3d027dca260e9d810fa09d06897c001e0d150869e8a53df075": 5,
+    "snapshots.go.blocks.599b872f42ab78df0429d1aebfe2d0a81676e50ba23097a532912b46": 7,
+    "snapshots.go.blocks.601e2966aabef67887022268eaebdbf68def151f26e16563c2c6d4e4": 4,
+    "snapshots.go.blocks.688548655448745d74c4b61da7383127ea9b56b2c6944ca7e3071893": 13,
+    "snapshots.go.blocks.707725a41873178814530f39fb14a4b2842d05377e2b62a546fe2014": 10,
+    "snapshots.go.blocks.76ce5348012e971dff93887b4870dd8aeb0a7ffc02a25ccdf337fc1c": 11,
+    "snapshots.go.blocks.7915290fffb9af0dc98414ff038fce20972eb85140f310006589d6c7": 1,
+    "snapshots.go.blocks.7e7eb329d995759d2b9fdb85b8d0c9e3fa2e57c460641c8fc875e780": 2,
+    "snapshots.go.blocks.8f8d157c7608c371b5fde9cd59004538b5fc3ddd77f073ddb2c86150": 3,
+    "snapshots.go.blocks.8fd80645f978b962da5932c976e76209329bc90d7fbc6bec04aa1d53": 1,
+    "snapshots.go.blocks.92229dcf782ce8a82050fdeecb9334cc4d906c6eb66cdbdcea86fb5f": 16,
+    "snapshots.go.blocks.a69c888f3f42ff777294145c10706be8468e65392ac43edafc01098d": 8,
+    "snapshots.go.blocks.adb8f11466290d1a8bef7c9665848cd66e45a7e74e5c25f586f0192e": 12,
+    "snapshots.go.blocks.adcaddd2bd92d5348d429fffbd601d9a80aaa630aadfbd6c67b6a314": 1,
+    "snapshots.go.blocks.b148b7a416a605becb126026ec69c5b5078c55e6c96c07d3b06d6385": 2,
+    "snapshots.go.blocks.b513c299f0657d07742e284911d449a296c0efde9ccccce7d4ef5cfb": 1,
+    "snapshots.go.blocks.ba67e271c925f7b066a00f4c9cbb9f27b13cef1ab02cca4c245c8acc": 6,
+    "snapshots.go.blocks.c94e6fe1123bf111b77b57994bcd836af8ba2b3aa72cfcefbec2d3d4": 6,
+    "snapshots.go.blocks.d6095a71081323dbc614d974f6159c37cd5f4133c8830172f877ca51": 1,
+    "snapshots.go.blocks.e1ca526fe5d2d2ac26a2b3ab52bf73ba4f1506da4e533eff8c5faa7f": 8,
+    "snapshots.go.blocks.e811a4b2f8ef3ec84143e3026d706564bc1cc98dc199a305e0fbb8e3": 16,
+    "snapshots.go.blocks.f1263e0885fb00f352968294c5a6bf18da372b98236f55a457416d62": 7,
+    "snapshots.go.blocks.feaf6e416cd79649df5a7575b240b5740d7735a80a8f688e8b73bf06": 1,
+    "snapshots.go.blocks.06122931cfcef487a82e900334df4ad3f214669ffc451f62d7c13f09": 11,
+    "snapshots.go.blocks.067e5ba8e2e8f81aa28d31690de50848f8056ad5f7f07ce9db68bbd2": 1,
+    "snapshots.go.blocks.1e1be043e289a619d8bcd2f0eca0941aa9eaf1278701c5542b46a3e9": 15,
+    "snapshots.go.blocks.2776a773d3744f514970cade5e5729f53843d5fb90f912cf97dbcdd0": 9,
+    "snapshots.go.blocks.2a748e3885f6f73320ad16a8331247b81fe01b8d39f57eec9caa5091": 2,
+    "snapshots.go.blocks.3409faed0879eeb5babb7784a5ca62d9e25cf8773e61484d0e06d880": 1,
+    "snapshots.go.blocks.4013a7d086bec89ec1b2ba4e43633012d02e66c54278c229b324a982": 10,
+    "snapshots.go.blocks.58494275c20e5786646ccc1f7d19a4c190382f374b0762208d596580": 9,
+    "snapshots.go.blocks.59239a40488fab7b31797465d3fa77f15a0cf765c81145edc297c925": 7,
+    "snapshots.go.blocks.68f2b85350421ffa24b8fb7c2b4acbb865ce4b67c1c4edf71e77089a": 6,
+    "snapshots.go.blocks.7c50cd5f07e18ab673d42f9353bf49e9059230735043189e6d12d1fd": 3,
+    "snapshots.go.blocks.81513973d897547309a685b7053aad72eda7291946e96aa30639689f": 1,
+    "snapshots.go.blocks.85e055f4c777392bd43a8d8c40aad6b3e67b1f23faf4c24d12f4c5f4": 4,
+    "snapshots.go.blocks.902303e776dc62a9f98d8ce9eeee428058b8dc88bd5c0810318861c4": 2,
+    "snapshots.go.blocks.a24a0b7f7dec890db8c59c47646290522234a522a98f00cf2d589a80": 10,
+    "snapshots.go.blocks.a4b95b2c1b5dfa560c95da6b5b8d41824eff4ebdc5e5ed08fcbf5c87": 7,
+    "snapshots.go.blocks.a930baffeb4ab6d3e93b39a70f1d6b5f5f922baad9e4f618da285b05": 5,
+    "snapshots.go.blocks.c4ded02c3f7275e4b6157dd164bf941eea0af4596501c5ed16752ed2": 14,
+    "snapshots.go.blocks.ca7045698268675561f5513e49ecd4d1f6fc413fcd08cb73778b2869": 15,
+    "snapshots.go.blocks.dcfbfc65083fd8a1d931b826e67549323d4946f02eda20622b618321": 15,
+    "snapshots.go.blocks.de2b7a06cf970096d3f279daf2b4ab4e48d3e99e866b602a44e164f9": 7,
+    "snapshots.go.blocks.e0079c2670ee8206a962d3c6ffe255b7277c546371fff68c2d624c50": 4,
+    "snapshots.go.blocks.f3dea3f6c7047c04d734fa7c23e49c8611818102997f7a1fb5416681": 7,
+    "snapshots.go.blocks.f49ab3d905832835d10aaa49ed0f11caa5221e1754d64f529ee263c9": 1,
+    "snapshots.go.blocks.fbc13e2e0c463f2f9663b2548996ee4a50fe420a5278e5ff8cd7f600": 1,
+    "snapshots.go.blocks.0abed0bdf287e9f298282efde1759706ddeeed68a4fe97c9dc6ff8a1": 5,
+    "snapshots.go.blocks.14c5dd786fb6f84d7e28046b7a30092202d59d483f210a2dbee06790": 1,
+    "snapshots.go.blocks.29ae2ec53e9933a9503a82e13b059d6e6425cc0cc59e8cc7eae10a86": 4,
+    "snapshots.go.blocks.30f9a4c529f89d60ad1bd1c33c0e13c20b347fec7cac794c557efcee": 14,
+    "snapshots.go.blocks.596371eefd3d7c3a201d12d64428b82a4c967bc7746d8a31350799ca": 2,
+    "snapshots.go.blocks.5fab8b03bc76e65ca684cbefec51d0425b1d08caaf32573255648b4c": 1,
+    "snapshots.go.blocks.6b5179aee4db62de5bec35029e4c9b02145366acfec872f1594924db": 2,
+    "snapshots.go.blocks.77ff160eacd3e99e84b70c9216f698965004da4b3dc628dac60cd290": 14,
+    "snapshots.go.blocks.9bb1c8f7f46277e5c5ab6139cadffbfb3226be98a3227d00afbfc2bb": 7,
+    "snapshots.go.blocks.a00a0c8a22810f8c49543c3ab1a65e86314fcf7d856b5e4694900ea6": 1,
+    "snapshots.go.blocks.a8a82e00853b4b4d62cb24b825f65ee57b574b273e0f970a606df5c3": 2,
+    "snapshots.go.blocks.ad709eb28c6e98eee65ac4022cf6219258dc4907d704c286e6ca047f": 1,
+    "snapshots.go.blocks.c77e03da421b0278fcef1ad88df3fde43e5282ab926c257c2a579962": 3,
+    "snapshots.go.blocks.d7a6f54ea7fd2e94279acd74601e7126538c6cadc4f794db66e1377c": 1,
+    "snapshots.go.blocks.e01133b97103bb932f7be0f7896ed1ca1d0ee350e4c8058e101b73d6": 5,
+    "snapshots.go.blocks.e7b605b72af41d6e8e6894274dedd18114f1759fea500b6d07031535": 13,
+    "snapshots.go.blocks.ea90b56d9c4d04c583ec728c8b415948b310d4653d12bd281aaff9df": 10,
+    "snapshots.go.blocks.eddd529ca919280b9b3bdd1a4a520491cc4f43efc32e4c071037f618": 4,
+    "snapshots.go.blocks.f1e470e5967d43d257e8128b82928ab45e607fdceca826c0020f4b27": 3,
+    "snapshots.go.blocks.0115102819d567aeb897189fd2fbf68d442c3101b2b3560377940fa8": 2,
+    "snapshots.go.blocks.09854fecdc9016f60a9f399a8eb8f467db9d05a55ed95a1264577944": 2,
+    "snapshots.go.blocks.2099857fb19f10292c0a18e272dc216dcafcff1a5387fbeca6a2f284": 1,
+    "snapshots.go.blocks.227b824daf6762372bcb97da913e89d5d32ba591d39cdbce2d22ae90": 7,
+    "snapshots.go.blocks.423f8ed17eba97626a43b85e781a098ef3865de6b6a18ab23bc0522c": 1,
+    "snapshots.go.blocks.51588318f3e0309016945846d10f8949a1da232551c4dec42641b150": 2,
+    "snapshots.go.blocks.5262e4a2d03c3c8eeadf5cbe53f49f9121c8a168c34de7406eaf9ea8": 2,
+    "snapshots.go.blocks.59d12b7a426724961607014aacea1e584f3ebc1196948f42a10893bc": 12,
+    "snapshots.go.blocks.5b60373e718a3647ec57f610b9942f91286748ddeaa0ad226acb927b": 6,
+    "snapshots.go.blocks.5b9a5633289c52003d359bce18f77f571a701fd3942a52bde3262558": 2,
+    "snapshots.go.blocks.5c509eb80b85bb3c2b80be62d6eb3814dcdcf762c1d2ca2446a6e4c9": 2,
+    "snapshots.go.blocks.73096f5303f3626021bf17f13903763eea9a043642cd305eb18e9948": 2,
+    "snapshots.go.blocks.7892c4b910d8387fd224506a7bc86ea6561309b4c3e431795e478f52": 1,
+    "snapshots.go.blocks.7c221e92cee4191105332bac31258ed0717a2ff8b7dc95c9efef8a4c": 3,
+    "snapshots.go.blocks.81ab938d86519a6459ce524325ed839f52b48d69465453627e55efeb": 2,
+    "snapshots.go.blocks.868dab7d64c04c03aae405fe0ffc128829f56ceea94a862f9530d2c5": 10,
+    "snapshots.go.blocks.8ccbeb007388fbc1f180d5b6036f854c6ee1034303f4e4fbfb3e5566": 1,
+    "snapshots.go.blocks.8ebb7e21acee66c3e5af6c765ea6ad31962e7b9160520aecd6f001a3": 5,
+    "snapshots.go.blocks.9d08bca04e8e670c25d559dd09116312947ea19b2e226ef478cf8289": 4,
+    "snapshots.go.blocks.a3e71398e80739522e907c35b8f652064e5268e62e9b78a9603f6b98": 13,
+    "snapshots.go.blocks.acff1b97fad8a2be2e5ff68f52b231355e59ff51db62d3f49e70f736": 1,
+    "snapshots.go.blocks.b3cdd3bbf09af72badca85e515c0206d6d22038e2af843521e10a928": 13,
+    "snapshots.go.blocks.bd24b3372791f401cc029455c44ea77f3c8750ce3b804a354af0ff16": 1,
+    "snapshots.go.blocks.e5d987eb01bacd87e0a954a4c935faa3a15a77a602dd48fdb615bdd6": 1,
+    "snapshots.go.blocks.e98e298624ce6efe34635318bdd5d634bed732bb238989d3d1b6fc9e": 1,
+    "snapshots.go.blocks.f37a8ad3edc8598b01a6630217349571c181404feb97c580925045d8": 9,
+    "snapshots.go.blocks.f8868abd1e639033268abd5fb933de711dd966d648e81d4518ef7483": 8,
+    "snapshots.go.blocks.00333b89543da962cc92e7ffa45848f42a98f7276780670728ce5256": 2,
+    "snapshots.go.blocks.2bf5a031b46b34c07937a769ff6f82b6a78a25c71022eaaf1f20eec9": 12,
+    "snapshots.go.blocks.325b0ae898cd61e798973d0d7cc48508eeb4189d92e356fee1757b60": 5,
+    "snapshots.go.blocks.32fdb90d73865d16463fe1e092c7814a9f035f781a661d9d43ed7443": 12,
+    "snapshots.go.blocks.4d470d31f80c01d797996b43abdfe7339ae5b408fb31cc655a80ccd7": 9,
+    "snapshots.go.blocks.566eb6f2974a521c8105d1d0b08313933d7726515c2e6c38ff447cb0": 6,
+    "snapshots.go.blocks.58f356d69e115c172a18b20a720f1108791235aff7757a448c037de1": 1,
+    "snapshots.go.blocks.6932f83b5765659cf9d9da31a6ccd7e839c17a06b596252c3b566d88": 1,
+    "snapshots.go.blocks.7182292d23f142d4c35bd311a36f0095fc54a4add41024b42c8280ad": 1,
+    "snapshots.go.blocks.88056a745a81bdefd95359c43e71eb52e04c878507a24e88ff3ca3c0": 1,
+    "snapshots.go.blocks.9b71eb208c8362aa1e5cc8442d33c99d2d95048c99e0a00ca4ad7a87": 1,
+    "snapshots.go.blocks.a3aa80e14222351aca84ea1e6078afbc55a48b08ae180d7a7bc5a363": 1,
+    "snapshots.go.blocks.a84d7b46aef878ae8873710bdb9ee3119094dc0bbe0d80e94f53cb9e": 4,
+    "snapshots.go.blocks.b43a281762c70838ed2363aa76e28eb2212c644bed89bdb3d209bf9f": 11,
+    "snapshots.go.blocks.bb308eefd925ce53f280d752003accbd164cd9497616e1dd8b472080": 1,
+    "snapshots.go.blocks.bba38410de5b0d75242daeac580103e72814cc4baccdc2314ef4ffbe": 8,
+    "snapshots.go.blocks.cd4e5544ade6727692d2f6646f377d1416e9e89a724d87da5d33a97b": 7,
+    "snapshots.go.blocks.cff42cd3d53a80249e2ffeaea217927fca91d11e30b83395b569dfa2": 3,
+    "snapshots.go.blocks.04d4b5c168596a9e003476585977581fad1028a32b3544a1ab0d24bb": 6,
+    "snapshots.go.blocks.079c374160b0ae34a5a20b8e95a5b5c8766239b2984f13d7ab962791": 1,
+    "snapshots.go.blocks.1870ec80a8c03e357a1a74b7af365bda92afd3be50b900c52aa46b5b": 1,
+    "snapshots.go.blocks.1c8e2b0ad16edffdce4bea70202427842fbecd07420f4c9032cdd59d": 10,
+    "snapshots.go.blocks.2671702f26f947ecc114861c4983bfdc8616d3fa2bace18dd4a91e65": 3,
+    "snapshots.go.blocks.32cfd0c41c8ab66ecf56edf3001a96cdabf7515ca5c01508306a216c": 4,
+    "snapshots.go.blocks.344cec17a25ad0de97250b1af4cea6fad5907e0ce616c8f90840aa0d": 3,
+    "snapshots.go.blocks.646cfa9534e90338aa8988d93f17daa638c00d9fbec04148f1a2473d": 2,
+    "snapshots.go.blocks.6aef3925b53d98084e8a9ec0145c1770e7eb57f84cd2d2613bb4c19a": 3,
+    "snapshots.go.blocks.9d1efdf43a630ceb1a63753656237200f6be9b9c359006085ed14b8f": 7,
+    "snapshots.go.blocks.ae3bc5a76ac9e46678ab650a81cc6491a074a9d970b5a7703a2d0c8e": 1,
+    "snapshots.go.blocks.be6d07b366b26dd577682e0e499c0d81988d8b3f49b52b853691eeba": 8,
+    "snapshots.go.blocks.bfb3964f94889a9e480917daeac90d95ebea71e8fb163e3873db764c": 1,
+    "snapshots.go.blocks.c2aa8383fbddcc3e2e1de414f68887ab27d741478961007d78e826e8": 3,
+    "snapshots.go.blocks.cfbee6efbab66ac5ae9b5a27e570d856ba2f0bd6c84fc36316933df8": 1,
+    "snapshots.go.blocks.ed6a2fb43057bac61d5beef6afca31d8c760344b896641a2746dad19": 6,
+    "snapshots.go.blocks.f137e6702bb09babf88cc93c93dffd64379d5d43bdbe3ce870ff5c54": 1,
+    "snapshots.go.blocks.000001442e7b05b3da1efca704b03e50503ed280f0c51f1f8c94bbd9": 1,
+    "snapshots.go.blocks.12e4492617ac5590657d6a4eae3b86b7eea39b07a0b01b85c0d6f791": 2,
+    "snapshots.go.blocks.1c2e3e1c3bd11f227a53c6d7a009303f2a9a03b44309789ec8ce3daf": 4,
+    "snapshots.go.blocks.206292eab4479f3c24724baa877bc80cd27783c6089dfc64a7f22a7b": 4,
+    "snapshots.go.blocks.2e6d553325ba456c7334044709f1a173b920e35e5ebe403cab931c8d": 1,
+    "snapshots.go.blocks.3199811db9dd4dc48a7eab144f261e7976974561017515dc48a66749": 9,
+    "snapshots.go.blocks.3c00ba81c11fd7a22d070f1400895a548acbfc5b5ba6a4b9970e262c": 1,
+    "snapshots.go.blocks.3fabae270fa58b139011fbda499e1a73372b627f16b7f4a9e6f39548": 2,
+    "snapshots.go.blocks.4a57fbcf474c7f99415c894386d0118890e9ff9b1854f68f58002c67": 4,
+    "snapshots.go.blocks.4b4e09f1acb8957ecff8c36091b9a6dedce48c9df8f64d7744d2b080": 3,
+    "snapshots.go.blocks.75f7b7dec6e4c973407a6a64132961635f405f2c3a9ff31598db01da": 4,
+    "snapshots.go.blocks.7c81fb493350d7fc6ae12d027b56efade2d4edb844d1dd736e0a861e": 3,
+    "snapshots.go.blocks.7d52d93ccdb8cf8065ae9bfe93b6ca7e8649e95699f6b2136f53e7c3": 1,
+    "snapshots.go.blocks.7df262feae9201d1b2e32d4c825ca91b29fbafb2b8e556f6efb7f549": 5,
+    "snapshots.go.blocks.84c9de7f612d7a6cfbebd805fb0960997a65d09608e4b35e2044e34c": 1,
+    "snapshots.go.blocks.88afe2e00c8923ac22d31750eca02723edc167ea93eba96f812faf79": 4,
+    "snapshots.go.blocks.9dda57fac3474adbe8b64be48aafeff6aa31f59909231f202b642d33": 1,
+    "snapshots.go.blocks.abcd27d5ee8f838e24cdb8653cbe309a86d7a4c48576ac3e0893a810": 3,
+    "snapshots.go.blocks.c70d35ffc108348294aac06f8f2fc65eae8bef2c4723c535ebc0830a": 1,
+    "snapshots.go.blocks.e7debade539dc55723a8bf7bebf07ef7fc80bfb6ea372355e37da67c": 1,
+    "snapshots.go.blocks.003da6afe37eca8d1bec9a040a51f23eb085c3e1b924948a214067e7": 7,
+    "snapshots.go.blocks.0c2256564f8d33210d1d50174d6137971c689dcccb4e36bf7c92c97d": 2,
+    "snapshots.go.blocks.1940494163c3e8f9c907fefce31287f5768e454a613f29adb0dd0083": 1,
+    "snapshots.go.blocks.26d2e140cb8d11143501d7883d1cf5a6adba156e1f8f27d327f10b57": 5,
+    "snapshots.go.blocks.3a69892d22415de2e0d027812ad5d7367c1c81e5a4cb2260181ca4b6": 1,
+    "snapshots.go.blocks.70e483a5702e3907e4079113470209ceab93ad83070c84a62b20b350": 2,
+    "snapshots.go.blocks.7b35cbf89d9a9a83f16e0a383969778f2308823b57f08388bb32e786": 4,
+    "snapshots.go.blocks.af8a2a59a5eb535acc49d6dd2003f44b13bd34f3f4d6870e2afed768": 3,
+    "snapshots.go.blocks.fb3cc38ce8ca95d45b8c5760be51f16d54cf54a1d0c31820ffd2ddc7": 2,
+    "snapshots.go.blocks.fd2ce4f1b300eee8dabf70b010f23a9f2650f18c1f8d3ecf823f5423": 8,
+    "snapshots.go.blocks.061ae3f2d469737fb6f8c10aad70e7d02e37f8dd8d2a41dbbb6b72f0": 4,
+    "snapshots.go.blocks.0775f0139af22e1ebf2c3278598816946e750029b70eace3c5135c3e": 5,
+    "snapshots.go.blocks.321cc307b088cf3620a27a6986e083a69d724edf2b43d7f2c10544b9": 1,
+    "snapshots.go.blocks.3f410945cd86c4352dd8ba3adb5422fef965487886af3450ee49c39e": 2,
+    "snapshots.go.blocks.5cd2d541b05ee59b99cf4b6262bb0ff17d4369f0e54c161653bc3bb5": 1,
+    "snapshots.go.blocks.6e8c50febc151bde603d07e35df55dcb8669fed81db9dba4bc5e87c3": 4,
+    "snapshots.go.blocks.78ce8b6855c8651d0ffc746dfb52cfe09386e1e37171c78b8433a9a0": 7,
+    "snapshots.go.blocks.90454dd6894d47a5cc1e9d16ed4536b876e8e08c3c274d15caa98ff9": 6,
+    "snapshots.go.blocks.96553a437b99271fdcaa30c279e432224342e88147741db73872f03c": 2,
+    "snapshots.go.blocks.c19a50d82b0d9ba8703bab6ef5ff85924da8fea694e6a4d986b51e45": 1,
+    "snapshots.go.blocks.dc2be21a6f44e5f2516600f6f130b46343e3ea22737ae4ab18dfd9f4": 1,
+    "snapshots.go.blocks.e62be741acba2d9f27a2fb6e1516a8dbe75e8686d64e42e1b158e172": 1,
+    "snapshots.go.blocks.e9ef42e5fe6e45c46565d601cf66e9006d84bfb7fa8ace69afd0ad5e": 1,
+    "snapshots.go.blocks.025ee4af86029ecae1f981e20427935e6bc36426f4b3021e781184a7": 2,
+    "snapshots.go.blocks.072a7705cee8f76cbaff72325340fe821674366002b5398f2a66b07e": 6,
+    "snapshots.go.blocks.1e00764c7fa28e57cd8b7c5ef7786805b96af4453d9a51619cac7a8b": 1,
+    "snapshots.go.blocks.2fc479904f9482d1b573977a3af26bb5577545014521eee513f54ef1": 5,
+    "snapshots.go.blocks.6226fce477c40a148f695fcd2de150dbd7566ee30137d7deda8071a4": 3,
+    "snapshots.go.blocks.711bb646ad9ec55cd8b0884b27761f7738b4916777ccb7eedc9cad8e": 1,
+    "snapshots.go.blocks.76156e005e74752a9b1e31fa0cd912bec95422d36b4004f1d5d8e21e": 2,
+    "snapshots.go.blocks.7e04f46e82e7ab8fdc660977bf73f0fb3307d5c449ba010eb090d426": 1,
+    "snapshots.go.blocks.8df1ec97a60edf8af20f88dd8714ba59c44152b4505f70f759b848a1": 1,
+    "snapshots.go.blocks.969b78926481d5e944e5f680f04611c16e1120d57da58056be55f5bf": 7,
+    "snapshots.go.blocks.9dfeca095f80562460252072fd8438f08936ef5a2077583a9722bd97": 7,
+    "snapshots.go.blocks.b3291d8a4e04835ebaa71e0523b37abe64e4cd2eeea35c0886a2dd40": 1,
+    "snapshots.go.blocks.bdadf198bdc79d4f37c5dcd9ed0cdf402bdc2299c3ae4c87d688a6fe": 3,
+    "snapshots.go.blocks.d291a7ebd793c51590c39fb2f76f028e8800ea66e4735353b7b39932": 2,
+    "snapshots.go.blocks.dc5dddfa4734bb70d3607c469b613825696cb049266db693d531d174": 1,
+    "snapshots.go.blocks.e63d0fa435f185cf651c81bf666f51199ca6dd7ba1fe7cbf75d76776": 1,
+    "snapshots.go.blocks.efa35ea93eb64d159597d27c367a54a55d583d6874555bda68cf1306": 2,
+    "snapshots.go.blocks.fd9f7e46723207d8e7684f7d1568f9f9ca011179c252f488453abac6": 1,
+    "snapshots.go.blocks.3c57cc6b808280758b369d694285db1a0fcb420a4b5cc5f363c3657d": 3,
+    "snapshots.go.blocks.42aebb6bd342c6ea6c5a9851c8af88de3804a38ff9b67dab4df1bc57": 3,
+    "snapshots.go.blocks.52887c69a0b24faafdfc31a623f05a7b703331bba3b528bd42f256f5": 1,
+    "snapshots.go.blocks.578ce876fe97ffc5f2f999d9ff4199a2bc7bfaf732e648471fac4ed2": 6,
+    "snapshots.go.blocks.6f05ceb1f6a8cf2316e6f623d60483560b7c577c4be6cd2553d67b5f": 1,
+    "snapshots.go.blocks.6ff0beb86703f1ed85743c0aacfcedfd6053fb8be54455f27f4fda69": 1,
+    "snapshots.go.blocks.989d03a92eb15d8649004a9cc0558ae90aa2ac300935ef1ba511d5f0": 1,
+    "snapshots.go.blocks.99b96e6f6d9434d640042d50dadd9d8dd022713d2e4dab64d66318c7": 3,
+    "snapshots.go.blocks.acffc99fc927cdbf37d851c8defc318d218c90f8a1cec1255cdc3ce9": 1,
+    "snapshots.go.blocks.b42eae6ad659bd5e2187975a36816b712422bfd5b64ea32f52781096": 6,
+    "snapshots.go.blocks.c0442d741f922c5f5a1e51cddf69c041756978b36e228ec0deb3663f": 1,
+    "snapshots.go.blocks.c6074d596a4d1629304bfd92715ec1677aeb378e4932723616d575f1": 3,
+    "snapshots.go.blocks.e2266a309ec7aa5c8158d35eddc680c11be66b4e6975d5c668e6e4d8": 3,
+    "snapshots.go.blocks.fbc3b43604dedb35f09d9d61391ce03cf65e9b3b7653ca1376e0150d": 6,
+    "snapshots.go.blocks.08453273401b3ee2f380ec570f8c926d5f3bd3522337d03b566a6b61": 5,
+    "snapshots.go.blocks.1d6f28d31f664d603e4fc751830d652d6980fba8143ec91829e9528d": 5,
+    "snapshots.go.blocks.54a7cf8a1e91ff0b72a3577c0d2f39d2d7ad1fca63ae0b9e4662053d": 3,
+    "snapshots.go.blocks.90caf0211fec868e9c295857ace58b184d314e564790c18279bef550": 1,
+    "snapshots.go.blocks.a1b6398200511816277ec4ac4a94160b6cb0fbf6a8bc002c506e41ad": 1,
+    "snapshots.go.blocks.bf082b24ce9ad72f0eb48beecf231466b62b7a8ce0890c7a9dcef87a": 4,
+    "snapshots.go.blocks.4599ae4c0a39e3a3d4b601185021527956f019f1be59c872f57cc4ed": 1,
+    "snapshots.go.blocks.6622bb2a073669662fed0eff7b22539af53b7ff9610901659d0a1e07": 3,
+    "snapshots.go.blocks.729bc73ff6f7cd20a412470cc585e29dfa049fea230584b7caf9d3cb": 1,
+    "snapshots.go.blocks.8f8fc899b4bc4b19bdae04049755bbcce8cfee7b5260dc09b161553d": 1,
+    "snapshots.go.blocks.96449f370656b2d484db0f2efa1333d57a5c4ab536d48443a1c186b0": 4,
+    "snapshots.go.blocks.b093e139447d33ef91bebadf3ff2f12a45be0f6a77190bb38bd7f4b7": 1,
+    "snapshots.go.blocks.021e8d5d8acd1eecb2c0946a87e09daa4bde370be90413b80eb996d9": 3,
+    "snapshots.go.blocks.05554f57e536471b5c0185ec772998d6dba17fb7f54b148742130bb0": 1,
+    "snapshots.go.blocks.11adfe44fee00220af204daa7ccedc7124c03c1d7614e60da4dd2af1": 3,
+    "snapshots.go.blocks.1c98f54e80591b99d12361091af1bf146605d89cf555b45f10738f3b": 1,
+    "snapshots.go.blocks.1fd0eca427ee981623e60337f1cc53230b06687f2f08bb08ed93bc15": 1,
+    "snapshots.go.blocks.263498e010c7a49bbfd7c4e1aab29809fca7ed993f9e14192a75871e": 2,
+    "snapshots.go.blocks.266916eadfae9f9466cd9f272fd566a0af0a0782c9e60b24c4973b9f": 3,
+    "snapshots.go.blocks.3b09246a5f22d5223bb9f4da263d3e35870c98c825f9330fe8dc45db": 3,
+    "snapshots.go.blocks.4c316a5b23e0a93a80998575028d8399b0399efcb676837442f9821d": 3,
+    "snapshots.go.blocks.5b0f169af28ad3081982499878bec888e848139b27c86ff517c9161c": 3,
+    "snapshots.go.blocks.7858e168a015747df8a4838e0963aca08f17c19516f2118f8a9d7b32": 3,
+    "snapshots.go.blocks.986e3e2b19a43848a6ec9be2e0c75b74a7b39cbc4c321aaa7d5aa2a8": 3,
+    "snapshots.go.blocks.a2a7050e1ef0618dc76bdcc9bbba0c01f88fe1b88e19cc3218acacd8": 2,
+    "snapshots.go.blocks.a3acf7487de502cd0c3a746a88ee46066564ca24ed9e6e977a8f0383": 1,
+    "snapshots.go.blocks.a7df170f18255d8888a34aeeda915b112b44666ea0f3efb2dbe926ee": 3,
+    "snapshots.go.blocks.b3a4abea31bd646040b2769f76db5c53e7d5a7c34f0cf8075437e856": 3,
+    "snapshots.go.blocks.c495cbbc9f0c147c0b1287e623d18a11127dfdaf7517c0063dd9ad59": 3,
+    "snapshots.go.blocks.c543d69a39a14c7720c185e2a79c7649d2cab35912866a3e2dc96335": 3,
+    "snapshots.go.blocks.c8a112cf336c9d2339a07b8de2d9ec5353852d8acb9128042d2e914f": 1,
+    "snapshots.go.blocks.e454652db4bb4a07aac51df90cc4f082cd28526ac990b7ddf7466ed2": 3,
+    "snapshots.go.blocks.e69e8670e01e8a2ab0c577019f9937c7192e1b8c31245cb5271db738": 3,
+    "snapshots.go.blocks.f80c43e32943a0187ddb64b0ce68cd6ec0e61292d9f75153acc92583": 3,
+    "snapshots.go.blocks.fdc55442d4c89bfa42bb62ac640ed710afd6eb79531e6dbb8459eb46": 3,
+    "snapshots.go.blocks.027a08f49ad5ece08e3a1575fb9cd8e8d7cf3b7815807a20b1a715f1": 1,
+    "snapshots.go.blocks.163cc36624d9332f6ae7770e8df8b8bad7e71711eb6c2ed7971c99d4": 2,
+    "snapshots.go.blocks.22532ae4a83dec91387b1a0ddd3306e086b80fb36ae850e2376d75bf": 1,
+    "snapshots.go.blocks.2ba96bc27be2bdde3ec11b9f696cf21fad39e49097be9b0193e6b572": 2,
+    "snapshots.go.blocks.342350284fd76ba9dbd7fd4ed579b2a2058d5ee558f8872b37817b28": 1,
+    "snapshots.go.blocks.3448894f1507bb66d7a60dc225fce74f0f650d7a5f0dcc407bbe7cb6": 1,
+    "snapshots.go.blocks.41c8a40ab0b78d727655d165f946722728dfb01df2fcc2e148b3c98d": 2,
+    "snapshots.go.blocks.48794370608c8d41cf4ad665833da210ad4fed6c6fd40b48bfad9ca8": 2,
+    "snapshots.go.blocks.4ee9e4c2ec6fc68850330dbc75ccd7ebf7951f20e1085d324f36cf44": 2,
+    "snapshots.go.blocks.57e0985d50391676b06b2ecf640d03d59735cd0c9a99d6e9e6f805eb": 2,
+    "snapshots.go.blocks.7113de447fb62c38e3e3aeec434cac6fc76e05e997b84227e9c637b8": 2,
+    "snapshots.go.blocks.7782b3a9574a1d179a767064213e03a061995a006e1aeafdfb8463f8": 2,
+    "snapshots.go.blocks.9495762e111912925166df9cfeee225fa1e866ed49c637273096c7e8": 2,
+    "snapshots.go.blocks.bb7ee671e73bfd6cea74486663163f2185b8c2e649a47db6068efee4": 1,
+    "snapshots.go.blocks.cd5721fe2ccf9b803bbe787266c3493fff67acc67951b88ebbaf9599": 2,
+    "snapshots.go.blocks.d785ff6a030ae9d521770c00f264a2aa423e928c85fc620b13d46eda": 2,
+    "snapshots.go.blocks.dabdc418201dad35588515619fe8f0d9b4280fbf9ef0b8934fe1d6bb": 2,
+    "snapshots.go.blocks.dec6d338be22ca05289dce3358dfd9da9378239b1b9de174b26b9653": 1,
+    "snapshots.go.blocks.df983a6e50640eab5e840968119614737ed4a9871e87b0b0e2a78813": 1,
+    "snapshots.go.blocks.f018942907ac50ed7f831f14755ad93698188492d09d229655e6ade1": 2,
+    "snapshots.mark.blocks.31af0509d4376a8a55b40e952aea7f009c13cadf0338c57512ff42e9": 1,
+    "snapshots.go.blocks.0840d05089b5bff1e24fe57c1ed905cd6fda68e1147a5b5863d39562": 1,
+    "snapshots.go.blocks.0e773f93f9dab25a991cbb62922e4579ea7b0595ea183d0d7732961a": 1,
+    "snapshots.go.blocks.15b5c3202b12c66377626bf881af87a9907dc89b6a8d86b0c0e8823e": 1,
+    "snapshots.go.blocks.1fd1a22c53e08de6bae42053ce40d5c0f7e0b52b33eb728867505a36": 1,
+    "snapshots.go.blocks.2f606921baedcad68bbc765b9ab82b2b201d42bd35262517ce5d7d96": 1,
+    "snapshots.go.blocks.3257f318b0f84542aef842dc86ca362e5f35ce21a827b142233d5b63": 1,
+    "snapshots.go.blocks.3778d01333555227a997e141d50c95ac3824d8e28fefe8634037b114": 1,
+    "snapshots.go.blocks.397f04eb0ae0497d8c4d691844c8c6b026bc942e3f406f26b8e24f48": 1,
+    "snapshots.go.blocks.43e608ee299b1aaad2d54f5986717379598cbc90ba291a27476a8dda": 1,
+    "snapshots.go.blocks.471f28088341d5dbd417e40defecaf440d499702876a7ec1675a7284": 1,
+    "snapshots.go.blocks.4ef0c287cc67a951bb0f0eb8d56d1bf69939bd007a2681dbc3055ef6": 1,
+    "snapshots.go.blocks.6371c7935c90ddb9b2bca3e5ae04d69711ec1bc28749393116c6d44c": 1,
+    "snapshots.go.blocks.6ab1fd13a4e182f731ecf356ce3e145311f43cd512be2579ba3572e9": 1,
+    "snapshots.go.blocks.6bd9b29295a7e24520a1eecd5a5ab9a94f3ffeed3b89551cac71f6bf": 1,
+    "snapshots.go.blocks.757bbac0aeaa2cb38deaad2dbd298b9cd85bdc1a968f930aea093a63": 1,
+    "snapshots.go.blocks.7c5fd84421a68f545d09ad8580b2a154a7bb6f79f4a3a8acb4d15e27": 1,
+    "snapshots.go.blocks.7c6b4a731eec6bef00e16ec4c990e7a817f61597dab1033006563ad7": 1,
+    "snapshots.go.blocks.86a19d5418cd07294af7d71386cf14a84e0478fbfde5b89fe4d98a58": 1,
+    "snapshots.go.blocks.936f24e391afc0738c816ae1f1388957b977de3d0e065dc9ba38af8d": 1,
+    "snapshots.go.blocks.afb33d38e92e03f9ce86f0175cc33e487b8def0ee25235f1e40183d1": 1,
+    "snapshots.go.blocks.afc65ca69d52a68a1b1c50ee1b5b07d72890aaa3a2272d5d9391b706": 1,
+    "snapshots.go.blocks.b25395824b7e80cb54a5a2c51cc405bc707c3405ce5a311c0389273c": 1,
+    "snapshots.go.blocks.ba0ece7ab72765406f5a240f1c3d1b1d6b2d690ab1e0584e15badcaf": 1,
+    "snapshots.go.blocks.baefbadf60969a5ecc5cd40d34054984c5ae2d0012f86a063784e554": 1,
+    "snapshots.go.blocks.bd80e49e7d10514fae8832ccc21620efdd1cfa2e56337e3c4d31e37f": 1,
+    "snapshots.go.blocks.cf4bb687f9bfcd905d87e98bf6de3a47d6006fbec531b8be4e7946a2": 1,
+    "snapshots.go.blocks.d68eed68381b65beb04fc7984dfa156c4dbf53c7911e900af6a535ef": 1,
+    "snapshots.go.blocks.d80765c06afe265213d446d5747a38ccbfc592bb97365d8535fb897b": 1,
+    "snapshots.go.blocks.d808aa16caa44c3226b76340f9f9535719d6e1018d46f499c100b6f1": 1,
+    "snapshots.go.blocks.e069112add6af5fa1a11a1716357de1848c22229eb2eaa007702d5c9": 1,
+    "snapshots.go.blocks.e0bfd78fd14b0336186ff6ca79a45f3619102b5bb484f7e0124dfdc0": 1,
+    "snapshots.go.blocks.e36c628f68125e717842a87c4b05a0835949a5ee3f1313b8706ce8d1": 1,
+    "snapshots.go.blocks.e3f8a83cefed03fe4ebdc4f50f3cdd880a7c2fd0b2ce7ff9da9cdce2": 1,
+    "snapshots.go.blocks.e778b14f2470ba19be2bcf811837d1f19a9cc912ff2bb6a642f6dd90": 1,
+    "snapshots.go.blocks.ef71e664f4299e9f0a3a0817aa153aa2ca2af3b3c7f9195117d81515": 1,
+    "snapshots.go.blocks.f5b2ef0d7db63c8d00446cd7d9ce9cdb9e73023ffaa5e806decceb66": 1,
+    "snapshots.go.blocks.f839821b8c95969d853e4b547952b84a3bb20cd96c6b564ddfd95c0b": 1,
+    "snapshots.go.blocks.ff46164e9121389ea4e9b9cb318c281f01801f6830d6d306843fb008": 1,
+    "snapshots.go.blocks.__count__": 39,
+    "snapshots.go.blocks.__digest__": 39,
+    "snapshots.go.blocks.__sum__": 39,
+    "snapshots.mark.blocks.80790f58f82501881d46bbb4f6b9d6536ac1a60fdd18350a0b7d50b0": 1,
+    "snapshots.mark.blocks.a631b46315b1567ef0ce2b2ad4cb63faac09f32ceba6716a7e331e5e": 1,
+    "snapshots.mark.blocks.2ba96bc27be2bdde3ec11b9f696cf21fad39e49097be9b0193e6b572": 1,
+    "snapshots.mark.blocks.4c316a5b23e0a93a80998575028d8399b0399efcb676837442f9821d": 1,
+    "snapshots.mark.blocks.3caaa49b3f45a914736c393c97c4bb8611ab7d5f66ecb4e214e93606": 1,
+    "snapshots.mark.blocks.41c8a40ab0b78d727655d165f946722728dfb01df2fcc2e148b3c98d": 1,
+    "snapshots.mark.blocks.95c4956f7a137f7fe9c72f2e831e6038744b6307d00143b2447e6443": 1,
+    "snapshots.mark.blocks.d248ded3c18e0e80d07a46f00a2d808075b989ccb1a0e40a76e5cee1": 1,
+    "snapshots.mark.blocks.6198d2070b6e70cc2a5e370a43dd49699960c88a084ffe390abe9a6a": 1,
+    "snapshots.mark.blocks.f83cb7810af45813ad4e16f2497a0d02997e2987f4a41fa3830a4d88": 1,
+    "snapshots.mark.blocks.6d9ce533e4874ff84f89a0f1d2f8a26c0838898ba16fcf66aa790c9e": 1,
+    "snapshots.mark.blocks.06b4d54e25e33f3adfa22098749005f7b610721e3c24d547450267ec": 1,
+    "snapshots.mark.blocks.d854986d64cb440f9554576eee79542ddd86afa49008f9223da2549e": 1,
+    "snapshots.mark.blocks.a3e71398e80739522e907c35b8f652064e5268e62e9b78a9603f6b98": 1,
+    "snapshots.mark.blocks.2cf87fadec7130c7e41910492073ae4dbe65ca462c1fdc3d2a56d015": 1,
+    "snapshots.mark.blocks.fb4b7b76ea6d857f442cb9569d186f328fc846bb83222c3150ec3346": 1,
+    "snapshots.mark.blocks.ca4d7a55367b654e7159ae78f3dbe6fd0908c3a1bb236ce231b3a266": 1,
+    "snapshots.mark.blocks.6371c7935c90ddb9b2bca3e5ae04d69711ec1bc28749393116c6d44c": 1
+  },
+  "diff": {
+    "eta": [
+      {
+        "epoch": 208,
+        "dugite": null,
+        "cstreamer": {
+          "denominator": 1,
+          "numerator": 1
+        }
+      },
+      {
+        "epoch": 209,
+        "dugite": null,
+        "cstreamer": {
+          "denominator": 1,
+          "numerator": 1
+        }
+      },
+      {
+        "epoch": 216,
+        "dugite": {
+          "denominator": 1,
+          "numerator": 1
+        },
+        "cstreamer": {
+          "denominator": 2808,
+          "numerator": 2855
+        }
+      },
+      {
+        "epoch": 221,
+        "dugite": {
+          "denominator": 1,
+          "numerator": 1
+        },
+        "cstreamer": {
+          "denominator": 864,
+          "numerator": 871
+        }
+      },
+      {
+        "epoch": 244,
+        "dugite": {
+          "denominator": 1,
+          "numerator": 1
+        },
+        "cstreamer": {
+          "denominator": 5184,
+          "numerator": 5201
+        }
+      },
+      {
+        "epoch": 268,
+        "dugite": {
+          "denominator": 1,
+          "numerator": 1
+        },
+        "cstreamer": {
+          "denominator": 3600,
+          "numerator": 3617
+        }
+      }
+    ],
+    "rupdNext": [
+      {
+        "epoch": 208,
+        "dugite": null,
+        "cstreamer": {
+          "deltaR1": 41664068558779,
+          "deltaR2": 33331254847024,
+          "deltaT1": 8332813711755,
+          "rPot": 41664068558779,
+          "rewardPot": 33331254847024,
+          "totalDistributed": 0
+        }
+      },
+      {
+        "epoch": 209,
+        "dugite": null,
+        "cstreamer": {
+          "deltaR1": 39858482139085,
+          "deltaR2": 31895321881035,
+          "deltaT1": 7973830470258,
+          "rPot": 39869152351293,
+          "rewardPot": 31895321881035,
+          "totalDistributed": 0
+        }
+      }
+    ],
+    "snapshots.set": [
+      {
+        "epoch": 208,
+        "dugite": null,
+        "cstreamer": {
+          "delegations": {
+            "__count__": 0,
+            "__digest__": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "__sum__": 0
+          },
+          "name": "set",
+          "poolParams": {},
+          "stake": {
+            "__count__": 0,
+            "__digest__": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "__sum__": 0
+          }
+        }
+      }
+    ],
+    "epochFees": [
+      {
+        "epoch": 210,
+        "dugite": 18336558632,
+        "cstreamer": 7666346424
+      },
+      {
+        "epoch": 211,
+        "dugite": 15436878697,
+        "cstreamer": 7770532273
+      },
+      {
+        "epoch": 212,
+        "dugite": 14288418501,
+        "cstreamer": 6517886228
+      },
+      {
+        "epoch": 213,
+        "dugite": 12096104507,
+        "cstreamer": 5578218279
+      },
+      {
+        "epoch": 214,
+        "dugite": 12678811535,
+        "cstreamer": 7100593256
+      },
+      {
+        "epoch": 215,
+        "dugite": 14602427002,
+        "cstreamer": 7501833746
+      },
+      {
+        "epoch": 216,
+        "dugite": 15611883020,
+        "cstreamer": 8110049274
+      },
+      {
+        "epoch": 217,
+        "dugite": 14045857701,
+        "cstreamer": 5935808427
+      },
+      {
+        "epoch": 218,
+        "dugite": 11011504481,
+        "cstreamer": 5075696054
+      },
+      {
+        "epoch": 219,
+        "dugite": 9622764527,
+        "cstreamer": 4547068473
+      },
+      {
+        "epoch": 220,
+        "dugite": 9517088989,
+        "cstreamer": 4970020516
+      },
+      {
+        "epoch": 221,
+        "dugite": 10105955304,
+        "cstreamer": 5135934788
+      },
+      {
+        "epoch": 222,
+        "dugite": 9049456646,
+        "cstreamer": 3913521858
+      },
+      {
+        "epoch": 223,
+        "dugite": 8413061963,
+        "cstreamer": 4499540105
+      },
+      {
+        "epoch": 224,
+        "dugite": 8923371391,
+        "cstreamer": 4423831286
+      },
+      {
+        "epoch": 225,
+        "dugite": 8548340302,
+        "cstreamer": 4124509016
+      },
+      {
+        "epoch": 226,
+        "dugite": 8327821210,
+        "cstreamer": 4203312194
+      },
+      {
+        "epoch": 227,
+        "dugite": 8597033084,
+        "cstreamer": 4393720890
+      },
+      {
+        "epoch": 228,
+        "dugite": 9356439857,
+        "cstreamer": 4962718967
+      },
+      {
+        "epoch": 229,
+        "dugite": 11740453906,
+        "cstreamer": 6777734939
+      },
+      {
+        "epoch": 230,
+        "dugite": 12094553663,
+        "cstreamer": 5316818724
+      },
+      {
+        "epoch": 231,
+        "dugite": 12485473927,
+        "cstreamer": 7168655203
+      },
+      {
+        "epoch": 232,
+        "dugite": 18278796880,
+        "cstreamer": 11110141677
+      },
+      {
+        "epoch": 233,
+        "dugite": 21791782022,
+        "cstreamer": 10681640345
+      },
+      {
+        "epoch": 234,
+        "dugite": 18854718291,
+        "cstreamer": 8173077946
+      },
+      {
+        "epoch": 235,
+        "dugite": 16179147328,
+        "cstreamer": 8006069382
+      },
+      {
+        "epoch": 236,
+        "dugite": 16121590205,
+        "cstreamer": 8115520823
+      },
+      {
+        "epoch": 237,
+        "dugite": 15953596390,
+        "cstreamer": 7838075567
+      },
+      {
+        "epoch": 238,
+        "dugite": 16804867197,
+        "cstreamer": 8966791630
+      },
+      {
+        "epoch": 239,
+        "dugite": 20660670827,
+        "cstreamer": 11693879197
+      },
+      {
+        "epoch": 240,
+        "dugite": 25854992322,
+        "cstreamer": 14161113125
+      },
+      {
+        "epoch": 241,
+        "dugite": 34230174021,
+        "cstreamer": 20069060896
+      },
+      {
+        "epoch": 242,
+        "dugite": 34759741979,
+        "cstreamer": 14690681083
+      },
+      {
+        "epoch": 243,
+        "dugite": 31595741500,
+        "cstreamer": 16905060417
+      },
+      {
+        "epoch": 244,
+        "dugite": 30273253793,
+        "cstreamer": 13368193376
+      },
+      {
+        "epoch": 245,
+        "dugite": 26884986297,
+        "cstreamer": 13516792921
+      },
+      {
+        "epoch": 246,
+        "dugite": 33561711431,
+        "cstreamer": 20044918510
+      },
+      {
+        "epoch": 247,
+        "dugite": 51573744087,
+        "cstreamer": 31528825577
+      },
+      {
+        "epoch": 248,
+        "dugite": 70096684264,
+        "cstreamer": 38567858687
+      },
+      {
+        "epoch": 249,
+        "dugite": 71254403965,
+        "cstreamer": 32686545278
+      },
+      {
+        "epoch": 250,
+        "dugite": 73191308421,
+        "cstreamer": 40504763143
+      },
+      {
+        "epoch": 251,
+        "dugite": 82336319417,
+        "cstreamer": 41831556274
+      },
+      {
+        "epoch": 252,
+        "dugite": 76333088790,
+        "cstreamer": 34501532516
+      },
+      {
+        "epoch": 253,
+        "dugite": 65260174069,
+        "cstreamer": 30758641553
+      },
+      {
+        "epoch": 254,
+        "dugite": 63238659765,
+        "cstreamer": 32480018212
+      },
+      {
+        "epoch": 255,
+        "dugite": 76089058244,
+        "cstreamer": 43609040032
+      },
+      {
+        "epoch": 256,
+        "dugite": 79969959539,
+        "cstreamer": 36360919507
+      },
+      {
+        "epoch": 257,
+        "dugite": 66994831591,
+        "cstreamer": 30633912084
+      },
+      {
+        "epoch": 258,
+        "dugite": 69804473258,
+        "cstreamer": 39170561174
+      },
+      {
+        "epoch": 259,
+        "dugite": 77149667603,
+        "cstreamer": 37979106429
+      },
+      {
+        "epoch": 260,
+        "dugite": 81761923170,
+        "cstreamer": 43782816741
+      },
+      {
+        "epoch": 261,
+        "dugite": 90690741655,
+        "cstreamer": 46907924914
+      },
+      {
+        "epoch": 262,
+        "dugite": 88298288531,
+        "cstreamer": 41390363617
+      },
+      {
+        "epoch": 263,
+        "dugite": 79371195930,
+        "cstreamer": 37980832313
+      },
+      {
+        "epoch": 264,
+        "dugite": 86851227526,
+        "cstreamer": 48870395213
+      },
+      {
+        "epoch": 265,
+        "dugite": 106647989833,
+        "cstreamer": 57777594620
+      },
+      {
+        "epoch": 266,
+        "dugite": 123746549459,
+        "cstreamer": 65968954839
+      },
+      {
+        "epoch": 267,
+        "dugite": 134386611109,
+        "cstreamer": 68417656270
+      },
+      {
+        "epoch": 268,
+        "dugite": 121116534786,
+        "cstreamer": 52698878516
+      },
+      {
+        "epoch": 269,
+        "dugite": 96858790644,
+        "cstreamer": 44159912128
+      },
+      {
+        "epoch": 270,
+        "dugite": 85977102498,
+        "cstreamer": 41817190370
+      },
+      {
+        "epoch": 271,
+        "dugite": 67283040140,
+        "cstreamer": 36489177917
+      }
+    ],
+    "snapshots.mark.poolParams.__digest__": [
+      {
+        "epoch": 210,
+        "dugite": "691d907a34271a62237985a46888f4cd73873354742aeaa8a9aefba403eec30e",
+        "cstreamer": "37483f022f259521c6e5fce8c48596ae6aced5814336d084c1a4bd2f06cb465a"
+      },
+      {
+        "epoch": 211,
+        "dugite": "16721b68e5ae704c7bb6e66bcb35338bdb21faa515ecb5376fc54bbab32cd3f8",
+        "cstreamer": "d2f75c9d0131f32d4f642f3facdfcf7346bfaef54f3a6c26773484d577d4c985"
+      },
+      {
+        "epoch": 212,
+        "dugite": "1705cc195efa49acb70dc7cbdb647cf87d01439b66a780085c7b67eb5b88f469",
+        "cstreamer": "8bb937945230e9817113beec8dec32aa32978e4476cf0a6e53272d6968390595"
+      },
+      {
+        "epoch": 213,
+        "dugite": "7ca0cc5d5dabd97fe8098a18abe7cd163d4b33fe4f432e4523b4675c95e96b56",
+        "cstreamer": "d7097049f3de283a95b78baf50048d8dbfa7169aa8583ad91eee1f2d71e0ab99"
+      },
+      {
+        "epoch": 214,
+        "dugite": "2857838cf465ec604ea561ab074ab1e262f07842a9ad9400d6b266322f6ca5c0",
+        "cstreamer": "a1e32ad5188a3f1e2a001da391b4dfbcbef83dd80f9177c37683f8c9e0fa9c3f"
+      },
+      {
+        "epoch": 215,
+        "dugite": "b4a13a168437bd1d7423aa30fa3da366d2e042305232b4fd977036c6df77c893",
+        "cstreamer": "e6dbbc3c698c045b6323bcfa2c365d1f120b947b0cd56fcb41247c9a8a95ec02"
+      },
+      {
+        "epoch": 216,
+        "dugite": "444d84f9f52e32a0874bff3867a088e8ce304875716dcc9c52a94680760750d2",
+        "cstreamer": "8179aa40f65431c17b24fe7a735d464f0df476b99579e395db51b9a412df6a7e"
+      },
+      {
+        "epoch": 217,
+        "dugite": "7dbe0166853bd9336e3ca436cae855e6b5bc8aa9704ab8984754d285ca0515b9",
+        "cstreamer": "1f29508457f9e6f1a6a4440ee9157c3c6197f3d752cffe66ae792be5493b0a5d"
+      },
+      {
+        "epoch": 218,
+        "dugite": "e5f50a5a6c683a4c17424966732eed7ee691943c534f6d110883497dd1e937d0",
+        "cstreamer": "576377293f62a6edc26a2d07c75700f6845f499702d55bf6969668842d0121f7"
+      },
+      {
+        "epoch": 219,
+        "dugite": "46d3ff04b9e7973c456a49feff45a02f03ab0775d53372718cf9f6ed523fbee2",
+        "cstreamer": "de33762e872ed13a9b66506e7e9f2da8993e5730d08e7fd876503d6f9cfb8b64"
+      },
+      {
+        "epoch": 220,
+        "dugite": "763ffd3db1f9e2613533556762e5f73a5469e8d98ec20b1115c51ddae8bf00e9",
+        "cstreamer": "cafb92c85aca94213b382a9f64b27f5718028fe4e58287014661f06d84b14eba"
+      },
+      {
+        "epoch": 221,
+        "dugite": "b7edfe7ba5e21099e366786c7fd958b43d5794af6e467a938b17ad3ce15609f2",
+        "cstreamer": "7ec3b51ab358fa3b8c47cb1b61805d0db97c1203380fa17dfd2ddb530e668936"
+      },
+      {
+        "epoch": 222,
+        "dugite": "577471e48a39ac75e76a68662ca3825c8234429707e39b0da9d587722f1ec402",
+        "cstreamer": "d2fd419265c02e02c83ee9173f30f4475a92f11b7f5d576505e2fd6e120695c1"
+      },
+      {
+        "epoch": 223,
+        "dugite": "df4f117672dd3c00bfe08c704f35b0f63366175f462c10f05b1e4fcc7cd732ff",
+        "cstreamer": "386b43a1d9a93716bcfbedd64a8babd407fdf6312ad018be586217452188b97a"
+      },
+      {
+        "epoch": 224,
+        "dugite": "8e6fbfaa292758ec8f290295cf698a7e7e86c01d649f344c0edffd5f6cbbee30",
+        "cstreamer": "bc03345ad1973304fdf702c7770f11c83a4f7aa506fd7a85ab9fb658f093b536"
+      },
+      {
+        "epoch": 225,
+        "dugite": "39e388fa9611be8af30ee23e97ddd650cefad44e130b78418684d7c39e5d62da",
+        "cstreamer": "864b6b88fd1019846028218a6009c70c1b50f95e2fe187ca1e2117f052ff18e6"
+      },
+      {
+        "epoch": 226,
+        "dugite": "d89d0e8c726ed6b15df84ee1e16ea016c12a445ea2d21d1657408cf39a398d41",
+        "cstreamer": "5a04b749217c7f94989eeac03e617bd8c7937ee91274a1302faf5ba85d56e62a"
+      },
+      {
+        "epoch": 227,
+        "dugite": "afe67916aaac5ad56aedcd7076764d15d8d0163185852b65b91117b74d318301",
+        "cstreamer": "7af380cf0debdc0fd76826152bf0d7098f11699856102d736b2755d224cf5858"
+      },
+      {
+        "epoch": 228,
+        "dugite": "d8e86407dd06a92987e734bab2f00bcf7ff6673c424bee5722ec24dfba7d0ac6",
+        "cstreamer": "bcca523f53f7522d9fd5e40283013f388333a75935ac66bac73a945b8458ad48"
+      },
+      {
+        "epoch": 229,
+        "dugite": "e846ad238649817e75fe0679996b20bcc66383f804756ff91fb0d045e8bb6d9e",
+        "cstreamer": "28f43d0f7c9406eb7f003a2b61c822656a1e8a8978ec1970249017da2c0a8c7b"
+      },
+      {
+        "epoch": 230,
+        "dugite": "da4a637389bd84e1b564a89d081003830a05b880a64d398ffe38a645132c92d6",
+        "cstreamer": "15db13e3ac96f6b317cc4590f1b38ecc5522f9dc097ca7117c05a289c091ece7"
+      },
+      {
+        "epoch": 231,
+        "dugite": "4026f9d57646a7fd64619f928b86828a849ea26e6db926d0d7066c6e92a060c0",
+        "cstreamer": "d5f1bc51ccfbfbdc7dc0b12d740b5261aee818f5ccfb283a3f54fbeb3d4f2fad"
+      },
+      {
+        "epoch": 232,
+        "dugite": "b860ab0a7960d2e6bafc63e95e99f81c83baea0b04ae8a79908f60e210db1069",
+        "cstreamer": "64fe2d34517247d7c07501da545adb2bbdaf549c3bf254bfe53eb248e757118e"
+      },
+      {
+        "epoch": 233,
+        "dugite": "591b78149a0685285b54ef00d86d61a21d59927482d8c0615b3dad877a52ebde",
+        "cstreamer": "bc6c194ff2d2cbb7df50338c3c176c6545dfa8458e81e6f99884476705344222"
+      },
+      {
+        "epoch": 234,
+        "dugite": "ace7bbff9f9df0e50a457933e7f60e105729989d8170166f4d5a2b2171a4c318",
+        "cstreamer": "9c88b15282cb5ad1b490900c059a199ef8655a67567abdbacd1b2659bc4ff74b"
+      },
+      {
+        "epoch": 235,
+        "dugite": "901f385938fd0dab1d8dc1e5e0c5e3636e0ded4cd0e86ca77784ae846cc3c8e5",
+        "cstreamer": "8177b6356d42c252728f38ad5c0df44ec69ff97a8ad04a9762685c555bbc4c13"
+      },
+      {
+        "epoch": 236,
+        "dugite": "d677a256e652c6ee5550e516b9e8dd9027e2344d4528903f1cc2f72bd4e86df6",
+        "cstreamer": "3b4a4ed931e74b5ccb37f19f6f7e9545481ecbcb7626beeb295b86a78cc6e2c4"
+      },
+      {
+        "epoch": 237,
+        "dugite": "8a05b515d9f6331d7a16522e66b7b32a99139492b2b2618f9bc3ff9dc9cb6ef0",
+        "cstreamer": "ca5ec1fe5d2ac91b0941889eae0dd1efafaea8cd2154a2242b3d610b256ff9d4"
+      },
+      {
+        "epoch": 238,
+        "dugite": "2a829037ac53d1cd36644966bd3a16897e7e625214fd644d321c3aa8d29686d5",
+        "cstreamer": "4a89f54cc4fb708ffb945d70c43073d6a48d1277193982271f5f6db4f98f2b5c"
+      },
+      {
+        "epoch": 239,
+        "dugite": "ead463165a90c2cb425d918362cabdd72bff213b44074b36c9465ff49db26705",
+        "cstreamer": "3855329aa16185202690e0ec8ea6089bc0fcdf45ef0f514aca1888904a6ca6e4"
+      },
+      {
+        "epoch": 240,
+        "dugite": "b715e749fedc3f2747b2e0851415f0b0524079b7f0d8e35b75238828677e8d48",
+        "cstreamer": "0a22841dbf9d1a10cbcc5e298c35c86980d2a8e2ca79af7cbdcb90eaf29cb858"
+      },
+      {
+        "epoch": 241,
+        "dugite": "ea661bb87932dfe5ac3bf23657119ee5768061443fd176f2ab55d7040a633417",
+        "cstreamer": "9b45b84135e560628f69a91409897bd80ea807e4f1257171540432a04f4fce9e"
+      },
+      {
+        "epoch": 242,
+        "dugite": "2a5f64fc304b36642a2fd355adab53fd94af4b339716226de9dfd8ad7b8ff24f",
+        "cstreamer": "6ba6dcd6d27f7495c75d80ad3ad74d476d16df604d32444c5f07a3eed23553f5"
+      },
+      {
+        "epoch": 243,
+        "dugite": "8b1ca713fee0a944b58a42b55b53473389b2dccce892e9c092e9a4703b23e528",
+        "cstreamer": "b024d039089346cce45480eb850ffadf6720b7690321ba8278f1e163057834bd"
+      },
+      {
+        "epoch": 244,
+        "dugite": "47d44466200e7809992f7329f09f06b73270f047c5a062293c849600e1a4662e",
+        "cstreamer": "b53e107da4e21a6e42bbe42b2c5c61d8699d193f39d0a17ca005c11525568ec4"
+      },
+      {
+        "epoch": 245,
+        "dugite": "f5ed1c7176a753664f0ca77f5d38591f438a1e90ed591aedbd15cc522ea4531f",
+        "cstreamer": "6e94bb5bc0cc631aba8106b348c10a4955667def76852f1c9e458f5965057528"
+      },
+      {
+        "epoch": 246,
+        "dugite": "fbe1ba0fd9ad0ac89b81be64a322dbde3763836d71c7c2d62769fa14e8a6693a",
+        "cstreamer": "98b0f69427cac38bbdc39714e7586145d8df5df197942b658f831cea3538b425"
+      },
+      {
+        "epoch": 247,
+        "dugite": "05d02f8da06ec51cf2dcea9d21643a6dde936e6cc78f99a481431be768f298a7",
+        "cstreamer": "0b86d6e2bdd9dea416a964f4b17e2ab45cda7ba856e1964da12bf64646f7a04c"
+      },
+      {
+        "epoch": 248,
+        "dugite": "05d0729c38f27a318e91b6ba968c4b16df8fde617e11bcf9b9946245b1b81fe2",
+        "cstreamer": "0c721aec13f8570163fee85aa8fe7cb48fbe53a489e0e3a49b848e7108ddc2c5"
+      },
+      {
+        "epoch": 249,
+        "dugite": "8970e4373b7360f13678557c76bc020b9523263c5d52ed291e37f48f511c0d51",
+        "cstreamer": "6e7dc910824dba7f37272bb808c4cf2be8bfa24cdfda38b6615f12011ed6205d"
+      },
+      {
+        "epoch": 250,
+        "dugite": "e01380c54a8fbf8daef87977d823115d6b16c6ef879edabd11e6503213da372a",
+        "cstreamer": "aaaed72840562039a39849fd02abab9d06419ece01059bab7e7d26c582a03ecd"
+      },
+      {
+        "epoch": 251,
+        "dugite": "6e507d4ce6d73922751ff71e56316357d7e59cb4f1a75a0da13d1f08a14635bb",
+        "cstreamer": "e7d2a9714b3aa58fb2c50d6e80e32ffb4f874e1bc83b125a0ae0ce9b72d56c42"
+      },
+      {
+        "epoch": 252,
+        "dugite": "2ff21a674764690ef1b34ea3c66b0fa6328d23aebfadb8f4c3811b3b8167c5c1",
+        "cstreamer": "ef9e27c3009addb64084cbbb5866dfa0205997d2d58005d9d0c7f7f2ebf0ef98"
+      },
+      {
+        "epoch": 253,
+        "dugite": "e8d7f0594535f3eb7532559cdbab5ee839f3bcf96be174cfe79d18d79731acab",
+        "cstreamer": "55732d4d8470235810b10dc1de928a31c8541828b0c1c8f8e7f7e234d17af47a"
+      },
+      {
+        "epoch": 254,
+        "dugite": "f61584ed67723adcc1df3f9e1393384544756e40980e53df884eeaf4ca4c0b9e",
+        "cstreamer": "be2da774b856e192fa88e891dd49074e68b3db5e4c063d1b24caf62e5ec68407"
+      },
+      {
+        "epoch": 255,
+        "dugite": "03010ccdb25f87bda890e22257a4e4a4fc1f1b7e3eeb7b2d8e7ec29b6c8dc374",
+        "cstreamer": "81ca113f84f42f7ec6413bad792f56c37537ba12e44f20562a6597b686353719"
+      },
+      {
+        "epoch": 256,
+        "dugite": "1f5cafea06224ccc1e470c711aad0220a5fb38b0f3a9a3e47c9bb001e8722532",
+        "cstreamer": "f9e20262d49d254423ff362b669b77988c5be009ffb4bcec1972a917c7bae604"
+      },
+      {
+        "epoch": 257,
+        "dugite": "d7388e32ea9d969d3e0fa8b94095a6d0f9850c5e2dd5c0c317c2d88fc3aa2e74",
+        "cstreamer": "f585136885b7b941223980fab0e68fd2e3664d5bf71e6b1231de679da2ccadfd"
+      },
+      {
+        "epoch": 258,
+        "dugite": "cd08eae0d0276a9ce1e24a86cd7265594b6aefdb34a96ead99eb43a00472edf0",
+        "cstreamer": "50e246baac7cb321bb56b0abb45ebc12ab2db06acf85b6e2fc3b46c9def843b9"
+      },
+      {
+        "epoch": 259,
+        "dugite": "8e08eebc72311b75a027f9342a6d724138b55f7911215074b0cfd763581ea351",
+        "cstreamer": "363e77ec26a590e3caec7f26a0196765af55c9fefaae2b2ca9b82f72c250df70"
+      },
+      {
+        "epoch": 260,
+        "dugite": "4482f63e0678e6d2dd44db9762854bbe1b5efbc19341dd0028b943b8636427b9",
+        "cstreamer": "18b824f2ace2626ab8ce1550ff64d62322a188e1cf41d29565b5cfc98d86a6dd"
+      },
+      {
+        "epoch": 261,
+        "dugite": "9b975be5b350042ecfa90df8291424a38e1f0b36e294d6e5b6e1ad0b2d74a224",
+        "cstreamer": "ff17f4a3c73ccd5b9303d43c31d2f11d28fcff0a73e5bf3c318af4fe078c778d"
+      },
+      {
+        "epoch": 262,
+        "dugite": "37e1a245f824351decbd81cfeeaf13f76be0b70e5a323abf38e27a3bf7f19c19",
+        "cstreamer": "67b3e507b8d88da8f2c3e8b21b8c4f0291245b0085ba78126e0d62e47b1b71fd"
+      },
+      {
+        "epoch": 263,
+        "dugite": "fb299a6b23708cf5a775030ff0efe2f3c2814c27479ce9df2e56a9953db7720a",
+        "cstreamer": "eadba73b7d96d5890f5e391290d62076980d05d6294f0c5063048bf075f124ee"
+      },
+      {
+        "epoch": 264,
+        "dugite": "8940c284d6f650208a17a587d4667318a17ecc5b13d8aeca362f0fd79dc48fcc",
+        "cstreamer": "3af63b20ae8ccb88d0ca22acf93a0e923145b03ebf27210620d9571b91843436"
+      },
+      {
+        "epoch": 265,
+        "dugite": "17f1efade11af113f7085e201fe0fd7c9e8a3b91801677048597a71d54fb24e3",
+        "cstreamer": "907718eb225970eef4deb152901c88727cbf532bc2457cb6aa8e38aef4ae60ee"
+      },
+      {
+        "epoch": 266,
+        "dugite": "0f5cebfda7cdfcb05c6a3ca5ccd6c2f4186d5d056d8370e2faef6cc6e70d1c32",
+        "cstreamer": "6aa451796cb70b2ab26a94a19c494d670ba81ab5de6dc141c7e327f3ea1148e0"
+      },
+      {
+        "epoch": 267,
+        "dugite": "6b01523210ee5b9e961e4ccf194ea98d9f46b32055684162f51e869122273991",
+        "cstreamer": "708d2d109b4624a1787a132b5c2f141c06f849c0a39219b865a7b67d063817a0"
+      },
+      {
+        "epoch": 268,
+        "dugite": "0ae8c7cc009c6d0317eeec415eab6d5e8250dc16f1f4f9b400c9519df960a7ef",
+        "cstreamer": "f2486178d14c21db8b1b886f5a7bb38e4422d8364493d8c8d725d8b327ecc170"
+      },
+      {
+        "epoch": 269,
+        "dugite": "8453aa359bb6e231a54d6ebe1567bf8210b2dc993b02316015bfb3ad1faae36a",
+        "cstreamer": "017638dca8f0515cd8ac5fcb1fb97bda34f2cd92a8205667159c0988e01ec081"
+      },
+      {
+        "epoch": 270,
+        "dugite": "6439e74f3cd983c5a09424dab31c8ba0b40ce7304a97ad1f185450e2e6cdf74b",
+        "cstreamer": "cbc34d41faa6d7a5c7e19bf0132c51996c2fa57074cf1db83b738d7125b358d0"
+      },
+      {
+        "epoch": 271,
+        "dugite": "5a7c4e026a567387a4b4a94a7432bbb6e74b4afd6a84e87e827a85735c56b47c",
+        "cstreamer": "4f7efbc9f4545900d95f4d8cc9f1620f64ab8c73cdc1c338600a871af2ae4116"
+      }
+    ],
+    "snapshots.set.poolParams.__digest__": [
+      {
+        "epoch": 211,
+        "dugite": "691d907a34271a62237985a46888f4cd73873354742aeaa8a9aefba403eec30e",
+        "cstreamer": "37483f022f259521c6e5fce8c48596ae6aced5814336d084c1a4bd2f06cb465a"
+      },
+      {
+        "epoch": 212,
+        "dugite": "16721b68e5ae704c7bb6e66bcb35338bdb21faa515ecb5376fc54bbab32cd3f8",
+        "cstreamer": "d2f75c9d0131f32d4f642f3facdfcf7346bfaef54f3a6c26773484d577d4c985"
+      },
+      {
+        "epoch": 213,
+        "dugite": "1705cc195efa49acb70dc7cbdb647cf87d01439b66a780085c7b67eb5b88f469",
+        "cstreamer": "8bb937945230e9817113beec8dec32aa32978e4476cf0a6e53272d6968390595"
+      },
+      {
+        "epoch": 214,
+        "dugite": "7ca0cc5d5dabd97fe8098a18abe7cd163d4b33fe4f432e4523b4675c95e96b56",
+        "cstreamer": "d7097049f3de283a95b78baf50048d8dbfa7169aa8583ad91eee1f2d71e0ab99"
+      },
+      {
+        "epoch": 215,
+        "dugite": "2857838cf465ec604ea561ab074ab1e262f07842a9ad9400d6b266322f6ca5c0",
+        "cstreamer": "a1e32ad5188a3f1e2a001da391b4dfbcbef83dd80f9177c37683f8c9e0fa9c3f"
+      },
+      {
+        "epoch": 216,
+        "dugite": "b4a13a168437bd1d7423aa30fa3da366d2e042305232b4fd977036c6df77c893",
+        "cstreamer": "e6dbbc3c698c045b6323bcfa2c365d1f120b947b0cd56fcb41247c9a8a95ec02"
+      },
+      {
+        "epoch": 217,
+        "dugite": "444d84f9f52e32a0874bff3867a088e8ce304875716dcc9c52a94680760750d2",
+        "cstreamer": "8179aa40f65431c17b24fe7a735d464f0df476b99579e395db51b9a412df6a7e"
+      },
+      {
+        "epoch": 218,
+        "dugite": "7dbe0166853bd9336e3ca436cae855e6b5bc8aa9704ab8984754d285ca0515b9",
+        "cstreamer": "1f29508457f9e6f1a6a4440ee9157c3c6197f3d752cffe66ae792be5493b0a5d"
+      },
+      {
+        "epoch": 219,
+        "dugite": "e5f50a5a6c683a4c17424966732eed7ee691943c534f6d110883497dd1e937d0",
+        "cstreamer": "576377293f62a6edc26a2d07c75700f6845f499702d55bf6969668842d0121f7"
+      },
+      {
+        "epoch": 220,
+        "dugite": "46d3ff04b9e7973c456a49feff45a02f03ab0775d53372718cf9f6ed523fbee2",
+        "cstreamer": "de33762e872ed13a9b66506e7e9f2da8993e5730d08e7fd876503d6f9cfb8b64"
+      },
+      {
+        "epoch": 221,
+        "dugite": "763ffd3db1f9e2613533556762e5f73a5469e8d98ec20b1115c51ddae8bf00e9",
+        "cstreamer": "cafb92c85aca94213b382a9f64b27f5718028fe4e58287014661f06d84b14eba"
+      },
+      {
+        "epoch": 222,
+        "dugite": "b7edfe7ba5e21099e366786c7fd958b43d5794af6e467a938b17ad3ce15609f2",
+        "cstreamer": "7ec3b51ab358fa3b8c47cb1b61805d0db97c1203380fa17dfd2ddb530e668936"
+      },
+      {
+        "epoch": 223,
+        "dugite": "577471e48a39ac75e76a68662ca3825c8234429707e39b0da9d587722f1ec402",
+        "cstreamer": "d2fd419265c02e02c83ee9173f30f4475a92f11b7f5d576505e2fd6e120695c1"
+      },
+      {
+        "epoch": 224,
+        "dugite": "df4f117672dd3c00bfe08c704f35b0f63366175f462c10f05b1e4fcc7cd732ff",
+        "cstreamer": "386b43a1d9a93716bcfbedd64a8babd407fdf6312ad018be586217452188b97a"
+      },
+      {
+        "epoch": 225,
+        "dugite": "8e6fbfaa292758ec8f290295cf698a7e7e86c01d649f344c0edffd5f6cbbee30",
+        "cstreamer": "bc03345ad1973304fdf702c7770f11c83a4f7aa506fd7a85ab9fb658f093b536"
+      },
+      {
+        "epoch": 226,
+        "dugite": "39e388fa9611be8af30ee23e97ddd650cefad44e130b78418684d7c39e5d62da",
+        "cstreamer": "864b6b88fd1019846028218a6009c70c1b50f95e2fe187ca1e2117f052ff18e6"
+      },
+      {
+        "epoch": 227,
+        "dugite": "d89d0e8c726ed6b15df84ee1e16ea016c12a445ea2d21d1657408cf39a398d41",
+        "cstreamer": "5a04b749217c7f94989eeac03e617bd8c7937ee91274a1302faf5ba85d56e62a"
+      },
+      {
+        "epoch": 228,
+        "dugite": "afe67916aaac5ad56aedcd7076764d15d8d0163185852b65b91117b74d318301",
+        "cstreamer": "7af380cf0debdc0fd76826152bf0d7098f11699856102d736b2755d224cf5858"
+      },
+      {
+        "epoch": 229,
+        "dugite": "d8e86407dd06a92987e734bab2f00bcf7ff6673c424bee5722ec24dfba7d0ac6",
+        "cstreamer": "bcca523f53f7522d9fd5e40283013f388333a75935ac66bac73a945b8458ad48"
+      },
+      {
+        "epoch": 230,
+        "dugite": "e846ad238649817e75fe0679996b20bcc66383f804756ff91fb0d045e8bb6d9e",
+        "cstreamer": "28f43d0f7c9406eb7f003a2b61c822656a1e8a8978ec1970249017da2c0a8c7b"
+      },
+      {
+        "epoch": 231,
+        "dugite": "da4a637389bd84e1b564a89d081003830a05b880a64d398ffe38a645132c92d6",
+        "cstreamer": "15db13e3ac96f6b317cc4590f1b38ecc5522f9dc097ca7117c05a289c091ece7"
+      },
+      {
+        "epoch": 232,
+        "dugite": "4026f9d57646a7fd64619f928b86828a849ea26e6db926d0d7066c6e92a060c0",
+        "cstreamer": "d5f1bc51ccfbfbdc7dc0b12d740b5261aee818f5ccfb283a3f54fbeb3d4f2fad"
+      },
+      {
+        "epoch": 233,
+        "dugite": "b860ab0a7960d2e6bafc63e95e99f81c83baea0b04ae8a79908f60e210db1069",
+        "cstreamer": "64fe2d34517247d7c07501da545adb2bbdaf549c3bf254bfe53eb248e757118e"
+      },
+      {
+        "epoch": 234,
+        "dugite": "591b78149a0685285b54ef00d86d61a21d59927482d8c0615b3dad877a52ebde",
+        "cstreamer": "bc6c194ff2d2cbb7df50338c3c176c6545dfa8458e81e6f99884476705344222"
+      },
+      {
+        "epoch": 235,
+        "dugite": "ace7bbff9f9df0e50a457933e7f60e105729989d8170166f4d5a2b2171a4c318",
+        "cstreamer": "9c88b15282cb5ad1b490900c059a199ef8655a67567abdbacd1b2659bc4ff74b"
+      },
+      {
+        "epoch": 236,
+        "dugite": "901f385938fd0dab1d8dc1e5e0c5e3636e0ded4cd0e86ca77784ae846cc3c8e5",
+        "cstreamer": "8177b6356d42c252728f38ad5c0df44ec69ff97a8ad04a9762685c555bbc4c13"
+      },
+      {
+        "epoch": 237,
+        "dugite": "d677a256e652c6ee5550e516b9e8dd9027e2344d4528903f1cc2f72bd4e86df6",
+        "cstreamer": "3b4a4ed931e74b5ccb37f19f6f7e9545481ecbcb7626beeb295b86a78cc6e2c4"
+      },
+      {
+        "epoch": 238,
+        "dugite": "8a05b515d9f6331d7a16522e66b7b32a99139492b2b2618f9bc3ff9dc9cb6ef0",
+        "cstreamer": "ca5ec1fe5d2ac91b0941889eae0dd1efafaea8cd2154a2242b3d610b256ff9d4"
+      },
+      {
+        "epoch": 239,
+        "dugite": "2a829037ac53d1cd36644966bd3a16897e7e625214fd644d321c3aa8d29686d5",
+        "cstreamer": "4a89f54cc4fb708ffb945d70c43073d6a48d1277193982271f5f6db4f98f2b5c"
+      },
+      {
+        "epoch": 240,
+        "dugite": "ead463165a90c2cb425d918362cabdd72bff213b44074b36c9465ff49db26705",
+        "cstreamer": "3855329aa16185202690e0ec8ea6089bc0fcdf45ef0f514aca1888904a6ca6e4"
+      },
+      {
+        "epoch": 241,
+        "dugite": "b715e749fedc3f2747b2e0851415f0b0524079b7f0d8e35b75238828677e8d48",
+        "cstreamer": "0a22841dbf9d1a10cbcc5e298c35c86980d2a8e2ca79af7cbdcb90eaf29cb858"
+      },
+      {
+        "epoch": 242,
+        "dugite": "ea661bb87932dfe5ac3bf23657119ee5768061443fd176f2ab55d7040a633417",
+        "cstreamer": "9b45b84135e560628f69a91409897bd80ea807e4f1257171540432a04f4fce9e"
+      },
+      {
+        "epoch": 243,
+        "dugite": "2a5f64fc304b36642a2fd355adab53fd94af4b339716226de9dfd8ad7b8ff24f",
+        "cstreamer": "6ba6dcd6d27f7495c75d80ad3ad74d476d16df604d32444c5f07a3eed23553f5"
+      },
+      {
+        "epoch": 244,
+        "dugite": "8b1ca713fee0a944b58a42b55b53473389b2dccce892e9c092e9a4703b23e528",
+        "cstreamer": "b024d039089346cce45480eb850ffadf6720b7690321ba8278f1e163057834bd"
+      },
+      {
+        "epoch": 245,
+        "dugite": "47d44466200e7809992f7329f09f06b73270f047c5a062293c849600e1a4662e",
+        "cstreamer": "b53e107da4e21a6e42bbe42b2c5c61d8699d193f39d0a17ca005c11525568ec4"
+      },
+      {
+        "epoch": 246,
+        "dugite": "f5ed1c7176a753664f0ca77f5d38591f438a1e90ed591aedbd15cc522ea4531f",
+        "cstreamer": "6e94bb5bc0cc631aba8106b348c10a4955667def76852f1c9e458f5965057528"
+      },
+      {
+        "epoch": 247,
+        "dugite": "fbe1ba0fd9ad0ac89b81be64a322dbde3763836d71c7c2d62769fa14e8a6693a",
+        "cstreamer": "98b0f69427cac38bbdc39714e7586145d8df5df197942b658f831cea3538b425"
+      },
+      {
+        "epoch": 248,
+        "dugite": "05d02f8da06ec51cf2dcea9d21643a6dde936e6cc78f99a481431be768f298a7",
+        "cstreamer": "0b86d6e2bdd9dea416a964f4b17e2ab45cda7ba856e1964da12bf64646f7a04c"
+      },
+      {
+        "epoch": 249,
+        "dugite": "05d0729c38f27a318e91b6ba968c4b16df8fde617e11bcf9b9946245b1b81fe2",
+        "cstreamer": "0c721aec13f8570163fee85aa8fe7cb48fbe53a489e0e3a49b848e7108ddc2c5"
+      },
+      {
+        "epoch": 250,
+        "dugite": "8970e4373b7360f13678557c76bc020b9523263c5d52ed291e37f48f511c0d51",
+        "cstreamer": "6e7dc910824dba7f37272bb808c4cf2be8bfa24cdfda38b6615f12011ed6205d"
+      },
+      {
+        "epoch": 251,
+        "dugite": "e01380c54a8fbf8daef87977d823115d6b16c6ef879edabd11e6503213da372a",
+        "cstreamer": "aaaed72840562039a39849fd02abab9d06419ece01059bab7e7d26c582a03ecd"
+      },
+      {
+        "epoch": 252,
+        "dugite": "6e507d4ce6d73922751ff71e56316357d7e59cb4f1a75a0da13d1f08a14635bb",
+        "cstreamer": "e7d2a9714b3aa58fb2c50d6e80e32ffb4f874e1bc83b125a0ae0ce9b72d56c42"
+      },
+      {
+        "epoch": 253,
+        "dugite": "2ff21a674764690ef1b34ea3c66b0fa6328d23aebfadb8f4c3811b3b8167c5c1",
+        "cstreamer": "ef9e27c3009addb64084cbbb5866dfa0205997d2d58005d9d0c7f7f2ebf0ef98"
+      },
+      {
+        "epoch": 254,
+        "dugite": "e8d7f0594535f3eb7532559cdbab5ee839f3bcf96be174cfe79d18d79731acab",
+        "cstreamer": "55732d4d8470235810b10dc1de928a31c8541828b0c1c8f8e7f7e234d17af47a"
+      },
+      {
+        "epoch": 255,
+        "dugite": "f61584ed67723adcc1df3f9e1393384544756e40980e53df884eeaf4ca4c0b9e",
+        "cstreamer": "be2da774b856e192fa88e891dd49074e68b3db5e4c063d1b24caf62e5ec68407"
+      },
+      {
+        "epoch": 256,
+        "dugite": "03010ccdb25f87bda890e22257a4e4a4fc1f1b7e3eeb7b2d8e7ec29b6c8dc374",
+        "cstreamer": "81ca113f84f42f7ec6413bad792f56c37537ba12e44f20562a6597b686353719"
+      },
+      {
+        "epoch": 257,
+        "dugite": "1f5cafea06224ccc1e470c711aad0220a5fb38b0f3a9a3e47c9bb001e8722532",
+        "cstreamer": "f9e20262d49d254423ff362b669b77988c5be009ffb4bcec1972a917c7bae604"
+      },
+      {
+        "epoch": 258,
+        "dugite": "d7388e32ea9d969d3e0fa8b94095a6d0f9850c5e2dd5c0c317c2d88fc3aa2e74",
+        "cstreamer": "f585136885b7b941223980fab0e68fd2e3664d5bf71e6b1231de679da2ccadfd"
+      },
+      {
+        "epoch": 259,
+        "dugite": "cd08eae0d0276a9ce1e24a86cd7265594b6aefdb34a96ead99eb43a00472edf0",
+        "cstreamer": "50e246baac7cb321bb56b0abb45ebc12ab2db06acf85b6e2fc3b46c9def843b9"
+      },
+      {
+        "epoch": 260,
+        "dugite": "8e08eebc72311b75a027f9342a6d724138b55f7911215074b0cfd763581ea351",
+        "cstreamer": "363e77ec26a590e3caec7f26a0196765af55c9fefaae2b2ca9b82f72c250df70"
+      },
+      {
+        "epoch": 261,
+        "dugite": "4482f63e0678e6d2dd44db9762854bbe1b5efbc19341dd0028b943b8636427b9",
+        "cstreamer": "18b824f2ace2626ab8ce1550ff64d62322a188e1cf41d29565b5cfc98d86a6dd"
+      },
+      {
+        "epoch": 262,
+        "dugite": "9b975be5b350042ecfa90df8291424a38e1f0b36e294d6e5b6e1ad0b2d74a224",
+        "cstreamer": "ff17f4a3c73ccd5b9303d43c31d2f11d28fcff0a73e5bf3c318af4fe078c778d"
+      },
+      {
+        "epoch": 263,
+        "dugite": "37e1a245f824351decbd81cfeeaf13f76be0b70e5a323abf38e27a3bf7f19c19",
+        "cstreamer": "67b3e507b8d88da8f2c3e8b21b8c4f0291245b0085ba78126e0d62e47b1b71fd"
+      },
+      {
+        "epoch": 264,
+        "dugite": "fb299a6b23708cf5a775030ff0efe2f3c2814c27479ce9df2e56a9953db7720a",
+        "cstreamer": "eadba73b7d96d5890f5e391290d62076980d05d6294f0c5063048bf075f124ee"
+      },
+      {
+        "epoch": 265,
+        "dugite": "8940c284d6f650208a17a587d4667318a17ecc5b13d8aeca362f0fd79dc48fcc",
+        "cstreamer": "3af63b20ae8ccb88d0ca22acf93a0e923145b03ebf27210620d9571b91843436"
+      },
+      {
+        "epoch": 266,
+        "dugite": "17f1efade11af113f7085e201fe0fd7c9e8a3b91801677048597a71d54fb24e3",
+        "cstreamer": "907718eb225970eef4deb152901c88727cbf532bc2457cb6aa8e38aef4ae60ee"
+      },
+      {
+        "epoch": 267,
+        "dugite": "0f5cebfda7cdfcb05c6a3ca5ccd6c2f4186d5d056d8370e2faef6cc6e70d1c32",
+        "cstreamer": "6aa451796cb70b2ab26a94a19c494d670ba81ab5de6dc141c7e327f3ea1148e0"
+      },
+      {
+        "epoch": 268,
+        "dugite": "6b01523210ee5b9e961e4ccf194ea98d9f46b32055684162f51e869122273991",
+        "cstreamer": "708d2d109b4624a1787a132b5c2f141c06f849c0a39219b865a7b67d063817a0"
+      },
+      {
+        "epoch": 269,
+        "dugite": "0ae8c7cc009c6d0317eeec415eab6d5e8250dc16f1f4f9b400c9519df960a7ef",
+        "cstreamer": "f2486178d14c21db8b1b886f5a7bb38e4422d8364493d8c8d725d8b327ecc170"
+      },
+      {
+        "epoch": 270,
+        "dugite": "8453aa359bb6e231a54d6ebe1567bf8210b2dc993b02316015bfb3ad1faae36a",
+        "cstreamer": "017638dca8f0515cd8ac5fcb1fb97bda34f2cd92a8205667159c0988e01ec081"
+      },
+      {
+        "epoch": 271,
+        "dugite": "6439e74f3cd983c5a09424dab31c8ba0b40ce7304a97ad1f185450e2e6cdf74b",
+        "cstreamer": "cbc34d41faa6d7a5c7e19bf0132c51996c2fa57074cf1db83b738d7125b358d0"
+      }
+    ],
+    "expectedBlocks": [
+      {
+        "epoch": 212,
+        "dugite": 0,
+        "cstreamer": 2160
+      },
+      {
+        "epoch": 213,
+        "dugite": 0,
+        "cstreamer": 4320
+      }
+    ],
+    "rupdNext.deltaR2": [
+      {
+        "epoch": 212,
+        "dugite": 24599199197203,
+        "cstreamer": 24599189003103
+      },
+      {
+        "epoch": 213,
+        "dugite": 22880869186439,
+        "cstreamer": 22879383619015
+      },
+      {
+        "epoch": 214,
+        "dugite": 21384226996237,
+        "cstreamer": 21383223011917
+      },
+      {
+        "epoch": 215,
+        "dugite": 21201342296023,
+        "cstreamer": 21200127054014
+      },
+      {
+        "epoch": 216,
+        "dugite": 21081690969100,
+        "cstreamer": 21081630930852
+      },
+      {
+        "epoch": 217,
+        "dugite": 20394201880042,
+        "cstreamer": 20393305607850
+      },
+      {
+        "epoch": 218,
+        "dugite": 20142659222423,
+        "cstreamer": 20141288771186
+      },
+      {
+        "epoch": 219,
+        "dugite": 19399590436589,
+        "cstreamer": 19398705129964
+      },
+      {
+        "epoch": 220,
+        "dugite": 19524762425541,
+        "cstreamer": 19523339814232
+      },
+      {
+        "epoch": 221,
+        "dugite": 19870978408465,
+        "cstreamer": 19869950336054
+      },
+      {
+        "epoch": 222,
+        "dugite": 19637440585327,
+        "cstreamer": 19637354279636
+      },
+      {
+        "epoch": 223,
+        "dugite": 18964208942833,
+        "cstreamer": 18730858302466
+      },
+      {
+        "epoch": 224,
+        "dugite": 18582999893465,
+        "cstreamer": 18313870494112
+      },
+      {
+        "epoch": 225,
+        "dugite": 18477119006614,
+        "cstreamer": 18217673178959
+      },
+      {
+        "epoch": 226,
+        "dugite": 18210363400375,
+        "cstreamer": 18001031937458
+      },
+      {
+        "epoch": 227,
+        "dugite": 18486398235604,
+        "cstreamer": 18241646976448
+      },
+      {
+        "epoch": 228,
+        "dugite": 17521886739757,
+        "cstreamer": 17521731625420
+      },
+      {
+        "epoch": 229,
+        "dugite": 17511163979878,
+        "cstreamer": 17510230464633
+      },
+      {
+        "epoch": 230,
+        "dugite": 16227204577207,
+        "cstreamer": 16227051319430
+      },
+      {
+        "epoch": 231,
+        "dugite": 16128475100495,
+        "cstreamer": 16126962397602
+      },
+      {
+        "epoch": 232,
+        "dugite": 15729457374721,
+        "cstreamer": 15728211047578
+      },
+      {
+        "epoch": 233,
+        "dugite": 15678426912426,
+        "cstreamer": 15675382290506
+      },
+      {
+        "epoch": 234,
+        "dugite": 15976987808897,
+        "cstreamer": 15973687897751
+      },
+      {
+        "epoch": 235,
+        "dugite": 18105454176829,
+        "cstreamer": 18102839289001
+      },
+      {
+        "epoch": 236,
+        "dugite": 18000124627850,
+        "cstreamer": 17999001735918
+      },
+      {
+        "epoch": 271,
+        "dugite": 13440402330911,
+        "cstreamer": 13438699043409
+      }
+    ],
+    "rupdNext.totalDistributed": [
+      {
+        "epoch": 212,
+        "dugite": 7235489131814,
+        "cstreamer": 7235499325914
+      },
+      {
+        "epoch": 213,
+        "dugite": 8916617064233,
+        "cstreamer": 8918102631657
+      },
+      {
+        "epoch": 214,
+        "dugite": 9525406328996,
+        "cstreamer": 9526410313316
+      },
+      {
+        "epoch": 215,
+        "dugite": 10124330094281,
+        "cstreamer": 10125545336290
+      },
+      {
+        "epoch": 216,
+        "dugite": 10592873002931,
+        "cstreamer": 10592933041179
+      },
+      {
+        "epoch": 217,
+        "dugite": 10800227125218,
+        "cstreamer": 10801123397410
+      },
+      {
+        "epoch": 218,
+        "dugite": 11055456466473,
+        "cstreamer": 11056826917710
+      },
+      {
+        "epoch": 219,
+        "dugite": 10928880402005,
+        "cstreamer": 10929765708630
+      },
+      {
+        "epoch": 220,
+        "dugite": 11325445231471,
+        "cstreamer": 11326867842780
+      },
+      {
+        "epoch": 221,
+        "dugite": 11576850940998,
+        "cstreamer": 11577879013409
+      },
+      {
+        "epoch": 222,
+        "dugite": 11644188886179,
+        "cstreamer": 11644275191870
+      },
+      {
+        "epoch": 223,
+        "dugite": 11961600151052,
+        "cstreamer": 12194950791419
+      },
+      {
+        "epoch": 224,
+        "dugite": 12102568435048,
+        "cstreamer": 12371697834401
+      },
+      {
+        "epoch": 225,
+        "dugite": 12334595370654,
+        "cstreamer": 12594041198309
+      },
+      {
+        "epoch": 226,
+        "dugite": 12369290058832,
+        "cstreamer": 12578621521749
+      },
+      {
+        "epoch": 227,
+        "dugite": 12334086032780,
+        "cstreamer": 12578837291936
+      },
+      {
+        "epoch": 228,
+        "dugite": 12369288971862,
+        "cstreamer": 12369444086199
+      },
+      {
+        "epoch": 229,
+        "dugite": 12504434236594,
+        "cstreamer": 12505367751839
+      },
+      {
+        "epoch": 230,
+        "dugite": 14290365726764,
+        "cstreamer": 14290518984541
+      },
+      {
+        "epoch": 231,
+        "dugite": 14343958368209,
+        "cstreamer": 14345471071102
+      },
+      {
+        "epoch": 232,
+        "dugite": 14346216548888,
+        "cstreamer": 14347462876031
+      },
+      {
+        "epoch": 233,
+        "dugite": 14364448098534,
+        "cstreamer": 14367492720454
+      },
+      {
+        "epoch": 234,
+        "dugite": 14536211966376,
+        "cstreamer": 14539511877522
+      },
+      {
+        "epoch": 235,
+        "dugite": 11705029728142,
+        "cstreamer": 11707644615970
+      },
+      {
+        "epoch": 236,
+        "dugite": 12842421552950,
+        "cstreamer": 12843544444882
+      },
+      {
+        "epoch": 271,
+        "dugite": 15817006798580,
+        "cstreamer": 15818710086082
+      }
+    ],
+    "snapshots.go.poolParams.__digest__": [
+      {
+        "epoch": 212,
+        "dugite": "691d907a34271a62237985a46888f4cd73873354742aeaa8a9aefba403eec30e",
+        "cstreamer": "37483f022f259521c6e5fce8c48596ae6aced5814336d084c1a4bd2f06cb465a"
+      },
+      {
+        "epoch": 213,
+        "dugite": "16721b68e5ae704c7bb6e66bcb35338bdb21faa515ecb5376fc54bbab32cd3f8",
+        "cstreamer": "d2f75c9d0131f32d4f642f3facdfcf7346bfaef54f3a6c26773484d577d4c985"
+      },
+      {
+        "epoch": 214,
+        "dugite": "1705cc195efa49acb70dc7cbdb647cf87d01439b66a780085c7b67eb5b88f469",
+        "cstreamer": "8bb937945230e9817113beec8dec32aa32978e4476cf0a6e53272d6968390595"
+      },
+      {
+        "epoch": 215,
+        "dugite": "7ca0cc5d5dabd97fe8098a18abe7cd163d4b33fe4f432e4523b4675c95e96b56",
+        "cstreamer": "d7097049f3de283a95b78baf50048d8dbfa7169aa8583ad91eee1f2d71e0ab99"
+      },
+      {
+        "epoch": 216,
+        "dugite": "2857838cf465ec604ea561ab074ab1e262f07842a9ad9400d6b266322f6ca5c0",
+        "cstreamer": "a1e32ad5188a3f1e2a001da391b4dfbcbef83dd80f9177c37683f8c9e0fa9c3f"
+      },
+      {
+        "epoch": 217,
+        "dugite": "b4a13a168437bd1d7423aa30fa3da366d2e042305232b4fd977036c6df77c893",
+        "cstreamer": "e6dbbc3c698c045b6323bcfa2c365d1f120b947b0cd56fcb41247c9a8a95ec02"
+      },
+      {
+        "epoch": 218,
+        "dugite": "444d84f9f52e32a0874bff3867a088e8ce304875716dcc9c52a94680760750d2",
+        "cstreamer": "8179aa40f65431c17b24fe7a735d464f0df476b99579e395db51b9a412df6a7e"
+      },
+      {
+        "epoch": 219,
+        "dugite": "7dbe0166853bd9336e3ca436cae855e6b5bc8aa9704ab8984754d285ca0515b9",
+        "cstreamer": "1f29508457f9e6f1a6a4440ee9157c3c6197f3d752cffe66ae792be5493b0a5d"
+      },
+      {
+        "epoch": 220,
+        "dugite": "e5f50a5a6c683a4c17424966732eed7ee691943c534f6d110883497dd1e937d0",
+        "cstreamer": "576377293f62a6edc26a2d07c75700f6845f499702d55bf6969668842d0121f7"
+      },
+      {
+        "epoch": 221,
+        "dugite": "46d3ff04b9e7973c456a49feff45a02f03ab0775d53372718cf9f6ed523fbee2",
+        "cstreamer": "de33762e872ed13a9b66506e7e9f2da8993e5730d08e7fd876503d6f9cfb8b64"
+      },
+      {
+        "epoch": 222,
+        "dugite": "763ffd3db1f9e2613533556762e5f73a5469e8d98ec20b1115c51ddae8bf00e9",
+        "cstreamer": "cafb92c85aca94213b382a9f64b27f5718028fe4e58287014661f06d84b14eba"
+      },
+      {
+        "epoch": 223,
+        "dugite": "b7edfe7ba5e21099e366786c7fd958b43d5794af6e467a938b17ad3ce15609f2",
+        "cstreamer": "7ec3b51ab358fa3b8c47cb1b61805d0db97c1203380fa17dfd2ddb530e668936"
+      },
+      {
+        "epoch": 224,
+        "dugite": "577471e48a39ac75e76a68662ca3825c8234429707e39b0da9d587722f1ec402",
+        "cstreamer": "d2fd419265c02e02c83ee9173f30f4475a92f11b7f5d576505e2fd6e120695c1"
+      },
+      {
+        "epoch": 225,
+        "dugite": "df4f117672dd3c00bfe08c704f35b0f63366175f462c10f05b1e4fcc7cd732ff",
+        "cstreamer": "386b43a1d9a93716bcfbedd64a8babd407fdf6312ad018be586217452188b97a"
+      },
+      {
+        "epoch": 226,
+        "dugite": "8e6fbfaa292758ec8f290295cf698a7e7e86c01d649f344c0edffd5f6cbbee30",
+        "cstreamer": "bc03345ad1973304fdf702c7770f11c83a4f7aa506fd7a85ab9fb658f093b536"
+      },
+      {
+        "epoch": 227,
+        "dugite": "39e388fa9611be8af30ee23e97ddd650cefad44e130b78418684d7c39e5d62da",
+        "cstreamer": "864b6b88fd1019846028218a6009c70c1b50f95e2fe187ca1e2117f052ff18e6"
+      },
+      {
+        "epoch": 228,
+        "dugite": "d89d0e8c726ed6b15df84ee1e16ea016c12a445ea2d21d1657408cf39a398d41",
+        "cstreamer": "5a04b749217c7f94989eeac03e617bd8c7937ee91274a1302faf5ba85d56e62a"
+      },
+      {
+        "epoch": 229,
+        "dugite": "afe67916aaac5ad56aedcd7076764d15d8d0163185852b65b91117b74d318301",
+        "cstreamer": "7af380cf0debdc0fd76826152bf0d7098f11699856102d736b2755d224cf5858"
+      },
+      {
+        "epoch": 230,
+        "dugite": "d8e86407dd06a92987e734bab2f00bcf7ff6673c424bee5722ec24dfba7d0ac6",
+        "cstreamer": "bcca523f53f7522d9fd5e40283013f388333a75935ac66bac73a945b8458ad48"
+      },
+      {
+        "epoch": 231,
+        "dugite": "e846ad238649817e75fe0679996b20bcc66383f804756ff91fb0d045e8bb6d9e",
+        "cstreamer": "28f43d0f7c9406eb7f003a2b61c822656a1e8a8978ec1970249017da2c0a8c7b"
+      },
+      {
+        "epoch": 232,
+        "dugite": "da4a637389bd84e1b564a89d081003830a05b880a64d398ffe38a645132c92d6",
+        "cstreamer": "15db13e3ac96f6b317cc4590f1b38ecc5522f9dc097ca7117c05a289c091ece7"
+      },
+      {
+        "epoch": 233,
+        "dugite": "4026f9d57646a7fd64619f928b86828a849ea26e6db926d0d7066c6e92a060c0",
+        "cstreamer": "d5f1bc51ccfbfbdc7dc0b12d740b5261aee818f5ccfb283a3f54fbeb3d4f2fad"
+      },
+      {
+        "epoch": 234,
+        "dugite": "b860ab0a7960d2e6bafc63e95e99f81c83baea0b04ae8a79908f60e210db1069",
+        "cstreamer": "64fe2d34517247d7c07501da545adb2bbdaf549c3bf254bfe53eb248e757118e"
+      },
+      {
+        "epoch": 235,
+        "dugite": "591b78149a0685285b54ef00d86d61a21d59927482d8c0615b3dad877a52ebde",
+        "cstreamer": "bc6c194ff2d2cbb7df50338c3c176c6545dfa8458e81e6f99884476705344222"
+      },
+      {
+        "epoch": 236,
+        "dugite": "ace7bbff9f9df0e50a457933e7f60e105729989d8170166f4d5a2b2171a4c318",
+        "cstreamer": "9c88b15282cb5ad1b490900c059a199ef8655a67567abdbacd1b2659bc4ff74b"
+      },
+      {
+        "epoch": 237,
+        "dugite": "901f385938fd0dab1d8dc1e5e0c5e3636e0ded4cd0e86ca77784ae846cc3c8e5",
+        "cstreamer": "8177b6356d42c252728f38ad5c0df44ec69ff97a8ad04a9762685c555bbc4c13"
+      },
+      {
+        "epoch": 238,
+        "dugite": "d677a256e652c6ee5550e516b9e8dd9027e2344d4528903f1cc2f72bd4e86df6",
+        "cstreamer": "3b4a4ed931e74b5ccb37f19f6f7e9545481ecbcb7626beeb295b86a78cc6e2c4"
+      },
+      {
+        "epoch": 239,
+        "dugite": "8a05b515d9f6331d7a16522e66b7b32a99139492b2b2618f9bc3ff9dc9cb6ef0",
+        "cstreamer": "ca5ec1fe5d2ac91b0941889eae0dd1efafaea8cd2154a2242b3d610b256ff9d4"
+      },
+      {
+        "epoch": 240,
+        "dugite": "2a829037ac53d1cd36644966bd3a16897e7e625214fd644d321c3aa8d29686d5",
+        "cstreamer": "4a89f54cc4fb708ffb945d70c43073d6a48d1277193982271f5f6db4f98f2b5c"
+      },
+      {
+        "epoch": 241,
+        "dugite": "ead463165a90c2cb425d918362cabdd72bff213b44074b36c9465ff49db26705",
+        "cstreamer": "3855329aa16185202690e0ec8ea6089bc0fcdf45ef0f514aca1888904a6ca6e4"
+      },
+      {
+        "epoch": 242,
+        "dugite": "b715e749fedc3f2747b2e0851415f0b0524079b7f0d8e35b75238828677e8d48",
+        "cstreamer": "0a22841dbf9d1a10cbcc5e298c35c86980d2a8e2ca79af7cbdcb90eaf29cb858"
+      },
+      {
+        "epoch": 243,
+        "dugite": "ea661bb87932dfe5ac3bf23657119ee5768061443fd176f2ab55d7040a633417",
+        "cstreamer": "9b45b84135e560628f69a91409897bd80ea807e4f1257171540432a04f4fce9e"
+      },
+      {
+        "epoch": 244,
+        "dugite": "2a5f64fc304b36642a2fd355adab53fd94af4b339716226de9dfd8ad7b8ff24f",
+        "cstreamer": "6ba6dcd6d27f7495c75d80ad3ad74d476d16df604d32444c5f07a3eed23553f5"
+      },
+      {
+        "epoch": 245,
+        "dugite": "8b1ca713fee0a944b58a42b55b53473389b2dccce892e9c092e9a4703b23e528",
+        "cstreamer": "b024d039089346cce45480eb850ffadf6720b7690321ba8278f1e163057834bd"
+      },
+      {
+        "epoch": 246,
+        "dugite": "47d44466200e7809992f7329f09f06b73270f047c5a062293c849600e1a4662e",
+        "cstreamer": "b53e107da4e21a6e42bbe42b2c5c61d8699d193f39d0a17ca005c11525568ec4"
+      },
+      {
+        "epoch": 247,
+        "dugite": "f5ed1c7176a753664f0ca77f5d38591f438a1e90ed591aedbd15cc522ea4531f",
+        "cstreamer": "6e94bb5bc0cc631aba8106b348c10a4955667def76852f1c9e458f5965057528"
+      },
+      {
+        "epoch": 248,
+        "dugite": "fbe1ba0fd9ad0ac89b81be64a322dbde3763836d71c7c2d62769fa14e8a6693a",
+        "cstreamer": "98b0f69427cac38bbdc39714e7586145d8df5df197942b658f831cea3538b425"
+      },
+      {
+        "epoch": 249,
+        "dugite": "05d02f8da06ec51cf2dcea9d21643a6dde936e6cc78f99a481431be768f298a7",
+        "cstreamer": "0b86d6e2bdd9dea416a964f4b17e2ab45cda7ba856e1964da12bf64646f7a04c"
+      },
+      {
+        "epoch": 250,
+        "dugite": "05d0729c38f27a318e91b6ba968c4b16df8fde617e11bcf9b9946245b1b81fe2",
+        "cstreamer": "0c721aec13f8570163fee85aa8fe7cb48fbe53a489e0e3a49b848e7108ddc2c5"
+      },
+      {
+        "epoch": 251,
+        "dugite": "8970e4373b7360f13678557c76bc020b9523263c5d52ed291e37f48f511c0d51",
+        "cstreamer": "6e7dc910824dba7f37272bb808c4cf2be8bfa24cdfda38b6615f12011ed6205d"
+      },
+      {
+        "epoch": 252,
+        "dugite": "e01380c54a8fbf8daef87977d823115d6b16c6ef879edabd11e6503213da372a",
+        "cstreamer": "aaaed72840562039a39849fd02abab9d06419ece01059bab7e7d26c582a03ecd"
+      },
+      {
+        "epoch": 253,
+        "dugite": "6e507d4ce6d73922751ff71e56316357d7e59cb4f1a75a0da13d1f08a14635bb",
+        "cstreamer": "e7d2a9714b3aa58fb2c50d6e80e32ffb4f874e1bc83b125a0ae0ce9b72d56c42"
+      },
+      {
+        "epoch": 254,
+        "dugite": "2ff21a674764690ef1b34ea3c66b0fa6328d23aebfadb8f4c3811b3b8167c5c1",
+        "cstreamer": "ef9e27c3009addb64084cbbb5866dfa0205997d2d58005d9d0c7f7f2ebf0ef98"
+      },
+      {
+        "epoch": 255,
+        "dugite": "e8d7f0594535f3eb7532559cdbab5ee839f3bcf96be174cfe79d18d79731acab",
+        "cstreamer": "55732d4d8470235810b10dc1de928a31c8541828b0c1c8f8e7f7e234d17af47a"
+      },
+      {
+        "epoch": 256,
+        "dugite": "f61584ed67723adcc1df3f9e1393384544756e40980e53df884eeaf4ca4c0b9e",
+        "cstreamer": "be2da774b856e192fa88e891dd49074e68b3db5e4c063d1b24caf62e5ec68407"
+      },
+      {
+        "epoch": 257,
+        "dugite": "03010ccdb25f87bda890e22257a4e4a4fc1f1b7e3eeb7b2d8e7ec29b6c8dc374",
+        "cstreamer": "81ca113f84f42f7ec6413bad792f56c37537ba12e44f20562a6597b686353719"
+      },
+      {
+        "epoch": 258,
+        "dugite": "1f5cafea06224ccc1e470c711aad0220a5fb38b0f3a9a3e47c9bb001e8722532",
+        "cstreamer": "f9e20262d49d254423ff362b669b77988c5be009ffb4bcec1972a917c7bae604"
+      },
+      {
+        "epoch": 259,
+        "dugite": "d7388e32ea9d969d3e0fa8b94095a6d0f9850c5e2dd5c0c317c2d88fc3aa2e74",
+        "cstreamer": "f585136885b7b941223980fab0e68fd2e3664d5bf71e6b1231de679da2ccadfd"
+      },
+      {
+        "epoch": 260,
+        "dugite": "cd08eae0d0276a9ce1e24a86cd7265594b6aefdb34a96ead99eb43a00472edf0",
+        "cstreamer": "50e246baac7cb321bb56b0abb45ebc12ab2db06acf85b6e2fc3b46c9def843b9"
+      },
+      {
+        "epoch": 261,
+        "dugite": "8e08eebc72311b75a027f9342a6d724138b55f7911215074b0cfd763581ea351",
+        "cstreamer": "363e77ec26a590e3caec7f26a0196765af55c9fefaae2b2ca9b82f72c250df70"
+      },
+      {
+        "epoch": 262,
+        "dugite": "4482f63e0678e6d2dd44db9762854bbe1b5efbc19341dd0028b943b8636427b9",
+        "cstreamer": "18b824f2ace2626ab8ce1550ff64d62322a188e1cf41d29565b5cfc98d86a6dd"
+      },
+      {
+        "epoch": 263,
+        "dugite": "9b975be5b350042ecfa90df8291424a38e1f0b36e294d6e5b6e1ad0b2d74a224",
+        "cstreamer": "ff17f4a3c73ccd5b9303d43c31d2f11d28fcff0a73e5bf3c318af4fe078c778d"
+      },
+      {
+        "epoch": 264,
+        "dugite": "37e1a245f824351decbd81cfeeaf13f76be0b70e5a323abf38e27a3bf7f19c19",
+        "cstreamer": "67b3e507b8d88da8f2c3e8b21b8c4f0291245b0085ba78126e0d62e47b1b71fd"
+      },
+      {
+        "epoch": 265,
+        "dugite": "fb299a6b23708cf5a775030ff0efe2f3c2814c27479ce9df2e56a9953db7720a",
+        "cstreamer": "eadba73b7d96d5890f5e391290d62076980d05d6294f0c5063048bf075f124ee"
+      },
+      {
+        "epoch": 266,
+        "dugite": "8940c284d6f650208a17a587d4667318a17ecc5b13d8aeca362f0fd79dc48fcc",
+        "cstreamer": "3af63b20ae8ccb88d0ca22acf93a0e923145b03ebf27210620d9571b91843436"
+      },
+      {
+        "epoch": 267,
+        "dugite": "17f1efade11af113f7085e201fe0fd7c9e8a3b91801677048597a71d54fb24e3",
+        "cstreamer": "907718eb225970eef4deb152901c88727cbf532bc2457cb6aa8e38aef4ae60ee"
+      },
+      {
+        "epoch": 268,
+        "dugite": "0f5cebfda7cdfcb05c6a3ca5ccd6c2f4186d5d056d8370e2faef6cc6e70d1c32",
+        "cstreamer": "6aa451796cb70b2ab26a94a19c494d670ba81ab5de6dc141c7e327f3ea1148e0"
+      },
+      {
+        "epoch": 269,
+        "dugite": "6b01523210ee5b9e961e4ccf194ea98d9f46b32055684162f51e869122273991",
+        "cstreamer": "708d2d109b4624a1787a132b5c2f141c06f849c0a39219b865a7b67d063817a0"
+      },
+      {
+        "epoch": 270,
+        "dugite": "0ae8c7cc009c6d0317eeec415eab6d5e8250dc16f1f4f9b400c9519df960a7ef",
+        "cstreamer": "f2486178d14c21db8b1b886f5a7bb38e4422d8364493d8c8d725d8b327ecc170"
+      },
+      {
+        "epoch": 271,
+        "dugite": "8453aa359bb6e231a54d6ebe1567bf8210b2dc993b02316015bfb3ad1faae36a",
+        "cstreamer": "017638dca8f0515cd8ac5fcb1fb97bda34f2cd92a8205667159c0988e01ec081"
+      }
+    ],
+    "deposits.pool": [
+      {
+        "epoch": 271,
+        "dugite": 1375000000000,
+        "cstreamer": 1358500000000
+      }
+    ],
+    "deposits.stakeKey": [
+      {
+        "epoch": 271,
+        "dugite": 1324740000000,
+        "cstreamer": 1302658000000
+      }
+    ],
+    "deposits.total": [
+      {
+        "epoch": 271,
+        "dugite": 2699740000000,
+        "cstreamer": 2661158000000
+      }
+    ]
+  },
+  "vacuous": {},
+  "absent_one_side": {
+    "drepDistr": [
+      [
+        208,
+        "cstreamer"
+      ],
+      [
+        209,
+        "cstreamer"
+      ],
+      [
+        210,
+        "cstreamer"
+      ],
+      [
+        211,
+        "cstreamer"
+      ],
+      [
+        212,
+        "cstreamer"
+      ],
+      [
+        213,
+        "cstreamer"
+      ],
+      [
+        214,
+        "cstreamer"
+      ],
+      [
+        215,
+        "cstreamer"
+      ],
+      [
+        216,
+        "cstreamer"
+      ],
+      [
+        217,
+        "cstreamer"
+      ],
+      [
+        218,
+        "cstreamer"
+      ],
+      [
+        219,
+        "cstreamer"
+      ],
+      [
+        220,
+        "cstreamer"
+      ],
+      [
+        221,
+        "cstreamer"
+      ],
+      [
+        222,
+        "cstreamer"
+      ],
+      [
+        223,
+        "cstreamer"
+      ],
+      [
+        224,
+        "cstreamer"
+      ],
+      [
+        225,
+        "cstreamer"
+      ],
+      [
+        226,
+        "cstreamer"
+      ],
+      [
+        227,
+        "cstreamer"
+      ],
+      [
+        228,
+        "cstreamer"
+      ],
+      [
+        229,
+        "cstreamer"
+      ],
+      [
+        230,
+        "cstreamer"
+      ],
+      [
+        231,
+        "cstreamer"
+      ],
+      [
+        232,
+        "cstreamer"
+      ],
+      [
+        233,
+        "cstreamer"
+      ],
+      [
+        234,
+        "cstreamer"
+      ],
+      [
+        235,
+        "cstreamer"
+      ],
+      [
+        236,
+        "cstreamer"
+      ],
+      [
+        237,
+        "cstreamer"
+      ],
+      [
+        238,
+        "cstreamer"
+      ],
+      [
+        239,
+        "cstreamer"
+      ],
+      [
+        240,
+        "cstreamer"
+      ],
+      [
+        241,
+        "cstreamer"
+      ],
+      [
+        242,
+        "cstreamer"
+      ],
+      [
+        243,
+        "cstreamer"
+      ],
+      [
+        244,
+        "cstreamer"
+      ],
+      [
+        245,
+        "cstreamer"
+      ],
+      [
+        246,
+        "cstreamer"
+      ],
+      [
+        247,
+        "cstreamer"
+      ],
+      [
+        248,
+        "cstreamer"
+      ],
+      [
+        249,
+        "cstreamer"
+      ],
+      [
+        250,
+        "cstreamer"
+      ],
+      [
+        251,
+        "cstreamer"
+      ],
+      [
+        252,
+        "cstreamer"
+      ],
+      [
+        253,
+        "cstreamer"
+      ],
+      [
+        254,
+        "cstreamer"
+      ],
+      [
+        255,
+        "cstreamer"
+      ],
+      [
+        256,
+        "cstreamer"
+      ],
+      [
+        257,
+        "cstreamer"
+      ],
+      [
+        258,
+        "cstreamer"
+      ],
+      [
+        259,
+        "cstreamer"
+      ],
+      [
+        260,
+        "cstreamer"
+      ],
+      [
+        261,
+        "cstreamer"
+      ],
+      [
+        262,
+        "cstreamer"
+      ],
+      [
+        263,
+        "cstreamer"
+      ],
+      [
+        264,
+        "cstreamer"
+      ],
+      [
+        265,
+        "cstreamer"
+      ],
+      [
+        266,
+        "cstreamer"
+      ],
+      [
+        267,
+        "cstreamer"
+      ],
+      [
+        268,
+        "cstreamer"
+      ],
+      [
+        269,
+        "cstreamer"
+      ],
+      [
+        270,
+        "cstreamer"
+      ],
+      [
+        271,
+        "cstreamer"
+      ]
+    ],
+    "enactedRoots": [
+      [
+        208,
+        "cstreamer"
+      ],
+      [
+        209,
+        "cstreamer"
+      ],
+      [
+        210,
+        "cstreamer"
+      ],
+      [
+        211,
+        "cstreamer"
+      ],
+      [
+        212,
+        "cstreamer"
+      ],
+      [
+        213,
+        "cstreamer"
+      ],
+      [
+        214,
+        "cstreamer"
+      ],
+      [
+        215,
+        "cstreamer"
+      ],
+      [
+        216,
+        "cstreamer"
+      ],
+      [
+        217,
+        "cstreamer"
+      ],
+      [
+        218,
+        "cstreamer"
+      ],
+      [
+        219,
+        "cstreamer"
+      ],
+      [
+        220,
+        "cstreamer"
+      ],
+      [
+        221,
+        "cstreamer"
+      ],
+      [
+        222,
+        "cstreamer"
+      ],
+      [
+        223,
+        "cstreamer"
+      ],
+      [
+        224,
+        "cstreamer"
+      ],
+      [
+        225,
+        "cstreamer"
+      ],
+      [
+        226,
+        "cstreamer"
+      ],
+      [
+        227,
+        "cstreamer"
+      ],
+      [
+        228,
+        "cstreamer"
+      ],
+      [
+        229,
+        "cstreamer"
+      ],
+      [
+        230,
+        "cstreamer"
+      ],
+      [
+        231,
+        "cstreamer"
+      ],
+      [
+        232,
+        "cstreamer"
+      ],
+      [
+        233,
+        "cstreamer"
+      ],
+      [
+        234,
+        "cstreamer"
+      ],
+      [
+        235,
+        "cstreamer"
+      ],
+      [
+        236,
+        "cstreamer"
+      ],
+      [
+        237,
+        "cstreamer"
+      ],
+      [
+        238,
+        "cstreamer"
+      ],
+      [
+        239,
+        "cstreamer"
+      ],
+      [
+        240,
+        "cstreamer"
+      ],
+      [
+        241,
+        "cstreamer"
+      ],
+      [
+        242,
+        "cstreamer"
+      ],
+      [
+        243,
+        "cstreamer"
+      ],
+      [
+        244,
+        "cstreamer"
+      ],
+      [
+        245,
+        "cstreamer"
+      ],
+      [
+        246,
+        "cstreamer"
+      ],
+      [
+        247,
+        "cstreamer"
+      ],
+      [
+        248,
+        "cstreamer"
+      ],
+      [
+        249,
+        "cstreamer"
+      ],
+      [
+        250,
+        "cstreamer"
+      ],
+      [
+        251,
+        "cstreamer"
+      ],
+      [
+        252,
+        "cstreamer"
+      ],
+      [
+        253,
+        "cstreamer"
+      ],
+      [
+        254,
+        "cstreamer"
+      ],
+      [
+        255,
+        "cstreamer"
+      ],
+      [
+        256,
+        "cstreamer"
+      ],
+      [
+        257,
+        "cstreamer"
+      ],
+      [
+        258,
+        "cstreamer"
+      ],
+      [
+        259,
+        "cstreamer"
+      ],
+      [
+        260,
+        "cstreamer"
+      ],
+      [
+        261,
+        "cstreamer"
+      ],
+      [
+        262,
+        "cstreamer"
+      ],
+      [
+        263,
+        "cstreamer"
+      ],
+      [
+        264,
+        "cstreamer"
+      ],
+      [
+        265,
+        "cstreamer"
+      ],
+      [
+        266,
+        "cstreamer"
+      ],
+      [
+        267,
+        "cstreamer"
+      ],
+      [
+        268,
+        "cstreamer"
+      ],
+      [
+        269,
+        "cstreamer"
+      ],
+      [
+        270,
+        "cstreamer"
+      ],
+      [
+        271,
+        "cstreamer"
+      ]
+    ],
+    "instantaneousRewards": [
+      [
+        208,
+        "dugite"
+      ],
+      [
+        209,
+        "dugite"
+      ],
+      [
+        210,
+        "dugite"
+      ],
+      [
+        211,
+        "dugite"
+      ],
+      [
+        212,
+        "dugite"
+      ],
+      [
+        213,
+        "dugite"
+      ],
+      [
+        214,
+        "dugite"
+      ],
+      [
+        215,
+        "dugite"
+      ],
+      [
+        216,
+        "dugite"
+      ],
+      [
+        217,
+        "dugite"
+      ],
+      [
+        218,
+        "dugite"
+      ],
+      [
+        219,
+        "dugite"
+      ],
+      [
+        220,
+        "dugite"
+      ],
+      [
+        221,
+        "dugite"
+      ],
+      [
+        222,
+        "dugite"
+      ],
+      [
+        223,
+        "dugite"
+      ],
+      [
+        224,
+        "dugite"
+      ],
+      [
+        225,
+        "dugite"
+      ],
+      [
+        226,
+        "dugite"
+      ],
+      [
+        227,
+        "dugite"
+      ],
+      [
+        228,
+        "dugite"
+      ],
+      [
+        229,
+        "dugite"
+      ],
+      [
+        230,
+        "dugite"
+      ],
+      [
+        231,
+        "dugite"
+      ],
+      [
+        232,
+        "dugite"
+      ],
+      [
+        233,
+        "dugite"
+      ],
+      [
+        234,
+        "dugite"
+      ],
+      [
+        235,
+        "dugite"
+      ],
+      [
+        236,
+        "dugite"
+      ],
+      [
+        237,
+        "dugite"
+      ],
+      [
+        238,
+        "dugite"
+      ],
+      [
+        239,
+        "dugite"
+      ],
+      [
+        240,
+        "dugite"
+      ],
+      [
+        241,
+        "dugite"
+      ],
+      [
+        242,
+        "dugite"
+      ],
+      [
+        243,
+        "dugite"
+      ],
+      [
+        244,
+        "dugite"
+      ],
+      [
+        245,
+        "dugite"
+      ],
+      [
+        246,
+        "dugite"
+      ],
+      [
+        247,
+        "dugite"
+      ],
+      [
+        248,
+        "dugite"
+      ],
+      [
+        249,
+        "dugite"
+      ],
+      [
+        250,
+        "dugite"
+      ],
+      [
+        251,
+        "dugite"
+      ],
+      [
+        252,
+        "dugite"
+      ],
+      [
+        253,
+        "dugite"
+      ],
+      [
+        254,
+        "dugite"
+      ],
+      [
+        255,
+        "dugite"
+      ],
+      [
+        256,
+        "dugite"
+      ],
+      [
+        257,
+        "dugite"
+      ],
+      [
+        258,
+        "dugite"
+      ],
+      [
+        259,
+        "dugite"
+      ],
+      [
+        260,
+        "dugite"
+      ],
+      [
+        261,
+        "dugite"
+      ],
+      [
+        262,
+        "dugite"
+      ],
+      [
+        263,
+        "dugite"
+      ],
+      [
+        264,
+        "dugite"
+      ],
+      [
+        265,
+        "dugite"
+      ],
+      [
+        266,
+        "dugite"
+      ],
+      [
+        267,
+        "dugite"
+      ],
+      [
+        268,
+        "dugite"
+      ],
+      [
+        269,
+        "dugite"
+      ],
+      [
+        270,
+        "dugite"
+      ],
+      [
+        271,
+        "dugite"
+      ]
+    ],
+    "proposals": [
+      [
+        208,
+        "cstreamer"
+      ],
+      [
+        209,
+        "cstreamer"
+      ],
+      [
+        210,
+        "cstreamer"
+      ],
+      [
+        211,
+        "cstreamer"
+      ],
+      [
+        212,
+        "cstreamer"
+      ],
+      [
+        213,
+        "cstreamer"
+      ],
+      [
+        214,
+        "cstreamer"
+      ],
+      [
+        215,
+        "cstreamer"
+      ],
+      [
+        216,
+        "cstreamer"
+      ],
+      [
+        217,
+        "cstreamer"
+      ],
+      [
+        218,
+        "cstreamer"
+      ],
+      [
+        219,
+        "cstreamer"
+      ],
+      [
+        220,
+        "cstreamer"
+      ],
+      [
+        221,
+        "cstreamer"
+      ],
+      [
+        222,
+        "cstreamer"
+      ],
+      [
+        223,
+        "cstreamer"
+      ],
+      [
+        224,
+        "cstreamer"
+      ],
+      [
+        225,
+        "cstreamer"
+      ],
+      [
+        226,
+        "cstreamer"
+      ],
+      [
+        227,
+        "cstreamer"
+      ],
+      [
+        228,
+        "cstreamer"
+      ],
+      [
+        229,
+        "cstreamer"
+      ],
+      [
+        230,
+        "cstreamer"
+      ],
+      [
+        231,
+        "cstreamer"
+      ],
+      [
+        232,
+        "cstreamer"
+      ],
+      [
+        233,
+        "cstreamer"
+      ],
+      [
+        234,
+        "cstreamer"
+      ],
+      [
+        235,
+        "cstreamer"
+      ],
+      [
+        236,
+        "cstreamer"
+      ],
+      [
+        237,
+        "cstreamer"
+      ],
+      [
+        238,
+        "cstreamer"
+      ],
+      [
+        239,
+        "cstreamer"
+      ],
+      [
+        240,
+        "cstreamer"
+      ],
+      [
+        241,
+        "cstreamer"
+      ],
+      [
+        242,
+        "cstreamer"
+      ],
+      [
+        243,
+        "cstreamer"
+      ],
+      [
+        244,
+        "cstreamer"
+      ],
+      [
+        245,
+        "cstreamer"
+      ],
+      [
+        246,
+        "cstreamer"
+      ],
+      [
+        247,
+        "cstreamer"
+      ],
+      [
+        248,
+        "cstreamer"
+      ],
+      [
+        249,
+        "cstreamer"
+      ],
+      [
+        250,
+        "cstreamer"
+      ],
+      [
+        251,
+        "cstreamer"
+      ],
+      [
+        252,
+        "cstreamer"
+      ],
+      [
+        253,
+        "cstreamer"
+      ],
+      [
+        254,
+        "cstreamer"
+      ],
+      [
+        255,
+        "cstreamer"
+      ],
+      [
+        256,
+        "cstreamer"
+      ],
+      [
+        257,
+        "cstreamer"
+      ],
+      [
+        258,
+        "cstreamer"
+      ],
+      [
+        259,
+        "cstreamer"
+      ],
+      [
+        260,
+        "cstreamer"
+      ],
+      [
+        261,
+        "cstreamer"
+      ],
+      [
+        262,
+        "cstreamer"
+      ],
+      [
+        263,
+        "cstreamer"
+      ],
+      [
+        264,
+        "cstreamer"
+      ],
+      [
+        265,
+        "cstreamer"
+      ],
+      [
+        266,
+        "cstreamer"
+      ],
+      [
+        267,
+        "cstreamer"
+      ],
+      [
+        268,
+        "cstreamer"
+      ],
+      [
+        269,
+        "cstreamer"
+      ],
+      [
+        270,
+        "cstreamer"
+      ],
+      [
+        271,
+        "cstreamer"
+      ]
+    ],
+    "rupdApplied": [
+      [
+        208,
+        "dugite"
+      ],
+      [
+        209,
+        "dugite"
+      ],
+      [
+        210,
+        "dugite"
+      ],
+      [
+        211,
+        "dugite"
+      ],
+      [
+        212,
+        "dugite"
+      ],
+      [
+        213,
+        "dugite"
+      ],
+      [
+        214,
+        "dugite"
+      ],
+      [
+        215,
+        "dugite"
+      ],
+      [
+        216,
+        "dugite"
+      ],
+      [
+        217,
+        "dugite"
+      ],
+      [
+        218,
+        "dugite"
+      ],
+      [
+        219,
+        "dugite"
+      ],
+      [
+        220,
+        "dugite"
+      ],
+      [
+        221,
+        "dugite"
+      ],
+      [
+        222,
+        "dugite"
+      ],
+      [
+        223,
+        "dugite"
+      ],
+      [
+        224,
+        "dugite"
+      ],
+      [
+        225,
+        "dugite"
+      ],
+      [
+        226,
+        "dugite"
+      ],
+      [
+        227,
+        "dugite"
+      ],
+      [
+        228,
+        "dugite"
+      ],
+      [
+        229,
+        "dugite"
+      ],
+      [
+        230,
+        "dugite"
+      ],
+      [
+        231,
+        "dugite"
+      ],
+      [
+        232,
+        "dugite"
+      ],
+      [
+        233,
+        "dugite"
+      ],
+      [
+        234,
+        "dugite"
+      ],
+      [
+        235,
+        "dugite"
+      ],
+      [
+        236,
+        "dugite"
+      ],
+      [
+        237,
+        "dugite"
+      ],
+      [
+        238,
+        "dugite"
+      ],
+      [
+        239,
+        "dugite"
+      ],
+      [
+        240,
+        "dugite"
+      ],
+      [
+        241,
+        "dugite"
+      ],
+      [
+        242,
+        "dugite"
+      ],
+      [
+        243,
+        "dugite"
+      ],
+      [
+        244,
+        "dugite"
+      ],
+      [
+        245,
+        "dugite"
+      ],
+      [
+        246,
+        "dugite"
+      ],
+      [
+        247,
+        "dugite"
+      ],
+      [
+        248,
+        "dugite"
+      ],
+      [
+        249,
+        "dugite"
+      ],
+      [
+        250,
+        "dugite"
+      ],
+      [
+        251,
+        "dugite"
+      ],
+      [
+        252,
+        "dugite"
+      ],
+      [
+        253,
+        "dugite"
+      ],
+      [
+        254,
+        "dugite"
+      ],
+      [
+        255,
+        "dugite"
+      ],
+      [
+        256,
+        "dugite"
+      ],
+      [
+        257,
+        "dugite"
+      ],
+      [
+        258,
+        "dugite"
+      ],
+      [
+        259,
+        "dugite"
+      ],
+      [
+        260,
+        "dugite"
+      ],
+      [
+        261,
+        "dugite"
+      ],
+      [
+        262,
+        "dugite"
+      ],
+      [
+        263,
+        "dugite"
+      ],
+      [
+        264,
+        "dugite"
+      ],
+      [
+        265,
+        "dugite"
+      ],
+      [
+        266,
+        "dugite"
+      ],
+      [
+        267,
+        "dugite"
+      ],
+      [
+        268,
+        "dugite"
+      ],
+      [
+        269,
+        "dugite"
+      ],
+      [
+        270,
+        "dugite"
+      ],
+      [
+        271,
+        "dugite"
+      ]
+    ],
+    "snapshots.go.epoch": [
+      [
+        208,
+        "cstreamer"
+      ],
+      [
+        209,
+        "cstreamer"
+      ],
+      [
+        210,
+        "cstreamer"
+      ],
+      [
+        211,
+        "cstreamer"
+      ],
+      [
+        212,
+        "cstreamer"
+      ],
+      [
+        213,
+        "cstreamer"
+      ],
+      [
+        214,
+        "cstreamer"
+      ],
+      [
+        215,
+        "cstreamer"
+      ],
+      [
+        216,
+        "cstreamer"
+      ],
+      [
+        217,
+        "cstreamer"
+      ],
+      [
+        218,
+        "cstreamer"
+      ],
+      [
+        219,
+        "cstreamer"
+      ],
+      [
+        220,
+        "cstreamer"
+      ],
+      [
+        221,
+        "cstreamer"
+      ],
+      [
+        222,
+        "cstreamer"
+      ],
+      [
+        223,
+        "cstreamer"
+      ],
+      [
+        224,
+        "cstreamer"
+      ],
+      [
+        225,
+        "cstreamer"
+      ],
+      [
+        226,
+        "cstreamer"
+      ],
+      [
+        227,
+        "cstreamer"
+      ],
+      [
+        228,
+        "cstreamer"
+      ],
+      [
+        229,
+        "cstreamer"
+      ],
+      [
+        230,
+        "cstreamer"
+      ],
+      [
+        231,
+        "cstreamer"
+      ],
+      [
+        232,
+        "cstreamer"
+      ],
+      [
+        233,
+        "cstreamer"
+      ],
+      [
+        234,
+        "cstreamer"
+      ],
+      [
+        235,
+        "cstreamer"
+      ],
+      [
+        236,
+        "cstreamer"
+      ],
+      [
+        237,
+        "cstreamer"
+      ],
+      [
+        238,
+        "cstreamer"
+      ],
+      [
+        239,
+        "cstreamer"
+      ],
+      [
+        240,
+        "cstreamer"
+      ],
+      [
+        241,
+        "cstreamer"
+      ],
+      [
+        242,
+        "cstreamer"
+      ],
+      [
+        243,
+        "cstreamer"
+      ],
+      [
+        244,
+        "cstreamer"
+      ],
+      [
+        245,
+        "cstreamer"
+      ],
+      [
+        246,
+        "cstreamer"
+      ],
+      [
+        247,
+        "cstreamer"
+      ],
+      [
+        248,
+        "cstreamer"
+      ],
+      [
+        249,
+        "cstreamer"
+      ],
+      [
+        250,
+        "cstreamer"
+      ],
+      [
+        251,
+        "cstreamer"
+      ],
+      [
+        252,
+        "cstreamer"
+      ],
+      [
+        253,
+        "cstreamer"
+      ],
+      [
+        254,
+        "cstreamer"
+      ],
+      [
+        255,
+        "cstreamer"
+      ],
+      [
+        256,
+        "cstreamer"
+      ],
+      [
+        257,
+        "cstreamer"
+      ],
+      [
+        258,
+        "cstreamer"
+      ],
+      [
+        259,
+        "cstreamer"
+      ],
+      [
+        260,
+        "cstreamer"
+      ],
+      [
+        261,
+        "cstreamer"
+      ],
+      [
+        262,
+        "cstreamer"
+      ],
+      [
+        263,
+        "cstreamer"
+      ],
+      [
+        264,
+        "cstreamer"
+      ],
+      [
+        265,
+        "cstreamer"
+      ],
+      [
+        266,
+        "cstreamer"
+      ],
+      [
+        267,
+        "cstreamer"
+      ],
+      [
+        268,
+        "cstreamer"
+      ],
+      [
+        269,
+        "cstreamer"
+      ],
+      [
+        270,
+        "cstreamer"
+      ],
+      [
+        271,
+        "cstreamer"
+      ]
+    ],
+    "snapshots.mark.epoch": [
+      [
+        208,
+        "cstreamer"
+      ],
+      [
+        209,
+        "cstreamer"
+      ],
+      [
+        210,
+        "cstreamer"
+      ],
+      [
+        211,
+        "cstreamer"
+      ],
+      [
+        212,
+        "cstreamer"
+      ],
+      [
+        213,
+        "cstreamer"
+      ],
+      [
+        214,
+        "cstreamer"
+      ],
+      [
+        215,
+        "cstreamer"
+      ],
+      [
+        216,
+        "cstreamer"
+      ],
+      [
+        217,
+        "cstreamer"
+      ],
+      [
+        218,
+        "cstreamer"
+      ],
+      [
+        219,
+        "cstreamer"
+      ],
+      [
+        220,
+        "cstreamer"
+      ],
+      [
+        221,
+        "cstreamer"
+      ],
+      [
+        222,
+        "cstreamer"
+      ],
+      [
+        223,
+        "cstreamer"
+      ],
+      [
+        224,
+        "cstreamer"
+      ],
+      [
+        225,
+        "cstreamer"
+      ],
+      [
+        226,
+        "cstreamer"
+      ],
+      [
+        227,
+        "cstreamer"
+      ],
+      [
+        228,
+        "cstreamer"
+      ],
+      [
+        229,
+        "cstreamer"
+      ],
+      [
+        230,
+        "cstreamer"
+      ],
+      [
+        231,
+        "cstreamer"
+      ],
+      [
+        232,
+        "cstreamer"
+      ],
+      [
+        233,
+        "cstreamer"
+      ],
+      [
+        234,
+        "cstreamer"
+      ],
+      [
+        235,
+        "cstreamer"
+      ],
+      [
+        236,
+        "cstreamer"
+      ],
+      [
+        237,
+        "cstreamer"
+      ],
+      [
+        238,
+        "cstreamer"
+      ],
+      [
+        239,
+        "cstreamer"
+      ],
+      [
+        240,
+        "cstreamer"
+      ],
+      [
+        241,
+        "cstreamer"
+      ],
+      [
+        242,
+        "cstreamer"
+      ],
+      [
+        243,
+        "cstreamer"
+      ],
+      [
+        244,
+        "cstreamer"
+      ],
+      [
+        245,
+        "cstreamer"
+      ],
+      [
+        246,
+        "cstreamer"
+      ],
+      [
+        247,
+        "cstreamer"
+      ],
+      [
+        248,
+        "cstreamer"
+      ],
+      [
+        249,
+        "cstreamer"
+      ],
+      [
+        250,
+        "cstreamer"
+      ],
+      [
+        251,
+        "cstreamer"
+      ],
+      [
+        252,
+        "cstreamer"
+      ],
+      [
+        253,
+        "cstreamer"
+      ],
+      [
+        254,
+        "cstreamer"
+      ],
+      [
+        255,
+        "cstreamer"
+      ],
+      [
+        256,
+        "cstreamer"
+      ],
+      [
+        257,
+        "cstreamer"
+      ],
+      [
+        258,
+        "cstreamer"
+      ],
+      [
+        259,
+        "cstreamer"
+      ],
+      [
+        260,
+        "cstreamer"
+      ],
+      [
+        261,
+        "cstreamer"
+      ],
+      [
+        262,
+        "cstreamer"
+      ],
+      [
+        263,
+        "cstreamer"
+      ],
+      [
+        264,
+        "cstreamer"
+      ],
+      [
+        265,
+        "cstreamer"
+      ],
+      [
+        266,
+        "cstreamer"
+      ],
+      [
+        267,
+        "cstreamer"
+      ],
+      [
+        268,
+        "cstreamer"
+      ],
+      [
+        269,
+        "cstreamer"
+      ],
+      [
+        270,
+        "cstreamer"
+      ],
+      [
+        271,
+        "cstreamer"
+      ]
+    ],
+    "snapshots.set.epoch": [
+      [
+        209,
+        "cstreamer"
+      ],
+      [
+        210,
+        "cstreamer"
+      ],
+      [
+        211,
+        "cstreamer"
+      ],
+      [
+        212,
+        "cstreamer"
+      ],
+      [
+        213,
+        "cstreamer"
+      ],
+      [
+        214,
+        "cstreamer"
+      ],
+      [
+        215,
+        "cstreamer"
+      ],
+      [
+        216,
+        "cstreamer"
+      ],
+      [
+        217,
+        "cstreamer"
+      ],
+      [
+        218,
+        "cstreamer"
+      ],
+      [
+        219,
+        "cstreamer"
+      ],
+      [
+        220,
+        "cstreamer"
+      ],
+      [
+        221,
+        "cstreamer"
+      ],
+      [
+        222,
+        "cstreamer"
+      ],
+      [
+        223,
+        "cstreamer"
+      ],
+      [
+        224,
+        "cstreamer"
+      ],
+      [
+        225,
+        "cstreamer"
+      ],
+      [
+        226,
+        "cstreamer"
+      ],
+      [
+        227,
+        "cstreamer"
+      ],
+      [
+        228,
+        "cstreamer"
+      ],
+      [
+        229,
+        "cstreamer"
+      ],
+      [
+        230,
+        "cstreamer"
+      ],
+      [
+        231,
+        "cstreamer"
+      ],
+      [
+        232,
+        "cstreamer"
+      ],
+      [
+        233,
+        "cstreamer"
+      ],
+      [
+        234,
+        "cstreamer"
+      ],
+      [
+        235,
+        "cstreamer"
+      ],
+      [
+        236,
+        "cstreamer"
+      ],
+      [
+        237,
+        "cstreamer"
+      ],
+      [
+        238,
+        "cstreamer"
+      ],
+      [
+        239,
+        "cstreamer"
+      ],
+      [
+        240,
+        "cstreamer"
+      ],
+      [
+        241,
+        "cstreamer"
+      ],
+      [
+        242,
+        "cstreamer"
+      ],
+      [
+        243,
+        "cstreamer"
+      ],
+      [
+        244,
+        "cstreamer"
+      ],
+      [
+        245,
+        "cstreamer"
+      ],
+      [
+        246,
+        "cstreamer"
+      ],
+      [
+        247,
+        "cstreamer"
+      ],
+      [
+        248,
+        "cstreamer"
+      ],
+      [
+        249,
+        "cstreamer"
+      ],
+      [
+        250,
+        "cstreamer"
+      ],
+      [
+        251,
+        "cstreamer"
+      ],
+      [
+        252,
+        "cstreamer"
+      ],
+      [
+        253,
+        "cstreamer"
+      ],
+      [
+        254,
+        "cstreamer"
+      ],
+      [
+        255,
+        "cstreamer"
+      ],
+      [
+        256,
+        "cstreamer"
+      ],
+      [
+        257,
+        "cstreamer"
+      ],
+      [
+        258,
+        "cstreamer"
+      ],
+      [
+        259,
+        "cstreamer"
+      ],
+      [
+        260,
+        "cstreamer"
+      ],
+      [
+        261,
+        "cstreamer"
+      ],
+      [
+        262,
+        "cstreamer"
+      ],
+      [
+        263,
+        "cstreamer"
+      ],
+      [
+        264,
+        "cstreamer"
+      ],
+      [
+        265,
+        "cstreamer"
+      ],
+      [
+        266,
+        "cstreamer"
+      ],
+      [
+        267,
+        "cstreamer"
+      ],
+      [
+        268,
+        "cstreamer"
+      ],
+      [
+        269,
+        "cstreamer"
+      ],
+      [
+        270,
+        "cstreamer"
+      ],
+      [
+        271,
+        "cstreamer"
+      ]
+    ],
+    "snapshots.mark.blocks.83f09b0af923a095a1c17905e802a35d1044f974b25d2a755a2d8266": [
+      [
+        271,
+        "dugite"
+      ]
+    ],
+    "snapshots.mark.blocks.__count__": [
+      [
+        271,
+        "cstreamer"
+      ]
+    ],
+    "snapshots.mark.blocks.__digest__": [
+      [
+        271,
+        "cstreamer"
+      ]
+    ],
+    "snapshots.mark.blocks.__sum__": [
+      [
+        271,
+        "cstreamer"
+      ]
+    ]
+  },
+  "unpaired_dugite_non_byron": [],
+  "unpaired_cstreamer": [
+    272,
+    273
+  ],
+  "exit_code": 1
+}
