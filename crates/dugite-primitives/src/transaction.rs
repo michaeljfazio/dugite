@@ -412,6 +412,14 @@ impl Rational {
 }
 
 /// Pool relay
+///
+/// `ipv6` holds the SIXTEEN WIRE BYTES, which are not a network-order address:
+/// cardano-ledger encodes an `IPv6` as its four `Word32`s in LITTLE-ENDIAN
+/// order, so each 4-byte group arrives reversed. Storing them verbatim is
+/// deliberate — the N2C re-encode has to round-trip them — so every consumer
+/// that wants an ADDRESS must go through [`ipv6_from_ledger_bytes`] rather than
+/// reinterpreting the array. Two consumers already got this wrong in different
+/// ways (see its docs).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Relay {
     SingleHostAddr {
@@ -426,6 +434,29 @@ pub enum Relay {
     MultiHostName {
         dns_name: String,
     },
+}
+
+/// Turn cardano-ledger's on-wire IPv6 bytes into an address.
+///
+/// cardano-ledger encodes an `IPv6` as its four `Word32`s LITTLE-ENDIAN, so the
+/// wire form is the address with each 4-byte group reversed. cardano-node then
+/// renders the DECODED value (`instance ToJSON IPv6 where toJSON = toJSON .
+/// show`, cardano-ledger-core `Cardano/Ledger/Orphans.hs:44`).
+///
+/// This lives here, beside the type, because both known consumers got it wrong
+/// independently and in opposite directions (#1078): `dump-snapshot` hex-dumped
+/// the raw bytes, printing `f804012a2c4191010000000003000000` where
+/// cardano-node prints `2a01:4f8:191:412c::3`; and ledger peer discovery
+/// dropped IPv6 relays entirely, which was accidentally the safer bug — adding
+/// them without this conversion would have dialled a completely different
+/// address than the operator registered.
+pub fn ipv6_from_ledger_bytes(b: &[u8; 16]) -> std::net::Ipv6Addr {
+    let mut be = [0u8; 16];
+    for i in 0..4 {
+        let w = u32::from_le_bytes([b[i * 4], b[i * 4 + 1], b[i * 4 + 2], b[i * 4 + 3]]);
+        be[i * 4..i * 4 + 4].copy_from_slice(&w.to_be_bytes());
+    }
+    std::net::Ipv6Addr::from(be)
 }
 
 /// Pool metadata reference
@@ -1789,5 +1820,41 @@ mod tests {
             let round: AccountBalanceInterval = serde_json::from_str(&j).unwrap();
             assert_eq!(iv, round);
         }
+    }
+
+    /// cardano-ledger encodes an `IPv6` as four LITTLE-ENDIAN `Word32`s, so the
+    /// wire bytes are the address with each 4-byte group reversed.
+    ///
+    /// The vector is a REAL mainnet relay — the fifth entry of pool
+    /// `bcc34d3c45cd3b8770c75c91c3023a9146aa505c4bd5cf094dae9acc` at epoch 212,
+    /// which cardano-streamer renders as `2a01:4f8:191:412c::3`. A synthetic
+    /// address would not catch this: the bug is a byte ORDER, and a palindromic
+    /// or all-zero value is invariant under it.
+    #[test]
+    fn ipv6_renders_ledger_little_endian_words_as_an_address() {
+        let wire: [u8; 16] = [
+            0xf8, 0x04, 0x01, 0x2a, 0x2c, 0x41, 0x91, 0x01, 0x00, 0x00, 0x00, 0x00, 0x03, 0x00,
+            0x00, 0x00,
+        ];
+        let addr = ipv6_from_ledger_bytes(&wire);
+        assert_eq!(addr.to_string(), "2a01:4f8:191:412c::3");
+
+        // Reading the wire bytes as a network-order address must NOT agree, or
+        // the vector is order-invariant and the assertion above proves nothing.
+        assert_ne!(
+            std::net::Ipv6Addr::from(wire).to_string(),
+            "2a01:4f8:191:412c::3"
+        );
+
+        // Ledger peer discovery builds `"{host}:{port}"` and hands it to
+        // `lookup_host`, so a v6 host MUST be bracketed. Unbracketed it does not
+        // parse, and the relay is dropped again — the same outcome as the bug,
+        // reached a different way, and just as silent.
+        let hostport = format!("[{addr}]:3001");
+        let sa: std::net::SocketAddr = hostport.parse().expect("bracketed v6 host:port must parse");
+        assert_eq!(sa.ip(), std::net::IpAddr::V6(addr));
+        assert!(format!("{addr}:3001")
+            .parse::<std::net::SocketAddr>()
+            .is_err());
     }
 }
