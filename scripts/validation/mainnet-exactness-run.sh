@@ -42,6 +42,14 @@ log "cstreamer: $CSTREAMER"
 log "cstreamer built: $(stat -f '%Sm' -t '%Y-%m-%d %H:%M' "$CSTREAMER")"
 
 # ── 1. wait ──────────────────────────────────────────────────────────────
+#
+# SKIP_WAIT=1 when the ImmutableDB already covers the range and the node is
+# already stopped — a re-run after a cstreamer failure, typically. Without it
+# the loop cannot be short-circuited by lowering TARGET_EPOCH, because an
+# unreadable tip `continue`s (correctly: unmeasured is not "target reached").
+if [ "${SKIP_WAIT:-0}" = "1" ]; then
+  log "SKIP_WAIT=1 — not waiting on the oracle"
+else
 log "waiting for oracle to reach epoch $TARGET_EPOCH"
 while true; do
   e=$(timeout 30 cardano-cli query tip --mainnet 2>/dev/null \
@@ -56,6 +64,7 @@ while true; do
   [ "$e" -ge "$TARGET_EPOCH" ] 2>/dev/null && break
   sleep 120
 done
+fi
 
 # ── 2. stop the oracle ───────────────────────────────────────────────────
 # cstreamer CAN read a live ImmutableDB (measured), but it is CPU-bound and
