@@ -1669,12 +1669,10 @@ async fn run_db_info(args: DbInfoArgs) -> Result<()> {
     )
     .map_err(|e| anyhow::anyhow!(e))?;
 
-    // Open the ChainDB read-only
-    let chain_db = dugite_storage::ChainDB::open_with_config(
-        db_path,
-        &storage_config.immutable,
-        dugite_storage::chain_db::DEFAULT_SECURITY_PARAM_K,
-    )?;
+    // Genuinely read-only: `open_with_config` enters WRITE mode, and this
+    // command has no genesis file, so it would record a guessed slots-per-chunk
+    // into the database and lock the real node out (#1081).
+    let chain_db = dugite_storage::ChainDB::open_read_only(db_path, &storage_config.immutable)?;
 
     // Immutable DB info
     let immutable_dir = db_path.join("immutable");
