@@ -25,6 +25,15 @@ pub(crate) struct DiscoveredFields {
 /// service holding a TCP connection open will not stall discovery.
 const PROBE_TIMEOUT: Duration = Duration::from_millis(500);
 
+/// Timeout for the single, deliberate probe of an explicit `--metrics-url`.
+///
+/// Longer than `PROBE_TIMEOUT` because that budget exists to keep a discovery
+/// fan-out over every listening port from stalling on one unrelated service.
+/// An explicit URL is one probe the operator asked for, and it may name a
+/// remote host, so the discovery budget would report a slow-but-healthy node
+/// as unreachable.
+const EXPLICIT_PROBE_TIMEOUT: Duration = Duration::from_secs(3);
+
 /// Result of probing a single `(pid, port)` candidate.
 #[derive(Debug, Clone)]
 pub(crate) struct ProbeOutcome {
@@ -59,6 +68,72 @@ pub(crate) async fn probe_metrics_url(url: &str) -> Option<ProbeOutcome> {
 /// other Cardano implementation publishes a metric with that name.
 pub(crate) fn is_dugite_response(body: &str) -> bool {
     body.contains("dugite_network_magic")
+}
+
+/// Outcome of probing an explicit `--metrics-url`.
+///
+/// Discovery collapses every failure into `None`, which is right when the
+/// question is "is there a dugite node on this port" across many ports. For an
+/// endpoint the operator NAMED, the two failures need different answers, and
+/// conflating them is the defect this type exists to prevent: a URL that
+/// answers with someone else's metrics is a mistake to report, while one that
+/// does not answer yet is the ordinary case of starting the dashboard before
+/// the node.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum ExplicitProbe {
+    /// The endpoint answered and publishes dugite metrics.
+    Dugite,
+    /// The endpoint answered, but it is not dugite. `hint` names what it
+    /// looks like, so the error can say more than "wrong".
+    NotDugite { hint: &'static str },
+    /// The endpoint could not be reached, or did not answer in time.
+    Unreachable,
+}
+
+/// Identify a non-dugite Prometheus body well enough to name it.
+///
+/// `cardano_node_metrics_` is cardano-node's own prefix, and pointing at a
+/// co-located cardano-node is by far the most likely way to land here — the
+/// two default ports differ by two digits.
+fn describe_foreign_body(body: &str) -> &'static str {
+    if body.contains("cardano_node_metrics_") {
+        "a cardano-node metrics endpoint"
+    } else if body.contains("# TYPE") || body.contains("# HELP") {
+        "a Prometheus endpoint, but not dugite's"
+    } else {
+        "not a Prometheus metrics endpoint"
+    }
+}
+
+/// Probe an endpoint the operator named explicitly, distinguishing "answered
+/// with the wrong thing" from "did not answer".
+pub(crate) async fn probe_explicit_url(url: &str) -> ExplicitProbe {
+    let Ok(client) = reqwest::Client::builder()
+        .timeout(EXPLICIT_PROBE_TIMEOUT)
+        .build()
+    else {
+        return ExplicitProbe::Unreachable;
+    };
+    let Ok(resp) = client.get(url).send().await else {
+        return ExplicitProbe::Unreachable;
+    };
+    // A 404 means something IS listening and served us a page that is not the
+    // metrics endpoint — a wrong URL, not an absent node. Report it as such.
+    if !resp.status().is_success() {
+        return ExplicitProbe::NotDugite {
+            hint: "an HTTP endpoint that did not return the metrics page",
+        };
+    }
+    let Ok(body) = resp.text().await else {
+        return ExplicitProbe::Unreachable;
+    };
+    if is_dugite_response(&body) {
+        ExplicitProbe::Dugite
+    } else {
+        ExplicitProbe::NotDugite {
+            hint: describe_foreign_body(&body),
+        }
+    }
 }
 
 /// Parse the discriminator fields out of a Prometheus text body. Any
@@ -310,6 +385,92 @@ cardano_node_metrics_blockNum_int 12345678
         let url = format!("http://{}/metrics", addr);
         let outcome = probe_metrics_url(&url).await;
         assert!(outcome.is_none(), "404 response must be rejected");
+    }
+
+    // ─── Explicit --metrics-url: the three outcomes must stay distinct ──
+    //
+    // Discovery answers one question ("is there a dugite node here?") and
+    // collapses every failure into None. An explicit URL asks two, and the
+    // answers differ: a foreign endpoint is an operator mistake to report,
+    // an absent one is the ordinary case of starting the dashboard first.
+    // Each test below drives a case that USED to be indistinguishable.
+
+    #[tokio::test]
+    async fn explicit_probe_accepts_dugite() {
+        let addr = serve_body(DUGITE_BODY, StatusCode::OK).await;
+        let url = format!("http://{}/metrics", addr);
+        assert_eq!(probe_explicit_url(&url).await, ExplicitProbe::Dugite);
+    }
+
+    /// The case the fix exists for: cardano-node's endpoint is two digits from
+    /// dugite's default port, and every `dugite_*` gauge is absent from it —
+    /// which the dashboard renders identically to a node stalled at slot zero.
+    #[tokio::test]
+    async fn explicit_probe_names_cardano_node_rather_than_drawing_it() {
+        let addr = serve_body(CARDANO_NODE_BODY, StatusCode::OK).await;
+        let url = format!("http://{}/metrics", addr);
+        assert_eq!(
+            probe_explicit_url(&url).await,
+            ExplicitProbe::NotDugite {
+                hint: "a cardano-node metrics endpoint"
+            }
+        );
+    }
+
+    /// A Prometheus endpoint that is neither dugite nor cardano-node is still
+    /// wrong, and must not be silently attached to.
+    #[tokio::test]
+    async fn explicit_probe_rejects_unrelated_prometheus() {
+        const OTHER: &str = "# HELP go_goroutines Number of goroutines\ngo_goroutines 7\n";
+        let addr = serve_body(OTHER, StatusCode::OK).await;
+        let url = format!("http://{}/metrics", addr);
+        assert_eq!(
+            probe_explicit_url(&url).await,
+            ExplicitProbe::NotDugite {
+                hint: "a Prometheus endpoint, but not dugite's"
+            }
+        );
+    }
+
+    /// Something IS listening and served a page that is not the metrics
+    /// endpoint — a wrong URL, not an absent node. Distinct from Unreachable.
+    #[tokio::test]
+    async fn explicit_probe_reports_404_as_wrong_url_not_absent_node() {
+        let addr = serve_body("not found", StatusCode::NOT_FOUND).await;
+        let url = format!("http://{}/metrics", addr);
+        assert_eq!(
+            probe_explicit_url(&url).await,
+            ExplicitProbe::NotDugite {
+                hint: "an HTTP endpoint that did not return the metrics page"
+            }
+        );
+    }
+
+    /// Nothing listening: ordinary, and must NOT be an error — otherwise
+    /// starting the dashboard before the node stops working.
+    #[tokio::test]
+    async fn explicit_probe_reports_closed_port_as_unreachable() {
+        // Bind to get a free port, then drop the listener so nothing answers.
+        let listener = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("local_addr");
+        drop(listener);
+        let url = format!("http://{}/metrics", addr);
+        assert_eq!(probe_explicit_url(&url).await, ExplicitProbe::Unreachable);
+    }
+
+    /// The explicit budget must be looser than the discovery budget, or an
+    /// operator naming a remote host gets "unreachable" for a healthy node.
+    /// Asserted on the constants, not by timing — see the note in
+    /// `probe_times_out_on_slow_server`.
+    #[test]
+    fn explicit_probe_budget_is_looser_than_discovery() {
+        assert!(
+            EXPLICIT_PROBE_TIMEOUT > PROBE_TIMEOUT,
+            "EXPLICIT_PROBE_TIMEOUT ({EXPLICIT_PROBE_TIMEOUT:?}) must exceed the \
+             discovery fan-out budget ({PROBE_TIMEOUT:?})"
+        );
     }
 
     #[tokio::test]

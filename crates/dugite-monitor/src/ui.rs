@@ -1551,7 +1551,7 @@ fn render_help_overlay(frame: &mut Frame, theme: &Theme, area: Rect) {
         )),
         Line::default(),
         Line::from(Span::styled(
-            "Metrics polled every 2 seconds (Prometheus :12798).",
+            "Metrics polled every second (Prometheus :12796).",
             Style::default().fg(theme.muted),
         )),
         Line::default(),
