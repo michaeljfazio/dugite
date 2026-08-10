@@ -341,6 +341,50 @@ Mithril snapshots ARE cardano-node's own chunk files, that DB is directly
 readable by cardano-streamer, which is the cheapest source of real Conway
 oracle output.
 
+### v2.8.0 IS VALIDATED AND READY TO TAG (not tagged)
+
+`reports/devnet-validate/v2.8.0.json` — standard preset, 4/4 rounds vs
+cardano-node 11.0.1, `gate_integrity {strict: true, admissible: true,
+missing: []}`, and **zero tx failures across the whole gate**.
+
+- baseline — tx-zoo 151 PASS / 3 SKIP / **0 FAIL** (154); cli-parity 23 EQUAL +
+  3 COMPARED / 0 divergent; adversarial N2N 26/26; UTxO RPC 27/27; chaos 4/4
+- parity-oracle — 99 scripts through BOTH sockets: 96 MATCH / 2 STATEFUL /
+  1 KNOWNDIFF, **0 OFFDIAG, 0 CLASSDIFF**
+- epoch-boundary — 103 scripts, 0 FAIL; pots BYTE-EXACT vs Haskell (treasury
+  `7089901042545`, reserves `5992882049461532`); futurePParams AND ratify-state
+  parity both reached NON-VACUITY
+- restart — tip 28 → 56
+
+Workspace 8172/8172, clippy and fmt clean, `SNAPSHOT_VERSION 38` (RE-SYNC),
+workspace version and Helm `appVersion` both 2.8.0. Tagging is a release-lead
+job and has deliberately not been started.
+
+**Round 2 MUST use the `epoch-long.json` overlay.** SKILL.md's body does not
+mention it and a driver written from that alone produces `FPP_RC=1`: at
+`epochLength=400`, `2*stabilityWindow = 480 > 400` puts the solidify point
+before the epoch's first slot, so `PotentialPParamsUpdate` survives ~3 slots and
+the sampler correctly reports INCONCLUSIVE. Export `LD_EPOCH_LENGTH=600` with
+it — the samplers derive the epoch as `slot / ${LD_EPOCH_LENGTH:-400}` — and run
+1800s, because the RUPD boundary moves to slot 1200.
+
+**A shared stall is the MACHINE, not the node.** One parity round tripped three
+analyzer anomalies (tip_age p99 345 s, density 0.179, 29 ERRORs). Cause:
+`pmset` showed `Entering Sleep ... 'Maintenance Sleep' ... 300 secs` on battery,
+matching the log gap to the second. The discriminator is that **all three nodes
+went silent in the same window** — a dugite defect leaves cardano-node logging.
+The 29 ERRORs were dugite CORRECTLY declining to forge on a ledger view 300
+slots stale. Wrap every round in `caffeinate -dimsu` and check `pmset -g log`
+before believing any timing anomaly.
+
+**Generating the report: name the round dirs EXPLICITLY.** A superseded re-run
+is NEWER than the baseline, so any "newest N" selection silently drops the
+baseline and reports the superseded evidence with no error. And if a shared
+`tx-zoo/state/results.csv` survives to generation time, the generator falls back
+to it for the rounds that legitimately run no zoo and reports
+`source="shared"` — a hard integrity violation. Running Round 3 last leaves
+nothing to fall back on, which is why the documented order ends there.
+
 ### 2026-08-10 (later still) — the gate found a real query-path defect
 
 **`MsgAcquire VolatileTip` could pin a point that is not the volatile tip.**
