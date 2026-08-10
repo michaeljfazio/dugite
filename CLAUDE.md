@@ -341,6 +341,68 @@ Mithril snapshots ARE cardano-node's own chunk files, that DB is directly
 readable by cardano-streamer, which is the cheapest source of real Conway
 oracle output.
 
+### 2026-08-10 (later still) — the gate found a real query-path defect
+
+**`MsgAcquire VolatileTip` could pin a point that is not the volatile tip.**
+Found by devnet-validate Round 1, which failed 14 tx-zoo scripts with
+`BadInputsUTxO` in what looked like a governance cluster and was not — 06d, 06e
+and 06f PASSED, interleaved.
+
+dugite-relay served a UTxO view older than its own applied chain while
+LocalTxSubmission validated against the live tip, so the node helped
+`cardano-cli` build a transaction and then correctly rejected it. Measured from
+the relay log: blocks applied at 09:04:10.219 and 09:04:20.218, next blocks 3.0 s
+and 4.0 s later, and **all 22 `InputNotFound` rejections fall strictly inside
+those gaps**, the last preceding the closing block by 0.2 s and 0.13 s.
+
+Root cause: `acquire` pins the `NodeStateSnapshot` last published by
+`update_query_state`, and that publish was rate-limited to 1 Hz at tip AND
+driven only by block apply. Two blocks under a second apart ⇒ refresh skipped ⇒
+snapshot holds the older block until the NEXT block, unbounded across an
+empty-slot gap.
+
+**The fix is the cadence, not the structure.** The at-tip interval is now ZERO
+(every applied block); catch-up stays at 30 s, where 1 Hz cost ~60% of wall time
+on mainnet bulk sync. It is close to free for the same reason the old comment
+called 1 Hz negligible — at tip the rebuild is amortised over ~20 s block
+arrivals, so the limit almost never bound. The one case where it did bind was
+the defect.
+
+**An adversarial review killed the design that preceded it.** The plan was to
+publish a cheap per-block header beside the slow collections; upstream requires
+the collections at the acquired point TOO (`openStateRefAtTarget` pins the whole
+state atomically, and `GetCurrentPParams`/`GetStakePools`/`GetGovState`/
+`GetProposals`/`GetPoolDistr` are all `QFNoTables`), so that shape would have
+traded a wrong point for a torn session — one Haskell-impossible state for
+another. Refreshing every block keeps the session coherent AND the point
+current, which is upstream's actual invariant. Design and review:
+`docs/superpowers/specs/2026-08-10-acquire-fix-design.md`.
+
+**Two tests were pinning the defect, and one of them said so.** The interval
+test asserted 1 Hz with the comment "effectively per block, since at-tip blocks
+arrive every ~20 s" — true on average, false in exactly the case that matters.
+And `utxo.rs`'s mock provider **ignored the `at` parameter entirely**, so the
+whole module could not fail for this family. The mock was fixed FIRST,
+deliberately: fixing the node against a blind harness lands unverified.
+
+**Also closed**: **#1082** — `.primary` was written with `File::create` on the
+real path, so a crash left a truncated index that dugite never reads back and
+cardano-node cannot stream; now temp + fsync + rename + directory fsync.
+**#1083** — `check_chunk_boundaries` windowed over adjacent chunk NUMBERS, so
+the durable empty gap chunks #1081 introduced made it skip both `(0, gap)` and
+`(gap, 2)`: every empty chunk punched a hole in the check that exists to find
+holes. It now carries the last NON-EMPTY chunk forward. Proven RED by disarming
+— restricted to numeric adjacency, a real break returns `Ok(())`.
+
+**Harness**: `setup.sh` wiped `$LD_STATE` (`local-devnet/state`) but not
+`tx-zoo/state`, so `built/gov-action-info.id` survived from a devnet two days
+older. 06a writes it only on PASS and every 07-* script reads it, so seven
+failures carried a `GovActionsDoNotExist` arm that reads as a Conway voting
+defect and is not one. Now `built/` and `gov-lifecycle/` are wiped — narrowed
+from a first attempt that wiped the whole directory and overrode a documented
+deliberate decision (keys are rewritten each `--setup`; `anchor/` is
+content-addressed).
+
 ### Mainnet tip coverage — how to finish it
 
 `scripts/validation/mainnet-exactness-run.sh` is now the whole pipeline: wait →
