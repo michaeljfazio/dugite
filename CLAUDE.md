@@ -216,25 +216,48 @@ then matches the oracle byte-for-byte.
   element and never applies `filterRewards`, so its `totalDistributed`
   over-counts at pv<=2. Window is exactly epochs 212-236 and the two diffs
   cancel to zero in all 25. Fix: `sumRewards rewProtocolVersion`.
-- **#1081** — a dugite-written ImmutableDB is UNREADABLE by cardano-node.
-  cardano-node rolls chunks on a fixed 21600-slot range; dugite rolls one per
-  write-open (`next_chunk = current_epoch.max(last + 1)`, and on a
-  Mithril-bootstrapped DB the clamp always wins). Measured: imported chunks are
-  a uniform ~2 MB, dugite's are 235 MB / 146 MB / 59 MB. Isolated by pointing
-  the same binary at a clone of a genuine cardano-node DB, which reads fine.
-  Costs dugite too — recovery granularity is coupled to chunk size, and this DB
-  holds a 52 MB `.chunk.orphaned`. **Gate exists**:
-  `scripts/validation/check-immutable-chunk-invariant.py` checks
-  `slot // chunkSize == chunkIndex` straight off the secondary index — no node,
-  seconds per run. cardano-node's DB PASSES (2357 chunks); dugite's preview
-  fails 14 of 27578 and preprod 19 of 5930, **tail only**, and the drift is
-  BIDIRECTIONAL (preview 27564 holds a block BELOW its range), so a fix that
-  merely bounds chunk size would leave the low-side violations. Its own control
-  run caught a bug in the checker: `blockOrEBB` is a UNION and holds the EPOCH
-  NUMBER for a Byron EBB, so `slot == idx` is the EBB case — without the control
-  it would have condemned every correct database. TWO of my hypotheses on this
-  issue were falsified by measurement; both are recorded there so they are not
-  re-derived.
+- **#1081 CLOSED** — a dugite-written ImmutableDB is now BYTE-IDENTICAL to
+  cardano-node's, and cardano-node 11.0.1 opens one and replays the ledger to
+  100%. It was **four** defects, not one: dugite derived the whole layout from
+  the EPOCH where consensus derives it from the SLOT. Chunk numbered
+  `epoch.max(last+1)` per write-open (ONE 9.7 GB chunk for 5.85M mainnet
+  blocks); primary arity `epoch_length + 1` instead of `chunk_size + 2`;
+  regular blocks off by one whenever the chunk held no EBB (relative slot 0 is
+  reserved for one regardless); and an EBB storing its SLOT where its EPOCH
+  NUMBER belongs — which IS the `blocks have non-increasing slot numbers`
+  failure (`21600, 21600`). Chunk size is `10 * k` from **Byron genesis**, held
+  for every era (the HFC takes `ChunkInfo` from the first era), and `k` is a
+  genesis parameter absent from `PParams`, so no governance action can move it.
+  **The devnet is structurally blind to all of it**: k=40 ⇒ chunk size 400 =
+  the devnet epoch length, so chunk == epoch there.
+  **The measurement that mattered**: regenerating the primary index from the
+  secondary index of every chunk of a real cardano-node mainnet DB — 3184/3185
+  byte-identical, the exception being the live tail cardano-node deliberately
+  leaves truncated. The chunk-number invariant is satisfied by an index with the
+  wrong arity, the wrong mapping, or both, so only a byte comparison could see
+  D2/D3/D4. Chunk 00208 is vendored as a fixture;
+  `examples/rewrite_immutable_db.rs` produces a dugite-written DB from a
+  cardano-node one without a sync.
+  **Chunk 0 is the ambiguous corner and I got it wrong TWICE** — the epoch-0 EBB
+  and the genesis block both store `blockOrEBB = 0` and belong at relative slots
+  0 and 1. First I called the collision harmless (both recover slot 0 — true and
+  irrelevant; the ambiguity is the RELATIVE slot), caught by the full sweep.
+  Then I disambiguated positionally, which is right on mainnet and WRONG on
+  preview, where a Shelley-from-genesis chain has the slot-0 block and no EBB —
+  caught by the independent review. Upstream never guesses: `getEntry` takes
+  `IsEBB` as an INPUT from the parsed block. dugite now reads the envelope.
+  An adversarial Fable review failed to refute the layout and found **six
+  defects around it, four introduced by the fix** — a reopened chunk recorded
+  twice (blocks served twice), gap chunks breaking `partition_point`'s
+  monotonicity, the preview EBB case, `db info` opening WRITE-mode and able to
+  poison the chunk-size marker, a false migration warning, and a gap cap
+  reachable in 46 days on a devnet. All closed in `106aa6d984`.
+  Open: **#1082** (`.primary` written non-atomically and no reconciliation path
+  ever reads one back — the file dugite writes only for cardano-node is the one
+  file dugite never checks, #926's family) and **#1083** (`check_chunk_boundaries`
+  skips linkage across the now-durable empty chunks). Pre-#1081 databases keep
+  the old layout: reads work, a warning names the re-sync, appending cannot
+  repair it. No live cardano-node open over dugite-written SHELLEY chunks yet.
 - **#1067/#1068/#1070/#1072/#1074/#1078** are fixed in-tree on
   `worktree-nonmyopic-1067`, verified, and carry `Closes` trailers that fire on
   MERGE — they are still open on GitHub until then, which is the honest state
