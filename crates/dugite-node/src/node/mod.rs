@@ -9640,15 +9640,41 @@ pub(crate) fn next_forged_block_number(
 /// and DRep in the ledger state — ~1.4 s at mainnet epoch-334 scale — and
 /// runs synchronously on the apply task with the ledger read lock held.
 ///
-/// At tip that cost is amortised over ~20 s block arrivals, so a 1 Hz
-/// limit keeps client-visible state fresh at negligible cost.  During
-/// catch-up the apply loop IS the sync throughput bottleneck: an
-/// unconditional 1 Hz cadence stalled it for ~60 % of wall time on
-/// mainnet (a metronomic ~1.4 s pause every ~2.5 s, measured 2026-06-10),
-/// so the cadence drops to the 30 s documented on `update_query_state`.
+/// At tip there is NO minimum: every applied block refreshes.
+///
+/// It used to be 1 Hz there, and the skip that produced was a defect.
+/// `MsgAcquire` pins this snapshot, so a skipped refresh leaves the acquired
+/// point behind the node's own chain — and because the refresh is driven only
+/// by block apply, it stays behind until the NEXT block, which across an
+/// empty-slot gap is unbounded. Measured on the devnet: 3.0 s and 4.0 s
+/// windows in which LocalStateQuery served a UTxO view older than the chain
+/// LocalTxSubmission was validating against, so the node helped build a
+/// transaction and then correctly rejected it.
+///
+/// Upstream cannot express that state: `ChainDB.allocInRegistryReadOnlyForkerAtPoint`
+/// allocates a forker against the CURRENT LedgerDB on every `MsgAcquire`
+/// (`Ouroboros/Consensus/Network/NodeToClient.hs`,
+/// `release-ouroboros-consensus-3.0.1.0`), and `answerQuery` reads only that
+/// forker — most queries are `QFNoTables`, answered purely from the pinned
+/// state. There is no cadence anywhere upstream, and `VolatileTip` can never
+/// lag the node's own adopted chain.
+///
+/// Removing the limit at tip is close to free, for the same reason the 1 Hz
+/// limit was called negligible: the rebuild is amortised over ~20 s block
+/// arrivals, so the limit almost never binds. The one case where it DID bind —
+/// two blocks under a second apart — is exactly the defect. Cost is unchanged
+/// in the common case and bounded by apply-task serialisation in a burst.
+///
+/// During catch-up the cadence is UNCHANGED. There the apply loop is the sync
+/// throughput bottleneck: an unconditional 1 Hz cadence stalled it for ~60 % of
+/// wall time on mainnet (a metronomic ~1.4 s pause every ~2.5 s, measured
+/// 2026-06-10), so it stays at the 30 s documented on `update_query_state`.
+/// The snapshot therefore still LAGS while catching up — but coherently, and
+/// it converges; that is a lag, not the torn read a per-field refresh would
+/// have introduced.
 pub(crate) fn query_state_refresh_interval(at_tip: bool) -> std::time::Duration {
     if at_tip {
-        std::time::Duration::from_secs(1)
+        std::time::Duration::ZERO
     } else {
         std::time::Duration::from_secs(30)
     }
@@ -11468,22 +11494,41 @@ mod tests {
         assert_eq!(value, 42);
     }
 
-    /// N2C query-snapshot refresh cadence: 1 Hz at tip (effectively per
-    /// block, since at-tip blocks arrive every ~20 s), 30 s during catch-up.
-    /// The rebuild walks every delegation/pool/DRep in the ledger (~1.4 s at
-    /// mainnet epoch-334 scale) and runs synchronously on the apply task, so
-    /// the previous unconditional 1 Hz cadence stalled the apply loop for
-    /// ~60 % of wall time during mainnet bulk sync (metronomic 1.4 s gap
-    /// every 2.5 s, measured 2026-06-10).
+    /// N2C query-snapshot refresh cadence: EVERY block at tip, 30 s during
+    /// catch-up.
+    ///
+    /// This test previously asserted 1 Hz at tip, and its own comment carried
+    /// the premise that made the defect invisible — "effectively per block,
+    /// since at-tip blocks arrive every ~20 s". True on average and false in
+    /// exactly the case that matters: when two blocks land under a second
+    /// apart the refresh is SKIPPED, and since only a block apply drives it,
+    /// the snapshot then stays behind until the NEXT block. `MsgAcquire` pins
+    /// that snapshot, so the acquired point falls behind the node's own chain
+    /// for the whole gap — 3.0 s and 4.0 s measured on the devnet, unbounded in
+    /// principle across empty slots.
+    ///
+    /// Zero at tip is what makes the skip inexpressible. A non-zero value here
+    /// does not merely delay freshness; it reintroduces a window in which
+    /// LocalStateQuery and LocalTxSubmission disagree about which chain the
+    /// node is on, which upstream cannot produce at all
+    /// (`allocInRegistryReadOnlyForkerAtPoint` resolves against the current
+    /// LedgerDB on every acquire).
+    ///
+    /// The catch-up arm is deliberately unchanged: there the apply loop is the
+    /// throughput bottleneck and a 1 Hz cadence cost ~60 % of wall time on
+    /// mainnet bulk sync (measured 2026-06-10).
     #[test]
-    fn query_state_refresh_interval_drops_to_30s_during_catch_up() {
-        assert_eq!(
-            super::query_state_refresh_interval(true),
-            std::time::Duration::from_secs(1)
+    fn query_state_refresh_never_skips_a_block_at_tip() {
+        assert!(
+            super::query_state_refresh_interval(true).is_zero(),
+            "a non-zero at-tip interval lets two blocks under that interval \
+             apart leave the acquired point behind the node's own chain"
         );
         assert_eq!(
             super::query_state_refresh_interval(false),
-            std::time::Duration::from_secs(30)
+            std::time::Duration::from_secs(30),
+            "catch-up cadence must stay 30 s — 1 Hz there cost ~60% of wall \
+             time on mainnet bulk sync"
         );
     }
 
