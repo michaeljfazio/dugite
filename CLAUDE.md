@@ -264,6 +264,83 @@ then matches the oracle byte-for-byte.
   rather than a checkmark ([[feedback_closed_issue_is_not_evidence_work_landed]]).
   **#1080 is CLOSED** (closed by hand after its four items were all done).
 
+### 2026-08-10 (later) — the tip run is DISK-blocked, and conwayGov was never the schema blocker
+
+**A mainnet tip run does not fit on this machine.** Measured per-epoch cost of
+`db-cn-mainnet`, complete epochs only, chunk+primary+secondary:
+
+| era | GiB/epoch | max |
+|---|---:|---:|
+| Byron (208) | 0.021 | 0.038 |
+| Shelley (28) | 0.037 | 0.055 |
+| Allegra (15) | 0.076 | 0.131 |
+| Mary (39) | 0.154 | 0.373 |
+| Alonzo (73) | 0.864 | 1.366 |
+
+Last 10 complete epochs: **0.837 GiB/epoch**. Reaching 648 needs **+239 GiB at
+the absolute floor** (Babbage/Conway assumed no costlier than Alonzo, which
+every prior boundary contradicts), +418 moderate, +596 heavy — against 161 GiB
+free on a single volume. **The dump reducer cannot fix this**: it addresses a
+few GB of oracle output while the binding constraint is chain data. Reclaiming
+`db-preview` + `db-mainnet-avvm` + the old `db-preprod` gave 220 GiB, which
+buys roughly **epoch 520** (early Conway), not tip.
+
+Rate, measured: ~750 slots/s late Alonzo, **663 slots/s early Babbage = 10.9
+min/epoch**, two independent windows agreeing. An earlier 177 slots/s figure
+was wrong — two samples ~49 s apart were treated as 3.5 min apart. 12 cores,
+so a concurrent cstreamer replay at 99% of ONE core is not the cause of the
+decay.
+
+**`conwayGov` is not what makes the comparison exit 2**, and carrying that
+belief forward hid five cheap fixes. `era_applicable` already returns False for
+it below Conway. The actual cause list, from
+`report-208-316-alonzo.json` — **eight** paths absent on one side in all 109
+epochs: three dugite-only `snapshots.*.epoch`, `proposals`, `enactedRoots`,
+`drepDistr`, and oracle-only `instantaneousRewards` + `rupdApplied`.
+
+Two are now closed, both grounded in real oracle output rather than upstream's
+types, and **validated by running the dump, not by trusting the commit**:
+`snapshots.*.epoch` deleted (upstream's `snapshotInfo` has no such field; the
+`go` branch filled it with a hardcoded 0 nothing compared), and `rupdApplied`
+threaded from the previous epoch's `rupdNext` — verified empirically that
+oracle epoch 209's `rupdApplied` is byte-identical to 208's `rupdNext`.
+
+**`instantaneousRewards` is deliberately left as an honest gap.** It holds
+PENDING MIR transfers that the boundary applies and clears, and both sides dump
+at the first block of the new epoch — an epoch-PHASE field whose interesting
+phase contains no dump point. Across all 66 oracle dumps, including the 28
+Shelley epochs where mainnet actually carried MIR certificates: **0 non-empty,
+0 non-zero deltas.** Emitting it converts a gap into `{}` vs `{}` in every
+epoch — a better exit code for no evidence. Its credential key encoding is also
+unknowable from data that is always `{}`.
+
+**Expect the divergence count to roughly DOUBLE, 61 → ~111, and it is not a
+regression.** `rupdApplied[E] == rupdNext[E-1]`, so #1077's oracle defect
+(epochs 212-236) reappears as `rupdApplied.deltaR2` / `.totalDistributed` over
+213-237. One oracle defect counted twice, by construction.
+
+Full analysis, including the oracle's authoritative `conwayGov` shape from
+`cardano-streamer/src/Cardano/Streamer/Run.hs:150-166` (five keys —
+`drepDistr`, `committee`, `constitution`, `committeeState`, `nextEnactState`,
+and NEITHER `proposals` nor `enactedRoots`):
+`docs/superpowers/specs/2026-08-10-mainnet-dump-schema-reconciliation.md`.
+
+**#1081 now verified on a SECOND network.** `examples/rewrite_immutable_db.rs`
+rewrote 399 preprod chunks through dugite's writer; **1197/1197 files
+byte-identical** to cardano-node's — every `.chunk`, `.primary` and
+`.secondary`, chunk 0 included and explicitly checked, since a sweep that skips
+the ambiguous corner proves nothing. The oracle binary was never missing: it is
+at `cardano-streamer/oracle-bin/cstreamer-10.6.2`, sha256 matching
+`PROVENANCE.txt`, which is exactly the path the driver defaults to.
+
+**preprod had to be re-imported**, and its old state confirmed #1081's defect
+D2 on disk: Mithril chunks carry `.primary` = 86,409 = `(21600+2)·4+1`, while
+dugite's pre-#1081 appended chunks carried 1,728,005 = `(432000+1)·4+1`. A
+fresh Mithril import is uniformly 86,409 across all 6,048 chunks — and because
+Mithril snapshots ARE cardano-node's own chunk files, that DB is directly
+readable by cardano-streamer, which is the cheapest source of real Conway
+oracle output.
+
 ### Mainnet tip coverage — how to finish it
 
 `scripts/validation/mainnet-exactness-run.sh` is now the whole pipeline: wait →
