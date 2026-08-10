@@ -34,16 +34,42 @@ into. `answerQuery` reads only the forker, and `GetCurrentPParams`,
 `QFNoTables` — answered purely from the pinned state. There is no cadence
 upstream. So this fix is a bounded approximation, not upstream's shape.
 
-## What the review got wrong, and why it matters
+## Reading the ledger at acquire: possible, but priced
 
-The review's preferred "option 4" — capture the header **at acquire, from the
-live ledger** — is **not implementable**. `QueryHandler::acquire` is a
-SYNCHRONOUS trait method taking `&self`
-(`dugite-network/src/protocol/local_state_query/server.rs:46`); it cannot await
-the ledger `RwLock`. That is the same cross-crate constraint that shaped #1068.
+`QueryHandler::acquire` is a SYNCHRONOUS trait method taking `&self`
+(`dugite-network/src/protocol/local_state_query/server.rs:46`), so it cannot
+`.await` the ledger `RwLock` — the cross-crate constraint that shaped #1068.
 
-So option 4 collapses back into the draft's option B: the header must be
-PUBLISHED cheaply per block, not read at acquire.
+An earlier draft of this document concluded from that alone that the review's
+preferred "capture the header at acquire from the live ledger" was **not
+implementable**. That was too strong, and the counter-example is inside
+`acquire` itself: the `SpecificPoint` arm already does
+
+```rust
+tokio::task::block_in_place(|| {
+    let db = chain_db.blocking_read();
+    db.has_block(&block_hash)
+})
+```
+
+So the pattern exists and would work for the ledger too. It is not free:
+`QueryHandler` holds no ledger reference today (only `chain_db`), so one must
+be added; `block_in_place` moves the task off its worker and requires the
+multi-threaded runtime; and taking the ledger read lock on EVERY acquire puts
+query latency behind block application, which indexers acquire often enough to
+notice.
+
+Both shapes are therefore available:
+
+| | cost at acquire | cost per block | staleness |
+|---|---|---|---|
+| publish a cheap header per block | none | one small lock-free write | none |
+| read the live ledger at acquire | `block_in_place` + ledger read lock | none | none |
+
+Prefer the published header: it keeps `acquire` allocation-free and lock-free,
+which is what the trait's own contract asks for ("must be cheap to produce").
+The ledger-read variant stays a legitimate fallback if publishing turns out to
+need more plumbing than expected — recorded so the option is not re-derived.
 
 ## Two things that make the epoch-frozen argument weaker than assumed
 
