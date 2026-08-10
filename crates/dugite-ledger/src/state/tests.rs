@@ -18350,6 +18350,221 @@ fn rollback_does_not_regress_era_across_block() {
     );
 }
 
+/// #1071 — with >120 credentials all THREE `nesRu` states become reachable.
+///
+/// `nesRu` is `SNothing` before the mark, `SJust (Pulsing ..)` while the fold
+/// is in flight, and `SJust (Complete ..)` once it finishes. dugite currently
+/// hardcodes the wire arm, and the reason the gap has never been observable is
+/// arithmetic rather than architectural:
+///
+///   pulse_size = max 1 (ceil (N / 4k))        -- PulsingReward.hs:114
+///
+/// The devnet runs k=40, so 4k=160 and any N <= 160 gives pulse_size ONE. The
+/// pulsing window is `4k/f .. epochLength` = 320..400, i.e. ~40 blocks at
+/// f=0.5. With the handful of credentials a normal devnet carries, the fold
+/// therefore finishes inside the window and `Pulsing` is never the state at any
+/// observable moment — every gate sees `Complete` (or `SNothing`) and reports
+/// agreement. That is #1071's blocker, and it is why this test seeds 150
+/// credentials: 150 > 40 blocks x 1 per block, so the fold provably CANNOT
+/// finish in the window.
+///
+/// Driven through `apply_block`, not `pulse_rupd_member_fold`, because the
+/// property under test is about what the per-block scheduler produces over a
+/// realistic block cadence — a unit test on one pulse cannot express "still
+/// pulsing at the boundary".
+///
+/// Emitting `Complete` where cardano-node emits `Pulsing` would replace an
+/// honest gap with a confident wrong answer (#979), so this pins the
+/// PRECONDITION the wire arms need rather than asserting any encoding.
+#[test]
+fn over_120_credentials_keeps_the_rupd_fold_pulsing_across_the_window() {
+    const POOL: u8 = 0x4b;
+    const OWNER: u8 = 0x90;
+    /// Above 4k/f's ~40 blocks at pulse_size 1, so the fold cannot complete
+    /// inside the window. 120 is the documented floor; 150 leaves margin.
+    const N_CREDS: u16 = 150;
+
+    let h28 = |b: u8| Hash28::from_bytes([b; 28]);
+    let rat = |n: u64, d: u64| dugite_primitives::transaction::Rational {
+        numerator: n,
+        denominator: d,
+    };
+    // 150 distinct credentials from a 2-byte counter, so they cannot collide.
+    let cred_n = |i: u16| {
+        let mut b = [0u8; 28];
+        b[0] = (i >> 8) as u8;
+        b[1] = (i & 0xff) as u8;
+        Hash28::from_bytes(b).to_hash32_padded()
+    };
+
+    let mut params = ProtocolParameters::mainnet_defaults();
+    params.rho = rat(3, 1000);
+    params.tau = rat(1, 5);
+    params.a0 = rat(3, 10);
+    params.n_opt = 500;
+    params.active_slots_coeff = 0.5;
+
+    let mut state = LedgerState::new(params.clone());
+    // The DEVNET's own shape, which is the configuration #1071 must be
+    // observable on: k=40 => 4k/f = 320 is the mark, epoch ends at 400.
+    state.epoch_length = 400;
+    state.randomness_stabilisation_window = 320;
+    state.security_param = 40;
+    state.shelley_transition_epoch = 0;
+    state.byron_epoch_length = 0;
+
+    assert_eq!(
+        crate::state::reward_pulser::pulse_size(N_CREDS as u64, state.security_param),
+        1,
+        "this test's whole premise is pulse_size == 1 at k=40; if 4k ever \
+         drops below the credential count the fold finishes early and the \
+         assertions below stop meaning anything"
+    );
+
+    // Large stakes on purpose: a token amount per credential drives sigma to
+    // ~1e-10, floors `maxPool'` to zero and pays nobody, at which point the
+    // fold's progress is trivially satisfiable for the wrong reason.
+    let pool_stake_total: u64 = 1_000_000_000_000_000;
+    let per_delegator = pool_stake_total / N_CREDS as u64;
+
+    let mut delegations: HashMap<Hash32, Hash28> = HashMap::new();
+    let mut stake_distribution: HashMap<Hash32, Lovelace> = HashMap::new();
+    for i in 0..N_CREDS {
+        delegations.insert(cred_n(i), h28(POOL));
+        stake_distribution.insert(cred_n(i), Lovelace(per_delegator));
+        // Registered: present in `fvAddrsRew`, so the pv<=6 prefilter keeps
+        // them and the fold has real work for every one.
+        state.certs.reward_accounts.insert(cred_n(i), Lovelace(0));
+    }
+
+    let mut pool_stake: HashMap<Hash28, Lovelace> = HashMap::new();
+    pool_stake.insert(h28(POOL), Lovelace(pool_stake_total));
+
+    let mut reward_account = vec![0xe0u8];
+    reward_account.extend_from_slice(&[OWNER; 28]);
+    let mut pool_params: HashMap<Hash28, PoolRegistration> = HashMap::new();
+    pool_params.insert(
+        h28(POOL),
+        PoolRegistration {
+            pool_id: h28(POOL),
+            vrf_keyhash: Hash28::from_bytes([0xff; 28]).to_hash32_padded(),
+            pledge: Lovelace(0),
+            cost: Lovelace(340_000_000),
+            margin_numerator: 7,
+            margin_denominator: 100,
+            reward_account,
+            owners: vec![h28(OWNER)],
+            relays: vec![],
+            metadata_url: None,
+            metadata_hash: None,
+        },
+    );
+
+    state.epochs.snapshots.go = Some(StakeSnapshot {
+        epoch: EpochNo(0),
+        delegations: Arc::new(delegations),
+        pool_stake,
+        pool_params: Arc::new(pool_params),
+        stake_distribution: Arc::new(stake_distribution),
+        epoch_fees: Lovelace(0),
+        epoch_block_count: 0,
+        epoch_blocks_by_pool: Arc::new(HashMap::new()),
+    });
+
+    let mut bprev: HashMap<Hash28, u64> = HashMap::new();
+    bprev.insert(h28(POOL), 100);
+    state.epochs.snapshots.bprev_blocks_by_pool = Arc::new(bprev);
+    state.epochs.snapshots.ss_fee = Lovelace(0);
+    state.epochs.reserves = Lovelace(10_000_000_000_000_000);
+    state.epochs.prev_protocol_params = params;
+    state.epochs.prev_d = rat(0, 1);
+    state.epochs.prev_protocol_version_major = 6;
+
+    // ── SNothing: before the mark there is no pulser at all ────────────────
+    let pre = make_test_block(300, 1, Hash32::ZERO, vec![]);
+    state
+        .apply_block(&pre, BlockValidationMode::ApplyOnly)
+        .expect("pre-mark block must apply");
+    assert!(
+        state.epochs.rupd_fold.fold.is_none(),
+        "slot 300 is before the 4k/f mark of 320 — nesRu must be SNothing, \
+         and a pulser existing here would mean the mark is computed wrong"
+    );
+
+    // ── Pulsing: fold in flight, shrinking by exactly pulse_size a block ───
+    let mut prev = *pre.hash();
+    let mut block_no = 2u64;
+    let mut observed: Vec<usize> = Vec::new();
+    // ~40 blocks at f=0.5 across slots 321..400, modelled as every other slot.
+    for slot in (321..400).step_by(2) {
+        let b = make_test_block(slot, block_no, prev, vec![]);
+        state
+            .apply_block(&b, BlockValidationMode::ApplyOnly)
+            .expect("in-window block must apply");
+        prev = *b.hash();
+        block_no += 1;
+        observed.push(state.epochs.rupd_fold.remaining());
+    }
+
+    assert!(
+        state.epochs.rupd_fold.fold.is_some(),
+        "the trigger block must have built the pulser"
+    );
+    assert!(
+        !state.epochs.rupd_fold.is_complete(),
+        "with {N_CREDS} credentials at pulse_size 1 and only {} blocks in the \
+         window, the fold CANNOT be done — this is the Pulsing state the wire \
+         arm has never been able to observe, and if it is complete here the \
+         test has stopped exercising #1071's condition",
+        observed.len()
+    );
+    assert!(
+        state.epochs.rupd_fold.remaining() > 0,
+        "Pulsing must carry a non-empty balance — that queue is what the wire \
+         arm encodes as its tag-258 set"
+    );
+
+    // Strictly decreasing: proves the scheduler is PULSING rather than
+    // rebuilding, which would look identical from is_complete() alone.
+    for w in observed.windows(2) {
+        assert!(
+            w[1] < w[0],
+            "each block must fold at least one credential; remaining went \
+             {} -> {}, so the pulse did not advance",
+            w[0],
+            w[1]
+        );
+    }
+    assert_eq!(
+        observed.first().copied().unwrap_or(0) - observed.last().copied().unwrap_or(0),
+        observed.len() - 1,
+        "pulse_size is 1, so N blocks must fold exactly N-1 more credentials \
+         than the first; a different slope means the pulse size drifted"
+    );
+
+    // ── Complete: the state machine still terminates ───────────────────────
+    // Enough further blocks to drain the queue, so this pins that >120
+    // credentials makes Pulsing REACHABLE without making Complete unreachable.
+    let mut slot = 401u64;
+    while !state.epochs.rupd_fold.is_complete() && slot < 2_000 {
+        let b = make_test_block(slot, block_no, prev, vec![]);
+        if state
+            .apply_block(&b, BlockValidationMode::ApplyOnly)
+            .is_err()
+        {
+            break;
+        }
+        prev = *b.hash();
+        block_no += 1;
+        slot += 1;
+    }
+    assert!(
+        state.epochs.rupd_fold.is_complete() || state.epochs.rupd_fold.fold.is_none(),
+        "the fold must eventually reach Complete (or be consumed by the \
+         boundary); a queue that never drains would be a non-terminating pulser"
+    );
+}
+
 /// #1074 — the RUPD pulser's FIRST pulse must see the frozen `fvAddrsRew`.
 ///
 /// This is an ORDERING defect, so it is deliberately driven through
