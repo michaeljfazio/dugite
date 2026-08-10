@@ -1,6 +1,6 @@
 //! dugite-monitor — Terminal UI dashboard for the Dugite Cardano node.
 //!
-//! Polls the Dugite Prometheus endpoint (default http://localhost:12798/metrics)
+//! Polls the Dugite Prometheus endpoint (default http://localhost:12796/metrics)
 //! every second and renders a real-time 5-panel dashboard:
 //!
 //! - **Node**:         Role, network, version, era, uptime
@@ -13,7 +13,7 @@
 //!
 //! ```bash
 //! dugite-monitor                                         # auto-discover running dugite-node
-//! dugite-monitor --metrics-url http://host:12798/metrics # explicit endpoint (skip discovery)
+//! dugite-monitor --metrics-url http://host:12796/metrics # explicit endpoint (skip discovery)
 //! dugite-monitor --network-magic 2                       # preview testnet epoch length
 //! ```
 //!
@@ -21,7 +21,7 @@
 //! `dugite-node` processes via `sysinfo` + `netstat2` and probes their
 //! `/metrics` endpoints. If exactly one node is found it attaches
 //! silently; if multiple are found a selection dialog is shown; if
-//! none are found it falls back to `http://localhost:12798/metrics`.
+//! none are found it falls back to `http://localhost:12796/metrics`.
 //!
 //! # Key bindings
 //!
@@ -59,8 +59,18 @@ use ratatui::prelude::*;
 use app::App;
 use metrics::fetch_metrics;
 
+/// Default Prometheus metrics port for a dugite node.
+///
+/// Mirrors `dugite_node::config::DEFAULT_METRICS_PORT`, which is deliberately
+/// offset from cardano-node's 12798 so the two can run co-located. It is
+/// duplicated rather than imported because dugite-monitor is a terminal
+/// dashboard and depending on dugite-node would pull the entire node — and
+/// mithril-client with it — into its build. `default_metrics_url_uses_the_node_default_port`
+/// pins the pair so the copy cannot drift silently again.
+const DEFAULT_METRICS_PORT: u16 = 12796;
+
 /// Default Prometheus metrics endpoint for the Dugite node.
-const DEFAULT_METRICS_URL: &str = "http://localhost:12798/metrics";
+const DEFAULT_METRICS_URL: &str = "http://localhost:12796/metrics";
 
 /// Poll interval for fetching metrics from the Prometheus endpoint.
 const POLL_INTERVAL: Duration = Duration::from_secs(1);
@@ -77,7 +87,7 @@ struct Args {
     /// When omitted, dugite-monitor discovers running `dugite-node`
     /// processes and auto-attaches. If multiple are found a selection
     /// dialog appears. If none are found, falls back to
-    /// `http://localhost:12798/metrics`.
+    /// `http://localhost:12796/metrics`.
     #[arg(long)]
     metrics_url: Option<String>,
 
@@ -181,9 +191,38 @@ async fn resolve_metrics_url(
     flag: Option<&str>,
     theme: &theme::Theme,
 ) -> Result<Option<ResolvedNode>> {
-    // Explicit non-empty flag bypasses discovery.
+    // Explicit non-empty flag bypasses DISCOVERY, but not the identity check.
+    //
+    // Discovery probes every candidate and drops anything that is not dugite,
+    // so the dashboard can only ever attach to a real node. An explicit URL
+    // used to skip that entirely: pointing at a co-located cardano-node — two
+    // digits away from dugite's default port — rendered every `dugite_*` gauge
+    // as absent, which the dashboard draws exactly like a node stalled at slot
+    // zero. A wrong endpoint is reported, not drawn.
     if let Some(url) = flag {
         if !url.is_empty() {
+            match discover::probe::probe_explicit_url(url).await {
+                discover::probe::ExplicitProbe::Dugite => {}
+                discover::probe::ExplicitProbe::NotDugite { hint } => {
+                    anyhow::bail!(
+                        "--metrics-url {url} is {hint}, not a dugite node.\n\
+                         dugite-node serves Prometheus on {DEFAULT_METRICS_PORT} by \
+                         default (cardano-node uses 12798); omit --metrics-url to \
+                         auto-discover a running dugite-node."
+                    );
+                }
+                // Unreachable is NOT an error: starting the dashboard before
+                // the node, or against a node that is still opening its
+                // database, is ordinary. Say which of the two happened rather
+                // than letting an empty dashboard imply a stalled node.
+                discover::probe::ExplicitProbe::Unreachable => {
+                    tracing::warn!(
+                        url = %url,
+                        "metrics endpoint did not answer — attaching anyway; \
+                         panels stay empty until it does"
+                    );
+                }
+            }
             return Ok(Some(ResolvedNode {
                 metrics_url: url.to_string(),
                 db_path: None,
@@ -338,4 +377,31 @@ async fn switch_node(
     // beneath the spot where the modal was sitting.
     terminal.clear()?;
     Ok(chosen)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The default endpoint must name dugite's port, not cardano-node's.
+    ///
+    /// This pins a constant DUPLICATED from
+    /// `dugite_node::config::DEFAULT_METRICS_PORT` (see the comment at
+    /// `DEFAULT_METRICS_PORT` for why it is copied rather than imported). The
+    /// two ports differ by two digits, and a monitor pointed at the wrong one
+    /// does not fail — it draws every absent `dugite_*` gauge exactly like a
+    /// node stalled at slot zero, so nothing downstream can notice.
+    #[test]
+    fn default_metrics_url_uses_the_node_default_port() {
+        assert_eq!(
+            DEFAULT_METRICS_URL,
+            format!("http://localhost:{DEFAULT_METRICS_PORT}/metrics"),
+            "DEFAULT_METRICS_URL drifted from DEFAULT_METRICS_PORT"
+        );
+        assert_ne!(
+            DEFAULT_METRICS_PORT, 12798,
+            "12798 is cardano-node's metrics port; dugite's is deliberately \
+             offset so the two can run co-located"
+        );
+    }
 }
