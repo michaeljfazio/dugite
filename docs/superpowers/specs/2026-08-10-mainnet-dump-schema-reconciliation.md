@@ -125,6 +125,40 @@ green:
   real artefact have already been wrong in this campaign by reasoning from
   types instead of decoding output.
 
+## Validated on preprod, not just asserted
+
+Items 1 and 2 were run, not trusted. dugite replayed the cloned preprod chain
+(172,931 blocks, 17 epochs) and the output was diffed against cardano-streamer
+over the same chain:
+
+- `snapshots.{mark,set,go}` now carry exactly `blocks, delegations, name,
+  poolParams, stake` — the oracle's five. The three `epoch` gaps are gone.
+- `rupdApplied` moved out of SCHEMA GAPS into real comparison, and
+  `rupdApplied[10] == rupdNext[9]` byte-for-byte on dugite's own side.
+- Schema gaps fell from 8 to 4: `drepDistr`, `enactedRoots`, `proposals`,
+  `instantaneousRewards`. Exit code still 2, which is correct.
+
+**The remaining divergences are the known definitional ones, reproduced on an
+independent network.** preprod shows dugite `null` vs oracle value for `eta`
+(from epoch 4), `rupdNext` (4–5) and `snapshots.set` (4 only) — the identical
+shape mainnet shows at 208, 208–209 and 208 respectively. Both are the first
+Shelley epoch of their chain. `rupdApplied` diverges at preprod 5–6, i.e.
+`rupdNext`'s 4–5 shifted by exactly one, which is the threading proving itself.
+
+## Consequence to expect on the next mainnet run
+
+Adding `rupdApplied` will roughly DOUBLE the #1077-attributable divergence
+count, from 50 to about 100, and that is not a regression.
+
+The 50 recorded today are `rupdNext.deltaR2` (25 epochs, 212–236) and
+`rupdNext.totalDistributed` (25 epochs, 212–236) — cardano-streamer's `sumRs`
+folding every `Set Reward` element without `filterRewards` at pv<=2. Because
+`rupdApplied[E] == rupdNext[E-1]`, the same oracle defect will surface again as
+`rupdApplied.deltaR2` and `rupdApplied.totalDistributed` over epochs 213–237.
+
+Anyone reading a jump from 61 to ~111 divergent as a regression will be wrong.
+It is one oracle defect counted twice, by construction.
+
 ## Remaining work, in order
 
 1. **Remove `snapshots.*.epoch`** from dugite's dump (closes 3 of 8; deletes a
