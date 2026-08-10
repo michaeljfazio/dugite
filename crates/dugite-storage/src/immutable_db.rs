@@ -3713,6 +3713,85 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "#1081: dugite rolls a chunk per write-open, not per slot range, \
+                so blocks land in a chunk whose number does not match \
+                slot / chunkSize. Remove the ignore when the writer is fixed."]
+    fn every_block_lands_in_the_chunk_its_slot_maps_to() {
+        // THE ImmutableDB INVARIANT, and the reason cardano-node cannot open a
+        // dugite-written database:
+        //
+        //     for chunk NNNNN, every block's slot satisfies
+        //         slot / chunkSize == NNNNN
+        //
+        // cardano-node numbers chunks by a FIXED slot range — the Byron epoch
+        // length, held constant across every era — and computes
+        // `chunkIndex(slot)` to locate any block. dugite instead names the chunk
+        // after the caller's epoch, clamped to `last + 1`, and only ever rolls on
+        // `open_for_writing`. So one chunk absorbs everything written between
+        // restarts: measured on real databases, 235 MB against cardano-node's
+        // uniform ~2 MB, with blocks up to 33 chunk-ranges past where their
+        // number says they belong.
+        //
+        // Consensus then computes an index for the tip's slot, finds no such
+        // file, and fails to open:
+        //
+        //     FsResourceDoesNotExist … immutable/06040.primary
+        //
+        // This test drives the WRITER rather than inspecting an existing
+        // database, so it fails on the defect itself and not on a historical
+        // artefact — a DB fixture would also be repaired away by any future
+        // reconciliation change.
+        const CHUNK_SIZE: u64 = 21600; // mainnet/preprod Byron epoch length
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = ImmutableDB::open_for_writing(dir.path(), 0, CHUNK_SIZE, 0).unwrap();
+
+        // Blocks spanning three nominal chunk ranges, written in one session —
+        // exactly what a node does between restarts.
+        let slots = [10u64, 500, CHUNK_SIZE + 7, CHUNK_SIZE * 2 + 3];
+        for (i, slot) in slots.iter().enumerate() {
+            db.append_block(
+                *slot,
+                i as u64 + 1,
+                &Hash32::from_bytes([i as u8 + 1; 32]),
+                b"block",
+                false,
+            )
+            .unwrap();
+        }
+        db.flush().unwrap();
+        drop(db);
+
+        // Read every secondary index back and check the invariant per chunk.
+        let mut violations = Vec::new();
+        for entry in std::fs::read_dir(dir.path()).unwrap() {
+            let path = entry.unwrap().path();
+            if path.extension().and_then(|e| e.to_str()) != Some("secondary") {
+                continue;
+            }
+            let idx: u64 = path.file_stem().unwrap().to_str().unwrap().parse().unwrap();
+            let bytes = std::fs::read(&path).unwrap();
+            for chunk in bytes.chunks_exact(56) {
+                let slot = u64::from_be_bytes(chunk[48..56].try_into().unwrap());
+                // An EBB stores the EPOCH NUMBER here, which in Byron equals the
+                // chunk index — not a violation. (Skipping this is what made the
+                // standalone checker condemn every correct database.)
+                if slot == idx {
+                    continue;
+                }
+                if slot / CHUNK_SIZE != idx {
+                    violations.push((idx, slot, slot / CHUNK_SIZE));
+                }
+            }
+        }
+
+        assert!(
+            violations.is_empty(),
+            "blocks landed in the wrong chunk — cardano-node cannot open this DB. \
+             (chunk, slot, chunk consensus would look for): {violations:?}"
+        );
+    }
+
+    #[test]
     fn test_epoch_based_chunk_numbering() {
         // Finalize with next_epoch=5 → new chunk should be named 00005.chunk.
         let dir = tempfile::tempdir().unwrap();
