@@ -60,28 +60,32 @@ fi
 log_info "Wiping prior state (genesis, keys, state, logs)"
 rm -rf "$LD_GENESIS" "$LD_KEYS" "$LD_STATE" "$LD_LOGS" "$LD_EVIDENCE"
 
-# The tx-zoo's own state is DEVNET-SPECIFIC and must go with it. `$LD_STATE` is
-# `local-devnet/state`, not `tx-zoo/state`, so before this the zoo's state
-# survived every genesis rebuild: wallets funded from a genesis that no longer
-# exists, `.raw`/`.signed` bodies spending UTxOs from a dead chain, and — the
-# case that cost a release gate — `built/gov-action-info.id` still holding a
-# proposal id from a devnet TWO DAYS old.
+# Drop the tx-zoo artefacts that name a SPECIFIC CHAIN. `tx-zoo/state` lives
+# outside `$LD_STATE` on purpose (see the results.csv note above), so nothing
+# under it was cleared when the genesis was rebuilt.
 #
-# That file is written by 06a only on PASS and read by every 07-* voting
-# script. When 06a failed for an unrelated reason, the 07s did not skip; they
-# voted on the previous devnet's action and failed with
-# `GovActionsDoNotExist`, which reads as a governance defect and is not one.
-# A stale artefact that makes a check fail for the wrong reason can equally
-# make one PASS for the wrong reason.
+# Most of it is fine that way: `run-all.sh --setup` rewrites `keys/` on every
+# run (verified — the zoo's `cc-1/cc-cold.vkey` is byte-identical to the
+# genesis-seated one it copies), and `anchor/` holds content-addressed JSON
+# bodies that no chain owns.
 #
-# Safe to wipe wholesale: `run-all.sh --reset` already does exactly this, the
-# skill's flow runs `run-all.sh --setup` immediately after setup.sh, and the
-# Plutus envelopes live in `tx-zoo/lib/plutus` (not state), so nothing that
-# costs real time to rebuild is lost.
-if [ -d "$LD_ROOT/tx-zoo/state" ]; then
-  rm -rf "$LD_ROOT/tx-zoo/state"
-  log_info "Wiped tx-zoo state (devnet-specific: keys, built txs, gov action ids)"
-fi
+# `built/` and `gov-lifecycle/` are different: they record ids from the chain
+# that produced them, and they are written CONDITIONALLY. `built/gov-action-info.id`
+# is written by 06a only on PASS and read by every 07-* voting script, so when
+# 06a failed for an unrelated reason the 07s did not skip — they voted on a
+# proposal from a devnet TWO DAYS older and failed with `GovActionsDoNotExist`,
+# which reads as a Conway voting defect and is not one. Seven of one round's
+# fourteen failures carried that arm.
+#
+# The direction that should worry more is the other one: an artefact that makes
+# a check fail for the wrong reason can equally make one PASS for the wrong
+# reason.
+for _stale in built gov-lifecycle; do
+  if [ -d "$LD_ROOT/tx-zoo/state/$_stale" ]; then
+    rm -rf "$LD_ROOT/tx-zoo/state/$_stale"
+    log_info "Wiped tx-zoo/state/$_stale (carries ids from the previous chain)"
+  fi
+done
 rm -f "$LD_CONFIG"/dugite-*.json "$LD_CONFIG"/cardano-*.json \
       "$LD_CONFIG"/relays.json "$LD_CONFIG"/genesis-hashes.env
 
