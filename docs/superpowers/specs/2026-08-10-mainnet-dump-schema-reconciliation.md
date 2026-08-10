@@ -173,7 +173,7 @@ conwayGov = { committee, committeeState, constitution, drepDistr, nextEnactState
 | key | shape |
 |---|---|
 | `committee` | `{"members": {"<kind>Hash-<56 hex>": <expiryEpoch>}, "threshold": {"numerator":N,"denominator":D}}` |
-| `committeeState` | `{"csCommitteeCreds": { … }}` (empty at 163-166) |
+| `committeeState` | `{"csCommitteeCreds": {"<kind>Hash-<56 hex>": {"tag": "CommitteeHotCredential", "contents": {"scriptHash"\|"keyHash": "<56 hex>"}}}}` — a TAGGED sum, not a bare hash; empty until preprod 171 |
 | `constitution` | `{"anchor": {"dataHash": "<64 hex>", "url": "ipfs://…"}, "script": "<56 hex>"}` |
 | `drepDistr` | `{"drep-keyHash-<56 hex>" \| "drep-scriptHash-<56 hex>" \| "drep-alwaysAbstain" \| "drep-alwaysNoConfidence": <lovelace>}` |
 | `nextEnactState` | `{committee, constitution, curPParams, prevGovActionIds, prevPParams}` |
@@ -182,8 +182,24 @@ conwayGov = { committee, committeeState, constitution, drepDistr, nextEnactState
 `{"Committee": null, "Constitution": null, "HardFork": null, "PParamUpdate": null}`
 — **this is dugite's top-level `enactedRoots`**, same four lanes, same
 information, nested and named differently. It is not an orphan field after all.
-Its non-null rendering is still unobserved (all four are null through preprod
-166) and must not be guessed; dugite currently emits `"<txid>#<index>"`.
+
+The non-null rendering is captured too, at preprod epoch 179 — the first
+enactment on that chain:
+
+```json
+"prevGovActionIds": {
+  "PParamUpdate": {"govActionIx": 0,
+                   "txId": "b52f02288e3ce8c7e57455522f4edd09c12797749e2db32098ecbe980b645d45"},
+  "Committee": null, "Constitution": null, "HardFork": null
+}
+```
+
+An **object with `govActionIx` and `txId`**, not a string. dugite emits
+`format!("{}#{}", txid, index)`, so the format is wrong as well as the
+location. Worth stating that this needed 16 Conway epochs to observe: every
+lane is null from 163 through 178, so a capture that stopped at the era
+boundary would have "confirmed" a null-only shape and the string format would
+have survived.
 
 `proposals` remains genuinely dugite-only — upstream's `extractConwayGovData`
 (Run.hs:150-166) emits neither it nor `enactedRoots`.
