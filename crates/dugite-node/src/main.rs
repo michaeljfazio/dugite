@@ -903,6 +903,11 @@ async fn run_dump_snapshot(args: DumpSnapshotArgs) -> Result<()> {
     let mut epoch_fees: u64 = 0;
     let mut blocks_applied = 0u64;
     let mut epochs_written = 0u64;
+    // Becomes the next dumped epoch's `rupdApplied`. Starts Null so the first
+    // epoch dumped reports `null`, which is what the oracle emits for its
+    // first epoch (verified: `rupdApplied` is null at 208, and at 209 equals
+    // 208's `rupdNext`).
+    let mut prev_rupd_next = serde_json::Value::Null;
     let start_time = std::time::Instant::now();
 
     // Skip the expensive full-UTxO rebuild_stake_distribution at each epoch boundary.
@@ -954,8 +959,21 @@ async fn run_dump_snapshot(args: DumpSnapshotArgs) -> Result<()> {
         // RC3: accumulate epoch_fees AFTER the transition check so the first block
         //      of a new epoch's fees go into the new epoch's bucket, not the old one.
         if last_epoch != u64::MAX && current_epoch > last_epoch {
-            let snapshot =
-                build_epoch_snapshot(&ledger, current_epoch, epoch_fees, max_lovelace_supply);
+            let snapshot = build_epoch_snapshot(
+                &ledger,
+                current_epoch,
+                epoch_fees,
+                max_lovelace_supply,
+                prev_rupd_next.clone(),
+            );
+            // Thread this epoch's `rupdNext` forward to become the next
+            // epoch's `rupdApplied`, mirroring upstream's `(json, rupdData)`
+            // return. Taken from the built snapshot rather than recomputed, so
+            // the two can never disagree about what this epoch's value was.
+            prev_rupd_next = snapshot
+                .get("rupdNext")
+                .cloned()
+                .unwrap_or(serde_json::Value::Null);
 
             write_epoch_snapshot(&snapshot, current_epoch, &args.output_dir, &mut output)
                 .map_err(|e| anyhow::anyhow!("Snapshot write error: {e}"))?;
@@ -1262,9 +1280,14 @@ fn serialize_stake_snapshot(
         )
     };
 
+    // No `epoch` key. Upstream's `snapshotInfo` (cardano-streamer Run.hs:296)
+    // emits exactly name/stake/delegations/poolParams, plus `blocks` for mark
+    // and go — a snapshot does not carry an epoch number there. Emitting one
+    // made all three snapshots a SCHEMA GAP in every paired epoch, and the
+    // `go` fallback branch below filled it with a hardcoded 0, so the wrong
+    // value was never visible to anything.
     let mut result = serde_json::json!({
         "name": name,
-        "epoch": snapshot.epoch.0,
         "delegations": delegations,
         "poolParams": pool_params,
         "stake": stake,
@@ -1294,6 +1317,23 @@ fn build_epoch_snapshot(
     epoch: u64,
     _driver_epoch_fees: u64,
     max_lovelace_supply: u64,
+    // The PREVIOUS epoch's `rupdNext`, verbatim. Upstream does not recompute
+    // an "applied" reward update: `buildSnapshotJson` returns
+    // `(json, rupdData)` and the driver threads the prior value straight back
+    // in as `mPrevRupd` (cardano-streamer Run.hs:169, 370), so
+    // `rupdApplied[E] == rupdNext[E-1]` by construction.
+    //
+    // Verified against real oracle output rather than read off the source:
+    // epoch 209's `rupdApplied` is byte-identical to epoch 208's `rupdNext`,
+    // and epoch 208's is `null`.
+    //
+    // This therefore adds NO independent signal — it re-compares, one epoch
+    // later, what `rupdNext` already compared. It is emitted to close a schema
+    // gap honestly, not as new coverage of the applied reward update.
+    // Computing it from what dugite actually applied would be more
+    // informative and would no longer match the oracle, manufacturing
+    // divergences that are definitional.
+    prev_rupd_next: serde_json::Value,
 ) -> serde_json::Value {
     // `epochFees` must be the LEDGER's `ssFee`, not a fee total the dump driver
     // accumulated for itself.
@@ -1565,7 +1605,6 @@ fn build_epoch_snapshot(
             .collect();
         serde_json::json!({
             "name": "go",
-            "epoch": 0,
             "delegations": {},
             "poolParams": {},
             "stake": {},
@@ -1607,6 +1646,7 @@ fn build_epoch_snapshot(
         "drepDistr": drep_distr,
         "protocolParams": protocol_params,
         "rupdNext": rupd_next,
+        "rupdApplied": prev_rupd_next,
         "snapshots": {
             "mark": snap_mark,
             "set": snap_set,
