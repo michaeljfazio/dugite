@@ -71,6 +71,33 @@ pub(crate) fn is_byron_ebb_envelope(cbor: &[u8]) -> bool {
     cbor.len() >= 2 && cbor[0] == 0x82 && cbor[1] == 0x00
 }
 
+/// Slots per ImmutableDB chunk, `10 * k`.
+///
+/// This is the Byron epoch length, and cardano-node uses it as the chunk size
+/// for the WHOLE chain — the hard-fork combinator takes its `ChunkInfo` from
+/// the first era and never revisits it, so a Shelley epoch of 432000 slots
+/// spans 20 chunks rather than one:
+///
+/// ```haskell
+/// -- ouroboros-consensus, HardFork/Combinator/Node/InitStorage.hs
+/// instance CanHardFork xs => NodeInitStorage (HardForkBlock xs) where
+///   -- We use the chunk info from the first era
+///   nodeImmutableDbChunkInfo cfg = ... nodeImmutableDbChunkInfo (hd cfgs)
+///
+/// -- ouroboros-consensus-cardano, Byron/Node.hs
+/// instance NodeInitStorage ByronBlock where
+///   nodeImmutableDbChunkInfo = simpleChunkInfo . coerce . kEpochSlots . gdK ...
+///
+/// -- cardano-ledger, Cardano/Chain/ProtocolConstants.hs
+/// kEpochSlots = EpochSlots . (*) 10 . unBlockCount
+/// ```
+///
+/// mainnet and preprod (k = 2160) use 21600; preview (k = 432) uses 4320.
+/// Both confirmed by measuring real databases (issue #1081).
+pub fn immutable_chunk_size(k: usize) -> u64 {
+    (k as u64) * 10
+}
+
 // ---------------------------------------------------------------------------
 // ChainDB
 // ---------------------------------------------------------------------------
@@ -123,30 +150,25 @@ impl ChainDB {
     /// Open or create a ChainDB at the given path with the given ImmutableDB config
     /// and security parameter k (number of blocks to retain in volatile storage).
     ///
-    /// Uses default epoch parameters (epoch 0, length 432000, first slot 0).
-    /// For production use with accurate chunk naming, use `open_with_epoch_config`.
+    /// The ImmutableDB chunk size is derived from `k` — see
+    /// [`immutable_chunk_size`].
     pub fn open_with_config(
         db_path: &Path,
         config: &ImmutableConfig,
         k: usize,
     ) -> Result<Self, ChainDBError> {
-        Self::open_with_epoch_config(db_path, config, k, 0, 432_000, 0)
+        Self::open_with_chunk_size(db_path, config, k, immutable_chunk_size(k))
     }
 
-    /// Open or create a ChainDB with full epoch configuration for
-    /// Haskell-compatible chunk numbering.
+    /// Open or create a ChainDB with an explicit ImmutableDB chunk size.
     ///
-    /// # Parameters
-    /// - `current_epoch`: Epoch number for the active chunk being written
-    /// - `epoch_length`: Slots per epoch for the current era
-    /// - `epoch_first_slot`: Absolute slot of the current epoch's first slot
-    pub fn open_with_epoch_config(
+    /// Only tests and tools should need this; production passes
+    /// `immutable_chunk_size(k)` via [`Self::open_with_config`].
+    pub fn open_with_chunk_size(
         db_path: &Path,
         config: &ImmutableConfig,
         k: usize,
-        current_epoch: u64,
-        epoch_length: u64,
-        epoch_first_slot: u64,
+        chunk_size: u64,
     ) -> Result<Self, ChainDBError> {
         debug!(path = %db_path.display(), k, index_type = ?config.index_type, "Opening ChainDB");
         std::fs::create_dir_all(db_path)?;
@@ -159,13 +181,8 @@ impl ChainDB {
         let immutable_dir = db_path.join("immutable");
         std::fs::create_dir_all(&immutable_dir)?;
 
-        let immutable = ImmutableDB::open_for_writing_with_config(
-            &immutable_dir,
-            config,
-            current_epoch,
-            epoch_length,
-            epoch_first_slot,
-        )?;
+        let immutable =
+            ImmutableDB::open_for_writing_with_config(&immutable_dir, config, chunk_size)?;
 
         let immutable_tip = if immutable.total_blocks() > 0 {
             Some((
@@ -1355,24 +1372,6 @@ impl ChainDB {
         self.immutable.get_historical_points(max_count)
     }
 
-    /// Finalize the current ImmutableDB chunk and start a new one.
-    /// Call this at epoch boundaries.
-    ///
-    /// # Parameters
-    /// - `next_epoch`: Epoch number for the next chunk
-    /// - `next_epoch_length`: Slots per epoch for the next chunk's era
-    /// - `next_epoch_first_slot`: Absolute slot of the next epoch's first slot
-    pub fn finalize_immutable_chunk(
-        &mut self,
-        next_epoch: u64,
-        next_epoch_length: u64,
-        next_epoch_first_slot: u64,
-    ) -> Result<(), ChainDBError> {
-        self.immutable
-            .finalize_chunk(next_epoch, next_epoch_length, next_epoch_first_slot)?;
-        Ok(())
-    }
-
     /// Persist ImmutableDB to disk (flush active chunk's secondary index).
     /// Call this on shutdown.
     pub fn persist(&mut self) -> Result<(), ChainDBError> {
@@ -1959,6 +1958,13 @@ mod tests {
     /// Point-aware successor lookup across the volatile/immutable seam:
     /// when the immutable tip is an EBB, its same-slot main-block successor
     /// still lives in the VolatileDB and must be returned.
+    ///
+    /// The EBB sits at slot 20 rather than at an arbitrary slot: with k = 2 the
+    /// chunk size is `10 * k` = 20, so slot 20 is the first slot of epoch 1 and
+    /// the boundary block for that epoch. An EBB placed anywhere else is not
+    /// representable — the on-disk `blockOrEBB` union stores its EPOCH, so the
+    /// slot is recovered as `epoch * chunk_size` and an off-boundary EBB cannot
+    /// survive the round trip in cardano-node either (#1081).
     #[test]
     fn test_get_next_block_after_point_across_immutable_volatile_seam() {
         let dir = tempfile::tempdir().unwrap();
@@ -1979,7 +1985,7 @@ mod tests {
         let ebb_hash = make_hash(0x66);
         db.add_block(
             ebb_hash,
-            SlotNo(6),
+            SlotNo(20),
             BlockNo(5),
             make_hash(5),
             vec![0x82, 0x00, 0x83],
@@ -1987,7 +1993,7 @@ mod tests {
         .unwrap();
         db.add_block(
             make_hash(6),
-            SlotNo(6),
+            SlotNo(20),
             BlockNo(6),
             ebb_hash,
             b"block6".to_vec(),
@@ -1996,7 +2002,7 @@ mod tests {
         for i in 7..=11u64 {
             db.add_block(
                 make_hash(i as u8),
-                SlotNo(i),
+                SlotNo(i + 14),
                 BlockNo(i),
                 make_hash(i as u8 - 1),
                 format!("block{i}").into_bytes(),
@@ -2004,42 +2010,43 @@ mod tests {
             .unwrap();
         }
 
-        // Flush 1..=5, then exactly the EBB, leaving the slot-6 main block
-        // in the VolatileDB: the immutable tip is now the EBB at slot 6.
+        // Flush 1..=5, then exactly the EBB, leaving the slot-20 main block
+        // in the VolatileDB: the immutable tip is now the EBB at slot 20.
         assert_eq!(db.flush_to_immutable_batch(5).unwrap(), 5);
         assert_eq!(db.flush_to_immutable_batch(1).unwrap(), 1);
         assert!(db.immutable.has_block(&ebb_hash));
         assert!(!db.immutable.has_block(&make_hash(6)));
         db.persist().unwrap();
 
-        // Immutable-interior step: pred -> EBB (same chunk, on disk).
+        // Immutable-interior step: pred -> EBB. The EBB opens chunk 1, so this
+        // also steps across a chunk boundary.
         let (s, hash, _) = db
             .get_next_block_after_point(SlotNo(5), &make_hash(5))
             .unwrap()
             .expect("EBB after block 5");
-        assert_eq!((s, hash), (SlotNo(6), ebb_hash));
+        assert_eq!((s, hash), (SlotNo(20), ebb_hash));
 
         // Seam step: EBB (immutable tip) -> same-slot main block (volatile).
         let (s, hash, cbor) = db
-            .get_next_block_after_point(SlotNo(6), &ebb_hash)
+            .get_next_block_after_point(SlotNo(20), &ebb_hash)
             .unwrap()
             .expect("same-slot main block after EBB across the seam");
-        assert_eq!((s, hash), (SlotNo(6), make_hash(6)));
+        assert_eq!((s, hash), (SlotNo(20), make_hash(6)));
         assert_eq!(cbor, b"block6");
 
         // Volatile-interior step: main block -> next volatile block.
         let (s, hash, _) = db
-            .get_next_block_after_point(SlotNo(6), &make_hash(6))
+            .get_next_block_after_point(SlotNo(20), &make_hash(6))
             .unwrap()
-            .expect("block 7 after slot-6 main block");
-        assert_eq!((s, hash), (SlotNo(7), make_hash(7)));
+            .expect("block 7 after slot-20 main block");
+        assert_eq!((s, hash), (SlotNo(21), make_hash(7)));
 
         // Unknown cursor falls back to the slot-based merge.
         let (s, _, _) = db
-            .get_next_block_after_point(SlotNo(6), &make_hash(0x99))
+            .get_next_block_after_point(SlotNo(20), &make_hash(0x99))
             .unwrap()
             .expect("slot-based fallback");
-        assert_eq!(s, SlotNo(7));
+        assert_eq!(s, SlotNo(21));
     }
 
     #[test]
