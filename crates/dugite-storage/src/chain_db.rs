@@ -71,6 +71,43 @@ pub(crate) fn is_byron_ebb_envelope(cbor: &[u8]) -> bool {
     cbor.len() >= 2 && cbor[0] == 0x82 && cbor[1] == 0x00
 }
 
+/// cardano-node's database marker file.
+///
+/// `Ouroboros.Consensus.Node.DbMarker` writes the network magic in decimal with
+/// no trailing newline, and REFUSES to open a non-empty directory that lacks it:
+///
+/// ```text
+/// cardano-node: Missing ".../protocolMagicId" but the folder was not empty
+/// ```
+///
+/// Measured — that is the exact error cardano-node 11.0.1 gives for a dugite
+/// database whose ImmutableDB is otherwise byte-identical to its own. Writing
+/// it is the difference between a database another implementation can open and
+/// one it rejects before reading a single chunk (issue #1081).
+const DB_MARKER: &str = "protocolMagicId";
+
+/// Write cardano-node's `protocolMagicId` marker into a database directory.
+///
+/// Idempotent, and refuses to overwrite a marker naming a DIFFERENT network —
+/// that would relabel one chain's database as another's.
+pub fn write_db_marker(db_path: &Path, network_magic: u64) -> Result<(), ChainDBError> {
+    let path = db_path.join(DB_MARKER);
+    let expected = network_magic.to_string();
+    match std::fs::read_to_string(&path) {
+        Ok(existing) if existing.trim() == expected => Ok(()),
+        Ok(existing) => Err(ChainDBError::Io(std::io::Error::other(format!(
+            "database at {} is marked for network magic {} but this node is \
+             configured for {network_magic}",
+            db_path.display(),
+            existing.trim()
+        )))),
+        Err(_) => {
+            std::fs::write(&path, expected)?;
+            Ok(())
+        }
+    }
+}
+
 /// Slots per ImmutableDB chunk, `10 * k`.
 ///
 /// This is the Byron epoch length, and cardano-node uses it as the chunk size
@@ -158,6 +195,41 @@ impl ChainDB {
         k: usize,
     ) -> Result<Self, ChainDBError> {
         Self::open_with_chunk_size(db_path, config, k, immutable_chunk_size(k))
+    }
+
+    /// Open a ChainDB for INSPECTION only — no writes of any kind.
+    ///
+    /// Tools that merely report on a database must use this. Every other open
+    /// path enters write mode, which removes the `clean` marker and records the
+    /// chunk size; a tool that guessed `k` (there is no genesis file in hand)
+    /// would stamp the wrong slots-per-chunk into a database whose correctly
+    /// configured node is then refused at startup. The ImmutableDB is opened
+    /// with [`ImmutableDB::open`], which never writes (#1081).
+    pub fn open_read_only(db_path: &Path, config: &ImmutableConfig) -> Result<Self, ChainDBError> {
+        let dir_lock = crate::db_lock::DbDirLock::acquire(db_path)?;
+        let immutable = ImmutableDB::open_with_config(&db_path.join("immutable"), config)?;
+        let immutable_tip = if immutable.total_blocks() > 0 {
+            Some((
+                SlotNo(immutable.tip_slot()),
+                immutable.tip_hash(),
+                BlockNo(immutable.tip_block_no()),
+            ))
+        } else {
+            None
+        };
+        let last_flushed_block_no = immutable_tip.map(|(_, _, b)| b.0).unwrap_or(0);
+
+        Ok(Self {
+            _path: db_path.to_path_buf(),
+            immutable,
+            volatile: VolatileDB::new(),
+            immutable_tip,
+            last_flushed_block_no,
+            security_param_k: DEFAULT_SECURITY_PARAM_K,
+            loe_handle: None,
+            loe_view: None,
+            _dir_lock: dir_lock,
+        })
     }
 
     /// Open or create a ChainDB with an explicit ImmutableDB chunk size.
@@ -1952,6 +2024,35 @@ mod tests {
         assert_eq!(
             hash, ebb_hash,
             "genesis EBB must precede the slot-0 main block"
+        );
+    }
+
+    /// The DB marker is cardano-node's exact bytes, and a foreign one is
+    /// refused rather than relabelled.
+    #[test]
+    fn db_marker_matches_cardano_nodes_and_refuses_a_foreign_network() {
+        let dir = tempfile::tempdir().unwrap();
+
+        write_db_marker(dir.path(), 764_824_073).unwrap();
+        let written = std::fs::read(dir.path().join("protocolMagicId")).unwrap();
+        // `DbMarker` writes the decimal magic with NO trailing newline; a real
+        // cardano-node mainnet database holds exactly these 9 bytes.
+        assert_eq!(written, b"764824073");
+
+        // Idempotent for the same network.
+        write_db_marker(dir.path(), 764_824_073).unwrap();
+
+        // Relabelling one chain's database as another's is refused.
+        let err = write_db_marker(dir.path(), 1).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("764824073") && msg.contains('1'),
+            "the error must name both networks, got: {msg}"
+        );
+        assert_eq!(
+            std::fs::read(dir.path().join("protocolMagicId")).unwrap(),
+            b"764824073",
+            "the existing marker must be left alone"
         );
     }
 

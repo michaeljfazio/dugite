@@ -1421,6 +1421,17 @@ impl Node {
             }
         });
 
+        // Stamp cardano-node's database marker. Without it cardano-node refuses
+        // a non-empty database directory outright — "Missing protocolMagicId but
+        // the folder was not empty" — however correct the chunks inside are
+        // (#1081). It is written here rather than at ChainDB::open because the
+        // magic is only resolved now.
+        if let Err(e) =
+            dugite_storage::chain_db::write_db_marker(&args.database_path, network_magic)
+        {
+            warn!(error = %e, "Failed to write the database marker");
+        }
+
         // ── Haskell ledger snapshot import (from Mithril ancillary) ─��──────
         //
         // After `mithril-import --ancillary`, the decoded Haskell ExtLedgerState
