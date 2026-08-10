@@ -1198,10 +1198,10 @@ impl Node {
                 Vec::new()
             };
 
-        // Open ChainDB with the security parameter k from Byron genesis.
-        // Uses default epoch parameters (epoch 0, length 432000) since era_history
-        // isn't built yet. The active chunk gets correctly named at the first
-        // finalize_chunk() call during epoch transitions, which passes real epoch info.
+        // Open ChainDB with the security parameter k from Byron genesis, which
+        // is also what fixes the ImmutableDB chunk size (`10 * k`). No era
+        // information is needed or wanted here: cardano-node derives the chunk
+        // size from Byron genesis once and holds it for every era (#1081).
         let opened_chain_db = ChainDB::open_with_config(
             &args.database_path,
             &args.storage_config.immutable,

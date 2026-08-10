@@ -19,7 +19,7 @@ use crate::block_index::{BlockIndex, BlockLocation, InMemoryBlockIndex};
 use crate::chunk_reader::{self, ChunkReaderTrait};
 use crate::config::ImmutableConfig;
 use dugite_primitives::hash::Hash32;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use thiserror::Error;
@@ -63,6 +63,14 @@ pub enum ImmutableDBError {
 /// can otherwise reflect torn OS page writeback from a killed process.
 const CLEAN_MARKER: &str = "clean";
 
+/// Records the slots-per-chunk this database was laid out with.
+///
+/// Not a cardano-node file — consensus needs none, because it recomputes the
+/// chunk size from the same genesis on every open and a wrong genesis fails
+/// earlier. dugite substitutes a default `k` when Byron genesis will not load,
+/// so the value it would use is not guaranteed to be the one already on disk.
+const CHUNK_SIZE_MARKER: &str = "chunk_size";
+
 /// Read a big-endian u64 from an 8-byte slice without panicking.
 ///
 /// Returns `None` if the slice is not exactly 8 bytes.
@@ -82,12 +90,14 @@ struct ChunkMeta {
 
 /// Active chunk being written to.
 struct ActiveChunk {
-    /// Chunk number — equals the epoch number for Haskell-compatible naming.
+    /// Chunk number, always `slot / chunk_size` for every block inside it.
+    ///
+    /// This is the ImmutableDB's central invariant and the reason cardano-node
+    /// can locate a block without consulting any index: given a slot it
+    /// computes the chunk number arithmetically and opens that file. The
+    /// chunk's first slot is therefore `chunk_num * chunk_size` — derived, not
+    /// carried, so the two can never drift (issue #1081).
     chunk_num: u64,
-    /// Number of slots per epoch for this chunk's era.
-    epoch_length: u64,
-    /// Absolute slot number of this epoch's first slot (for relative slot calc).
-    first_slot_of_epoch: u64,
     chunk_file: std::io::BufWriter<std::fs::File>,
     /// Incrementally-appended on-disk secondary index (issue #926).
     ///
@@ -110,8 +120,12 @@ struct ActiveChunk {
 struct SecondaryEntry {
     block_offset: u64,
     header_hash: [u8; 32],
-    /// For regular blocks: absolute slot number.
-    /// For EBBs (Epoch Boundary Blocks): epoch number.
+    /// The block's absolute slot, ALWAYS — including for an EBB.
+    ///
+    /// The on-disk `blockOrEBB` field is a union and holds the EPOCH NUMBER
+    /// for an EBB; [`Self::encode`] performs that substitution. Keeping the
+    /// real slot in memory means slot-ordered reads and chunk slot ranges do
+    /// not have to know which entries are boundary blocks.
     slot: u64,
     /// CRC32 checksum of the block CBOR data (0 for legacy entries).
     checksum: u32,
@@ -127,7 +141,16 @@ struct SecondaryEntry {
 }
 
 impl SecondaryEntry {
-    fn encode(&self) -> [u8; SECONDARY_ENTRY_SIZE] {
+    /// Serialize for the `.secondary` file.
+    ///
+    /// `chunk_num` is needed because the on-disk `blockOrEBB` field carries the
+    /// EPOCH NUMBER for a boundary block, and for Byron the epoch number and
+    /// the chunk number are the same thing (the chunk size IS the Byron epoch
+    /// length). Writing the EBB's slot instead is what put
+    /// `…, 21600, 21600, …` in a dugite mainnet index, which cardano-node
+    /// rejects as non-increasing (issue #1081).
+    fn encode(&self, chunk_num: u64) -> [u8; SECONDARY_ENTRY_SIZE] {
+        let block_or_ebb = if self.is_ebb { chunk_num } else { self.slot };
         let mut entry = [0u8; SECONDARY_ENTRY_SIZE];
         entry[0..8].copy_from_slice(&self.block_offset.to_be_bytes());
         // bytes 8..10: header_offset (u16 big-endian)
@@ -137,7 +160,7 @@ impl SecondaryEntry {
         // bytes 12..16: CRC32 checksum
         entry[12..16].copy_from_slice(&self.checksum.to_be_bytes());
         entry[16..48].copy_from_slice(&self.header_hash);
-        entry[48..56].copy_from_slice(&self.slot.to_be_bytes());
+        entry[48..56].copy_from_slice(&block_or_ebb.to_be_bytes());
         entry
     }
 }
@@ -284,8 +307,28 @@ pub struct ImmutableDB {
     tip_slot: u64,
     tip_hash: Hash32,
     tip_block_no: u64,
-    /// Active chunk for writing (None in read-only mode).
+    /// Active chunk for writing.
+    ///
+    /// `None` in read-only mode, and also `None` in write mode until the first
+    /// `append_block` — the chunk number is a function of the block's slot, so
+    /// there is nothing to open before one arrives. Use [`Self::is_writable`]
+    /// rather than this field to ask whether the DB accepts writes.
     active_chunk: Option<ActiveChunk>,
+    /// Slots per chunk, fixed for the lifetime of the database.
+    ///
+    /// `None` in read-only mode. cardano-node derives this once from the Byron
+    /// genesis (`10 * k`) and holds it constant across every era, so a Shelley
+    /// epoch of 432000 slots spans 20 chunks of 21600 — see
+    /// [`Self::open_for_writing`].
+    chunk_size: Option<u64>,
+    /// Highest chunk NUMBER present in the directory at open, whether or not it
+    /// holds any blocks.
+    ///
+    /// Read from the filenames rather than from `chunks`, which skips chunks
+    /// with an empty secondary index — those are exactly the gap-fillers a
+    /// previous session wrote, and treating them as absent would re-create them
+    /// and, worse, pick a stale tail to continue from.
+    last_chunk_on_disk: Option<u64>,
     /// CRC32 checksums for blocks (hash -> checksum). Zero means no checksum (legacy).
     checksums: HashMap<Hash32, u32>,
 }
@@ -342,6 +385,8 @@ impl ImmutableDB {
                 tip_hash: Hash32::ZERO,
                 tip_block_no: 0,
                 active_chunk: None,
+                chunk_size: None,
+                last_chunk_on_disk: None,
                 checksums: HashMap::new(),
             });
         }
@@ -600,6 +645,11 @@ impl ImmutableDB {
             tip_hash,
             tip_block_no,
             active_chunk: None,
+            chunk_size: None,
+            // `chunk_nums` is the filename scan, so this counts gap-filling
+            // chunks whose secondary index is empty and which are therefore
+            // absent from `chunks`.
+            last_chunk_on_disk: chunk_nums.last().copied(),
             checksums,
         })
     }
@@ -1276,7 +1326,7 @@ impl ImmutableDB {
                 let mut header_hash = [0u8; 32];
                 header_hash.copy_from_slice(&data[16..48]);
                 let slot = match read_be_u64(&data[48..56]) {
-                    Some(v) => v,
+                    Some(v) => self.entry_slot(chunk_meta.chunk_num, v, pos == 0),
                     None => {
                         pos += SECONDARY_ENTRY_SIZE;
                         continue;
@@ -1357,12 +1407,13 @@ impl ImmutableDB {
             let mut pos = 0;
             while pos + SECONDARY_ENTRY_SIZE <= secondary_data.len() {
                 let data = &secondary_data[pos..];
-                let (Some(block_offset), Some(entry_slot)) =
+                let (Some(block_offset), Some(block_or_ebb)) =
                     (read_be_u64(&data[0..8]), read_be_u64(&data[48..56]))
                 else {
                     pos += SECONDARY_ENTRY_SIZE;
                     continue;
                 };
+                let entry_slot = self.entry_slot(chunk_meta.chunk_num, block_or_ebb, pos == 0);
 
                 if serve_next {
                     let next_pos = pos + SECONDARY_ENTRY_SIZE;
@@ -1447,7 +1498,7 @@ impl ImmutableDB {
                 let mut header_hash = [0u8; 32];
                 header_hash.copy_from_slice(&data[16..48]);
                 let entry_slot = match read_be_u64(&data[48..56]) {
-                    Some(v) => v,
+                    Some(v) => self.entry_slot(chunk_meta.chunk_num, v, pos == 0),
                     None => {
                         pos += SECONDARY_ENTRY_SIZE;
                         continue;
@@ -1524,7 +1575,7 @@ impl ImmutableDB {
                     }
                 };
                 let slot = match read_be_u64(&data[48..56]) {
-                    Some(v) => v,
+                    Some(v) => self.entry_slot(chunk_meta.chunk_num, v, pos == 0),
                     None => {
                         pos += SECONDARY_ENTRY_SIZE;
                         continue;
@@ -1567,87 +1618,101 @@ impl ImmutableDB {
 
     /// Open an ImmutableDB for writing, appending to existing chunk files.
     ///
-    /// Scans existing chunks read-only (like `open`), then prepares the
-    /// next chunk for writing. Chunks are named by epoch number for
-    /// Haskell ImmutableDB compatibility.
+    /// Scans existing chunks read-only (like `open`), then enters write mode.
+    /// No chunk file is created here: which chunk a block belongs to is a
+    /// function of its slot, so the first `append_block` opens it.
+    ///
+    /// # The chunk size, and why it is not the epoch length
+    ///
+    /// cardano-node derives the chunk size ONCE, from the Byron genesis, and
+    /// holds it constant for the entire chain regardless of era — mainnet and
+    /// preprod use 21600 slots (`10 * k`, k = 2160) and preview 4320 (k = 432).
+    /// A Shelley epoch of 432000 slots therefore spans **20 chunks**, not one.
+    ///
+    /// Naming a chunk after the epoch (which dugite did until #1081) makes the
+    /// two agree only for Byron, where the epoch length happens to equal the
+    /// chunk size. Everywhere else the numbering drifts, and consensus — which
+    /// locates a block by computing `slot / chunk_size` and opening that file —
+    /// asks for a chunk that was never written.
     ///
     /// # Parameters
-    /// - `current_epoch`: Epoch number for the chunk being written to
-    /// - `epoch_length`: Slots per epoch for the current era
-    /// - `epoch_first_slot`: Absolute slot of the current epoch's first slot
-    pub fn open_for_writing(
-        dir: &Path,
-        current_epoch: u64,
-        epoch_length: u64,
-        epoch_first_slot: u64,
-    ) -> Result<Self, ImmutableDBError> {
-        Self::open_for_writing_with_config(
-            dir,
-            &ImmutableConfig::default(),
-            current_epoch,
-            epoch_length,
-            epoch_first_slot,
-        )
+    /// - `chunk_size`: slots per chunk, `10 * k` from the Byron genesis
+    pub fn open_for_writing(dir: &Path, chunk_size: u64) -> Result<Self, ImmutableDBError> {
+        Self::open_for_writing_with_config(dir, &ImmutableConfig::default(), chunk_size)
     }
 
     /// Open an ImmutableDB for writing with the given config.
     ///
-    /// Chunks are named by epoch number for Haskell ImmutableDB compatibility.
+    /// See [`Self::open_for_writing`] for the meaning of `chunk_size`.
     pub fn open_for_writing_with_config(
         dir: &Path,
         config: &ImmutableConfig,
-        current_epoch: u64,
-        epoch_length: u64,
-        epoch_first_slot: u64,
+        chunk_size: u64,
     ) -> Result<Self, ImmutableDBError> {
+        if chunk_size == 0 {
+            return Err(ImmutableDBError::Io(std::io::Error::other(
+                "ImmutableDB chunk_size must be non-zero",
+            )));
+        }
+
         let mut db = Self::open_with_config(dir, config)?;
 
         // Entering write mode: the on-disk state is no longer known-clean
         // until the next graceful flush() (issue #928).
         let _ = fs::remove_file(dir.join(CLEAN_MARKER));
 
-        // Use epoch number as chunk number for Haskell-compatible naming.
-        // Ensure we never overwrite an existing finalized chunk — use the
-        // greater of the requested epoch and one past the last chunk.
-        let min_safe_chunk = db.chunks.last().map_or(0, |c| c.chunk_num + 1);
-        let next_chunk = current_epoch.max(min_safe_chunk);
-
-        let chunk_path = dir.join(format!("{next_chunk:05}.chunk"));
-        // #926 belt-and-braces: after reconciliation every non-empty chunk
-        // file is indexed (and thus below `min_safe_chunk`) or the open
-        // failed — so colliding here is unreachable. Refuse to truncate
-        // rather than trust that reasoning forever.
-        if let Ok(meta) = chunk_path.metadata() {
-            if meta.len() > 0 {
+        // The chunk size decides the on-disk layout, so it must be the same on
+        // every open of the same database. It is derived from the Byron
+        // genesis `k`, and dugite falls back to a DEFAULT k when that file
+        // cannot be read — which would silently re-lay the database at 21600
+        // slots per chunk on a network that uses 4320. Record it once and
+        // refuse a mismatch, so a misconfiguration is a startup error rather
+        // than a database no implementation can read.
+        let recorded_path = dir.join(CHUNK_SIZE_MARKER);
+        match fs::read_to_string(&recorded_path)
+            .ok()
+            .and_then(|s| s.trim().parse::<u64>().ok())
+        {
+            Some(recorded) if recorded != chunk_size => {
                 return Err(ImmutableDBError::InconsistentChunk {
-                    chunk: next_chunk,
+                    chunk: 0,
                     reason: format!(
-                        "refusing to reuse chunk number {next_chunk}: target \
-                         chunk file already contains {} bytes of un-indexed data",
-                        meta.len()
+                        "this database was written with {recorded} slots per chunk but \
+                         the node is configured for {chunk_size} (Byron genesis k = {}). \
+                         Check the Byron genesis file for this network; opening would \
+                         produce a layout no implementation can read",
+                        chunk_size / 10
                     ),
                 });
             }
+            Some(_) => {}
+            None => fs::write(&recorded_path, chunk_size.to_string())?,
         }
-        let file = std::fs::File::create(&chunk_path)?;
-        let writer = std::io::BufWriter::new(file);
-        let secondary_path = dir.join(format!("{next_chunk:05}.secondary"));
-        let secondary_file = std::fs::File::create(&secondary_path)?;
 
-        db.active_chunk = Some(ActiveChunk {
-            chunk_num: next_chunk,
-            epoch_length,
-            first_slot_of_epoch: epoch_first_slot,
-            chunk_file: writer,
-            secondary_file,
-            secondary_entries: Vec::new(),
-            current_offset: 0,
-            pending_blocks: HashMap::new(),
-        });
+        db.chunk_size = Some(chunk_size);
+
+        // A database written before #1081 carries chunks whose number does not
+        // match their contents' slots. Reads still work (they go through the
+        // hash index), but appending cannot repair the existing layout, and
+        // cardano-node will not open it. Say so once, at open, naming the
+        // remedy — silently producing a half-correct database is how this
+        // defect stayed invisible for so long.
+        if let Some(tail) = db.chunks.last() {
+            let expected = tail.last_slot / chunk_size;
+            if expected != tail.chunk_num && tail.last_slot != tail.chunk_num {
+                warn!(
+                    chunk = tail.chunk_num,
+                    last_slot = tail.last_slot,
+                    consensus_would_look_in = expected,
+                    "ImmutableDB: chunk layout predates the slot-derived numbering \
+                     — this database is not readable by cardano-node and a re-sync \
+                     is required to make it so. New chunks will be numbered correctly."
+                );
+            }
+        }
 
         debug!(
-            next_chunk,
-            epoch_length,
+            chunk_size,
             existing_chunks = db.chunks.len(),
             "ImmutableDB opened for writing"
         );
@@ -1655,14 +1720,290 @@ impl ImmutableDB {
         Ok(db)
     }
 
+    /// Make `target` the active chunk, finalizing whatever preceded it and
+    /// materialising any chunk range the chain skipped over.
+    ///
+    /// Chunks are append-only and strictly increasing, so a target at or below
+    /// the active chunk is a caller error and is refused rather than silently
+    /// truncating a written file.
+    fn roll_to_chunk(&mut self, target: u64, chunk_size: u64) -> Result<(), ImmutableDBError> {
+        // The chunk immediately after the last one that exists on disk — where
+        // a gap, if any, begins.
+        let mut gap_from = match self.active_chunk.as_ref() {
+            Some(active) => {
+                if target == active.chunk_num {
+                    return Ok(());
+                }
+                if target < active.chunk_num {
+                    return Err(ImmutableDBError::InconsistentChunk {
+                        chunk: target,
+                        reason: format!(
+                            "block belongs in chunk {target} but chunk {} is already \
+                             open for writing — blocks must be appended in slot order",
+                            active.chunk_num
+                        ),
+                    });
+                }
+                let n = active.chunk_num;
+                self.finalize_active_chunk(chunk_size)?;
+                n + 1
+            }
+            // First append of this session.
+            None => match self.last_chunk_on_disk {
+                // The block belongs in the chunk the last session left behind:
+                // continue it rather than starting a new one. A restart lands
+                // here on almost every block, since a chunk spans `10 * k`
+                // slots and a node rarely stops exactly on that boundary.
+                Some(tail) if target == tail => {
+                    return self.reopen_chunk_for_append(tail, chunk_size);
+                }
+                Some(tail) if target < tail => {
+                    return Err(ImmutableDBError::InconsistentChunk {
+                        chunk: target,
+                        reason: format!(
+                            "block belongs in chunk {target} but the database already \
+                             holds chunk {tail}; appending would rewrite history"
+                        ),
+                    });
+                }
+                Some(tail) => tail + 1,
+                // Nothing on disk. Upstream measures its gap from
+                // `firstChunkNo` in exactly this situation, so a fresh
+                // database whose first block is not in chunk 0 still gets
+                // chunk 0 — an ImmutableDB is a chain from its own start, not
+                // a sparse map.
+                None => 0,
+            },
+        };
+
+        // Refuse an implausible fill rather than writing millions of files.
+        // The ImmutableDB only ever receives blocks that are already k-deep on
+        // a validated chain, so a gap this size is a bad slot, not a quiet
+        // period.
+        const MAX_GAP_CHUNKS: u64 = 1000;
+        if target.saturating_sub(gap_from) > MAX_GAP_CHUNKS {
+            return Err(ImmutableDBError::InconsistentChunk {
+                chunk: target,
+                reason: format!(
+                    "block would leave a gap of {} empty chunks after chunk {}; \
+                     refusing to materialise it (limit {MAX_GAP_CHUNKS})",
+                    target - gap_from,
+                    gap_from.saturating_sub(1)
+                ),
+            });
+        }
+
+        // A slot range with no blocks in it still gets its files. Consensus's
+        // iterator walks chunk numbers one at a time and reads each chunk's
+        // primary index to find the next filled slot; an absent file is not
+        // read as "empty", it raises `FsResourceDoesNotExist` and aborts the
+        // open. Upstream keeps the sequence dense for the same reason —
+        // `appendBlockImpl` starts `countChunks chunk initialChunk` new chunks
+        // when a block skips ahead, not just the one it needs (issue #1081).
+        while gap_from < target {
+            Self::write_empty_chunk(&self.dir, gap_from, chunk_size)?;
+            self.chunks.push(ChunkMeta {
+                chunk_num: gap_from,
+                // No blocks, so no slot range is covered. `chunk_covers_slot`
+                // asks `first <= slot <= last`, which is false for every slot
+                // when first > last — correct for an empty chunk.
+                first_slot: 1,
+                last_slot: 0,
+            });
+            gap_from += 1;
+        }
+
+        let chunk_path = self.dir.join(format!("{target:05}.chunk"));
+        // #926 belt-and-braces: after reconciliation every non-empty chunk file
+        // is indexed, so a collision here means the caller is re-writing history
+        // (or the database predates #1081 and its tail overshot into this
+        // chunk's range). Refuse to truncate rather than trust that reasoning.
+        if let Ok(meta) = chunk_path.metadata() {
+            if meta.len() > 0 {
+                return Err(ImmutableDBError::InconsistentChunk {
+                    chunk: target,
+                    reason: format!(
+                        "refusing to reuse chunk number {target}: target chunk file \
+                         already contains {} bytes of data",
+                        meta.len()
+                    ),
+                });
+            }
+        }
+        let file = std::fs::File::create(&chunk_path)?;
+        let secondary_path = self.dir.join(format!("{target:05}.secondary"));
+        let secondary_file = std::fs::File::create(&secondary_path)?;
+
+        self.active_chunk = Some(ActiveChunk {
+            chunk_num: target,
+            chunk_file: std::io::BufWriter::new(file),
+            secondary_file,
+            secondary_entries: Vec::new(),
+            current_offset: 0,
+            pending_blocks: HashMap::new(),
+        });
+        self.last_chunk_on_disk = Some(target);
+        Ok(())
+    }
+
+    /// Continue writing into a chunk a previous session left on disk.
+    ///
+    /// A chunk covers a fixed slot range, so a restart almost always lands
+    /// back inside the chunk it stopped in. Its existing blocks stay where
+    /// they are — the file is opened for APPEND and the secondary index is
+    /// read back so subsequent offsets continue from the right place.
+    fn reopen_chunk_for_append(
+        &mut self,
+        chunk_num: u64,
+        chunk_size: u64,
+    ) -> Result<(), ImmutableDBError> {
+        let chunk_path = self.dir.join(format!("{chunk_num:05}.chunk"));
+        let secondary_path = self.dir.join(format!("{chunk_num:05}.secondary"));
+
+        let current_offset = chunk_path.metadata().map(|m| m.len()).unwrap_or(0);
+
+        // Reconciliation at open already truncated both files to a mutually
+        // consistent prefix (#926), so what is here is what we continue from.
+        let secondary_data = fs::read(&secondary_path).unwrap_or_default();
+        let mut secondary_entries = Vec::with_capacity(secondary_data.len() / SECONDARY_ENTRY_SIZE);
+        for (i, raw) in secondary_data
+            .chunks_exact(SECONDARY_ENTRY_SIZE)
+            .enumerate()
+        {
+            let block_offset = read_be_u64(&raw[0..8]).unwrap_or(0);
+            let block_or_ebb = read_be_u64(&raw[48..56]).unwrap_or(0);
+            let mut header_hash = [0u8; 32];
+            header_hash.copy_from_slice(&raw[16..48]);
+            // See `entry_slot`: an EBB is the chunk's first entry AND carries
+            // the chunk's own number. The positional half is what keeps chunk
+            // 0's genesis block from being mistaken for the epoch-0 EBB.
+            let is_ebb = i == 0 && block_or_ebb == chunk_num;
+            secondary_entries.push(SecondaryEntry {
+                block_offset,
+                header_hash,
+                // Restore the in-memory invariant: `slot` is the real slot.
+                slot: if is_ebb {
+                    chunk_num.saturating_mul(chunk_size)
+                } else {
+                    block_or_ebb
+                },
+                checksum: u32::from_be_bytes([raw[12], raw[13], raw[14], raw[15]]),
+                header_offset: u16::from_be_bytes([raw[8], raw[9]]),
+                header_size: u16::from_be_bytes([raw[10], raw[11]]),
+                is_ebb,
+            });
+        }
+
+        let chunk_file = std::fs::OpenOptions::new()
+            .append(true)
+            .create(true)
+            .open(&chunk_path)?;
+        let secondary_file = std::fs::OpenOptions::new()
+            .append(true)
+            .create(true)
+            .open(&secondary_path)?;
+
+        debug!(
+            chunk = chunk_num,
+            entries = secondary_entries.len(),
+            current_offset,
+            "ImmutableDB: continuing the tail chunk"
+        );
+
+        self.active_chunk = Some(ActiveChunk {
+            chunk_num,
+            chunk_file: std::io::BufWriter::new(chunk_file),
+            secondary_file,
+            secondary_entries,
+            current_offset,
+            pending_blocks: HashMap::new(),
+        });
+        Ok(())
+    }
+
+    /// Write the three files for a chunk that contains no blocks.
+    ///
+    /// Empty `.chunk` and `.secondary`, and a `.primary` whose offsets are all
+    /// zero — the shape upstream's `backfillChunk` produces for a chunk it
+    /// starts and immediately finalises.
+    fn write_empty_chunk(
+        dir: &Path,
+        chunk_num: u64,
+        chunk_size: u64,
+    ) -> Result<(), ImmutableDBError> {
+        std::fs::File::create(dir.join(format!("{chunk_num:05}.chunk")))?;
+        std::fs::File::create(dir.join(format!("{chunk_num:05}.secondary")))?;
+        Self::write_primary_index(dir, chunk_num, chunk_size, &[])
+    }
+
+    /// Finalize the active chunk: fsync its data, write its primary index and
+    /// record its slot range. Leaves the DB with no active chunk.
+    fn finalize_active_chunk(&mut self, chunk_size: u64) -> Result<(), ImmutableDBError> {
+        use std::io::Write;
+
+        let active = match self.active_chunk.take() {
+            Some(a) => a,
+            None => return Ok(()),
+        };
+
+        // Flush and fsync the chunk file to guarantee durability before
+        // syncing the secondary index. Without this, a crash could leave the
+        // chunk file with missing tail data while the secondary index already
+        // references those blocks.
+        let mut chunk_file = active.chunk_file;
+        chunk_file.flush()?;
+        chunk_file.get_ref().sync_data()?;
+
+        // The secondary entries were appended incrementally on every
+        // append_block (issue #926); fsync so the chunk is fully recoverable
+        // on restart even if the OS crashes immediately after this call.
+        active.secondary_file.sync_data()?;
+
+        Self::write_primary_index(
+            &self.dir,
+            active.chunk_num,
+            chunk_size,
+            &active.secondary_entries,
+        )?;
+
+        if let (Some(first), Some(last)) = (
+            active.secondary_entries.first(),
+            active.secondary_entries.last(),
+        ) {
+            self.chunks.push(ChunkMeta {
+                chunk_num: active.chunk_num,
+                first_slot: first.slot,
+                last_slot: last.slot,
+            });
+        }
+
+        debug!(chunk = active.chunk_num, "ImmutableDB: chunk finalized");
+        Ok(())
+    }
+
     /// Append a block to the active chunk.
     ///
     /// Updates the in-memory hash index immediately so the block is
     /// readable before the secondary index is flushed.
     ///
-    /// For Byron Epoch Boundary Blocks (EBBs), set `is_ebb = true` and
-    /// pass the epoch number as the `slot` parameter. The secondary index
-    /// `block_or_ebb` field will contain the epoch number (not a slot).
+    /// `slot` is always the block's own slot, EBB or not.
+    ///
+    /// For a Byron Epoch Boundary Block (`is_ebb = true`) the secondary index
+    /// records the EPOCH NUMBER rather than the slot — upstream's `BlockOrEBB`
+    /// is a union and `chunkSlotForBlockOrEBB` dispatches on it:
+    ///
+    /// ```haskell
+    /// data BlockOrEBB = Block !SlotNo | EBB !EpochNo
+    /// chunkSlotForBoundaryBlock ci epoch = ... unsafeEpochNoToChunkNo epoch ...
+    /// ```
+    ///
+    /// The epoch is DERIVED here rather than demanded from the caller. dugite's
+    /// Byron decoder sets an EBB's slot to `epoch * byron_epoch_length`, and the
+    /// chunk size *is* the Byron epoch length, so `slot / chunk_size` recovers
+    /// the epoch exactly. Requiring the caller to substitute the epoch number
+    /// for the slot is what produced a mainnet secondary index carrying
+    /// `…, 21600, 21600, …` — the EBB's slot where its epoch number belonged,
+    /// which cardano-node rejects as non-increasing (issue #1081).
     pub fn append_block(
         &mut self,
         slot: u64,
@@ -1673,9 +2014,18 @@ impl ImmutableDB {
     ) -> Result<(), ImmutableDBError> {
         use std::io::Write;
 
-        let active = self.active_chunk.as_mut().ok_or_else(|| {
+        let chunk_size = self.chunk_size.ok_or_else(|| {
             ImmutableDBError::Io(std::io::Error::other("ImmutableDB not opened for writing"))
         })?;
+
+        // The chunk is a function of the block, not of when the DB was opened.
+        let target = slot / chunk_size;
+        self.roll_to_chunk(target, chunk_size)?;
+
+        let active = self
+            .active_chunk
+            .as_mut()
+            .expect("roll_to_chunk installs an active chunk");
 
         let block_offset = active.current_offset;
         active.chunk_file.write_all(cbor)?;
@@ -1689,7 +2039,6 @@ impl ImmutableDB {
 
         // Persist the secondary entry incrementally (issue #926) and buffer
         // it (plus the block data) for reads and primary-index generation.
-        // For EBBs, `slot` contains the epoch number (per Haskell convention).
         let entry = SecondaryEntry {
             block_offset,
             header_hash: *hash.as_bytes(),
@@ -1699,7 +2048,9 @@ impl ImmutableDB {
             header_size,
             is_ebb,
         };
-        active.secondary_file.write_all(&entry.encode())?;
+        active
+            .secondary_file
+            .write_all(&entry.encode(active.chunk_num))?;
         active.secondary_entries.push(entry);
         active.pending_blocks.insert(*hash, cbor.to_vec());
 
@@ -1727,84 +2078,6 @@ impl ImmutableDB {
         Ok(())
     }
 
-    /// Finalize the current chunk: write its `.secondary` and `.primary`
-    /// indexes and open a new chunk file. Call this at epoch boundaries.
-    ///
-    /// # Parameters
-    /// - `next_epoch`: Epoch number for the next chunk
-    /// - `next_epoch_length`: Slots per epoch for the next chunk's era
-    /// - `next_epoch_first_slot`: Absolute slot of the next epoch's first slot
-    pub fn finalize_chunk(
-        &mut self,
-        next_epoch: u64,
-        next_epoch_length: u64,
-        next_epoch_first_slot: u64,
-    ) -> Result<(), ImmutableDBError> {
-        use std::io::Write;
-
-        let active = match self.active_chunk.take() {
-            Some(a) => a,
-            None => return Ok(()),
-        };
-
-        // Flush and fsync the chunk file to guarantee durability before
-        // syncing the secondary index. Without this, a crash could leave the
-        // chunk file with missing tail data while the secondary index already
-        // references those blocks.
-        let mut chunk_file = active.chunk_file;
-        chunk_file.flush()?;
-        chunk_file.get_ref().sync_data()?;
-
-        // The secondary entries were appended incrementally on every
-        // append_block (issue #926); fsync so the chunk is fully recoverable
-        // on restart even if the OS crashes immediately after this call.
-        active.secondary_file.sync_data()?;
-
-        // Write primary index for Haskell ImmutableDB interoperability
-        Self::write_primary_index(
-            &self.dir,
-            active.chunk_num,
-            active.epoch_length,
-            active.first_slot_of_epoch,
-            &active.secondary_entries,
-        )?;
-
-        // Update chunk metadata
-        if let (Some(first), Some(last)) = (
-            active.secondary_entries.first(),
-            active.secondary_entries.last(),
-        ) {
-            self.chunks.push(ChunkMeta {
-                chunk_num: active.chunk_num,
-                first_slot: first.slot,
-                last_slot: last.slot,
-            });
-        }
-
-        // Open new chunk for writing — named by epoch number
-        let chunk_path = self.dir.join(format!("{next_epoch:05}.chunk"));
-        let file = std::fs::File::create(&chunk_path)?;
-        let secondary_path = self.dir.join(format!("{next_epoch:05}.secondary"));
-        let secondary_file = std::fs::File::create(&secondary_path)?;
-        self.active_chunk = Some(ActiveChunk {
-            chunk_num: next_epoch,
-            epoch_length: next_epoch_length,
-            first_slot_of_epoch: next_epoch_first_slot,
-            chunk_file: std::io::BufWriter::new(file),
-            secondary_file,
-            secondary_entries: Vec::new(),
-            current_offset: 0,
-            pending_blocks: HashMap::new(),
-        });
-
-        debug!(
-            finalized_chunk = active.chunk_num,
-            next_chunk = next_epoch,
-            "ImmutableDB: chunk finalized"
-        );
-        Ok(())
-    }
-
     /// Flush the active chunk's data and secondary index to disk without
     /// starting a new chunk, and stamp the clean-shutdown marker.
     ///
@@ -1815,9 +2088,25 @@ impl ImmutableDB {
     pub fn flush(&mut self) -> Result<(), ImmutableDBError> {
         use std::io::Write;
 
+        // Read before the mutable borrow of `active_chunk` below.
+        let Some(chunk_size) = self.chunk_size else {
+            // Read-only: nothing to flush and no claim to make about the
+            // on-disk state.
+            return Ok(());
+        };
+
         let active = match self.active_chunk.as_mut() {
             Some(a) => a,
-            None => return Ok(()),
+            None => {
+                // Opened for writing but no block was ever appended, so there
+                // is no active chunk. The on-disk state is still exactly what
+                // the last graceful stop left, so stamp the marker — otherwise
+                // an open/close with no writes would force the next open to
+                // rebuild the hash index for nothing (#928).
+                self.block_index.persist()?;
+                fs::write(self.dir.join(CLEAN_MARKER), b"")?;
+                return Ok(());
+            }
         };
 
         // Flush and fsync chunk data to guarantee durability. Without
@@ -1834,8 +2123,7 @@ impl ImmutableDB {
         Self::write_primary_index(
             &self.dir,
             active.chunk_num,
-            active.epoch_length,
-            active.first_slot_of_epoch,
+            chunk_size,
             &active.secondary_entries,
         )?;
 
@@ -1887,13 +2175,41 @@ impl ImmutableDB {
     ///   into the `.secondary` file (always a multiple of 56)
     ///
     /// ## Entry layout
-    /// For Shelley+ chunks (no EBB capability, epoch_length = E):
-    /// - `E + 1` entries: slots `0..E-1` plus one sentinel
-    /// - Entry `r`: byte offset of the secondary entry for relative slot `r`
-    /// - Entry `E` (sentinel): total byte size of the secondary file
     ///
-    /// For Byron chunks (EBB-capable, epoch_length = E):
-    /// - `E + 2` entries: slot 0 = EBB, slots `1..E` = regular, plus sentinel
+    /// A chunk of `C` slots always gets `C + 2` offsets, whatever its era and
+    /// whether or not it actually holds an EBB:
+    ///
+    /// - relative slot **0** is the EBB slot,
+    /// - relative slots `1..=C` are the regular slots, so a block at absolute
+    ///   slot `s` sits at `s - chunk_num * C + 1`,
+    /// - one trailing sentinel holding the total `.secondary` size.
+    ///
+    /// Upstream derives both from `ChunkSize`, not from the chunk's contents:
+    ///
+    /// ```haskell
+    /// -- Chunks/Internal.hs
+    /// simpleChunkInfo (EpochSize sz) = UniformChunkSize (ChunkSize True sz)
+    ///
+    /// maxRelativeIndex ChunkSize{..}
+    ///   | chunkCanContainEBB = numRegularBlocks
+    ///   | otherwise          = numRegularBlocks - 1
+    ///
+    /// -- Chunks/Layout.hs
+    /// chunkSlotForRegularBlock (UniformChunkSize sz@ChunkSize{..}) (SlotNo slot) =
+    ///   ... RelativeSlot ... $ if chunkCanContainEBB then withinChunk + 1
+    ///                                                else withinChunk
+    ///   where (chunk, withinChunk) = slot `divMod` numRegularBlocks
+    /// ```
+    ///
+    /// `chunkCanContainEBB` is `True` for the whole Cardano chain — the hard-fork
+    /// combinator takes its `ChunkInfo` from the FIRST era (`hd cfgs`), which is
+    /// always Byron. Confirmed by measurement: 3102 of 3103 primary indexes in a
+    /// real cardano-node mainnet DB are byte-identical in size at 86409 =
+    /// `1 + 21602 * 4`, Byron through Alonzo (issue #1081).
+    ///
+    /// Deciding the arity from whether an EBB is *present* — which dugite did
+    /// until #1081 — makes every Shelley+ chunk both the wrong length and
+    /// shifted one slot down, since index 0 stays reserved regardless.
     ///
     /// ## Slot lookup
     /// To check if slot `r` has a block: `offset[r+1] > offset[r]`
@@ -1901,61 +2217,36 @@ impl ImmutableDB {
     fn write_primary_index(
         dir: &Path,
         chunk_num: u64,
-        epoch_length: u64,
-        first_slot_of_epoch: u64,
+        chunk_size: u64,
         secondary_entries: &[SecondaryEntry],
     ) -> Result<(), ImmutableDBError> {
         use std::io::Write;
 
-        // Build a map from relative slot → secondary entry index for filled slots.
-        let mut has_ebb = false;
-        let mut slot_to_entry_idx: HashMap<u64, usize> = HashMap::new();
-        for (idx, entry) in secondary_entries.iter().enumerate() {
-            if entry.is_ebb {
-                has_ebb = true;
+        // Relative slots 0..=chunk_size — index 0 is the EBB slot.
+        let num_slots = chunk_size + 1;
+        let first_slot_of_chunk = chunk_num.saturating_mul(chunk_size);
+
+        // Which relative slots are filled, in secondary-file order.
+        let mut filled: HashSet<u64> = HashSet::with_capacity(secondary_entries.len());
+        for entry in secondary_entries {
+            let relative_slot = if entry.is_ebb {
+                0
             } else {
-                let relative_slot = entry.slot.saturating_sub(first_slot_of_epoch);
-                slot_to_entry_idx.insert(relative_slot, idx);
-            }
+                entry.slot.saturating_sub(first_slot_of_chunk) + 1
+            };
+            filled.insert(relative_slot);
         }
 
-        // Determine the number of relative slots in this chunk.
-        // Shelley+ chunks (no EBB): E slots (0..E-1), E+1 offsets (including sentinel).
-        // Byron chunks (with EBB): slot 0 = EBB, E regular slots (1..E), E+2 offsets.
-        let num_offsets = if has_ebb {
-            epoch_length as usize + 2
-        } else {
-            epoch_length as usize + 1
-        };
-        let mut offsets: Vec<u32> = Vec::with_capacity(num_offsets);
-
-        // Track the running byte offset into the secondary index.
-        // Each secondary entry is SECONDARY_ENTRY_SIZE (56) bytes.
+        let mut offsets: Vec<u32> = Vec::with_capacity(num_slots as usize + 1);
+        // Running byte offset into the secondary index; each entry is
+        // SECONDARY_ENTRY_SIZE (56) bytes.
         let mut current_offset: u32 = 0;
-
-        if has_ebb {
-            // Slot 0 = EBB position. The EBB is always the first secondary entry
-            // when present, so offset[0] = 0.
+        for r in 0..num_slots {
             offsets.push(current_offset);
-            current_offset += SECONDARY_ENTRY_SIZE as u32;
-
-            // Regular slots 0..epoch_length-1 map to entries 1..epoch_length
-            for r in 0..epoch_length {
-                offsets.push(current_offset);
-                if slot_to_entry_idx.contains_key(&r) {
-                    current_offset += SECONDARY_ENTRY_SIZE as u32;
-                }
-            }
-        } else {
-            // No EBB: slots 0..epoch_length-1
-            for r in 0..epoch_length {
-                offsets.push(current_offset);
-                if slot_to_entry_idx.contains_key(&r) {
-                    current_offset += SECONDARY_ENTRY_SIZE as u32;
-                }
+            if filled.contains(&r) {
+                current_offset += SECONDARY_ENTRY_SIZE as u32;
             }
         }
-
         // Sentinel: total size of the secondary file
         offsets.push(current_offset);
 
@@ -1974,7 +2265,6 @@ impl ImmutableDB {
             chunk = chunk_num,
             entries = offsets.len(),
             blocks = secondary_entries.len(),
-            has_ebb,
             "ImmutableDB: primary index written"
         );
 
@@ -2037,9 +2327,43 @@ impl ImmutableDB {
         points
     }
 
+    /// Resolve a secondary entry's `blockOrEBB` union into an absolute slot.
+    ///
+    /// `blockOrEBB` holds the EPOCH NUMBER for a Byron boundary block and the
+    /// slot for everything else. Two conditions identify the EBB, and BOTH are
+    /// needed:
+    ///
+    /// * the value equals the chunk number (a Byron epoch and its chunk are the
+    ///   same number), and
+    /// * it is the chunk's FIRST entry — an EBB occupies relative slot 0, and
+    ///   entries are stored in increasing relative-slot order, so nothing can
+    ///   precede it.
+    ///
+    /// Dropping the positional half silently breaks CHUNK 0, where the epoch-0
+    /// EBB and the genesis block at slot 0 both store `0`. They belong at
+    /// relative slots 0 and 1; treating both as the EBB merges them into one.
+    /// Verified against a real cardano-node mainnet database — with the
+    /// positional test, regenerating the primary index of chunks 0, 1, 7, 100,
+    /// 207, 208, 1000, 2351, 3000 and 3050 is byte-identical; without it,
+    /// chunk 0 alone differs.
+    ///
+    /// Returns the raw value when the chunk size is unknown (a read-only open),
+    /// which is what every reader did unconditionally before #1081 — including
+    /// for the cardano-node-written Byron chunks a Mithril bootstrap installs.
+    fn entry_slot(&self, chunk_num: u64, block_or_ebb: u64, is_first_entry: bool) -> u64 {
+        match self.chunk_size {
+            Some(cs) if is_first_entry && block_or_ebb == chunk_num => chunk_num.saturating_mul(cs),
+            _ => block_or_ebb,
+        }
+    }
+
     /// Whether this ImmutableDB is open for writing.
+    ///
+    /// Keyed on the chunk size rather than on an active chunk: a chunk is only
+    /// opened once a block establishes which one it should be, so a writable DB
+    /// has no active chunk until its first `append_block`.
     pub fn is_writable(&self) -> bool {
-        self.active_chunk.is_some()
+        self.chunk_size.is_some()
     }
 
     /// Read a byte range from a chunk file with plain std I/O.
@@ -2179,7 +2503,7 @@ mod tests {
     #[test]
     fn secondary_index_survives_kill_without_flush() {
         let dir = tempfile::tempdir().unwrap();
-        let mut db = ImmutableDB::open_for_writing(dir.path(), 0, 432_000, 0).unwrap();
+        let mut db = ImmutableDB::open_for_writing(dir.path(), 432_000).unwrap();
         let payloads: Vec<Vec<u8>> = (1..=3u8).map(|i| envelope_payload(i, 16 * 1024)).collect();
         for (i, p) in payloads.iter().enumerate() {
             let hash = Hash32::from_bytes([(i + 1) as u8; 32]);
@@ -2213,7 +2537,7 @@ mod tests {
     #[test]
     fn unindexed_chunk_tail_is_truncated_at_open() {
         let dir = tempfile::tempdir().unwrap();
-        let mut db = ImmutableDB::open_for_writing(dir.path(), 0, 432_000, 0).unwrap();
+        let mut db = ImmutableDB::open_for_writing(dir.path(), 432_000).unwrap();
         let payloads: Vec<Vec<u8>> = (1..=3u8).map(|i| envelope_payload(i, 16 * 1024)).collect();
         for (i, p) in payloads.iter().enumerate() {
             let hash = Hash32::from_bytes([(i + 1) as u8; 32]);
@@ -2249,7 +2573,7 @@ mod tests {
     #[test]
     fn index_less_last_chunk_is_quarantined_not_skipped() {
         let dir = tempfile::tempdir().unwrap();
-        let mut db = ImmutableDB::open_for_writing(dir.path(), 0, 432_000, 0).unwrap();
+        let mut db = ImmutableDB::open_for_writing(dir.path(), 432_000).unwrap();
         db.append_block(
             100,
             1,
@@ -2258,7 +2582,6 @@ mod tests {
             false,
         )
         .unwrap();
-        db.finalize_chunk(1, 432_000, 432_000).unwrap();
         db.append_block(
             432_100,
             2,
@@ -2313,7 +2636,7 @@ mod tests {
     #[test]
     fn stale_tip_meta_is_clamped_to_indexed_chain() {
         let dir = tempfile::tempdir().unwrap();
-        let mut db = ImmutableDB::open_for_writing(dir.path(), 0, 432_000, 0).unwrap();
+        let mut db = ImmutableDB::open_for_writing(dir.path(), 432_000).unwrap();
         for i in 1..=2u8 {
             db.append_block(
                 100 + i as u64,
@@ -2360,7 +2683,7 @@ mod tests {
     #[test]
     fn has_verified_block_rejects_corrupt_backing_data() {
         let dir = tempfile::tempdir().unwrap();
-        let mut db = ImmutableDB::open_for_writing(dir.path(), 0, 432_000, 0).unwrap();
+        let mut db = ImmutableDB::open_for_writing(dir.path(), 432_000).unwrap();
         let hash = Hash32::from_bytes([1u8; 32]);
         db.append_block(100, 1, &hash, &envelope_payload(1, 16 * 1024), false)
             .unwrap();
@@ -2391,7 +2714,7 @@ mod tests {
     #[test]
     fn tail_reconcile_cascades_below_empty_tail_artifact() {
         let dir = tempfile::tempdir().unwrap();
-        let mut db = ImmutableDB::open_for_writing(dir.path(), 0, 432_000, 0).unwrap();
+        let mut db = ImmutableDB::open_for_writing(dir.path(), 432_000).unwrap();
         let payloads: Vec<Vec<u8>> = (1..=3u8).map(|i| envelope_payload(i, 16 * 1024)).collect();
         for (i, p) in payloads.iter().enumerate() {
             let hash = Hash32::from_bytes([(i + 1) as u8; 32]);
@@ -2448,7 +2771,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let h1 = [1u8; 32];
         let h2 = [2u8; 32];
-        let mut db = ImmutableDB::open_for_writing(dir.path(), 0, 432_000, 0).unwrap();
+        let mut db = ImmutableDB::open_for_writing(dir.path(), 432_000).unwrap();
         db.append_block(
             100,
             1,
@@ -2465,7 +2788,6 @@ mod tests {
             false,
         )
         .unwrap();
-        db.finalize_chunk(1, 432_000, 432_000).unwrap();
         db.append_block(
             432_100,
             3,
@@ -2489,7 +2811,7 @@ mod tests {
     fn chunk_boundary_break_at_tail_quarantines_orphan_island() {
         let dir = tempfile::tempdir().unwrap();
         let h1 = [1u8; 32];
-        let mut db = ImmutableDB::open_for_writing(dir.path(), 0, 432_000, 0).unwrap();
+        let mut db = ImmutableDB::open_for_writing(dir.path(), 432_000).unwrap();
         db.append_block(
             100,
             1,
@@ -2498,7 +2820,6 @@ mod tests {
             false,
         )
         .unwrap();
-        db.finalize_chunk(1, 432_000, 432_000).unwrap();
         // Tail chunk's first block claims a prev that is NOT chunk 0's tip
         // (simulating the incident's 38k-slot indexed hole).
         db.append_block(
@@ -2533,7 +2854,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let h1 = [1u8; 32];
         let h9 = [9u8; 32];
-        let mut db = ImmutableDB::open_for_writing(dir.path(), 0, 432_000, 0).unwrap();
+        let mut db = ImmutableDB::open_for_writing(dir.path(), 432_000).unwrap();
         db.append_block(
             100,
             1,
@@ -2542,7 +2863,6 @@ mod tests {
             false,
         )
         .unwrap();
-        db.finalize_chunk(1, 432_000, 432_000).unwrap();
         // Chunk 1 breaks the chain (prev = garbage)…
         db.append_block(
             432_100,
@@ -2552,7 +2872,6 @@ mod tests {
             false,
         )
         .unwrap();
-        db.finalize_chunk(2, 432_000, 864_000).unwrap();
         // …and chunk 2 chains onto chunk 1, so the break is NOT at the tail.
         db.append_block(
             864_100,
@@ -2578,7 +2897,7 @@ mod tests {
     #[test]
     fn clean_marker_lifecycle() {
         let dir = tempfile::tempdir().unwrap();
-        let mut db = ImmutableDB::open_for_writing(dir.path(), 0, 432_000, 0).unwrap();
+        let mut db = ImmutableDB::open_for_writing(dir.path(), 432_000).unwrap();
         assert!(
             !dir.path().join("clean").exists(),
             "no marker while in write mode"
@@ -2598,7 +2917,7 @@ mod tests {
         );
         drop(db);
 
-        let db2 = ImmutableDB::open_for_writing(dir.path(), 0, 432_000, 0).unwrap();
+        let db2 = ImmutableDB::open_for_writing(dir.path(), 432_000).unwrap();
         assert!(
             !dir.path().join("clean").exists(),
             "opening for writing removes the marker"
@@ -3225,7 +3544,7 @@ mod tests {
             mmap_initial_capacity: 0,
         };
         let mut db =
-            ImmutableDB::open_for_writing_with_config(dir.path(), &config, 0, 432_000, 0).unwrap();
+            ImmutableDB::open_for_writing_with_config(dir.path(), &config, 432_000).unwrap();
         assert!(db.is_writable());
         assert_eq!(db.total_blocks(), 1);
 
@@ -3296,7 +3615,7 @@ mod tests {
     fn test_crc32_write_and_verify() {
         // Blocks written via append_block should have CRC32 stored
         let dir = tempfile::tempdir().unwrap();
-        let mut db = ImmutableDB::open_for_writing(dir.path(), 0, 432_000, 0).unwrap();
+        let mut db = ImmutableDB::open_for_writing(dir.path(), 432_000).unwrap();
 
         let hash = Hash32::from_bytes([42u8; 32]);
         let cbor = b"test block data with CRC";
@@ -3318,7 +3637,7 @@ mod tests {
         let cbor = b"block for CRC persistence test";
 
         {
-            let mut db = ImmutableDB::open_for_writing(dir.path(), 0, 432_000, 0).unwrap();
+            let mut db = ImmutableDB::open_for_writing(dir.path(), 432_000).unwrap();
             db.append_block(100, 1, &hash, cbor, false).unwrap();
             db.flush().unwrap();
         }
@@ -3394,7 +3713,7 @@ mod tests {
         ];
 
         {
-            let mut db = ImmutableDB::open_for_writing(dir.path(), 0, 432_000, 0).unwrap();
+            let mut db = ImmutableDB::open_for_writing(dir.path(), 432_000).unwrap();
             for (i, (hash, cbor)) in blocks.iter().enumerate() {
                 db.append_block((i as u64 + 1) * 10, i as u64 + 1, hash, cbor, false)
                     .unwrap();
@@ -3419,7 +3738,7 @@ mod tests {
     fn test_append_block_at_slot_zero() {
         // First block at slot 0 should work correctly
         let dir = tempfile::tempdir().unwrap();
-        let mut db = ImmutableDB::open_for_writing(dir.path(), 0, 432_000, 0).unwrap();
+        let mut db = ImmutableDB::open_for_writing(dir.path(), 432_000).unwrap();
 
         let hash = Hash32::from_bytes([1u8; 32]);
         db.append_block(0, 0, &hash, b"genesis_block", false)
@@ -3431,20 +3750,35 @@ mod tests {
         assert_eq!(db.get_block(&hash).unwrap(), b"genesis_block");
     }
 
+    /// A block at an absurd slot is REFUSED, not stored.
+    ///
+    /// Its chunk is `slot / chunk_size`, so `u64::MAX` names chunk 4.2e13 and
+    /// storing it means materialising every chunk below it — upstream measures
+    /// its gap the same way and would attempt the same thing. Before #1081 the
+    /// chunk number was unrelated to the slot, so this landed in chunk 0 and
+    /// looked fine; the layout it produced was the defect.
     #[test]
     fn test_append_block_at_max_slot() {
-        // Block at u64::MAX slot should work
         let dir = tempfile::tempdir().unwrap();
-        let mut db = ImmutableDB::open_for_writing(dir.path(), 0, 432_000, 0).unwrap();
+        let mut db = ImmutableDB::open_for_writing(dir.path(), 432_000).unwrap();
 
         let hash = Hash32::from_bytes([1u8; 32]);
-        db.append_block(u64::MAX, 1, &hash, b"far_future_block", false)
-            .unwrap();
+        let err = db
+            .append_block(u64::MAX, 1, &hash, b"far_future_block", false)
+            .unwrap_err();
+        assert!(
+            matches!(err, ImmutableDBError::InconsistentChunk { .. }),
+            "expected a refusal naming the gap, got {err:?}"
+        );
+        assert_eq!(db.total_blocks(), 0, "nothing may be stored");
+        assert!(!db.has_block(&hash));
 
+        // A block at a plausible slot in the same session still works.
+        db.append_block(4_320_000, 1, &hash, b"real_block", false)
+            .unwrap();
         assert_eq!(db.total_blocks(), 1);
-        assert_eq!(db.tip_slot(), u64::MAX);
-        assert!(db.has_block(&hash));
-        assert_eq!(db.get_block(&hash).unwrap(), b"far_future_block");
+        assert_eq!(db.tip_slot(), 4_320_000);
+        assert_eq!(db.get_block(&hash).unwrap(), b"real_block");
     }
 
     #[test]
@@ -3454,7 +3788,7 @@ mod tests {
         let hashes: Vec<Hash32> = (1..=5u8).map(|i| Hash32::from_bytes([i; 32])).collect();
 
         {
-            let mut db = ImmutableDB::open_for_writing(dir.path(), 0, 432_000, 0).unwrap();
+            let mut db = ImmutableDB::open_for_writing(dir.path(), 432_000).unwrap();
             for (i, hash) in hashes.iter().enumerate() {
                 let cbor = format!("block_{}", i + 1);
                 db.append_block(
@@ -3505,7 +3839,7 @@ mod tests {
         let original = b"original_block_data_here";
 
         {
-            let mut db = ImmutableDB::open_for_writing(dir.path(), 0, 432_000, 0).unwrap();
+            let mut db = ImmutableDB::open_for_writing(dir.path(), 432_000).unwrap();
             db.append_block(100, 1, &hash, original, false).unwrap();
             db.flush().unwrap();
         }
@@ -3531,12 +3865,11 @@ mod tests {
         let h3 = Hash32::from_bytes([3u8; 32]);
 
         {
-            let mut db = ImmutableDB::open_for_writing(dir.path(), 0, 432_000, 0).unwrap();
+            let mut db = ImmutableDB::open_for_writing(dir.path(), 432_000).unwrap();
             db.append_block(10, 1, &h1, b"epoch0_block1", false)
                 .unwrap();
             db.append_block(20, 2, &h2, b"epoch0_block2", false)
                 .unwrap();
-            db.finalize_chunk(1, 432_000, 432_000).unwrap();
             db.append_block(30, 3, &h3, b"epoch1_block1", false)
                 .unwrap();
             db.flush().unwrap();
@@ -3582,52 +3915,56 @@ mod tests {
         ])
     }
 
+    /// A chunk holding NO EBB still reserves relative slot 0 for one, so a
+    /// block at absolute slot `s` sits at primary entry `s - first + 1` and the
+    /// index has `chunk_size + 2` entries.
+    ///
+    /// Both facts are measured off a real cardano-node mainnet database, where
+    /// chunks 208 (Shelley), 2351 (Mary) and 3000 (Alonzo) all carry 21602
+    /// entries and all match `slot - first + 1` — never `slot - first`.
+    /// dugite chose the arity and the mapping from whether an EBB happened to
+    /// be present, so every Shelley+ chunk was both the wrong length and
+    /// shifted down one slot (issue #1081).
     #[test]
-    fn test_primary_index_written_on_finalize() {
-        // Finalize a chunk → verify .primary file exists with correct Haskell format.
-        // Format: 1 version byte + (epoch_length+1) u32 BE entries (byte offsets).
+    fn primary_index_reserves_the_ebb_slot_even_with_no_ebb() {
         let dir = tempfile::tempdir().unwrap();
-        let epoch_length = 1000u64;
+        let chunk_size = 1000u64;
 
-        let mut db = ImmutableDB::open_for_writing(dir.path(), 0, epoch_length, 0).unwrap();
+        let mut db = ImmutableDB::open_for_writing(dir.path(), chunk_size).unwrap();
         db.append_block(100, 1, &Hash32::from_bytes([1u8; 32]), b"b1", false)
             .unwrap();
         db.append_block(200, 2, &Hash32::from_bytes([2u8; 32]), b"b2", false)
             .unwrap();
         db.append_block(300, 3, &Hash32::from_bytes([3u8; 32]), b"b3", false)
             .unwrap();
-        db.finalize_chunk(1, epoch_length, epoch_length).unwrap();
+        db.flush().unwrap();
 
-        let primary_path = dir.path().join("00000.primary");
-        assert!(
-            primary_path.exists(),
-            ".primary file should exist after finalize"
+        let data = fs::read(dir.path().join("00000.primary")).unwrap();
+
+        // `chunk_size` regular slots + 1 EBB slot + 1 sentinel.
+        let num_entries = chunk_size as usize + 2;
+        assert_eq!(
+            data.len(),
+            1 + num_entries * 4,
+            "primary index arity must come from the chunk size, not the contents"
         );
-
-        let data = fs::read(&primary_path).unwrap();
-
-        // Non-EBB chunk: epoch_length + 1 entries + 1 version byte
-        let num_entries = epoch_length as usize + 1;
-        assert_eq!(data.len(), 1 + num_entries * 4);
-
-        // Version byte
         assert_eq!(data[0], 0x01, "Version byte should be 0x01");
 
-        // Entries are byte offsets into the .secondary file.
-        // Slots 0-99: empty → offset stays 0
-        assert_eq!(read_primary_offset(&data, 99), 0);
-
-        // Slot 100 has a block → offset[100] = 0, offset[101] = 56
+        // Slot 0 is the EBB slot and is empty here, so nothing has moved yet.
+        assert_eq!(read_primary_offset(&data, 0), 0);
         assert_eq!(read_primary_offset(&data, 100), 0);
-        assert_eq!(read_primary_offset(&data, 101), 56);
 
-        // Slot 200: offset[200] = 56, offset[201] = 112
-        assert_eq!(read_primary_offset(&data, 200), 56);
-        assert_eq!(read_primary_offset(&data, 201), 112);
+        // Slot 100 → entry 101. Entry 100 must be EMPTY: that is the whole
+        // off-by-one, and asserting only entry 101 would pass under the bug
+        // too, because offsets are non-decreasing.
+        assert_eq!(read_primary_offset(&data, 101), 0);
+        assert_eq!(read_primary_offset(&data, 102), 56);
 
-        // Slot 300: offset[300] = 112, offset[301] = 168
-        assert_eq!(read_primary_offset(&data, 300), 112);
-        assert_eq!(read_primary_offset(&data, 301), 168);
+        // Slot 200 → entry 201; slot 300 → entry 301.
+        assert_eq!(read_primary_offset(&data, 201), 56);
+        assert_eq!(read_primary_offset(&data, 202), 112);
+        assert_eq!(read_primary_offset(&data, 301), 112);
+        assert_eq!(read_primary_offset(&data, 302), 168);
 
         // Sentinel (last entry) = total secondary file size = 3 * 56 = 168
         assert_eq!(read_primary_offset(&data, num_entries - 1), 168);
@@ -3638,7 +3975,7 @@ mod tests {
         // flush() should also write .primary for the active chunk.
         let dir = tempfile::tempdir().unwrap();
 
-        let mut db = ImmutableDB::open_for_writing(dir.path(), 0, 1000, 0).unwrap();
+        let mut db = ImmutableDB::open_for_writing(dir.path(), 1000).unwrap();
         db.append_block(50, 1, &Hash32::from_bytes([1u8; 32]), b"b1", false)
             .unwrap();
         db.flush().unwrap();
@@ -3657,18 +3994,19 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let epoch_length = 500u64;
 
-        let mut db = ImmutableDB::open_for_writing(dir.path(), 0, epoch_length, 0).unwrap();
+        let mut db = ImmutableDB::open_for_writing(dir.path(), epoch_length).unwrap();
         // EBB: pass epoch number (0) as slot, is_ebb=true
         db.append_block(0, 0, &Hash32::from_bytes([1u8; 32]), b"ebb", true)
             .unwrap();
         // Regular block at slot 100
         db.append_block(100, 1, &Hash32::from_bytes([2u8; 32]), b"regular", false)
             .unwrap();
-        db.finalize_chunk(1, epoch_length, epoch_length).unwrap();
+        db.flush().unwrap();
 
         let data = fs::read(dir.path().join("00000.primary")).unwrap();
 
-        // EBB chunk: epoch_length + 2 entries + version byte
+        // EBB chunk: chunk_size + 2 entries + version byte — the SAME arity as
+        // the no-EBB chunk above.
         let num_entries = epoch_length as usize + 2;
         assert_eq!(data.len(), 1 + num_entries * 4);
         assert_eq!(data[0], 0x01, "Version byte");
@@ -3689,18 +4027,22 @@ mod tests {
         assert_eq!(read_primary_offset(&data, num_entries - 1), 112);
     }
 
+    /// An EBB is appended with its own SLOT, like every other block, and the
+    /// secondary index records its EPOCH NUMBER — the two differ by a factor of
+    /// the chunk size, and writing the slot is what made a dugite mainnet DB
+    /// read `…, 21600, 21600, …` where cardano-node writes `…, 1, …` (#1081).
     #[test]
     fn test_secondary_entry_ebb_stores_epoch_number() {
-        // For EBBs, the secondary index slot field should contain the epoch number.
         let dir = tempfile::tempdir().unwrap();
 
-        let mut db = ImmutableDB::open_for_writing(dir.path(), 5, 1000, 5000).unwrap();
-        // EBB for epoch 5: pass epoch number (5) as slot
-        db.append_block(5, 0, &Hash32::from_bytes([1u8; 32]), b"ebb_epoch5", true)
+        let mut db = ImmutableDB::open_for_writing(dir.path(), 1000).unwrap();
+        // The EBB for epoch 5 sits at slot 5 * 1000, as dugite's Byron decoder
+        // assigns it (`epoch * byron_epoch_length`).
+        db.append_block(5000, 0, &Hash32::from_bytes([1u8; 32]), b"ebb_epoch5", true)
             .unwrap();
         db.flush().unwrap();
 
-        // Read the secondary index and verify slot field = 5 (epoch number)
+        // It lands in chunk 5, and its `blockOrEBB` is the epoch, not the slot.
         let secondary_data = fs::read(dir.path().join("00005.secondary")).unwrap();
         assert_eq!(secondary_data.len(), SECONDARY_ENTRY_SIZE);
 
@@ -3708,14 +4050,223 @@ mod tests {
         let slot_value = u64::from_be_bytes(slot_bytes);
         assert_eq!(
             slot_value, 5,
-            "EBB block_or_ebb should contain epoch number"
+            "EBB block_or_ebb should contain the epoch number, not slot 5000"
         );
+
+        // And it occupies relative slot 0, so entry 1 has already advanced.
+        let primary = fs::read(dir.path().join("00005.primary")).unwrap();
+        assert_eq!(read_primary_offset(&primary, 0), 0);
+        assert_eq!(read_primary_offset(&primary, 1), 56);
+    }
+
+    /// dugite's primary index is BYTE-IDENTICAL to cardano-node's for the same
+    /// chunk contents.
+    ///
+    /// The fixture is a real cardano-node mainnet chunk — 00208, the first
+    /// Shelley chunk, 1079 blocks — copied unmodified out of a synced
+    /// `db-cn-mainnet`. Its secondary index is fed through dugite's writer and
+    /// the result compared against cardano-node's own `.primary`.
+    ///
+    /// This is the only check that can see the whole of #1081's second half.
+    /// The chunk-number invariant (`slot / chunkSize == chunkIndex`) is
+    /// satisfied by an index with the wrong arity, the wrong relative-slot
+    /// mapping, or both — cardano-node still could not open it. Comparing
+    /// against the real bytes cannot be satisfied by a self-consistent wrong
+    /// answer, which a same-process round-trip always can.
+    #[test]
+    fn primary_index_is_byte_identical_to_cardano_nodes() {
+        const MAINNET_CHUNK_SIZE: u64 = 21600; // 10 * k, k = 2160
+        const CHUNK: u64 = 208;
+
+        let fixtures = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/cardano-node-immutable");
+        let secondary = fs::read(fixtures.join("00208.secondary")).unwrap();
+        let expected_primary = fs::read(fixtures.join("00208.primary")).unwrap();
+
+        // Rebuild the entries exactly as `append_block` would have recorded
+        // them, from cardano-node's own secondary index.
+        let first_slot = CHUNK * MAINNET_CHUNK_SIZE;
+        let entries: Vec<SecondaryEntry> = secondary
+            .chunks_exact(SECONDARY_ENTRY_SIZE)
+            .enumerate()
+            .map(|(i, raw)| {
+                let block_or_ebb = read_be_u64(&raw[48..56]).unwrap();
+                let is_ebb = i == 0 && block_or_ebb == CHUNK;
+                let mut header_hash = [0u8; 32];
+                header_hash.copy_from_slice(&raw[16..48]);
+                SecondaryEntry {
+                    block_offset: read_be_u64(&raw[0..8]).unwrap(),
+                    header_hash,
+                    slot: if is_ebb { first_slot } else { block_or_ebb },
+                    checksum: u32::from_be_bytes([raw[12], raw[13], raw[14], raw[15]]),
+                    header_offset: u16::from_be_bytes([raw[8], raw[9]]),
+                    header_size: u16::from_be_bytes([raw[10], raw[11]]),
+                    is_ebb,
+                }
+            })
+            .collect();
+        assert_eq!(entries.len(), 1079, "fixture should hold 1079 blocks");
+
+        let dir = tempfile::tempdir().unwrap();
+        ImmutableDB::write_primary_index(dir.path(), CHUNK, MAINNET_CHUNK_SIZE, &entries).unwrap();
+        let ours = fs::read(dir.path().join("00208.primary")).unwrap();
+
+        assert_eq!(
+            ours.len(),
+            expected_primary.len(),
+            "primary index length differs: {} vs cardano-node's {}",
+            ours.len(),
+            expected_primary.len()
+        );
+        if ours != expected_primary {
+            let first = ours
+                .iter()
+                .zip(&expected_primary)
+                .position(|(a, b)| a != b)
+                .unwrap();
+            panic!(
+                "primary index differs from cardano-node's at byte {first} \
+                 (entry {}): ours {:?} vs theirs {:?}",
+                first.saturating_sub(1) / 4,
+                &ours[first..(first + 8).min(ours.len())],
+                &expected_primary[first..(first + 8).min(expected_primary.len())]
+            );
+        }
+    }
+
+    /// Re-encoding cardano-node's secondary index reproduces it byte for byte.
+    ///
+    /// Pins the entry layout and, with a Byron fixture, would pin the
+    /// `blockOrEBB` union too. Chunk 00208 holds no EBB — every Byron chunk is
+    /// ~21600 entries and too large to vendor — so the EBB arm is covered by
+    /// [`test_secondary_entry_ebb_stores_epoch_number`] instead.
+    #[test]
+    fn secondary_index_round_trips_cardano_nodes_bytes() {
+        const CHUNK: u64 = 208;
+        let fixtures = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/cardano-node-immutable");
+        let secondary = fs::read(fixtures.join("00208.secondary")).unwrap();
+
+        let mut ours = Vec::with_capacity(secondary.len());
+        for (i, raw) in secondary.chunks_exact(SECONDARY_ENTRY_SIZE).enumerate() {
+            let block_or_ebb = read_be_u64(&raw[48..56]).unwrap();
+            let is_ebb = i == 0 && block_or_ebb == CHUNK;
+            let mut header_hash = [0u8; 32];
+            header_hash.copy_from_slice(&raw[16..48]);
+            let entry = SecondaryEntry {
+                block_offset: read_be_u64(&raw[0..8]).unwrap(),
+                header_hash,
+                slot: if is_ebb { CHUNK * 21600 } else { block_or_ebb },
+                checksum: u32::from_be_bytes([raw[12], raw[13], raw[14], raw[15]]),
+                header_offset: u16::from_be_bytes([raw[8], raw[9]]),
+                header_size: u16::from_be_bytes([raw[10], raw[11]]),
+                is_ebb,
+            };
+            ours.extend_from_slice(&entry.encode(CHUNK));
+        }
+
+        assert_eq!(ours, secondary, "secondary entry layout differs");
+    }
+
+    /// Chunk 0's epoch-0 EBB and its genesis block both store `blockOrEBB = 0`,
+    /// and they must still occupy DIFFERENT relative slots (0 and 1).
+    ///
+    /// This is the one place the union is genuinely ambiguous on disk, and it
+    /// is resolved positionally: only a chunk's first entry can be an EBB.
+    /// Reading it back must not merge the two — which is what a
+    /// `blockOrEBB == chunk_num` test alone does, and it survives a restart
+    /// into `reopen_chunk_for_append` where the primary index is rewritten.
+    ///
+    /// Found by regenerating chunk 0 of a real cardano-node mainnet database:
+    /// with the value test alone it was the ONLY chunk of ten that differed.
+    #[test]
+    fn chunk_zero_ebb_and_genesis_block_do_not_collide() {
+        let dir = tempfile::tempdir().unwrap();
+        let ebb = Hash32::from_bytes([0xEBu8; 32]);
+        let genesis = Hash32::from_bytes([0x01u8; 32]);
+        let second = Hash32::from_bytes([0x02u8; 32]);
+
+        {
+            let mut db = ImmutableDB::open_for_writing(dir.path(), 1000).unwrap();
+            // The epoch-0 boundary block, then the block at slot 0.
+            db.append_block(0, 0, &ebb, b"ebb0", true).unwrap();
+            db.append_block(0, 1, &genesis, b"genesis", false).unwrap();
+            db.flush().unwrap();
+        }
+
+        let expected = fs::read(dir.path().join("00000.primary")).unwrap();
+        // Relative slot 0 = EBB, relative slot 1 = the slot-0 block.
+        assert_eq!(read_primary_offset(&expected, 0), 0);
+        assert_eq!(read_primary_offset(&expected, 1), 56);
+        assert_eq!(read_primary_offset(&expected, 2), 112);
+
+        // Restart and append into the same chunk: the reopen path re-reads the
+        // secondary index and rewrites the primary from it.
+        {
+            let mut db = ImmutableDB::open_for_writing(dir.path(), 1000).unwrap();
+            db.append_block(5, 2, &second, b"slot5", false).unwrap();
+            db.flush().unwrap();
+        }
+
+        let after = fs::read(dir.path().join("00000.primary")).unwrap();
+        assert_eq!(
+            read_primary_offset(&after, 0),
+            0,
+            "the EBB must stay at relative slot 0"
+        );
+        assert_eq!(
+            read_primary_offset(&after, 1),
+            56,
+            "the genesis block must stay at relative slot 1, not merged into the EBB"
+        );
+        assert_eq!(read_primary_offset(&after, 2), 112);
+        // Slot 5 → relative slot 6.
+        assert_eq!(read_primary_offset(&after, 6), 112);
+        assert_eq!(read_primary_offset(&after, 7), 168);
+
+        let db = ImmutableDB::open(dir.path()).unwrap();
+        assert_eq!(db.total_blocks(), 3);
+        assert!(db.has_block(&ebb) && db.has_block(&genesis) && db.has_block(&second));
+    }
+
+    /// Reopening a database with a different chunk size is refused.
+    ///
+    /// `k` is a GENESIS parameter — it is not in `PParams` and no governance
+    /// action can change it — so the size is stable for a given network. What
+    /// is not stable is dugite's ability to read the genesis file: `Node::new`
+    /// falls back to `DEFAULT_SECURITY_PARAM_K` on a load failure and only
+    /// warns, which on preview would re-lay the database at 21600 slots per
+    /// chunk instead of 4320.
+    #[test]
+    fn reopening_with_a_different_chunk_size_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let mut db = ImmutableDB::open_for_writing(dir.path(), 4320).unwrap();
+        db.append_block(10, 1, &Hash32::from_bytes([1u8; 32]), b"b1", false)
+            .unwrap();
+        db.flush().unwrap();
+        drop(db);
+
+        // Same size: fine.
+        drop(ImmutableDB::open_for_writing(dir.path(), 4320).unwrap());
+
+        // preview's 4320 vs mainnet's 21600 — the exact confusion the Byron
+        // genesis fallback can produce.
+        let msg = match ImmutableDB::open_for_writing(dir.path(), 21600) {
+            Err(e) => format!("{e}"),
+            Ok(_) => panic!("a chunk-size change must be refused"),
+        };
+        assert!(
+            msg.contains("4320") && msg.contains("21600"),
+            "the error must name both sizes, got: {msg}"
+        );
+
+        // The refusal must not have damaged anything.
+        let db = ImmutableDB::open(dir.path()).unwrap();
+        assert_eq!(db.total_blocks(), 1);
     }
 
     #[test]
-    #[ignore = "#1081: dugite rolls a chunk per write-open, not per slot range, \
-                so blocks land in a chunk whose number does not match \
-                slot / chunkSize. Remove the ignore when the writer is fixed."]
     fn every_block_lands_in_the_chunk_its_slot_maps_to() {
         // THE ImmutableDB INVARIANT, and the reason cardano-node cannot open a
         // dugite-written database:
@@ -3743,7 +4294,7 @@ mod tests {
         // reconciliation change.
         const CHUNK_SIZE: u64 = 21600; // mainnet/preprod Byron epoch length
         let dir = tempfile::tempdir().unwrap();
-        let mut db = ImmutableDB::open_for_writing(dir.path(), 0, CHUNK_SIZE, 0).unwrap();
+        let mut db = ImmutableDB::open_for_writing(dir.path(), CHUNK_SIZE).unwrap();
 
         // Blocks spanning three nominal chunk ranges, written in one session —
         // exactly what a node does between restarts.
@@ -3791,33 +4342,58 @@ mod tests {
         );
     }
 
+    /// A block whose slot skips several chunk ranges rolls straight to its own
+    /// chunk AND materialises the ranges it jumped over.
+    ///
+    /// Upstream does the same in `appendBlockImpl` — it starts
+    /// `countChunks chunk initialChunk` new chunks, not one — because its
+    /// iterator walks chunk numbers one at a time and reads each chunk's
+    /// primary index to find the next filled slot. A missing file is not read
+    /// as "empty"; it raises `FsResourceDoesNotExist` and aborts the open,
+    /// which is the failure originally reported in #1081.
     #[test]
-    fn test_epoch_based_chunk_numbering() {
-        // Finalize with next_epoch=5 → new chunk should be named 00005.chunk.
+    fn skipped_chunk_ranges_are_materialised_not_left_as_holes() {
         let dir = tempfile::tempdir().unwrap();
 
-        let mut db = ImmutableDB::open_for_writing(dir.path(), 0, 1000, 0).unwrap();
+        let mut db = ImmutableDB::open_for_writing(dir.path(), 1000).unwrap();
         db.append_block(10, 1, &Hash32::from_bytes([1u8; 32]), b"b1", false)
             .unwrap();
-        db.finalize_chunk(5, 2000, 1000).unwrap();
+        // Slot 5010 belongs in chunk 5, four chunk ranges beyond chunk 0.
+        db.append_block(5010, 2, &Hash32::from_bytes([2u8; 32]), b"b2", false)
+            .unwrap();
+        db.flush().unwrap();
 
-        // Chunk 0 finalized, chunk 5 opened
-        assert!(
-            dir.path().join("00000.chunk").exists(),
-            "Finalized chunk 0 should exist"
-        );
-        assert!(
-            dir.path().join("00000.secondary").exists(),
-            "Secondary index for chunk 0 should exist"
-        );
-        assert!(
-            dir.path().join("00000.primary").exists(),
-            "Primary index for chunk 0 should exist"
-        );
-        assert!(
-            dir.path().join("00005.chunk").exists(),
-            "New chunk 5 should be opened"
-        );
+        // Every chunk from 0 through 5 must have all three files — the empty
+        // ones included.
+        for n in 0..=5u64 {
+            for ext in ["chunk", "secondary", "primary"] {
+                let p = dir.path().join(format!("{n:05}.{ext}"));
+                assert!(p.exists(), "chunk {n} is missing its .{ext} file");
+            }
+        }
+
+        // The skipped chunks are genuinely empty, and their primary index is a
+        // full-length run of zero offsets rather than a truncated file.
+        for n in 1..=4u64 {
+            let data = fs::read(dir.path().join(format!("{n:05}.primary"))).unwrap();
+            assert_eq!(data.len(), 1 + (1000 + 2) * 4, "chunk {n} primary length");
+            assert!(
+                data[1..].iter().all(|&b| b == 0),
+                "chunk {n} must have all-zero offsets"
+            );
+            assert_eq!(
+                fs::read(dir.path().join(format!("{n:05}.secondary")))
+                    .unwrap()
+                    .len(),
+                0
+            );
+        }
+
+        // And the blocks are still readable across the gap after a reopen.
+        drop(db);
+        let db = ImmutableDB::open(dir.path()).unwrap();
+        assert_eq!(db.total_blocks(), 2);
+        assert_eq!(db.tip_slot(), 5010);
     }
 
     #[test]
@@ -3830,10 +4406,10 @@ mod tests {
         let h3 = Hash32::from_bytes([3u8; 32]);
 
         {
-            let mut db = ImmutableDB::open_for_writing(dir.path(), 0, 1000, 0).unwrap();
+            let mut db = ImmutableDB::open_for_writing(dir.path(), 1000).unwrap();
             db.append_block(10, 1, &h1, b"block1", false).unwrap();
             db.append_block(20, 2, &h2, b"block2", false).unwrap();
-            db.finalize_chunk(1, 1000, 1000).unwrap();
+            // Slot 1050 is in chunk 1 — the roll is driven by the slot.
             db.append_block(1050, 3, &h3, b"block3", false).unwrap();
             db.flush().unwrap();
         }
@@ -3859,17 +4435,21 @@ mod tests {
         // An empty chunk should produce a valid primary index with all offsets = 0.
         let dir = tempfile::tempdir().unwrap();
 
-        let mut db = ImmutableDB::open_for_writing(dir.path(), 0, 100, 0).unwrap();
-        db.finalize_chunk(1, 100, 100).unwrap();
+        let mut db = ImmutableDB::open_for_writing(dir.path(), 100).unwrap();
+        // Chunk 0 is skipped over entirely by a block in chunk 1, and is
+        // materialised as an empty chunk rather than left as a hole.
+        db.append_block(150, 1, &Hash32::from_bytes([1u8; 32]), b"b1", false)
+            .unwrap();
+        db.flush().unwrap();
 
         let primary_path = dir.path().join("00000.primary");
         assert!(primary_path.exists());
 
         let data = fs::read(&primary_path).unwrap();
-        // Non-EBB: 101 entries (epoch_length + 1) + version byte
-        assert_eq!(data.len(), 1 + 101 * 4);
+        // 100 regular slots + 1 EBB slot + 1 sentinel + version byte
+        assert_eq!(data.len(), 1 + 102 * 4);
         assert_eq!(data[0], 0x01, "Version byte");
-        for i in 0..101 {
+        for i in 0..102 {
             assert_eq!(
                 read_primary_offset(&data, i),
                 0,
@@ -3878,40 +4458,38 @@ mod tests {
         }
     }
 
+    /// The chunk's first slot is `chunk_num * chunk_size` — derived, never
+    /// carried alongside. A block at absolute slot 5100 with chunk size 500
+    /// lands in chunk 10 at relative slot 100, hence entry 101.
     #[test]
     fn test_primary_index_nonzero_epoch_start() {
-        // Verify relative slot computation works with non-zero first_slot_of_epoch.
         let dir = tempfile::tempdir().unwrap();
-        let epoch_length = 500u64;
-        let epoch_first_slot = 5000u64;
+        let chunk_size = 500u64;
 
-        let mut db =
-            ImmutableDB::open_for_writing(dir.path(), 10, epoch_length, epoch_first_slot).unwrap();
-        // Blocks at absolute slots 5100, 5200, 5300 → relative slots 100, 200, 300
+        let mut db = ImmutableDB::open_for_writing(dir.path(), chunk_size).unwrap();
+        // Blocks at absolute slots 5100, 5200, 5300 → all in chunk 10
+        // (5100 / 500 == 10), relative slots 100, 200, 300.
         db.append_block(5100, 1, &Hash32::from_bytes([1u8; 32]), b"b1", false)
             .unwrap();
         db.append_block(5200, 2, &Hash32::from_bytes([2u8; 32]), b"b2", false)
             .unwrap();
         db.append_block(5300, 3, &Hash32::from_bytes([3u8; 32]), b"b3", false)
             .unwrap();
-        db.finalize_chunk(11, epoch_length, epoch_first_slot + epoch_length)
-            .unwrap();
+        db.flush().unwrap();
 
         let data = fs::read(dir.path().join("00010.primary")).unwrap();
         assert_eq!(data[0], 0x01);
 
-        // Relative slot 100 → entry[100] = 0, entry[101] = 56
-        assert_eq!(read_primary_offset(&data, 100), 0);
-        assert_eq!(read_primary_offset(&data, 101), 56);
+        // Relative slot 100 → entry[101]; entry[100] must stay empty.
+        assert_eq!(read_primary_offset(&data, 101), 0);
+        assert_eq!(read_primary_offset(&data, 102), 56);
 
-        // Relative slot 200 → entry[201] = 112
-        assert_eq!(read_primary_offset(&data, 201), 112);
-
-        // Relative slot 300 → entry[301] = 168
-        assert_eq!(read_primary_offset(&data, 301), 168);
+        // Relative slot 200 → entry[201]; relative slot 300 → entry[301].
+        assert_eq!(read_primary_offset(&data, 202), 112);
+        assert_eq!(read_primary_offset(&data, 302), 168);
 
         // Sentinel = 3 * 56 = 168
-        let sentinel_idx = epoch_length as usize; // last entry
+        let sentinel_idx = chunk_size as usize + 1;
         assert_eq!(read_primary_offset(&data, sentinel_idx), 168);
     }
 

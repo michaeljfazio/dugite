@@ -755,14 +755,9 @@ fn bench_immutabledb_append(c: &mut Criterion) {
                 || {
                     let dir = tempfile::tempdir().unwrap();
                     std::fs::create_dir_all(dir.path()).unwrap();
-                    let db = ImmutableDB::open_for_writing_with_config(
-                        dir.path(),
-                        &config,
-                        0,
-                        432_000,
-                        0,
-                    )
-                    .unwrap();
+                    let db =
+                        ImmutableDB::open_for_writing_with_config(dir.path(), &config, 432_000)
+                            .unwrap();
                     (dir, db)
                 },
                 |(_dir, mut db)| {
