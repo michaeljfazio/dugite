@@ -779,77 +779,104 @@ impl ImmutableDB {
         }
         nums.sort();
 
-        for w in nums.windows(2) {
-            let (prev, next) = (w[0], w[1]);
-            let prev_entries =
-                Self::read_secondary_entries(&dir.join(format!("{prev:05}.secondary")))?;
+        // Link each non-empty chunk to the previous NON-EMPTY chunk, not to its
+        // numeric predecessor.
+        //
+        // #1081 made empty gap chunks durable: a chunk whose slots contain no
+        // blocks is still created so the numbering stays slot-derived. Windowing
+        // over adjacent chunk NUMBERS then sees `(gap, next)`, whose
+        // `prev_entries.last()` is `None`, and skips — so the linkage between
+        // the chunks either side of the gap was never checked at all. Every
+        // empty chunk silently punched a hole in exactly the check that exists
+        // to find holes.
+        //
+        // An empty chunk carries no blocks, so it can neither break nor
+        // establish linkage: the correct predecessor is the last chunk that
+        // actually held one.
+        let mut prev_nonempty: Option<(u64, [u8; 32])> = None;
+        for &next in &nums {
             let next_entries =
                 Self::read_secondary_entries(&dir.join(format!("{next:05}.secondary")))?;
-            let (Some(&(_, _, prev_tip_hash)), Some(&(first_off, first_crc, _))) =
-                (prev_entries.last(), next_entries.first())
-            else {
-                continue; // empty artifacts — nothing to link
+            let Some(&(first_off, first_crc, _)) = next_entries.first() else {
+                continue; // empty gap chunk — carry the previous tip forward
+            };
+            let Some(&(_, _, next_tip_hash)) = next_entries.last() else {
+                continue;
             };
 
-            // First block of `next`: its end is the second entry's offset,
-            // or (single-entry chunk) recovered by CRC scan.
-            let first_end = if let Some(&(second_off, _, _)) = next_entries.get(1) {
-                second_off
-            } else {
-                let chunk_data = fs::read(dir.join(format!("{next:05}.chunk")))?;
-                match Self::find_last_entry_end(&chunk_data, first_off as usize, first_crc) {
-                    Some(e) => e as u64,
-                    None => continue, // tail chunk already reconciled; be lenient
+            let Some((prev, prev_tip_hash)) = prev_nonempty else {
+                // First non-empty chunk: nothing below it to chain onto.
+                prev_nonempty = Some((next, next_tip_hash));
+                continue;
+            };
+
+            // A `break 'check` abandons only the linkage check for this chunk;
+            // `prev_nonempty` must still advance, or one undecodable block
+            // would re-point every later comparison at a stale predecessor.
+            'check: {
+                // First block of `next`: its end is the second entry's offset,
+                // or (single-entry chunk) recovered by CRC scan.
+                let first_end = if let Some(&(second_off, _, _)) = next_entries.get(1) {
+                    second_off
+                } else {
+                    let chunk_data = fs::read(dir.join(format!("{next:05}.chunk")))?;
+                    match Self::find_last_entry_end(&chunk_data, first_off as usize, first_crc) {
+                        Some(e) => e as u64,
+                        None => break 'check, // tail chunk already reconciled; be lenient
+                    }
+                };
+                let Some(first_block) = Self::read_range_std(dir, next, first_off, first_end)
+                else {
+                    break 'check;
+                };
+
+                let Some(prev_hash) = decode_prev_hash(&first_block) else {
+                    warn!(
+                        chunk = next,
+                        "ImmutableDB: cannot decode the chunk's first block to \
+                         verify chain linkage — skipping the boundary check"
+                    );
+                    break 'check;
+                };
+
+                if prev_hash == prev_tip_hash {
+                    break 'check;
                 }
-            };
-            let Some(first_block) = Self::read_range_std(dir, next, first_off, first_end) else {
-                continue;
-            };
 
-            let Some(prev_hash) = decode_prev_hash(&first_block) else {
-                warn!(
-                    chunk = next,
-                    "ImmutableDB: cannot decode the chunk's first block to \
-                     verify chain linkage — skipping the boundary check"
-                );
-                continue;
-            };
-
-            if prev_hash == prev_tip_hash {
-                continue;
+                let is_tail = next == *nums.last().unwrap();
+                if is_tail {
+                    let chunk_len = dir
+                        .join(format!("{next:05}.chunk"))
+                        .metadata()
+                        .map(|m| m.len())
+                        .unwrap_or(0);
+                    warn!(
+                        prev_chunk = prev,
+                        prev_tip_hash = %Hash32::from_bytes(prev_tip_hash).to_hex(),
+                        first_block_prev_hash = %Hash32::from_bytes(prev_hash).to_hex(),
+                        "ImmutableDB: tail chunk does not chain onto the previous \
+                         chunk — quarantining the orphan island above the hole (#926)"
+                    );
+                    Self::quarantine_tail_chunk(
+                        dir,
+                        next,
+                        chunk_len,
+                        "first block does not chain onto the previous chunk's tip",
+                    )?;
+                    return Ok(());
+                }
+                return Err(ImmutableDBError::InconsistentChunk {
+                    chunk: next,
+                    reason: format!(
+                        "first block's prev_hash {} does not chain onto chunk \
+                         {prev:05}'s tip {} — the chain has a hole below the tail",
+                        Hash32::from_bytes(prev_hash).to_hex(),
+                        Hash32::from_bytes(prev_tip_hash).to_hex()
+                    ),
+                });
             }
 
-            let is_tail = next == *nums.last().unwrap();
-            if is_tail {
-                let chunk_len = dir
-                    .join(format!("{next:05}.chunk"))
-                    .metadata()
-                    .map(|m| m.len())
-                    .unwrap_or(0);
-                warn!(
-                    prev_chunk = prev,
-                    prev_tip_hash = %Hash32::from_bytes(prev_tip_hash).to_hex(),
-                    first_block_prev_hash = %Hash32::from_bytes(prev_hash).to_hex(),
-                    "ImmutableDB: tail chunk does not chain onto the previous \
-                     chunk — quarantining the orphan island above the hole (#926)"
-                );
-                Self::quarantine_tail_chunk(
-                    dir,
-                    next,
-                    chunk_len,
-                    "first block does not chain onto the previous chunk's tip",
-                )?;
-                return Ok(());
-            }
-            return Err(ImmutableDBError::InconsistentChunk {
-                chunk: next,
-                reason: format!(
-                    "first block's prev_hash {} does not chain onto chunk \
-                     {prev:05}'s tip {} — the chain has a hole below the tail",
-                    Hash32::from_bytes(prev_hash).to_hex(),
-                    Hash32::from_bytes(prev_tip_hash).to_hex()
-                ),
-            });
+            prev_nonempty = Some((next, next_tip_hash));
         }
         Ok(())
     }
@@ -2297,16 +2324,39 @@ impl ImmutableDB {
         // Sentinel: total size of the secondary file
         offsets.push(current_offset);
 
-        // Write to disk: version byte + u32 BE offsets
+        // Write to disk ATOMICALLY: temp file, fsync, rename, fsync dir.
+        //
+        // `File::create` on the real path truncates in place, so a crash
+        // between the truncate and the last `write_all` leaves a SHORT
+        // `.primary` on disk — structurally valid to dugite (which never reads
+        // one back) and unusable to cardano-node, which indexes into it by
+        // relative slot and would read past the end or land on the wrong
+        // entry. This is the one file dugite writes purely for another
+        // implementation to consume, which is exactly why nothing here noticed.
+        //
+        // A rename is atomic within a directory, so a reader sees either the
+        // whole previous file or the whole new one, never a prefix. The
+        // directory fsync is what makes the rename itself durable — without it
+        // the rename can be lost on power failure even though the data was
+        // synced.
         let primary_path = dir.join(format!("{chunk_num:05}.primary"));
-        let mut file = std::io::BufWriter::new(std::fs::File::create(&primary_path)?);
-        // Version byte (matches Haskell currentVersionNumber = 1)
-        file.write_all(&[0x01])?;
-        for &offset in &offsets {
-            file.write_all(&offset.to_be_bytes())?;
+        let tmp_path = dir.join(format!("{chunk_num:05}.primary.tmp"));
+        {
+            let mut file = std::io::BufWriter::new(std::fs::File::create(&tmp_path)?);
+            // Version byte (matches Haskell currentVersionNumber = 1)
+            file.write_all(&[0x01])?;
+            for &offset in &offsets {
+                file.write_all(&offset.to_be_bytes())?;
+            }
+            file.flush()?;
+            file.get_ref().sync_data()?;
         }
-        file.flush()?;
-        file.get_ref().sync_data()?;
+        std::fs::rename(&tmp_path, &primary_path)?;
+        // Best-effort directory sync: a filesystem that does not support
+        // opening a directory for sync must not fail the write.
+        if let Ok(dirf) = std::fs::File::open(dir) {
+            let _ = dirf.sync_all();
+        }
 
         debug!(
             chunk = chunk_num,
@@ -2809,6 +2859,102 @@ mod tests {
         v[0] = 0x82;
         v[1..33].copy_from_slice(&prev);
         v
+    }
+
+    /// #1083: a break must still be caught when an EMPTY chunk sits between
+    /// the two chunks that actually hold the blocks.
+    ///
+    /// #1081 made empty gap chunks durable so numbering stays slot-derived.
+    /// The check used to window over adjacent chunk NUMBERS, so the pairs it
+    /// examined were `(0, gap)` and `(gap, 2)` — both skipped, because a gap
+    /// chunk has no entries to compare. The break between chunk 0 and chunk 2
+    /// was therefore invisible: every empty chunk punched a hole in exactly the
+    /// check that exists to find holes.
+    ///
+    /// Chunk 3 is present so the offending chunk is NOT the tail, which routes
+    /// the violation to the hard error rather than the lenient quarantine.
+    #[test]
+    fn chunk_boundary_check_links_across_an_empty_gap_chunk() {
+        let dir = tempfile::tempdir().unwrap();
+        let h1 = [1u8; 32];
+        let mut db = ImmutableDB::open_for_writing(dir.path(), 432_000).unwrap();
+        // chunk 0
+        db.append_block(
+            100,
+            1,
+            &Hash32::from_bytes(h1),
+            &linked_payload([0u8; 32], 1, 64),
+            false,
+        )
+        .unwrap();
+        // chunk 1 is skipped entirely -> durable empty gap chunk
+        // chunk 2: first block does NOT chain onto chunk 0's tip (h1)
+        let wrong = [0xAAu8; 32];
+        let h2 = [2u8; 32];
+        db.append_block(
+            864_100,
+            2,
+            &Hash32::from_bytes(h2),
+            &linked_payload(wrong, 2, 64),
+            false,
+        )
+        .unwrap();
+        // chunk 3, so chunk 2 is not the tail
+        db.append_block(
+            1_296_100,
+            3,
+            &Hash32::from_bytes([3u8; 32]),
+            &linked_payload(h2, 3, 64),
+            false,
+        )
+        .unwrap();
+        db.flush().unwrap();
+        drop(db);
+
+        // The gap chunk must actually exist, or this test proves nothing.
+        assert!(
+            dir.path().join("00001.secondary").exists(),
+            "expected a durable empty gap chunk 00001 — without it this test \
+             does not exercise the gap path at all"
+        );
+
+        let res = ImmutableDB::check_chunk_boundaries(dir.path(), stub_decode_prev);
+        match res {
+            Err(ImmutableDBError::InconsistentChunk { chunk, .. }) => assert_eq!(chunk, 2),
+            other => panic!("a break across an empty gap chunk must be detected, got {other:?}"),
+        }
+    }
+
+    /// #1082: the `.primary` write leaves no temporary file behind.
+    ///
+    /// It is written via a temp file + rename so a crash cannot expose a
+    /// truncated index to cardano-node — the one file dugite writes purely for
+    /// another implementation to read, and the one it never reads back. This
+    /// asserts the cleanup half; true crash-atomicity needs fault injection and
+    /// is not claimed here.
+    #[test]
+    fn primary_index_write_leaves_no_temp_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = ImmutableDB::open_for_writing(dir.path(), 432_000).unwrap();
+        db.append_block(
+            100,
+            1,
+            &Hash32::from_bytes([1u8; 32]),
+            &linked_payload([0u8; 32], 1, 64),
+            false,
+        )
+        .unwrap();
+        db.flush().unwrap();
+        drop(db);
+
+        let strays: Vec<String> = fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.ends_with(".tmp"))
+            .collect();
+        assert!(strays.is_empty(), "temp files left behind: {strays:?}");
+        assert!(dir.path().join("00000.primary").exists());
     }
 
     /// #926: adjacent chunks whose blocks chain correctly pass the boundary
