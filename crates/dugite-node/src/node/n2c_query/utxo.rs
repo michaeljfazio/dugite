@@ -179,18 +179,41 @@ pub(crate) fn handle_utxo_by_txin(
 mod tests {
     use super::*;
 
+    /// A provider that actually honours the acquired point.
+    ///
+    /// The previous mock took `_at` and ignored it, answering `Some(..)` for
+    /// every point. That contradicts the trait's own contract — "returns `None`
+    /// when it cannot honour" the point — and, more importantly, made every
+    /// test in this module structurally unable to observe a UTxO query served
+    /// from the WRONG ledger point. A whole defect family was invisible here by
+    /// construction, which is the "check that measures nothing" shape rather
+    /// than a missing test.
+    ///
+    /// The real provider reconstructs a view by undoing LedgerSeq deltas newer
+    /// than the acquired point, and can only do so while that point is still
+    /// inside the volatile window. This models exactly that: a point present in
+    /// `views` is reconstructible, a point absent from it is not.
     struct MockUtxoProvider {
-        utxos: Vec<super::super::types::UtxoSnapshot>,
+        views: Vec<(UtxoViewPoint, Vec<super::super::types::UtxoSnapshot>)>,
+    }
+
+    impl MockUtxoProvider {
+        fn view(&self, at: &UtxoViewPoint) -> Option<&[super::super::types::UtxoSnapshot]> {
+            self.views
+                .iter()
+                .find(|(p, _)| p == at)
+                .map(|(_, u)| u.as_slice())
+        }
     }
 
     impl UtxoQueryProvider for MockUtxoProvider {
         fn utxos_at_address_bytes(
             &self,
             addr_bytes: &[u8],
-            _at: &UtxoViewPoint,
+            at: &UtxoViewPoint,
         ) -> Option<Vec<super::super::types::UtxoSnapshot>> {
             Some(
-                self.utxos
+                self.view(at)?
                     .iter()
                     .filter(|u| u.address_bytes == addr_bytes)
                     .cloned()
@@ -201,10 +224,10 @@ mod tests {
         fn utxos_by_tx_inputs(
             &self,
             inputs: &[(Vec<u8>, u32)],
-            _at: &UtxoViewPoint,
+            at: &UtxoViewPoint,
         ) -> Option<Vec<super::super::types::UtxoSnapshot>> {
             Some(
-                self.utxos
+                self.view(at)?
                     .iter()
                     .filter(|u| {
                         inputs
@@ -216,8 +239,8 @@ mod tests {
             )
         }
 
-        fn utxos_all(&self, _at: &UtxoViewPoint) -> Option<Vec<super::super::types::UtxoSnapshot>> {
-            Some(self.utxos.clone())
+        fn utxos_all(&self, at: &UtxoViewPoint) -> Option<Vec<super::super::types::UtxoSnapshot>> {
+            Some(self.view(at)?.to_vec())
         }
     }
 
@@ -240,10 +263,101 @@ mod tests {
         }
     }
 
+    /// Register `utxos` at the point a `NodeStateSnapshot::default()` acquires,
+    /// so the existing tests keep exercising the happy path unchanged.
     fn make_provider(
         utxos: Vec<super::super::types::UtxoSnapshot>,
     ) -> Option<Arc<dyn UtxoQueryProvider>> {
-        Some(Arc::new(MockUtxoProvider { utxos }))
+        make_provider_at(vec![(
+            acquired_point(&super::super::types::NodeStateSnapshot::default()),
+            utxos,
+        )])
+    }
+
+    /// Register a distinct UTxO set per point. Any point NOT listed models one
+    /// that has fallen out of the volatile window.
+    fn make_provider_at(
+        views: Vec<(UtxoViewPoint, Vec<super::super::types::UtxoSnapshot>)>,
+    ) -> Option<Arc<dyn UtxoQueryProvider>> {
+        Some(Arc::new(MockUtxoProvider { views }))
+    }
+
+    /// A snapshot whose acquired point is a specific block, for tests that need
+    /// the pinned point to differ from the default.
+    fn snapshot_at(slot: u64, hash_byte: u8) -> super::super::types::NodeStateSnapshot {
+        let mut s = super::super::types::NodeStateSnapshot::default();
+        s.tip.point = dugite_primitives::block::Point::Specific(
+            dugite_primitives::time::SlotNo(slot),
+            dugite_primitives::hash::Hash32::from_bytes([hash_byte; 32]),
+        );
+        s
+    }
+
+    /// The answer must follow the ACQUIRED point, not the newest state the
+    /// provider happens to hold.
+    ///
+    /// This is the property the old mock could not express: it filtered one
+    /// flat `utxos` vector regardless of `at`, so a handler that pinned the
+    /// wrong point produced the identical answer and no test could tell.
+    #[test]
+    fn utxo_by_address_answers_from_the_acquired_point_not_the_newest() {
+        let addr = vec![0x61; 29];
+        let old = snapshot_at(100, 0xaa);
+        let new = snapshot_at(200, 0xbb);
+        // At the older point the output exists; by the newer point it is spent.
+        let provider = make_provider_at(vec![
+            (
+                acquired_point(&old),
+                vec![make_utxo(vec![1u8; 32], 0, addr.clone(), 5_000_000)],
+            ),
+            (acquired_point(&new), vec![]),
+        ]);
+
+        let encoded = {
+            let mut buf = Vec::new();
+            minicbor::Encoder::new(&mut buf).bytes(&addr).ok();
+            buf
+        };
+
+        let mut dec = minicbor::Decoder::new(&encoded);
+        match handle_utxo_by_address(&old, &provider, &mut dec) {
+            QueryResult::UtxoByAddress(u) => assert_eq!(u.len(), 1, "unspent at the older point"),
+            other => panic!("expected UtxoByAddress, got {other:?}"),
+        }
+
+        let mut dec = minicbor::Decoder::new(&encoded);
+        match handle_utxo_by_address(&new, &provider, &mut dec) {
+            QueryResult::UtxoByAddress(u) => assert!(u.is_empty(), "spent by the newer point"),
+            other => panic!("expected UtxoByAddress, got {other:?}"),
+        }
+    }
+
+    /// A point the provider cannot reconstruct must be REFUSED, not answered
+    /// from whatever view is available. Answering anyway is precisely the
+    /// silent torn read #1068 removed.
+    #[test]
+    fn utxo_by_address_refuses_an_unreconstructible_point() {
+        let addr = vec![0x61; 29];
+        let known = snapshot_at(100, 0xaa);
+        let fallen_out = snapshot_at(999, 0xcc);
+        let provider = make_provider_at(vec![(
+            acquired_point(&known),
+            vec![make_utxo(vec![1u8; 32], 0, addr.clone(), 5_000_000)],
+        )]);
+
+        let mut buf = Vec::new();
+        minicbor::Encoder::new(&mut buf).bytes(&addr).ok();
+        let mut dec = minicbor::Decoder::new(&buf);
+
+        match handle_utxo_by_address(&fallen_out, &provider, &mut dec) {
+            QueryResult::Error(msg) => {
+                assert!(
+                    msg.contains("no longer available"),
+                    "error should name the unreconstructible point, got: {msg}"
+                );
+            }
+            other => panic!("expected a refusal for an unreconstructible point, got {other:?}"),
+        }
     }
 
     #[test]
