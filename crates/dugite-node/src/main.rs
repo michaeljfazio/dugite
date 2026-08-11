@@ -1047,6 +1047,271 @@ async fn run_dump_snapshot(args: DumpSnapshotArgs) -> Result<()> {
     Ok(())
 }
 
+/// Render a credential hash the way cardano-ledger's `credToText` does when a
+/// `Credential` is used as a JSON map KEY: `keyHash-<56 hex>` /
+/// `scriptHash-<56 hex>` (`Cardano/Ledger/Credential.hs`).
+///
+/// dugite stores these as `Credential::to_typed_hash32`: bytes `[..28]` are the
+/// hash, byte `[28]` is `0x01` for a script and `0x00` for a key. The kind is
+/// therefore READ from the key, never assumed — labelling every entry
+/// `keyHash-` is precisely the defect that made `drepDistr` mismatch the oracle
+/// on chains that have script-credentialled DReps or committee members, and
+/// preprod's whole constitutional committee is script-credentialled.
+fn credential_key(hash: &dugite_primitives::hash::Hash32) -> String {
+    let bytes = hash.as_bytes();
+    let kind = if bytes[28] == 0x01 {
+        "scriptHash"
+    } else {
+        "keyHash"
+    };
+    format!("{kind}-{}", hex::encode(&bytes[..28]))
+}
+
+/// The same credential in a VALUE position, where cardano-ledger emits an
+/// object rather than the prefixed text form: `{"keyHash": "<56 hex>"}` /
+/// `{"scriptHash": "<56 hex>"}` (`Credential.hs`, the `ToJSON` instance as
+/// distinct from `ToJSONKey`).
+fn credential_value(hash: &dugite_primitives::hash::Hash32) -> serde_json::Value {
+    let bytes = hash.as_bytes();
+    let kind = if bytes[28] == 0x01 {
+        "scriptHash"
+    } else {
+        "keyHash"
+    };
+    serde_json::json!({ kind: hex::encode(&bytes[..28]) })
+}
+
+/// `GovActionId` — `{"govActionIx": <int>, "txId": "<64 hex>"}`, or `null`.
+///
+/// NOT `"<txid>#<ix>"`. dugite emitted the string form under a top-level
+/// `enactedRoots` key that upstream does not have at all; the object form is
+/// what `Conway/Governance/Procedures.hs` prints, confirmed against preprod
+/// epoch 179's first non-null root.
+fn gov_action_id_json(
+    id: Option<&dugite_primitives::transaction::GovActionId>,
+) -> serde_json::Value {
+    match id {
+        None => serde_json::Value::Null,
+        Some(id) => serde_json::json!({
+            "govActionIx": id.action_index,
+            "txId": id.transaction_id.to_hex(),
+        }),
+    }
+}
+
+/// A `BoundedRatio` as cardano-ledger prints it: a JSON NUMBER, not a
+/// `{numerator, denominator}` object.
+///
+/// Upstream goes `Rational -> Scientific -> JSON`, so `3/1000` reaches the file
+/// as `0.0030` and `15/1` as `15`. Both parse to the same value as this f64
+/// division, which is what the comparison is on — it compares parsed JSON
+/// values, and folds an integral float to an int before hashing, so `15` and
+/// `15.0` are one value in both the deep-diff and the digest paths.
+fn rational_json(r: &dugite_primitives::transaction::Rational) -> serde_json::Value {
+    if r.denominator == 0 {
+        // Not reachable from a decoded parameter (every `BoundedRatio` has a
+        // non-zero denominator) — but a NaN would serialise as `null` and read
+        // as an absent field rather than a broken one.
+        return serde_json::Value::Null;
+    }
+    serde_json::json!(r.numerator as f64 / r.denominator as f64)
+}
+
+/// `Committee` — `{"members": {<credKey>: <expiryEpoch>}, "threshold": <ratio>}`,
+/// or `null` for `SNothing` (no committee, e.g. after an enacted `NoConfidence`).
+fn committee_json(
+    members: &imbl::HashMap<dugite_primitives::hash::Hash32, dugite_primitives::time::EpochNo>,
+    threshold: Option<&dugite_primitives::transaction::Rational>,
+) -> serde_json::Value {
+    let Some(threshold) = threshold else {
+        return serde_json::Value::Null;
+    };
+    let mut m = serde_json::Map::new();
+    for (cold, expiry) in members {
+        m.insert(
+            credential_key(cold),
+            serde_json::Value::Number(expiry.0.into()),
+        );
+    }
+    serde_json::json!({
+        "members": serde_json::Value::Object(m),
+        // `threshold` is a `UnitInterval` and prints as the numerator/
+        // denominator OBJECT here, unlike the pparams thresholds which print as
+        // decimals — confirmed against preprod, which carries 2/3.
+        "threshold": {
+            "numerator": threshold.numerator,
+            "denominator": threshold.denominator,
+        },
+    })
+}
+
+/// `Constitution` — `{"anchor": {"dataHash", "url"}}` plus `"script"` ONLY when
+/// the guardrail script is present.
+///
+/// The key is ABSENT, not null, when there is no script: upstream builds the
+/// pair list with a comprehension guard
+/// (`["script" .= s | SJust s <- [constitutionScript]]`,
+/// `Conway/Governance/Procedures.hs`). Emitting `"script": null` instead would
+/// be a schema gap on one side in every epoch of a chain without a guardrail.
+fn constitution_json(
+    c: Option<&dugite_primitives::transaction::Constitution>,
+) -> serde_json::Value {
+    let Some(c) = c else {
+        return serde_json::Value::Null;
+    };
+    let mut o = serde_json::Map::new();
+    o.insert(
+        "anchor".to_string(),
+        serde_json::json!({
+            "dataHash": c.anchor.data_hash.to_hex(),
+            "url": c.anchor.url,
+        }),
+    );
+    if let Some(script) = &c.script_hash {
+        o.insert(
+            "script".to_string(),
+            serde_json::Value::String(script.to_hex()),
+        );
+    }
+    serde_json::Value::Object(o)
+}
+
+/// `CommitteeState` — `{"csCommitteeCreds": {<coldKey>: <authorization>}}`.
+///
+/// The authorization is a TAGGED SUM, not a bare hash:
+///
+/// ```text
+/// {"tag": "CommitteeHotCredential", "contents": {"scriptHash"|"keyHash": "<56 hex>"}}
+/// {"tag": "CommitteeMemberResigned", "contents": null | {"url", "dataHash"}}
+/// ```
+///
+/// Only members that have authorized a hot key or resigned appear — a seated
+/// member who has done neither has no entry, which is why preprod's map is
+/// empty for its first eight Conway epochs while the committee already has
+/// seven members.
+///
+/// Resignation wins over any hot-key entry. It is permanent upstream
+/// (`checkAndOverwriteCommitteeMemberState`) and dugite drops the hot key on
+/// resign, so the two maps are disjoint in practice; the precedence makes that
+/// independent of the drop rather than reliant on it.
+fn committee_state_json(gov: &dugite_ledger::state::GovernanceState) -> serde_json::Value {
+    let mut creds = serde_json::Map::new();
+    for (cold, hot) in &gov.committee_hot_keys {
+        creds.insert(
+            credential_key(cold),
+            serde_json::json!({
+                "tag": "CommitteeHotCredential",
+                "contents": credential_value(hot),
+            }),
+        );
+    }
+    for (cold, anchor) in &gov.committee_resigned {
+        creds.insert(
+            credential_key(cold),
+            serde_json::json!({
+                "tag": "CommitteeMemberResigned",
+                "contents": anchor.as_ref().map(|a| serde_json::json!({
+                    "url": a.url,
+                    "dataHash": a.data_hash.to_hex(),
+                })).unwrap_or(serde_json::Value::Null),
+            }),
+        );
+    }
+    serde_json::json!({ "csCommitteeCreds": serde_json::Value::Object(creds) })
+}
+
+/// Conway `PParams` in the shape cardano-ledger's `ToJSON` prints — the 31-key
+/// cardano-cli-style record, NOT the small rational-rendered summary this dump
+/// emits at top level under `protocolParams`.
+///
+/// The two are different records and must not be conflated: the top-level one
+/// carries `a0`/`d`/`rho`/`tau` as `{numerator, denominator}` objects and holds
+/// the PREVIOUS epoch's parameters, while this one names every Conway parameter
+/// the way cardano-cli does and renders every ratio as a decimal.
+fn conway_pparams_json(
+    pp: &dugite_primitives::protocol_params::ProtocolParameters,
+) -> serde_json::Value {
+    let mut cost_models = serde_json::Map::new();
+    for (name, model) in [
+        ("PlutusV1", &pp.cost_models.plutus_v1),
+        ("PlutusV2", &pp.cost_models.plutus_v2),
+        ("PlutusV3", &pp.cost_models.plutus_v3),
+        ("PlutusV4", &pp.cost_models.plutus_v4),
+    ] {
+        if let Some(m) = model {
+            cost_models.insert(name.to_string(), serde_json::json!(m));
+        }
+    }
+    // `unknown_cost_models` (language keys >= 4) is deliberately NOT emitted:
+    // no such key has ever been on-chain, so the oracle's rendering for it has
+    // never been observed and would have to be guessed. If one ever appears,
+    // this omission shows up as a schema gap — which is the honest signal —
+    // rather than as a confidently wrong key name.
+
+    serde_json::json!({
+        "collateralPercentage": pp.collateral_percentage,
+        "committeeMaxTermLength": pp.committee_max_term_length,
+        "committeeMinSize": pp.committee_min_size,
+        "costModels": serde_json::Value::Object(cost_models),
+        "dRepActivity": pp.drep_activity,
+        "dRepDeposit": pp.drep_deposit.0,
+        "dRepVotingThresholds": {
+            "committeeNoConfidence": rational_json(&pp.dvt_committee_no_confidence),
+            "committeeNormal": rational_json(&pp.dvt_committee_normal),
+            "hardForkInitiation": rational_json(&pp.dvt_hard_fork),
+            "motionNoConfidence": rational_json(&pp.dvt_no_confidence),
+            "ppEconomicGroup": rational_json(&pp.dvt_pp_economic_group),
+            "ppGovGroup": rational_json(&pp.dvt_pp_gov_group),
+            "ppNetworkGroup": rational_json(&pp.dvt_pp_network_group),
+            "ppTechnicalGroup": rational_json(&pp.dvt_pp_technical_group),
+            "treasuryWithdrawal": rational_json(&pp.dvt_treasury_withdrawal),
+            "updateToConstitution": rational_json(&pp.dvt_constitution),
+        },
+        "executionUnitPrices": {
+            "priceMemory": rational_json(&pp.execution_costs.mem_price),
+            "priceSteps": rational_json(&pp.execution_costs.step_price),
+        },
+        "govActionDeposit": pp.gov_action_deposit.0,
+        "govActionLifetime": pp.gov_action_lifetime,
+        "maxBlockBodySize": pp.max_block_body_size,
+        "maxBlockExecutionUnits": {
+            "memory": pp.max_block_ex_units.mem,
+            "steps": pp.max_block_ex_units.steps,
+        },
+        "maxBlockHeaderSize": pp.max_block_header_size,
+        "maxCollateralInputs": pp.max_collateral_inputs,
+        "maxTxExecutionUnits": {
+            "memory": pp.max_tx_ex_units.mem,
+            "steps": pp.max_tx_ex_units.steps,
+        },
+        "maxTxSize": pp.max_tx_size,
+        "maxValueSize": pp.max_val_size,
+        "minFeeRefScriptCostPerByte": rational_json(&pp.min_fee_ref_script_cost_per_byte),
+        "minPoolCost": pp.min_pool_cost.0,
+        "monetaryExpansion": rational_json(&pp.rho),
+        "poolPledgeInfluence": rational_json(&pp.a0),
+        "poolRetireMaxEpoch": pp.e_max,
+        "poolVotingThresholds": {
+            "committeeNoConfidence": rational_json(&pp.pvt_committee_no_confidence),
+            "committeeNormal": rational_json(&pp.pvt_committee_normal),
+            "hardForkInitiation": rational_json(&pp.pvt_hard_fork),
+            "motionNoConfidence": rational_json(&pp.pvt_motion_no_confidence),
+            "ppSecurityGroup": rational_json(&pp.pvt_pp_security_group),
+        },
+        "protocolVersion": {
+            "major": pp.protocol_version_major,
+            "minor": pp.protocol_version_minor,
+        },
+        "stakeAddressDeposit": pp.key_deposit.0,
+        "stakePoolDeposit": pp.pool_deposit.0,
+        "stakePoolTargetNum": pp.n_opt,
+        "treasuryCut": rational_json(&pp.tau),
+        "txFeeFixed": pp.min_fee_b,
+        "txFeePerByte": pp.min_fee_a,
+        "utxoCostPerByte": pp.ada_per_utxo_byte.0,
+    })
+}
+
 /// Greatest common divisor (Euclidean algorithm).
 fn gcd(mut a: u64, mut b: u64) -> u64 {
     while b != 0 {
@@ -1183,8 +1448,26 @@ fn serialize_stake_snapshot(
                     "Testnet"
                 };
                 let cred_hex = hex::encode(&reg.reward_account[1..29]);
+                // Bit 4 of the header selects the credential KIND — reward
+                // address headers are 0xe0/0xe1 for a key hash and 0xf0/0xf1
+                // for a script hash. This read is the ledger's own
+                // (`eras/common.rs::reward_account_to_hash`), which has always
+                // had it right; only this serialiser hardcoded `keyHash`.
+                //
+                // Every script-credentialled pool reward account was therefore
+                // mislabelled. Measured on preprod, where it made three
+                // `snapshots.{mark,set,go}.poolParams.<pool>.rewardAccount
+                // .credential.*` paths a SCHEMA GAP in ~90 epochs each: dugite
+                // emitted a `keyHash` key the oracle does not have and lacked
+                // the `scriptHash` key it does. Same family as the `drepDistr`
+                // key defect — a credential kind assumed rather than read.
+                let kind = if header & 0x10 != 0 {
+                    "scriptHash"
+                } else {
+                    "keyHash"
+                };
                 serde_json::json!({
-                    "credential": { "keyHash": cred_hex },
+                    "credential": { kind: cred_hex },
                     "network": network,
                 })
             } else {
@@ -1464,18 +1747,33 @@ fn build_epoch_snapshot(
     // every such epoch, and a per-epoch constant difference is the noise that
     // hid a real IPv6 defect in #1078.
     //
-    // STATED LIMITATION: `build_drep_power_cache` returns the two as plain
-    // counters, so dugite cannot distinguish "absent from the map" from
-    // "present with zero". A genuinely-zero-but-present entry would therefore
-    // be omitted here. Every sample observed so far is absent-when-zero, and
-    // guessing the other way would invent a key upstream does not have.
-    if drep_no_conf > 0 {
+    // PRESENCE, NOT AMOUNT. The gate is the pulser's two `*_delegated` flags,
+    // which exist for exactly this (#994): upstream's `Map.insertWith` creates
+    // the key when an account delegates to a predefined DRep, so a delegated
+    // pseudo-DRep holding zero stake IS a key with value 0, while an
+    // undelegated one is absent. Gating on `stake > 0` collapses those two and
+    // is wrong in the first case; gating on the flag reproduces the key set.
+    //
+    // SUPERSEDED LIMITATION: `build_drep_power_cache` returns the two as plain
+    // counters, so on its own dugite cannot distinguish "absent from the map"
+    // from "present with zero" — which is why the flags are read from the
+    // pulsing snapshot directly rather than inferred from the amounts.
+    //
+    // With no pulser there is no key set to reproduce (Haskell's `Default` is
+    // `DRComplete def def`, an empty map), so neither is emitted.
+    let (no_conf_present, abstain_present) = ledger
+        .gov
+        .governance
+        .pulsing_snapshot()
+        .map(|s| (s.drep_no_confidence_delegated, s.drep_abstain_delegated))
+        .unwrap_or((false, false));
+    if no_conf_present {
         drep_distr_map.insert(
             "drep-alwaysNoConfidence".to_string(),
             serde_json::Value::Number(drep_no_conf.into()),
         );
     }
-    if drep_abstain_val > 0 {
+    if abstain_present {
         drep_distr_map.insert(
             "drep-alwaysAbstain".to_string(),
             serde_json::Value::Number(drep_abstain_val.into()),
@@ -1483,30 +1781,54 @@ fn build_epoch_snapshot(
     }
     let drep_distr = serde_json::Value::Object(drep_distr_map);
 
-    // Proposal details for cross-validation debugging.
-    let proposal_details: Vec<serde_json::Value> = ledger
-        .gov.governance
-        .proposals
-        .iter()
-        .map(|(id, state)| {
-            serde_json::json!({
-                "txId": id.transaction_id.to_hex(),
-                "index": id.action_index,
-                "expiresEpoch": state.expires_epoch.0,
-                "proposedEpoch": state.proposed_epoch.0,
-                "deposit": state.procedure.deposit.0,
-                "actionType": match &state.procedure.gov_action {
-                    dugite_primitives::transaction::GovAction::ParameterChange { .. } => "ParameterChange",
-                    dugite_primitives::transaction::GovAction::HardForkInitiation { .. } => "HardForkInitiation",
-                    dugite_primitives::transaction::GovAction::TreasuryWithdrawals { .. } => "TreasuryWithdrawals",
-                    dugite_primitives::transaction::GovAction::NoConfidence { .. } => "NoConfidence",
-                    dugite_primitives::transaction::GovAction::UpdateCommittee { .. } => "UpdateCommittee",
-                    dugite_primitives::transaction::GovAction::NewConstitution { .. } => "NewConstitution",
-                    dugite_primitives::transaction::GovAction::InfoAction => "InfoAction",
+    // `conwayGov` — cardano-streamer's `extractConwayGovData` (Run.hs:150-166),
+    // five keys and no others:
+    //
+    // ```haskell
+    // let (snap, ratifyState) = finishDRepPulser (nes ^. newEpochStateDRepPulsingStateL)
+    //     drepDistr      = Map.map fromCompact (psDRepDistr snap)
+    //     committee      = nes ^. newEpochStateGovStateL . committeeGovStateL
+    //     constitution   = nes ^. newEpochStateGovStateL . constitutionGovStateL
+    //     committeeState = nes ^. … . certVStateL . vsCommitteeStateL
+    //     nextEnactState = ratifyState ^. rsEnactStateL
+    // ```
+    //
+    // Note the two DIFFERENT provenances, which is the whole subtlety of this
+    // record: `committee` and `constitution` are read LIVE from the governance
+    // state, while `nextEnactState`'s copies of the same two come from the
+    // forced pulser and therefore already carry whatever the NEXT boundary will
+    // enact. Emitting one value in both places would agree in every epoch that
+    // enacts nothing — see `EnactedGovTerms`.
+    //
+    // `null` before Conway: `applyConwayNewEpochState` returns Nothing for
+    // earlier eras, and the comparator's `era_applicable` models exactly that.
+    let conway_gov: serde_json::Value = if ledger.era < dugite_primitives::era::Era::Conway {
+        serde_json::Value::Null
+    } else {
+        let gov = &ledger.gov.governance;
+        let next = ledger.gov.governance.ratify_plan();
+        serde_json::json!({
+            "drepDistr": drep_distr,
+            "committee": committee_json(&gov.committee_expiration, gov.committee_threshold.as_ref()),
+            "constitution": constitution_json(gov.constitution.as_ref()),
+            "committeeState": committee_state_json(gov),
+            "nextEnactState": next.map(|n| serde_json::json!({
+                "committee": committee_json(
+                    &n.enact_state.committee_expiration,
+                    n.enact_state.committee_threshold.as_ref(),
+                ),
+                "constitution": constitution_json(n.enact_state.constitution.as_ref()),
+                "curPParams": conway_pparams_json(&n.cur_pparams),
+                "prevPParams": conway_pparams_json(&ledger.epochs.prev_protocol_params),
+                "prevGovActionIds": {
+                    "PParamUpdate": gov_action_id_json(n.enact_state.prev_gov_action_ids.pparam.as_ref()),
+                    "HardFork": gov_action_id_json(n.enact_state.prev_gov_action_ids.hard_fork.as_ref()),
+                    "Committee": gov_action_id_json(n.enact_state.prev_gov_action_ids.committee.as_ref()),
+                    "Constitution": gov_action_id_json(n.enact_state.prev_gov_action_ids.constitution.as_ref()),
                 },
-            })
+            })).unwrap_or(serde_json::Value::Null),
         })
-        .collect();
+    };
 
     // Protocol params summary.
     // Use prev_protocol_params (esPrevPp) to match cstreamer's convention:
@@ -1662,16 +1984,6 @@ fn build_epoch_snapshot(
         "totalPools": pool_distribution.len(),
         "poolDistribution": pool_distribution,
         "snapshotEraName": format!("{}", ledger.era),
-        "enactedRoots": {
-            "PParamUpdate": ledger.gov.governance.enacted_pparam_update.as_ref()
-                .map(|id| format!("{}#{}", id.transaction_id.to_hex(), id.action_index)),
-            "HardFork": ledger.gov.governance.enacted_hard_fork.as_ref()
-                .map(|id| format!("{}#{}", id.transaction_id.to_hex(), id.action_index)),
-            "Committee": ledger.gov.governance.enacted_committee.as_ref()
-                .map(|id| format!("{}#{}", id.transaction_id.to_hex(), id.action_index)),
-            "Constitution": ledger.gov.governance.enacted_constitution.as_ref()
-                .map(|id| format!("{}#{}", id.transaction_id.to_hex(), id.action_index)),
-        },
         "epochNonce": epoch_nonce,
         "eta": eta,
         "expectedBlocks": expected_blocks,
@@ -1682,8 +1994,26 @@ fn build_epoch_snapshot(
             "proposal": deposit_proposal,
             "total": deposit_total,
         },
-        "proposals": proposal_details,
-        "drepDistr": drep_distr,
+        // `proposals` and `enactedRoots` USED to be emitted here and are not
+        // any more. Neither has an upstream counterpart:
+        // `extractConwayGovData` emits exactly five keys and neither is among
+        // them, so each was an unconditional SCHEMA GAP in every Conway epoch —
+        // a dugite-only debugging field holding the comparison at exit 2 for
+        // ~140 epochs it could never say anything about.
+        //
+        // `enactedRoots` was not merely unpaired, it was WRONG in two ways that
+        // only real Conway oracle output showed: the roots belong inside
+        // `conwayGov.nextEnactState.prevGovActionIds`, where they are the
+        // pulser's self-inclusive copy rather than the live one, and each id
+        // renders as `{govActionIx, txId}` rather than dugite's `txid#ix`
+        // string. Both are now emitted there.
+        //
+        // `proposals` is dropped outright rather than kept behind a comparator
+        // exclusion: an exclusion is for a field that IS compared and whose
+        // difference is known-benign, and this one has nothing to compare
+        // against. The live proposal set remains queryable over N2C
+        // (`GetProposals`), which is where a debugging reader should get it.
+        "conwayGov": conway_gov,
         "protocolParams": protocol_params,
         "rupdNext": rupd_next,
         "rupdApplied": prev_rupd_next,
