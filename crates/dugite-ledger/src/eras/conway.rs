@@ -92,67 +92,107 @@ impl EraRules for ConwayRules {
         // Step 1: ExUnit budget check (shared with Alonzo/Babbage).
         common::validate_block_ex_units(block, ctx)?;
 
-        // Step 2: Block-level reference script size check.
-        // Build within-block UTxO overlay for ref script resolution (outputs
-        // created earlier in the block may be referenced later).
-        let mut block_utxo_overlay: std::collections::HashMap<
-            dugite_primitives::transaction::TransactionInput,
+        // Step 2: Block-level reference script size check —
+        // `totalRefScriptSizeInBlock` (`Conway/Rules/Bbody.hs`), which is
+        // PV-GATED and was not:
+        //
+        // ```haskell
+        // totalRefScriptSizeInBlock protVer txs (UTxO utxo)
+        //   | pvMajor protVer <= natVersion @10 =
+        //       getSum $ foldMap' (Monoid.Sum . txNonDistinctRefScriptsSize (UTxO utxo)) txs
+        //   | otherwise =
+        //       snd $ F.foldl' accum (utxo, 0) txs
+        //   where
+        //     accum (!accUtxo, !accSum) tx =
+        //       let updatedUtxo = accUtxo `Map.union` unUTxO toAdd
+        //           toAdd | IsValid True <- tx ^. isValidTxL = txouts $ tx ^. bodyTxL
+        //                 | otherwise = collOuts $ tx ^. bodyTxL
+        //        in (updatedUtxo, accSum + txNonDistinctRefScriptsSize (UTxO accUtxo) tx)
+        // ```
+        //
+        // Below PV11 every transaction is measured against the BLOCK-INITIAL
+        // UTxO, so a reference to an output created earlier in the same block
+        // resolves to nothing and contributes zero. dugite applied the
+        // accumulating form at every protocol version, which OVER-counts before
+        // 11 and can reject a block cardano-node accepts — on mainnet that is
+        // every Conway epoch from 507 until the PV11 fork, i.e. the range the
+        // exactness replay covers.
+        //
+        // Two further details of the accumulating arm, both easy to lose:
+        //
+        //   * the size is measured against `accUtxo` BEFORE this transaction's
+        //     own outputs are folded in, so a transaction can never see its
+        //     own outputs — a pre-built overlay over all transactions lets it
+        //     see its own AND later ones, over-counting again;
+        //   * an `IsValid False` transaction contributes `collOuts`, its
+        //     collateral return, NOT nothing.
+        let pv_major = ctx.params.protocol_version_major;
+        let tx_ref_script_size = |tx: &dugite_primitives::transaction::Transaction,
+                                  lookup: &dyn Fn(
+            &dugite_primitives::transaction::TransactionInput,
+        ) -> Option<
             dugite_primitives::transaction::TransactionOutput,
-        > = std::collections::HashMap::new();
-        for tx in &block.transactions {
-            if tx.is_valid {
-                for (idx, output) in tx.body.outputs.iter().enumerate() {
-                    block_utxo_overlay.insert(
+        >|
+         -> u64 {
+            // `txNonDistinctRefScriptsSize`: spending AND reference inputs, and
+            // NON-distinct — the same script resolved twice counts twice.
+            tx.body
+                .inputs
+                .iter()
+                .chain(tx.body.reference_inputs.iter())
+                .filter_map(|inp| {
+                    lookup(inp).and_then(|out| {
+                        out.script_ref
+                            .as_ref()
+                            .map(crate::validation::script_ref_byte_size)
+                    })
+                })
+                .fold(0u64, |a, b| a.saturating_add(b))
+        };
+
+        let total_ref_script_size: u64 = if pv_major <= 10 {
+            block
+                .transactions
+                .iter()
+                .map(|tx| tx_ref_script_size(tx, &|i| utxo.utxo_set.lookup(i)))
+                .fold(0u64, |a, b| a.saturating_add(b))
+        } else {
+            let mut acc: std::collections::HashMap<
+                dugite_primitives::transaction::TransactionInput,
+                dugite_primitives::transaction::TransactionOutput,
+            > = std::collections::HashMap::new();
+            let mut total = 0u64;
+            for tx in &block.transactions {
+                // Measure FIRST — against everything the block has produced so
+                // far but not this transaction.
+                total = total.saturating_add(tx_ref_script_size(tx, &|i| {
+                    acc.get(i).cloned().or_else(|| utxo.utxo_set.lookup(i))
+                }));
+                // Then fold this transaction's contribution in.
+                if tx.is_valid {
+                    for (idx, output) in tx.body.outputs.iter().enumerate() {
+                        acc.insert(
+                            dugite_primitives::transaction::TransactionInput {
+                                transaction_id: tx.hash,
+                                index: idx as u32,
+                            },
+                            output.clone(),
+                        );
+                    }
+                } else if let Some(collateral_return) = &tx.body.collateral_return {
+                    // `collOuts` indexes the collateral return at the count of
+                    // regular outputs, matching `apply_collateral_consumption`.
+                    acc.insert(
                         dugite_primitives::transaction::TransactionInput {
                             transaction_id: tx.hash,
-                            index: idx as u32,
+                            index: tx.body.outputs.len() as u32,
                         },
-                        output.clone(),
+                        collateral_return.clone(),
                     );
                 }
             }
-        }
-
-        let lookup_with_overlay = |input: &dugite_primitives::transaction::TransactionInput| {
-            block_utxo_overlay
-                .get(input)
-                .cloned()
-                .or_else(|| utxo.utxo_set.lookup(input))
+            total
         };
-
-        let total_ref_script_size: u64 = block
-            .transactions
-            .iter()
-            .map(|tx| {
-                let spending_size: u64 = tx
-                    .body
-                    .inputs
-                    .iter()
-                    .filter_map(|inp| {
-                        lookup_with_overlay(inp).and_then(|utxo_out| {
-                            utxo_out
-                                .script_ref
-                                .as_ref()
-                                .map(crate::validation::script_ref_byte_size)
-                        })
-                    })
-                    .sum();
-                let reference_size: u64 = tx
-                    .body
-                    .reference_inputs
-                    .iter()
-                    .filter_map(|inp| {
-                        lookup_with_overlay(inp).and_then(|utxo_out| {
-                            utxo_out
-                                .script_ref
-                                .as_ref()
-                                .map(crate::validation::script_ref_byte_size)
-                        })
-                    })
-                    .sum();
-                spending_size.saturating_add(reference_size)
-            })
-            .fold(0u64, |acc, x| acc.saturating_add(x));
 
         // Conway block body limit: 1 MiB (hardcoded, not governance-updateable).
         const MAX_REF_SCRIPT_SIZE_PER_BLOCK: u64 = 1024 * 1024;
@@ -3185,6 +3225,106 @@ mod tests {
         assert_eq!(drep.deposit.0, 500_000_000);
         assert!(drep.active);
         assert_eq!(drep.registered_epoch, EpochNo(5));
+    }
+
+    /// `totalRefScriptSizeInBlock` is PV-GATED, and the two arms must disagree.
+    ///
+    /// A block where tx[1] references a script output that tx[0] created:
+    ///
+    /// * at PV ≤ 10 the lookup is against the BLOCK-INITIAL UTxO, so it
+    ///   resolves to nothing and contributes ZERO;
+    /// * at PV ≥ 11 the accumulating fold has already folded tx[0]'s outputs
+    ///   in, so it contributes the script's size.
+    ///
+    /// dugite accumulated at every protocol version, which over-counts before
+    /// 11 and can reject a block cardano-node accepts. That is not a
+    /// hypothetical range: mainnet is Conway from epoch 507 and PV11 only from
+    /// ~644, so every epoch the exactness replay covers is in the ≤10 arm.
+    ///
+    /// Asserting the SIZES differ is what makes this fail if the gate is
+    /// dropped; a test that only checked "the block is accepted" passes under
+    /// either arm whenever the limit is generous, which it is.
+    #[test]
+    fn ref_script_size_counts_same_block_outputs_only_from_pv11() {
+        use dugite_primitives::transaction::{TransactionInput, TransactionOutput};
+
+        // The script is deliberately LARGER than the 1 MiB block limit, so the
+        // two arms produce different VERDICTS and the difference is observable
+        // through the public API. With a small script both arms accept and the
+        // test proves nothing.
+        let script_ref =
+            dugite_primitives::transaction::ScriptRef::PlutusV2(vec![0xAB; 2 * 1024 * 1024]);
+        let mut tx0 = make_tx(0x01, vec![], vec![], 0);
+        tx0.body.outputs = vec![TransactionOutput {
+            address: make_enterprise_address(Hash28::from_bytes([0x0Bu8; 28])),
+            value: dugite_primitives::value::Value::lovelace(1_000_000),
+            datum: dugite_primitives::transaction::OutputDatum::None,
+            script_ref: Some(script_ref),
+            is_legacy: false,
+            raw_cbor: None,
+        }];
+        let mut tx1 = make_tx(0x02, vec![], vec![], 0);
+        tx1.body.reference_inputs = vec![TransactionInput {
+            transaction_id: tx0.hash,
+            index: 0,
+        }];
+
+        let block = Block {
+            era: Era::Conway,
+            header: dugite_primitives::block::BlockHeader {
+                header_hash: Hash32::ZERO,
+                prev_hash: Hash32::ZERO,
+                issuer_vkey: vec![],
+                vrf_vkey: vec![],
+                vrf_result: dugite_primitives::block::VrfOutput {
+                    output: vec![],
+                    proof: vec![],
+                },
+                block_number: dugite_primitives::time::BlockNo(0),
+                slot: dugite_primitives::time::SlotNo(0),
+                epoch_nonce: Hash32::ZERO,
+                body_size: 0,
+                body_hash: Hash32::ZERO,
+                operational_cert: dugite_primitives::block::OperationalCert {
+                    hot_vkey: vec![],
+                    sequence_number: 0,
+                    kes_period: 0,
+                    sigma: vec![],
+                },
+                protocol_version: dugite_primitives::block::ProtocolVersion { major: 9, minor: 0 },
+                kes_signature: vec![],
+                nonce_vrf_output: vec![],
+                nonce_vrf_proof: vec![],
+                prev_nonce: None,
+                raw_header_body: None,
+            },
+            transactions: vec![tx0, tx1],
+            raw_cbor: None,
+        };
+
+        let utxo = make_utxo_sub(vec![]);
+        let rules = ConwayRules::new();
+
+        let mut pv10 = ProtocolParameters::mainnet_defaults();
+        pv10.protocol_version_major = 10;
+        assert!(
+            rules
+                .validate_block_body(&block, &make_conway_ctx(&pv10), &utxo)
+                .is_ok(),
+            "at pv<=10 the reference resolves against the BLOCK-INITIAL UTxO, \
+             finds nothing, and contributes zero — the block must be accepted, \
+             exactly as cardano-node accepts it"
+        );
+
+        let mut pv11 = ProtocolParameters::mainnet_defaults();
+        pv11.protocol_version_major = 11;
+        assert!(
+            rules
+                .validate_block_body(&block, &make_conway_ctx(&pv11), &utxo)
+                .is_err(),
+            "at pv>=11 the accumulating fold has already folded tx0's outputs \
+             in, so the 2 MiB script counts and the block must be rejected"
+        );
     }
 
     fn pool_params_with_vrf(
