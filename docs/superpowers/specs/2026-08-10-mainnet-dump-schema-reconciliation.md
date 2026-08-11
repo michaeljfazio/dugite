@@ -1,7 +1,67 @@
 # Mainnet exactness — dump schema reconciliation (#1073)
 
-Status: **conwayGov half BLOCKED on real Conway oracle output; the rest is
-specified below and deliberately NOT implemented.** See "What must not be done".
+Status: **conwayGov LANDED and cross-validated against real preprod Conway
+oracle output.** The remaining honest gap is `instantaneousRewards`, which is
+deliberate — see below. Everything under "What must not be done" still stands.
+
+## `nextEnactState` is the pulser's SELF-INCLUSIVE `rsEnactState`
+
+This is the load-bearing fact of the whole conwayGov half, it was not obvious
+from the shape, and getting it wrong would have produced a confident
+one-epoch-shifted answer in exactly the epochs that matter.
+
+RATIFY threads ONE `EnactState` through the ENACT rule and returns it inside the
+`RatifyState` it produces (`Conway/Rules/Ratify.hs`, `ratifyTransition`, at
+cardano-ledger `faa7a9dc347697b11d4da5b7818b1731e11aeeef` = conway 1.20.0.0):
+
+```haskell
+newEnactState <- trans @(EraRule "ENACT" era) $
+                   TRC ((), rsEnactState, EnactSignal gasId govAction)
+let st' = st & rsEnactStateL .~ newEnactState
+             & rsEnactedL %~ (Seq.:|> gas)
+trans @(ConwayRATIFY era) $ TRC (env, st', RatifySignal sigs)
+```
+
+So `ensCommittee`, `ensConstitution`, `ensCurPParams` and `ensPrevGovActionIds`
+carry the effects of the actions in the pulser's own `rsEnacted` — **one
+boundary before live governance state gains them**. `ensPrevPParams` is the
+exception: nothing in RATIFY/ENACT writes it, and it changes only at the
+boundary (`Rules/Epoch.hs`, `cgsPrevPParamsL .~ curPParams`).
+
+**Verified against the oracle rather than accepted from the analysis.** The
+rival reading — that `rsEnactState` equals the `dpEnactState` the pulser was
+seeded with — predicts that epoch 180's `curPParams`/`prevPParams` differ in
+`protocolVersion` ALONE. Measured, they differ in `{costModels,
+protocolVersion}`, which only the self-inclusive reading produces. Three further
+predictions, all confirmed on `reports/preprod-conway-oracle/`:
+
+| epoch | cur vs prev differ in | predicted by |
+|---|---|---|
+| 179 | `costModels` only | self-inclusive |
+| 180 | `costModels`, `protocolVersion` | self-inclusive (rival says protocolVersion only) |
+| 181 | `protocolVersion` only | self-inclusive |
+| 182 | nothing | both |
+
+Dating the preprod events from that: the `PParamUpdate` b52f… enacts at the
+179→180 boundary and the `HardFork` ccb2… at 180→181, so preprod runs PV10 from
+epoch 181. The top-level `protocolParams` key reads major 9 at epoch 181 because
+it is `prevPParams`, not the live parameters.
+
+**Consequence for dugite.** `PulsedRatifyState` already stored the
+self-inclusive `cur_pparams` (#977 needs it for `predictFuturePParams`) but
+none of the other three. They are now stored beside it as
+`PulsedRatifyState.enact_state` (`EnactedGovTerms`), captured from the state the
+pulser's own dry run produced — `compute_pulsed_ratify_state` clones, runs
+`ratify_proposals_impl`, and that clone has had every enactment applied by the
+same `enact_gov_action_impl` the real boundary uses. Nothing is re-derived, so
+there is no second copy of enactment to drift.
+
+Reading them live instead would have been correct in every epoch that enacts
+nothing and wrong in every epoch that enacts something — #977's and #1071's
+shape. The regression test asserts the two are DIFFERENT at that instant
+(`frozen_plan_carries_its_own_enactment_roots_before_live_state_does`), which is
+what makes it fail when the source is swapped for live state; it was proven red
+by doing exactly that.
 
 `scripts/validation/diff-cstreamer-dumps.py` exits **2 (SCHEMA GAP)** on the
 validated 208–316 range. That is the correct verdict and it is not the fault of
@@ -253,6 +313,32 @@ every such epoch, which is the constant-noise shape that hid a real defect in
 #1078. Now emitted only when non-zero, with the limitation stated at the code:
 the cache returns the two pseudo-DReps as plain counters, so dugite cannot
 distinguish "absent" from "present with zero".
+
+## What conwayGov emits, and what preprod could not exercise
+
+dugite now emits the oracle's five keys and drops the two dugite-only ones.
+`proposals` and `enactedRoots` are **removed outright**, not excluded in the
+comparator: an exclusion is for a field that is compared and whose difference is
+known-benign, and neither has anything to compare against. The live proposal set
+is still reachable over N2C (`GetProposals`).
+
+The two provenances are distinct and must stay so — `committee` and
+`constitution` are read LIVE from governance state, while
+`nextEnactState`'s copies of the same two come from the frozen pulser.
+
+Preprod exercises a lot of this but not all of it, and the untested arms are
+worth naming rather than discovering on mainnet:
+
+| arm | preprod 163-184 | note |
+|---|---|---|
+| `scriptHash-` credential keys | YES — the whole committee | key kind read from byte 28 of the typed hash, not a side set |
+| `keyHash-` credential keys | NO | mainnet's committee will exercise it |
+| `committeeState` non-empty | YES — grows 0 → 4 | all `CommitteeHotCredential` |
+| `CommitteeMemberResigned` | NO | shape taken from the ToJSON instance, unobserved |
+| `constitution.script` present | YES | absent-arm (key omitted, not null) unobserved |
+| `committee = null` (SNothing) | NO | needs an enacted `NoConfidence` |
+| `prevGovActionIds` non-null | YES — 2 of 4 lanes | `Committee`/`Constitution` lanes unobserved |
+| `curPParams` ≠ `prevPParams` | YES — at 179, 180, 181 | covers costModels and protocolVersion |
 
 ## Remaining work, in order
 

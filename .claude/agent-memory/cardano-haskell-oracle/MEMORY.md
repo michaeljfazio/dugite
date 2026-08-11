@@ -55,6 +55,7 @@
 - [conway-gov-rule-verbatim-checks.md](conway-gov-rule-verbatim-checks.md) — conwayGovTransition order; UnelectedCommitteeVoters vs VotersDoNotExist use DIFFERENT committee sets
 
 ## Governance (Conway / CIP-1694)
+- [conway-nextenactstate-dump-semantics.md](conway-nextenactstate-dump-semantics.md) — rsEnactState is SELF-INCLUSIVE: forced-pulser dump shows an enacting id/PV ONE epoch early; EnactState JSON prints 5/7 fields (no treasury/withdrawals)
 - [drep-dormant-epoch-expiry-exact-mechanism.md](drep-dormant-epoch-expiry-exact-mechanism.md) — numDormantEpochs bump-at-submission (NOT ratify-check)
 - [drep-pulser-ratification.md](drep-pulser-ratification.md) — pulser snapshot at END of EPOCH rule, pulse spreads 4k blocks
 - [conway-ratification-details.md](conway-ratification-details.md) — threshold fns, enactment priority, committee expiry, DRep activity
