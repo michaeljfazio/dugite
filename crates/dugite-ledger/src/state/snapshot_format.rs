@@ -95,6 +95,16 @@ pub struct LedgerStateSnapshot {
     pub future_pool_params: HashMap<Hash28, PoolRegistration>,
     /// Pool retirements pending: pool -> retirement epoch.
     pub pending_retirements: HashMap<Hash28, EpochNo>,
+    /// `psVRFKeyHashes` — occurrences per pool VRF key hash (#1085).
+    ///
+    /// Persisted rather than recomputed on load: it is NOT a function of the
+    /// pool set. See `CertSubState::vrf_key_hashes` for the counter-example
+    /// (POOLREAP deletes a superseded key outright even when another pool still
+    /// holds it, so a derived count and upstream's map disagree afterwards).
+    /// `BTreeMap`, not `HashMap`: bincode writes a map in iteration order, and
+    /// a `HashMap` reserialised after a round trip can order differently — the
+    /// snapshot round-trip determinism guard catches exactly that.
+    pub vrf_key_hashes: BTreeMap<Hash32, u64>,
     /// Stake snapshots for the Cardano "mark/set/go" snapshot model
     pub snapshots: EpochSnapshots,
     /// Reward accounts: stake credential hash -> accumulated rewards.
@@ -284,6 +294,12 @@ impl From<&super::LedgerState> for LedgerStateSnapshot {
             pool_params: (*s.certs.pool_params).clone(),
             future_pool_params: s.certs.future_pool_params.clone(),
             pending_retirements: s.certs.pending_retirements.clone(),
+            vrf_key_hashes: s
+                .certs
+                .vrf_key_hashes
+                .iter()
+                .map(|(h, c)| (*h, *c))
+                .collect(),
             reward_accounts: s
                 .certs
                 .reward_accounts
@@ -383,6 +399,7 @@ impl From<LedgerStateSnapshot> for super::LedgerState {
                 pool_params: Arc::new(s.pool_params),
                 future_pool_params: s.future_pool_params,
                 pending_retirements: s.pending_retirements,
+                vrf_key_hashes: s.vrf_key_hashes.into_iter().collect::<ImblHashMap<_, _>>(),
                 reward_accounts: s.reward_accounts.into_iter().collect::<ImblHashMap<_, _>>(),
                 stake_key_deposits: s
                     .stake_key_deposits
@@ -517,6 +534,7 @@ mod tests {
             pool_params,
             future_pool_params,
             pending_retirements,
+            vrf_key_hashes,
             snapshots,
             reward_accounts,
             pointer_map,
@@ -596,6 +614,7 @@ mod tests {
             pool_params, "pool_params";
             future_pool_params, "future_pool_params";
             pending_retirements, "pending_retirements";
+            vrf_key_hashes, "vrf_key_hashes";
             reward_accounts, "reward_accounts";
             pointer_map, "pointer_map";
             genesis_delegates, "genesis_delegates";

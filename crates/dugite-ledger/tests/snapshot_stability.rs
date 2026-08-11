@@ -120,6 +120,8 @@ fn snapshot_format_hash_stability() {
     //     xtask/tests/snapshot_one_bump_invariant.rs)
     //   ea9ce3ba3840ac8d99da93a47062410f322ed7736466b167ca2e536ad2f48e54
     //     SNAPSHOT 38 + #1072/Phase-1a RUPD fields, pre-#1073
+    //   0d232f9217eadbb64a7e274dc120e6348178f5dc3d95d2b2c14d940f927e366b
+    //     SNAPSHOT 38 + #1084 `DRepRegistration.delegs`, pre-#1085
     //   13ccf15836c55ac86885c9c9a5d0f8aa2347351b8421143cb51e5631454301ba
     //     SNAPSHOT 38 + #1073 `PulsedRatifyState.enact_state`, pre-#1084
     //
@@ -140,7 +142,12 @@ fn snapshot_format_hash_stability() {
     // the reverse index a DRep deregistration uses to orphan its delegators.
     // It cannot be derived from the forward map below PV10 (ledger #4772), so
     // it is stored rather than reconstructed.
-    const EXPECTED_HASH: &str = "0d232f9217eadbb64a7e274dc120e6348178f5dc3d95d2b2c14d940f927e366b";
+    //
+    // #1085 joins them with `CertSubState.vrf_key_hashes` — Haskell's
+    // `psVRFKeyHashes`, the occurrence count that makes the PV11
+    // duplicate-VRF-key rejection possible. Also not derivable: POOLREAP
+    // deletes a superseded key outright even when another pool still holds it.
+    const EXPECTED_HASH: &str = "4408444e5df5244c3a36d86a7af305a1e3836b0c79ba41296ee651ebe92e5574";
 
     if EXPECTED_HASH == "COMPUTE_ON_FIRST_RUN" {
         panic!(

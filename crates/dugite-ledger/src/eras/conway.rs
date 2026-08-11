@@ -846,6 +846,36 @@ impl EraRules for ConwayRules {
             epoch_blocks_by_pool: Arc::clone(&consensus.epoch_blocks_by_pool),
         });
 
+        // `danglingVRFKeyHashes` (#1085) — computed BEFORE the activation
+        // below, because it is the set of keys a re-registration OVERWROTE and
+        // that information exists only while both maps still hold their own
+        // version of the pool:
+        //
+        // ```haskell
+        // danglingVRFKeyHashes = Set.fromList $ Map.elems $
+        //   Map.merge dropMissing dropMissing
+        //     (zipWithMaybeMatched $ \_ sps spsF ->
+        //        if sps ^. spsVrfL /= spsF ^. spsVrfL then Just (sps ^. spsVrfL) else Nothing)
+        //     (ps0 ^. psStakePoolsL) (ps0 ^. psFutureStakePoolsL)
+        // ```
+        //
+        // Only pools present in BOTH maps contribute, and only when the key
+        // actually changed — a re-registration that kept its VRF key must not
+        // surrender it.
+        let dangling_vrf: Vec<Hash32> = if epochs.protocol_params.protocol_version_major >= 11 {
+            certs
+                .future_pool_params
+                .iter()
+                .filter_map(|(pool_id, future)| {
+                    certs.pool_params.get(pool_id).and_then(|current| {
+                        (current.vrf_keyhash != future.vrf_keyhash).then_some(current.vrf_keyhash)
+                    })
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+
         // Apply future pool parameters (re-registrations deferred from previous epoch).
         if !certs.future_pool_params.is_empty() {
             let pool_params = Arc::make_mut(&mut certs.pool_params);
@@ -868,6 +898,40 @@ impl EraRules for ConwayRules {
                 }
             })
             .collect();
+        // `psVRFKeyHashes` at POOLREAP (#1085), in upstream's order:
+        //
+        // ```haskell
+        // %~ ( removeVRFKeyHashOccurrences retiredVRFKeyHashes
+        //        . (`Map.withoutKeys` danglingVRFKeyHashes) )
+        // ```
+        //
+        // Composition applies right-to-left, so the superseded keys go first.
+        // The two removals are NOT the same operation, and the asymmetry is
+        // upstream's: a dangling key is DELETED outright — even if another pool
+        // still holds it, which is how a pre-PV11 duplicate can stop blocking
+        // registrations — while a retiring pool's key is DECREMENTED and
+        // disappears only at zero (`Map.update (mapNonZero (\n -> n - 1))`).
+        //
+        // The retired keys are read from the POST-activation pool set, so a
+        // pool that re-registered and is also retiring surrenders its NEW key.
+        if epochs.protocol_params.protocol_version_major >= 11 {
+            for key in &dangling_vrf {
+                certs.vrf_key_hashes.remove(key);
+            }
+            for pool_id in &retiring_pools {
+                if let Some(reg) = certs.pool_params.get(pool_id) {
+                    let vrf = reg.vrf_keyhash;
+                    if let Some(n) = certs.vrf_key_hashes.get(&vrf).copied() {
+                        if n <= 1 {
+                            certs.vrf_key_hashes.remove(&vrf);
+                        } else {
+                            certs.vrf_key_hashes.insert(vrf, n - 1);
+                        }
+                    }
+                }
+            }
+        }
+
         if !retiring_pools.is_empty() {
             for pool_id in &retiring_pools {
                 certs.pending_retirements.remove(pool_id);
@@ -1015,20 +1079,39 @@ impl EraRules for ConwayRules {
                     );
                 }
                 11 => {
-                    // NOT IMPLEMENTED, and named rather than skipped silently.
-                    // The pvMajor-11 arm is `populateVRFKeyHashes`, folding an
-                    // occurrence count of every current AND FUTURE pool's VRF
-                    // key into `psVRFKeyHashes`. dugite models no such map — it
-                    // derives a narrower single-holder one from live
-                    // `pool_params` at validation time — so there is nothing to
-                    // populate, and a half-built one would be worse than its
-                    // absence (#979).
+                    // `populateVRFKeyHashes` (#1085) — seed the occurrence
+                    // count from EVERY current and future pool:
                     //
-                    // This is NOT prospective: mainnet epoch 648 is PV 11.0.
-                    // The three resulting divergences, all
-                    // accept-where-Haskell-rejects, are enumerated at the
-                    // `VrfKeyHashAlreadyRegistered` check in
-                    // `validation/mod.rs`. Tracked as #1085.
+                    // ```haskell
+                    // pState & psVRFKeyHashesL
+                    //   %~ accumulateVRFKeyHashes (pState ^. psStakePoolsL)
+                    //     . accumulateVRFKeyHashes (pState ^. psFutureStakePoolsL)
+                    // ```
+                    //
+                    // Counts above one are the POINT of this being a counter
+                    // rather than a set: duplicate VRF keys were LEGAL before
+                    // PV11, and the fork preserves the duplicates instead of
+                    // collapsing them, so a pre-existing pair keeps blocking
+                    // new registrations until its LAST holder reaps.
+                    //
+                    // The fold saturates at u64::MAX exactly as upstream's
+                    // `NonZero Word64` `combine` does; it is unreachable in
+                    // practice and cheap to be faithful about.
+                    let mut counts: imbl::HashMap<Hash32, u64> = imbl::HashMap::new();
+                    for reg in certs.pool_params.values() {
+                        let e = counts.entry(reg.vrf_keyhash).or_insert(0);
+                        *e = e.saturating_add(1);
+                    }
+                    for reg in certs.future_pool_params.values() {
+                        let e = counts.entry(reg.vrf_keyhash).or_insert(0);
+                        *e = e.saturating_add(1);
+                    }
+                    debug!(
+                        boundary_epoch = new_epoch.0,
+                        keys = counts.len(),
+                        "HARDFORK pv11: VRF key registry seeded"
+                    );
+                    certs.vrf_key_hashes = counts;
                 }
                 _ => {}
             }
@@ -2197,6 +2280,7 @@ fn make_empty_cert_sub() -> CertSubState {
         pool_params: Arc::new(HashMap::new()),
         future_pool_params: HashMap::new(),
         pending_retirements: HashMap::new(),
+        vrf_key_hashes: Default::default(),
         reward_accounts: imbl::HashMap::new(),
         stake_key_deposits: imbl::HashMap::new(),
         pool_deposits: HashMap::new(),
@@ -2385,6 +2469,7 @@ mod tests {
             pool_params: Arc::new(HashMap::new()),
             future_pool_params: HashMap::new(),
             pending_retirements: HashMap::new(),
+            vrf_key_hashes: Default::default(),
             reward_accounts: imbl::HashMap::new(),
             stake_key_deposits: imbl::HashMap::new(),
             pool_deposits: HashMap::new(),
@@ -3100,6 +3185,113 @@ mod tests {
         assert_eq!(drep.deposit.0, 500_000_000);
         assert!(drep.active);
         assert_eq!(drep.registered_epoch, EpochNo(5));
+    }
+
+    fn pool_params_with_vrf(
+        pool_id: Hash28,
+        vrf_keyhash: Hash32,
+    ) -> dugite_primitives::transaction::PoolParams {
+        dugite_primitives::transaction::PoolParams {
+            operator: pool_id,
+            vrf_keyhash,
+            pledge: Lovelace(100_000_000),
+            cost: Lovelace(340_000_000),
+            margin: dugite_primitives::transaction::Rational {
+                numerator: 1,
+                denominator: 100,
+            },
+            reward_account: vec![0xe1u8; 29],
+            pool_owners: vec![Hash28::from_bytes([0x0Au8; 28])],
+            relays: vec![],
+            pool_metadata: None,
+        }
+    }
+
+    /// #1085 — the PV11 duplicate-VRF registry, through the PRODUCTION path.
+    ///
+    /// Each assertion below corresponds to one of the three ways the previous
+    /// DERIVED registry (a fold over live `pool_params`) differed from
+    /// upstream's `psVRFKeyHashes`, and each difference was
+    /// accept-where-Haskell-rejects.
+    #[test]
+    fn pv11_vrf_registry_tracks_pending_reregistrations_and_retirements() {
+        let rules = ConwayRules::new();
+        let mut params = ProtocolParameters::mainnet_defaults();
+        params.protocol_version_major = 11;
+        let ctx = make_conway_ctx(&params);
+
+        let mut utxo = make_utxo_sub(vec![]);
+        let mut certs = make_cert_sub();
+        let mut gov = make_gov_sub();
+        let mut epochs = make_epoch_sub();
+        epochs.protocol_params.protocol_version_major = 11;
+
+        let pool_a = Hash28::from_bytes([0xA1; 28]);
+        let vrf1 = Hash32::from_bytes([0x11; 32]);
+        let vrf2 = Hash32::from_bytes([0x22; 32]);
+
+        let apply = |rules: &ConwayRules,
+                     certificates: Vec<Certificate>,
+                     id: u8,
+                     utxo: &mut _,
+                     certs: &mut _,
+                     gov: &mut _,
+                     epochs: &mut _| {
+            let mut tx = make_tx(id, vec![], vec![], 0);
+            tx.body.certificates = certificates;
+            rules
+                .apply_valid_tx(
+                    &tx,
+                    BlockValidationMode::ApplyOnly,
+                    &ctx,
+                    utxo,
+                    certs,
+                    gov,
+                    epochs,
+                )
+                .expect("cert applies");
+        };
+
+        // Register A with vrf1 — the key is claimed immediately.
+        apply(
+            &rules,
+            vec![Certificate::PoolRegistration(pool_params_with_vrf(
+                pool_a, vrf1,
+            ))],
+            0x01,
+            &mut utxo,
+            &mut certs,
+            &mut gov,
+            &mut epochs,
+        );
+        assert_eq!(certs.vrf_key_hashes.get(&vrf1), Some(&1));
+
+        // Re-register A with vrf2. The re-registration is DEFERRED to
+        // `future_pool_params`, so a registry derived from `pool_params` would
+        // still show only vrf1 — and a second pool could then take vrf2, which
+        // upstream rejects. The claim must be immediate.
+        apply(
+            &rules,
+            vec![Certificate::PoolRegistration(pool_params_with_vrf(
+                pool_a, vrf2,
+            ))],
+            0x02,
+            &mut utxo,
+            &mut certs,
+            &mut gov,
+            &mut epochs,
+        );
+        assert_eq!(
+            certs.vrf_key_hashes.get(&vrf2),
+            Some(&1),
+            "a PENDING re-registration must claim its key at once — this is the \
+             window a derived registry leaves open"
+        );
+        assert_eq!(
+            certs.vrf_key_hashes.get(&vrf1),
+            Some(&1),
+            "and the old key is still held until POOLREAP, not released early"
+        );
     }
 
     /// #1084, driven through the PRODUCTION certificate path.

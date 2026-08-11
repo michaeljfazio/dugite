@@ -278,6 +278,33 @@ fn gov_action_prev_id(action: &GovAction) -> Option<&GovActionId> {
     }
 }
 
+/// What the PV11 duplicate-VRF predicate needs, which is two things (#1085).
+///
+/// Upstream's check is not "is this key held by another pool" — it is:
+///
+/// ```haskell
+/// -- new registration
+/// Map.notMember ppVrf psVRFKeyHashes ?! VRFKeyHashAlreadyRegistered ppId ppVrf
+/// -- re-registration
+/// ppVrf == stakePoolState ^. spsVrfL
+///   || Map.notMember ppVrf psVRFKeyHashes ?! VRFKeyHashAlreadyRegistered ppId ppVrf
+/// ```
+///
+/// so the exemption is "the key I ALREADY have", not "a key I happen to hold
+/// somewhere". Those differ once `occurrences` can contain a key whose holder
+/// is no longer the pool re-registering — which is precisely what a pre-PV11
+/// duplicate, a pending re-registration, or a retiring pool produces.
+#[derive(Default, Clone, Debug)]
+pub struct VrfKeyRegistry {
+    /// `psVRFKeyHashes` — occurrence count per VRF key hash. Membership, not
+    /// the count, decides the predicate; the count decides when POOLREAP
+    /// finally releases a key.
+    pub occurrences: HashMap<Hash32, u64>,
+    /// `psStakePools`' pool → its CURRENT VRF key, for the exemption above.
+    /// A pool absent here is registering for the first time.
+    pub pool_current_vrf: HashMap<Hash28, Hash32>,
+}
+
 /// `Clone` is cheap by construction: every heavyweight field is an [`Arc`] or
 /// an `imbl` persistent map, so a clone is a refcount bump, not a deep copy.
 /// Post-block mempool revalidation (#996) needs one context per transaction.
@@ -309,7 +336,9 @@ pub struct ValidationContext {
     /// refund-mismatch predicate is silently skipped (lenient default —
     /// matches the convention used by `stake_key_deposits`).
     pub drep_deposits: Option<Arc<HashMap<Hash32, u64>>>,
-    pub registered_vrf_keys: Option<Arc<HashMap<Hash32, Hash28>>>,
+    /// `psVRFKeyHashes` plus the pool→current-key map the re-registration
+    /// exemption needs (#1085). See [`VrfKeyRegistry`].
+    pub registered_vrf_keys: Option<Arc<VrfKeyRegistry>>,
     pub node_network: Option<NetworkId>,
     pub committee_members: Option<Arc<HashSet<Hash32>>>,
     pub committee_resigned: Option<Arc<HashSet<Hash32>>>,
@@ -548,13 +577,13 @@ impl ValidationContext {
         self
     }
 
-    pub fn with_vrf_keys(mut self, keys: HashMap<Hash32, Hash28>) -> Self {
-        self.registered_vrf_keys = Some(Arc::new(keys));
+    pub fn with_vrf_key_registry(mut self, registry: VrfKeyRegistry) -> Self {
+        self.registered_vrf_keys = Some(Arc::new(registry));
         self
     }
 
-    pub fn with_vrf_keys_arc(mut self, keys: Arc<HashMap<Hash32, Hash28>>) -> Self {
-        self.registered_vrf_keys = Some(keys);
+    pub fn with_vrf_key_registry_arc(mut self, registry: Arc<VrfKeyRegistry>) -> Self {
+        self.registered_vrf_keys = Some(registry);
         self
     }
 
@@ -827,7 +856,7 @@ impl ValidationContext {
         accounts: HashMap<Hash32, Lovelace>,
         epoch: u64,
         dreps: HashSet<Hash32>,
-        vrf_keys: HashMap<Hash32, Hash28>,
+        vrf_keys: VrfKeyRegistry,
         network: NetworkId,
         committee_members: HashSet<Hash32>,
         committee_resigned: HashSet<Hash32>,
@@ -3605,7 +3634,7 @@ pub fn validate_transaction_with_pools(
     reward_accounts: Option<&ImblMap<Hash32, Lovelace>>,
     current_epoch: Option<u64>,
     registered_dreps: Option<&HashSet<Hash32>>,
-    registered_vrf_keys: Option<&HashMap<Hash32, Hash28>>,
+    registered_vrf_keys: Option<&VrfKeyRegistry>,
     node_network: Option<dugite_primitives::network::NetworkId>,
     committee_members: Option<&HashSet<Hash32>>,
     committee_resigned: Option<&HashSet<Hash32>>,
@@ -4282,20 +4311,26 @@ pub fn validate_transaction_with_pools(
     // with its own validation, not a widening of this loop.
     // ------------------------------------------------------------------
     if params.protocol_version_major >= 11 {
-        if let Some(vrf_keys) = registered_vrf_keys {
+        if let Some(registry) = registered_vrf_keys {
             for cert in &tx.body.certificates {
                 if let dugite_primitives::transaction::Certificate::PoolRegistration(pool_params) =
                     cert
                 {
-                    // Check if this VRF key is held by a different pool.
-                    // Same pool re-registering with the same key is fine.
-                    if let Some(&existing_pool) = vrf_keys.get(&pool_params.vrf_keyhash) {
-                        if existing_pool != pool_params.operator {
-                            errors.push(ValidationError::VrfKeyHashAlreadyRegistered {
-                                vrf_keyhash: pool_params.vrf_keyhash.to_hex(),
-                                existing_pool_id: existing_pool.to_hex(),
-                            });
-                        }
+                    let vrf = pool_params.vrf_keyhash;
+                    // The exemption is "this is ALREADY my key", taken from
+                    // `psStakePools`, NOT "some entry names me". A pool absent
+                    // from `pool_current_vrf` is registering for the first time
+                    // and gets no exemption at all.
+                    let keeps_own_key =
+                        registry.pool_current_vrf.get(&pool_params.operator) == Some(&vrf);
+                    if !keeps_own_key && registry.occurrences.contains_key(&vrf) {
+                        errors.push(ValidationError::VrfKeyHashAlreadyRegistered {
+                            vrf_keyhash: vrf.to_hex(),
+                            // The registry counts occurrences and does not name
+                            // a holder; report the pool that is being refused,
+                            // which is the one the operator can act on.
+                            existing_pool_id: pool_params.operator.to_hex(),
+                        });
                     }
                 }
             }

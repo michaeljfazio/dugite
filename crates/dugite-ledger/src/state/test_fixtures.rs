@@ -134,6 +134,11 @@ pub fn populated_ledger_state() -> LedgerState {
         .certs
         .pending_retirements
         .insert(h28(0x15), EpochNo(320));
+    // `psVRFKeyHashes` — a count above one on purpose: that is the state a
+    // pre-PV11 duplicate leaves behind, and a layout that only ever saw 1
+    // would not exercise the field's width.
+    state.certs.vrf_key_hashes.insert(h32(0x72), 2);
+    state.certs.vrf_key_hashes.insert(h32(0x73), 1);
     state
         .certs
         .reward_accounts

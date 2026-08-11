@@ -658,9 +658,43 @@ pub(crate) fn apply_shelley_cert(
                 metadata_url: params.pool_metadata.as_ref().map(|m| m.url.clone()),
                 metadata_hash: params.pool_metadata.as_ref().map(|m| m.hash),
             };
+            // `psVRFKeyHashes` maintenance (#1085), from PV11 only —
+            // `hardforkConwayDisallowDuplicatedVRFKeys`. Below it the map is
+            // unused and upstream's `updateVRFKeyHash` is `id`, so leaving it
+            // untouched is the faithful no-op rather than an omission.
+            //
+            // Note both arms INSERT the count as 1 rather than incrementing:
+            // the POOL rule's own predicate has already established the key is
+            // unheld, so a value above one can only come from the fork seeding.
+            let track_vrf = epochs.protocol_params.protocol_version_major >= 11;
+
             // Re-registration: defer to future_pool_params and cancel pending retirement.
             // First registration: apply immediately and record deposit.
             if certs.pool_params.contains_key(&params.operator) {
+                if track_vrf {
+                    // `updateFutureVRFKeyHash`: claim the new key, and drop the
+                    // key claimed by an EARLIER re-registration in this same
+                    // epoch, which this certificate supersedes.
+                    //
+                    // ```haskell
+                    // case Map.lookup ppId psFutureStakePools of
+                    //   Nothing -> Map.insert ppVrf 1
+                    //   Just f | f ^. spsVrfL /= ppVrf ->
+                    //              Map.insert ppVrf 1 . Map.delete (f ^. spsVrfL)
+                    //          | otherwise -> id
+                    // ```
+                    match certs.future_pool_params.get(&params.operator) {
+                        Some(pending) if pending.vrf_keyhash == params.vrf_keyhash => {}
+                        Some(pending) => {
+                            let superseded = pending.vrf_keyhash;
+                            certs.vrf_key_hashes.remove(&superseded);
+                            certs.vrf_key_hashes.insert(params.vrf_keyhash, 1);
+                        }
+                        None => {
+                            certs.vrf_key_hashes.insert(params.vrf_keyhash, 1);
+                        }
+                    }
+                }
                 certs.pending_retirements.remove(&params.operator);
                 certs.future_pool_params.insert(params.operator, pool_reg);
                 debug!(
@@ -668,6 +702,9 @@ pub(crate) fn apply_shelley_cert(
                     params.operator.to_hex()
                 );
             } else {
+                if track_vrf {
+                    certs.vrf_key_hashes.insert(params.vrf_keyhash, 1);
+                }
                 Arc::make_mut(&mut certs.pool_params).insert(params.operator, pool_reg);
                 certs
                     .pool_deposits
@@ -1275,6 +1312,7 @@ mod tests {
             pool_params: Arc::new(HashMap::new()),
             future_pool_params: HashMap::new(),
             pending_retirements: HashMap::new(),
+            vrf_key_hashes: Default::default(),
             reward_accounts: imbl::HashMap::new(),
             stake_key_deposits: imbl::HashMap::new(),
             pool_deposits: HashMap::new(),

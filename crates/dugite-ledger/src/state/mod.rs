@@ -135,7 +135,17 @@ pub(crate) struct CachedValidationRegistry {
     /// `certs.pool_params` Arc the pool registries were derived from (ptr-eq key).
     pub pool_params_src: std::sync::Arc<std::collections::HashMap<Hash28, PoolRegistration>>,
     pub pools: std::sync::Arc<std::collections::HashSet<Hash28>>,
-    pub vrf_keys: std::sync::Arc<std::collections::HashMap<Hash32, Hash28>>,
+    /// `certs.vrf_key_hashes` the registry was derived from — a SECOND ptr-eq
+    /// key, and it is not optional (#1085).
+    ///
+    /// The VRF registry depends on two sources, and they move independently: a
+    /// re-registration updates `vrf_key_hashes` and `future_pool_params`
+    /// while leaving `pool_params` untouched, so keying the cache on
+    /// `pool_params` alone would serve a registry that is stale in exactly the
+    /// direction the predicate cares about — the pending key would look
+    /// unclaimed and a second pool could take it.
+    pub vrf_key_hashes_src: ImblHashMap<Hash32, u64>,
+    pub vrf_keys: std::sync::Arc<crate::validation::VrfKeyRegistry>,
     /// `gov.governance.dreps` imbl map the DRep set was derived from (ptr-eq key).
     pub dreps_src: ImblHashMap<Hash32, DRepRegistration>,
     pub dreps: std::sync::Arc<std::collections::HashSet<Hash32>>,
@@ -1231,13 +1241,25 @@ impl LedgerState {
         let mut ctx = crate::validation::ValidationContext::new()
             .with_pools(self.certs.pool_params.keys().copied().collect())
             .with_dreps(gov.dreps.keys().copied().collect())
-            .with_vrf_keys(
-                self.certs
+            // `psVRFKeyHashes` — the MAINTAINED registry, not a fold over the
+            // live pool set (#1085). The derived version omitted pending
+            // re-registrations, released a retiring pool's key early, and
+            // could not represent a pre-PV11 duplicate; each of those is an
+            // accept-where-Haskell-rejects.
+            .with_vrf_key_registry(crate::validation::VrfKeyRegistry {
+                occurrences: self
+                    .certs
+                    .vrf_key_hashes
+                    .iter()
+                    .map(|(h, c)| (*h, *c))
+                    .collect(),
+                pool_current_vrf: self
+                    .certs
                     .pool_params
                     .values()
-                    .map(|reg| (reg.vrf_keyhash, reg.pool_id))
+                    .map(|reg| (reg.pool_id, reg.vrf_keyhash))
                     .collect(),
-            )
+            })
             .with_active_proposals(active_proposals)
             .with_enacted_gov_roots(self.enacted_gov_roots())
             .with_committee_authorized_hot_keys(gov.committee_hot_keys.values().copied().collect())
@@ -1285,6 +1307,7 @@ impl LedgerState {
                 pool_params: Arc::new(HashMap::new()),
                 future_pool_params: HashMap::new(),
                 pending_retirements: HashMap::new(),
+                vrf_key_hashes: ImblHashMap::new(),
                 reward_accounts: ImblHashMap::new(),
                 stake_key_deposits: ImblHashMap::new(),
                 pool_deposits: HashMap::new(),
@@ -1859,6 +1882,25 @@ impl LedgerState {
                 pool_params: Arc::new(pool_params_map),
                 future_pool_params,
                 pending_retirements,
+                // `psVRFKeyHashes`, taken from the snapshot rather than
+                // recomputed. The decoder has always read PState's field [0]
+                // (`map(bytes(32) -> uint)`) — it simply had no destination
+                // until #1085 gave it one.
+                //
+                // Deriving it from the pool set here would be wrong for the
+                // reason documented at `CertSubState::vrf_key_hashes`: after a
+                // POOLREAP that deletes a superseded key still held by another
+                // pool, upstream's map and any derived count disagree. A
+                // Mithril import lands at PV11 on every live network, which is
+                // exactly where the rule is enforced.
+                vrf_key_hashes: hs
+                    .new_epoch_state
+                    .cert_state
+                    .pstate
+                    .vrf_key_hashes
+                    .iter()
+                    .map(|(h, c)| (*h, *c))
+                    .collect::<ImblHashMap<_, _>>(),
                 reward_accounts: reward_accounts.into_iter().collect::<ImblHashMap<_, _>>(),
                 stake_key_deposits: stake_key_deposits
                     .into_iter()

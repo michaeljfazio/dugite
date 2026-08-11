@@ -11798,9 +11798,13 @@ mod tests {
             )));
 
         // registered_vrf_keys: shared_vrf is already held by pool_a
-        let mut registered_vrf_keys: std::collections::HashMap<Hash32, Hash28> =
-            std::collections::HashMap::new();
-        registered_vrf_keys.insert(shared_vrf, pool_a);
+        // `psVRFKeyHashes` holds an occurrence count; `pool_current_vrf` carries
+        // the pool -> its-own-key map the re-registration exemption needs.
+        let mut registered_vrf_keys = crate::validation::VrfKeyRegistry::default();
+        registered_vrf_keys.occurrences.insert(shared_vrf, 1);
+        registered_vrf_keys
+            .pool_current_vrf
+            .insert(pool_a, shared_vrf);
 
         // registered_pools: pool_b is NEW (so deposit is charged → value conserved)
         let registered_pools: std::collections::HashSet<Hash28> = std::collections::HashSet::new();
@@ -11879,9 +11883,9 @@ mod tests {
         tx.witness_set.vkey_witnesses.push(owner_witness);
 
         // VRF key is currently held by pool_a itself — re-registration is fine.
-        let mut registered_vrf_keys: std::collections::HashMap<Hash32, Hash28> =
-            std::collections::HashMap::new();
-        registered_vrf_keys.insert(own_vrf, pool_a);
+        let mut registered_vrf_keys = crate::validation::VrfKeyRegistry::default();
+        registered_vrf_keys.occurrences.insert(own_vrf, 1);
+        registered_vrf_keys.pool_current_vrf.insert(pool_a, own_vrf);
 
         // pool_a is already registered → re-reg (no deposit charged)
         let mut registered_pools: std::collections::HashSet<Hash28> =
@@ -11956,9 +11960,13 @@ mod tests {
                 pool_b, shared_vrf,
             )));
 
-        let mut registered_vrf_keys: std::collections::HashMap<Hash32, Hash28> =
-            std::collections::HashMap::new();
-        registered_vrf_keys.insert(shared_vrf, pool_a);
+        // `psVRFKeyHashes` holds an occurrence count; `pool_current_vrf` carries
+        // the pool -> its-own-key map the re-registration exemption needs.
+        let mut registered_vrf_keys = crate::validation::VrfKeyRegistry::default();
+        registered_vrf_keys.occurrences.insert(shared_vrf, 1);
+        registered_vrf_keys
+            .pool_current_vrf
+            .insert(pool_a, shared_vrf);
 
         let registered_pools: std::collections::HashSet<Hash28> = std::collections::HashSet::new();
 
@@ -12037,9 +12045,11 @@ mod tests {
                     pool_b, shared_vrf,
                 )));
 
-            let mut registered_vrf_keys: std::collections::HashMap<Hash32, Hash28> =
-                std::collections::HashMap::new();
-            registered_vrf_keys.insert(shared_vrf, pool_a);
+            let mut registered_vrf_keys = crate::validation::VrfKeyRegistry::default();
+            registered_vrf_keys.occurrences.insert(shared_vrf, 1);
+            registered_vrf_keys
+                .pool_current_vrf
+                .insert(pool_a, shared_vrf);
             let registered_pools: std::collections::HashSet<Hash28> =
                 std::collections::HashSet::new();
 
