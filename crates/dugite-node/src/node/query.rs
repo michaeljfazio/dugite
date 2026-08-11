@@ -1736,6 +1736,7 @@ mod tests {
             registered_epoch: EpochNo(registered_epoch),
             drep_expiry: EpochNo(drep_expiry),
             active: true,
+            delegs: Default::default(),
         }
     }
 

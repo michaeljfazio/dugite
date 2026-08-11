@@ -1930,6 +1930,7 @@ impl Node {
                         registered_epoch: EpochNo(0),
                         drep_expiry: EpochNo(drep_activity),
                         active: true,
+                        delegs: Default::default(),
                     },
                 );
             }

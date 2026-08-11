@@ -793,6 +793,9 @@ async fn run_dump_snapshot(args: DumpSnapshotArgs) -> Result<()> {
                     registered_epoch: EpochNo(0),
                     drep_expiry: EpochNo(drep_activity),
                     active: true,
+                    // A genesis DRep starts with no delegators, like
+                    // `ConwayRegDRep`'s `drepDelegs = mempty`.
+                    delegs: Default::default(),
                 },
             );
         }
