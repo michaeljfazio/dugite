@@ -289,6 +289,11 @@ pub fn populated_ledger_state() -> LedgerState {
             registered_epoch: EpochNo(310),
             drep_expiry: EpochNo(330),
             active: true,
+            delegs: {
+                let mut s = imbl::HashSet::new();
+                s.insert(h32(0x71));
+                s
+            },
         },
     );
     gov.vote_delegations

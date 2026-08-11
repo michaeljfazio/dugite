@@ -606,6 +606,7 @@ fn drep_registration_reflected_in_tip_state() {
         registered_epoch: EpochNo(10),
         drep_expiry: EpochNo(30),
         active: true,
+        delegs: Default::default(),
     };
 
     let mut delta = LedgerDelta::new(SlotNo(1), h(1), BlockNo(1));
@@ -639,6 +640,7 @@ fn drep_unregistration_removes_from_dreps() {
         registered_epoch: EpochNo(10),
         drep_expiry: EpochNo(30),
         active: true,
+        delegs: Default::default(),
     };
 
     let mut d1 = LedgerDelta::new(SlotNo(1), h(1), BlockNo(1));

@@ -1280,6 +1280,7 @@ impl RatificationFixture {
                         registered_epoch: EpochNo(0),
                         drep_expiry: EpochNo(u64::MAX / 2),
                         active: true,
+                        delegs: Default::default(),
                     });
             }
             fixture_drep_no_confidence = drep_no_confidence;

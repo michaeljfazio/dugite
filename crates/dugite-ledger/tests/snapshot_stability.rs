@@ -120,6 +120,8 @@ fn snapshot_format_hash_stability() {
     //     xtask/tests/snapshot_one_bump_invariant.rs)
     //   ea9ce3ba3840ac8d99da93a47062410f322ed7736466b167ca2e536ad2f48e54
     //     SNAPSHOT 38 + #1072/Phase-1a RUPD fields, pre-#1073
+    //   13ccf15836c55ac86885c9c9a5d0f8aa2347351b8421143cb51e5631454301ba
+    //     SNAPSHOT 38 + #1073 `PulsedRatifyState.enact_state`, pre-#1084
     //
     // Current: SNAPSHOT 38, extended in place. #1067 added
     // `EpochSubState.non_myopic` + `PendingRewardUpdate.non_myopic`; #1072 adds
@@ -133,7 +135,12 @@ fn snapshot_format_hash_stability() {
     // `ensCommittee` / `ensConstitution` / `ensPrevGovActionIds`, captured from
     // the pulser's own dry run so the frozen plan is one boundary ahead of live
     // governance state exactly as upstream's is.
-    const EXPECTED_HASH: &str = "13ccf15836c55ac86885c9c9a5d0f8aa2347351b8421143cb51e5631454301ba";
+    //
+    // #1084 joins them with `DRepRegistration.delegs` — Haskell's `drepDelegs`,
+    // the reverse index a DRep deregistration uses to orphan its delegators.
+    // It cannot be derived from the forward map below PV10 (ledger #4772), so
+    // it is stored rather than reconstructed.
+    const EXPECTED_HASH: &str = "0d232f9217eadbb64a7e274dc120e6348178f5dc3d95d2b2c14d940f927e366b";
 
     if EXPECTED_HASH == "COMPUTE_ON_FIRST_RUN" {
         panic!(

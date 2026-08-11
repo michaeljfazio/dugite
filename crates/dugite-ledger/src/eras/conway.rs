@@ -964,10 +964,57 @@ impl EraRules for ConwayRules {
             );
         }
 
-        // === Step 12: HARDFORK check ===
-        // HardForkInitiation actions set protocol_version during enactment
-        // in ratify_proposals_impl. The consensus layer detects the version
-        // bump and triggers the actual hardfork. No additional logic needed.
+        // === Step 12: HARDFORK rule ===
+        //
+        // This said "No additional logic needed" and that was wrong. Conway has
+        // an INTRA-ERA hard-fork rule with real state effects
+        // (`Rules/HardFork.hs`), fired from `epochTransition` after enactment
+        // and immediately BEFORE `setFreshDRepPulsingState`:
+        //
+        // ```haskell
+        // epochState2 <- do
+        //   let curPv = epochState1 ^. curPParamsEpochStateL . ppProtocolVersionL
+        //   if curPv /= epochState1 ^. prevPParamsEpochStateL . ppProtocolVersionL
+        //     then trans @(EraRule "HARDFORK" era) $ TRC ((), epochState1, curPv)
+        //     else pure epochState1
+        // liftSTS $ setFreshDRepPulsingState eNo stakePoolDistr epochState2
+        // ```
+        //
+        // The ordering is load-bearing: the pulser frozen at this boundary must
+        // see the POST-cleanup state, so this cannot move below step 13.
+        //
+        // Dispatch is on the NEW major version. Comparing majors alone is
+        // equivalent to upstream's full `ProtVer` inequality here, because both
+        // arms test `== 10` / `== 11` exactly — a minor-only bump enters the
+        // rule and matches neither, which is the identity it would have been.
+        if epochs.protocol_params.protocol_version_major != old_proto_major {
+            match epochs.protocol_params.protocol_version_major {
+                10 => {
+                    // `updateDRepDelegations` — the one-shot reconciliation of
+                    // the #4772 mess: empty every `delegs`, re-index from the
+                    // forward map, and DELETE any delegation pointing at a DRep
+                    // that does not exist. Both preprod and mainnet are past
+                    // this fork, so a from-genesis replay must perform it.
+                    crate::state::governance::update_drep_delegations(Arc::make_mut(
+                        &mut gov.governance,
+                    ));
+                    debug!(
+                        boundary_epoch = new_epoch.0,
+                        "HARDFORK pv10: DRep delegations reconciled"
+                    );
+                }
+                11 => {
+                    // NOT IMPLEMENTED, and named rather than skipped silently.
+                    // The pvMajor-11 arm is `populateVRFKeyHashes`, folding an
+                    // occurrence count of every current and future pool's VRF
+                    // key into `psVRFKeyHashes`. dugite models no such map, so
+                    // there is nothing to populate — implementing it means
+                    // adding the state first, and a half-built one would be
+                    // worse than its absence (#979). Tracked under #1084.
+                }
+                _ => {}
+            }
+        }
 
         // === Step 13: setFreshDRepPulsingState ===
         // Pass the OLD epoch (ctx.current_epoch) for the snapshot label, matching
@@ -1215,6 +1262,9 @@ impl EraRules for ConwayRules {
                         anchor: None,
                         registered_epoch: ctx.current_epoch,
                         active: true,
+                        // `ConwayRegDRep` starts `drepDelegs = mempty`; a
+                        // genesis DRep has no delegators until one delegates.
+                        delegs: Default::default(),
                     });
             }
 
@@ -1565,6 +1615,11 @@ pub(crate) fn apply_conway_cert(
                 .saturating_sub(stored_deposit);
             certs.delegations.remove(&key);
             certs.reward_accounts.remove(&key);
+            // `ConwayUnRegCert` runs `processDRepUnDelegation` before dropping
+            // the account, so the DRep this credential delegated to loses it
+            // from `drepDelegs` too. Must precede the forward removal — the
+            // reverse index is found THROUGH the forward entry.
+            crate::state::governance::undelegate_vote(key, governance);
             governance.vote_delegations.remove(&key);
             certs.script_stake_credentials.remove(&key);
             certs.pointer_map.retain(|_, v| *v != key);
@@ -1587,6 +1642,12 @@ pub(crate) fn apply_conway_cert(
                     registered_epoch: current_epoch,
                     drep_expiry,
                     active: true,
+                    // `ConwayRegDRep`: `drepDelegs = mempty`. A re-registration
+                    // after a deregistration therefore comes back with NONE of
+                    // its former delegators — they were cleared by the dereg
+                    // and must delegate again. That is the whole mechanism
+                    // behind #1084's measured divergence.
+                    delegs: Default::default(),
                 },
             );
             governance.drep_registration_count += 1;
@@ -1599,7 +1660,28 @@ pub(crate) fn apply_conway_cert(
             refund: _,
         } => {
             let key = credential.to_typed_hash32();
-            governance.dreps.remove(&key);
+            // `ConwayUnRegDRep` has TWO mutations (`GovCert.hs`) and this path
+            // performed only the first for as long as it has existed:
+            //
+            //   certState' = certState & certVStateL . vsDRepsL %~ Map.delete cred
+            //   … & certDStateL . accountsL . accountsMapL
+            //       %~ clearDRepDelegations (drepDelegs dRepState)
+            //
+            // Dropping the registration while leaving the delegations behind
+            // left stale voting power in `psDRepDistr`, which IS RATIFY's
+            // `reDRepDistr` — so the stale stake landed in
+            // `dRepAcceptedRatio`'s DENOMINATOR as implicit-NO and pushed every
+            // ratio down. False-reject direction, and a near-threshold action
+            // flips (#1084).
+            //
+            // The clear is driven by the DRep's own `delegs` set, NOT by
+            // scanning the forward map for current delegators: below PV10 the
+            // two differ, and upstream clears what the set says.
+            if let Some(state) = governance.dreps.remove(&key) {
+                for stake_cred in state.delegs.iter() {
+                    governance.vote_delegations.remove(stake_cred);
+                }
+            }
             debug!("DRep deregistered: {}", key.to_hex());
         }
 
@@ -1619,7 +1701,11 @@ pub(crate) fn apply_conway_cert(
         // Vote delegation: delegate stake credential's vote to a DRep.
         Certificate::VoteDelegation { credential, drep } => {
             let key = credential.to_typed_hash32();
-            governance.vote_delegations.insert(key, drep.clone());
+            // Both directions, and the #4772 quirk below PV10 — see
+            // `delegate_vote`. A bare forward insert leaves the PREVIOUS DRep
+            // still listing this credential, which its deregistration would
+            // then use to clear a delegation that has moved on.
+            crate::state::governance::delegate_vote(pv_major < 10, key, drep, governance);
             debug!("Vote delegated to DRep: {}", key.to_hex());
         }
 
@@ -1631,7 +1717,7 @@ pub(crate) fn apply_conway_cert(
         } => {
             let key = credential.to_typed_hash32();
             certs.delegations.insert(key, *pool_hash);
-            governance.vote_delegations.insert(key, drep.clone());
+            crate::state::governance::delegate_vote(pv_major < 10, key, drep, governance);
             debug!(
                 "Stake+vote delegated: {} -> pool {} + DRep",
                 key.to_hex(),
@@ -1687,9 +1773,11 @@ pub(crate) fn apply_conway_cert(
             }
             certs.total_stake_key_deposits += deposit.0;
             certs.stake_key_deposits.insert(key, deposit.0);
-            // Delegate to pool + DRep.
+            // Delegate to pool + DRep. `ConwayRegDelegCert` goes through
+            // `processDelegationInternal` too, with no current delegatee to
+            // clean up — the credential is being registered by this very cert.
             certs.delegations.insert(key, *pool_hash);
-            governance.vote_delegations.insert(key, drep.clone());
+            crate::state::governance::delegate_vote(pv_major < 10, key, drep, governance);
             debug!(
                 "RegStakeVoteDeleg: {} -> pool {} + DRep",
                 key.to_hex(),
@@ -1717,7 +1805,7 @@ pub(crate) fn apply_conway_cert(
             certs.total_stake_key_deposits += deposit.0;
             certs.stake_key_deposits.insert(key, deposit.0);
             // Delegate vote.
-            governance.vote_delegations.insert(key, drep.clone());
+            crate::state::governance::delegate_vote(pv_major < 10, key, drep, governance);
             debug!("VoteRegDeleg: {} + DRep", key.to_hex());
         }
 
@@ -2996,6 +3084,97 @@ mod tests {
         assert_eq!(drep.registered_epoch, EpochNo(5));
     }
 
+    /// #1084, driven through the PRODUCTION certificate path.
+    ///
+    /// The helper-level test in `state::governance` bounds `delegate_vote` and
+    /// the wipe as functions; this one bounds the SYSTEM. `apply_conway_cert`
+    /// is where the defect actually lived — the wipe existed in
+    /// `certificates.rs`'s legacy helper the whole time, and that helper's own
+    /// comment asserted this path "has always matched Haskell". A unit test on
+    /// the helper is green under that arrangement, which is exactly how the
+    /// #977 and #1057 families survived review.
+    #[test]
+    fn drep_dereg_through_the_real_cert_path_orphans_delegators() {
+        let rules = ConwayRules::new();
+        let params = ProtocolParameters::mainnet_defaults();
+        let ctx = make_conway_ctx(&params);
+
+        let mut utxo = make_utxo_sub(vec![]);
+        let mut certs = make_cert_sub();
+        let mut gov = make_gov_sub();
+        let mut epochs = make_epoch_sub();
+
+        let drep_cred = Credential::VerificationKey(Hash28::from_bytes([0xDD; 28]));
+        let drep_key = drep_cred.to_typed_hash32();
+        let staker_cred = Credential::VerificationKey(Hash28::from_bytes([0xAA; 28]));
+        let staker_key = staker_cred.to_typed_hash32();
+
+        // Register the DRep, then delegate a vote to it — both through the
+        // production path, so the reverse index is built the way a real chain
+        // builds it.
+        let mut tx = make_tx(0x01, vec![], vec![], 0);
+        tx.body.certificates = vec![
+            Certificate::RegDRep {
+                credential: drep_cred.clone(),
+                deposit: Lovelace(500_000_000),
+                anchor: None,
+            },
+            Certificate::VoteDelegation {
+                credential: staker_cred.clone(),
+                drep: DRep::KeyHash(drep_key),
+            },
+        ];
+        rules
+            .apply_valid_tx(
+                &tx,
+                BlockValidationMode::ApplyOnly,
+                &ctx,
+                &mut utxo,
+                &mut certs,
+                &mut gov,
+                &mut epochs,
+            )
+            .expect("register + delegate");
+
+        assert!(
+            gov.governance.vote_delegations.contains_key(&staker_key),
+            "fixture is wrong: the delegation must exist before the dereg"
+        );
+        assert!(
+            gov.governance.dreps[&drep_key].delegs.contains(&staker_key),
+            "fixture is wrong: the reverse index must be populated, else the \
+             wipe has nothing to act on and this test cannot fail"
+        );
+
+        // Deregister. Haskell clears the delegation of everyone in `drepDelegs`.
+        let mut tx2 = make_tx(0x02, vec![], vec![], 0);
+        tx2.body.certificates = vec![Certificate::UnregDRep {
+            credential: drep_cred,
+            refund: Lovelace(500_000_000),
+        }];
+        rules
+            .apply_valid_tx(
+                &tx2,
+                BlockValidationMode::ApplyOnly,
+                &ctx,
+                &mut utxo,
+                &mut certs,
+                &mut gov,
+                &mut epochs,
+            )
+            .expect("deregister");
+
+        assert!(
+            !gov.governance.dreps.contains_key(&drep_key),
+            "the registration must be gone"
+        );
+        assert!(
+            !gov.governance.vote_delegations.contains_key(&staker_key),
+            "the delegation must be gone too — leaving it is #1084, and it \
+             feeds RATIFY's denominator as implicit-NO stake"
+        );
+    }
+
     /// Process Conway vote delegation certificate.
     #[test]
     fn test_conway_vote_delegation() {
@@ -3362,6 +3541,7 @@ mod tests {
                 registered_epoch: EpochNo(2),
                 drep_expiry: EpochNo(22), // epoch 2 + drep_activity 20
                 active: true,
+                delegs: Default::default(),
             },
         );
 
@@ -3425,6 +3605,7 @@ mod tests {
                     registered_epoch: EpochNo(2),
                     drep_expiry: EpochNo(22),
                     active: false,
+                    delegs: Default::default(),
                 },
             );
             // DRep B: far-expired, expiry 3 → bumped 3+29=32 (< 40) → NOT revived.
@@ -3437,6 +3618,7 @@ mod tests {
                     registered_epoch: EpochNo(2),
                     drep_expiry: EpochNo(3),
                     active: false,
+                    delegs: Default::default(),
                 },
             );
         }
@@ -3503,6 +3685,7 @@ mod tests {
                 registered_epoch: EpochNo(2),
                 drep_expiry: EpochNo(22),
                 active: true,
+                delegs: Default::default(),
             },
         );
 
@@ -4250,6 +4433,7 @@ mod tests {
                     anchor: None,
                     registered_epoch: EpochNo(450),
                     active: true,
+                    delegs: Default::default(),
                 },
             );
             // Mutated committee (different cred + expiry than genesis).
@@ -4951,6 +5135,7 @@ mod tests {
                     registered_epoch: EpochNo(0),
                     drep_expiry: EpochNo(100),
                     active: true,
+                    delegs: Default::default(),
                 },
             );
             let stake_key = Hash32::from_bytes([200u8 + i; 32]);
@@ -5424,6 +5609,7 @@ mod tests {
                     registered_epoch: EpochNo(0),
                     drep_expiry: EpochNo(200),
                     active: true,
+                    delegs: Default::default(),
                 },
             );
             let stake_key = Hash32::from_bytes([200u8 + i; 32]);

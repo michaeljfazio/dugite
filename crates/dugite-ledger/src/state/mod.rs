@@ -862,6 +862,36 @@ pub struct DRepRegistration {
     /// Whether this DRep is currently active (per CIP-1694 activity tracking).
     /// Inactive DReps remain registered but are excluded from voting power calculations.
     pub active: bool,
+    /// `drepDelegs` — the staking credentials delegating their VOTE to this
+    /// DRep. Haskell's `DRepState` carries it as a `Set (Credential 'Staking)`
+    /// and it is the 4th field of its CBOR encoding.
+    ///
+    /// # It is not derivable from the forward map, and that is the whole point
+    ///
+    /// `ConwayUnRegDRep` has TWO state mutations, not one (`GovCert.hs`):
+    ///
+    /// ```haskell
+    /// certState' = certState & certVStateL . vsDRepsL %~ Map.delete cred
+    /// clearDRepDelegations delegs accountsMap =
+    ///   foldr (Map.adjust (dRepDelegationAccountStateL .~ Nothing)) accountsMap delegs
+    /// ```
+    ///
+    /// so deregistering a DRep ORPHANS its delegators — and since
+    /// `ConwayRegDRep` starts `drepDelegs = mempty`, a dereg/re-reg cycle
+    /// leaves the re-registered DRep with none of them. dugite tracked only the
+    /// forward map and so kept counting them forever (#1084).
+    ///
+    /// At protocol version 10 and above this set happens to equal
+    /// `{a : vote_delegations[a] == this}`, so a `retain` over the forward map
+    /// would give the same answer. **Below 10 it does not**, and that is why
+    /// the set is stored rather than derived: `processDelegationInternal`
+    /// preserves ledger #4772 at PV9, leaving delegators who have already moved
+    /// to another DRep in this set, whereupon this DRep's dereg collaterally
+    /// clears a delegation that no longer points at it. Reproducing the number
+    /// with a `retain` would be right on today's networks and wrong on the
+    /// replay of their history.
+    #[serde(default)]
+    pub delegs: ImblHashSet<Hash32>,
 }
 
 impl GovernanceState {
@@ -1512,12 +1542,39 @@ impl LedgerState {
                     registered_epoch: EpochNo(0), // Not tracked in Haskell snapshot
                     drep_expiry: drep_state.expiry,
                     active: hs.epoch.0 <= drep_state.expiry.0,
+                    // Filled in below, once the forward map is available.
+                    delegs: Default::default(),
                 },
             );
         }
 
         // Vote delegations
         gov.vote_delegations = vote_delegations_map.into_iter().collect();
+
+        // `drepDelegs`, rebuilt from the forward map rather than decoded.
+        //
+        // The importer SKIPS `DRepState`'s 4th CBOR field (the delegator set)
+        // and a comment claimed it was "reconstructed from DState accounts".
+        // Nothing reconstructed it — a field with no writer, so every imported
+        // node had an empty set and a later deregistration cleared nothing
+        // (#1084, and #1067's shape: the import path silently dropping a record
+        // while looking authoritative).
+        //
+        // Rebuilding is EXACT here, and only here. From protocol version 10 the
+        // hard-fork rule `updateDRepDelegations` reindexes every set from the
+        // accounts map, and PV10+ delegation processing keeps the two in step,
+        // so `delegs` and the forward map agree by construction. Below PV10
+        // they do NOT — ledger #4772 leaves stale entries — but a Mithril
+        // snapshot tracks the live chain, and preprod and mainnet are both past
+        // that fork. Decoding the set would be strictly better and is the right
+        // change if a PV9 snapshot ever has to be imported.
+        for (stake_cred, drep) in gov.vote_delegations.iter() {
+            if let Some(target) = drep.credential_hash32() {
+                if let Some(state) = gov.dreps.get_mut(&target) {
+                    state.delegs.insert(*stake_cred);
+                }
+            }
+        }
 
         // Committee state
         for ((tag, hash28), auth) in &hs.new_epoch_state.cert_state.vstate.committee_state {

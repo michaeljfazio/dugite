@@ -107,6 +107,7 @@ fn setup_dreps_with_stake(state: &mut LedgerState, count: usize, stake_per_drep:
                 registered_epoch: EpochNo(0),
                 drep_expiry: EpochNo(20),
                 active: true,
+                delegs: Default::default(),
             },
         );
         // Set up vote delegation and stake
@@ -2007,6 +2008,7 @@ fn test_governance_proposal_expiry() {
             registered_epoch: EpochNo(0),
             drep_expiry: EpochNo(20),
             active: true,
+            delegs: Default::default(),
         },
     );
 
@@ -2459,6 +2461,7 @@ fn test_parameter_change_not_ratified_below_threshold() {
                 registered_epoch: EpochNo(0),
                 drep_expiry: EpochNo(20),
                 active: true,
+                delegs: Default::default(),
             },
         );
         // Set up vote delegation and stake for each DRep
@@ -3304,6 +3307,7 @@ fn test_arc_cow_governance_isolation() {
             registered_epoch: EpochNo(0),
             drep_expiry: EpochNo(20),
             active: true,
+            delegs: Default::default(),
         },
     );
 
@@ -6161,6 +6165,7 @@ fn setup_governance_state(
                 registered_epoch: EpochNo(0),
                 drep_expiry: EpochNo(20),
                 active: true,
+                delegs: Default::default(),
             },
         );
         let delegator_cred = Credential::VerificationKey(Hash28::from_bytes([(i + 100) as u8; 28]));
@@ -8602,6 +8607,7 @@ fn governance_test_state() -> LedgerState {
                 registered_epoch: EpochNo(0),
                 drep_expiry: EpochNo(20),
                 active: true,
+                delegs: Default::default(),
             },
         );
         // Vote-delegate to the DRep

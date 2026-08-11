@@ -2302,6 +2302,7 @@ mod tests {
                     anchor: None,
                     registered_epoch: EpochNo(650),
                     active: true,
+                    delegs: Default::default(),
                 },
             );
             g.committee_threshold = Some(Rational {
