@@ -1872,6 +1872,143 @@ fn compute_pulsed_ratify_state(
 /// on preview by the #988 detector (`boundary_epoch=743 predicted_at=741`),
 /// not by any test, because both the prediction and the application are
 /// self-consistent in isolation.
+/// Haskell `processDRepUnDelegation` — drop `stake_cred` from whatever DRep it
+/// currently delegates its vote to (`Deleg.hs`).
+///
+/// ```haskell
+/// unDelegVote vState = \case
+///   DRepCredential dRepCred ->
+///     let removeDelegation dRepState =
+///           dRepState {drepDelegs = Set.delete stakeCred (drepDelegs dRepState)}
+///      in vState & vsDRepsL %~ Map.adjust removeDelegation dRepCred
+///   _ -> vState
+/// ```
+///
+/// `Map.adjust` is a no-op on an absent key, so an unregistered target is
+/// simply skipped, and `Abstain`/`NoConfidence` have no set to leave. Returns
+/// the credential key it removed from, so the #4772 branch below can put it
+/// back — the ONLY reason this reports anything.
+///
+/// Unlike delegation, this has no protocol-version variation: it runs the same
+/// way at every PV, from stake-key deregistration and from the undelegation
+/// half of a re-delegation.
+pub(crate) fn undelegate_vote(
+    stake_cred: Hash32,
+    governance: &mut GovernanceState,
+) -> Option<Hash32> {
+    let current = governance.vote_delegations.get(&stake_cred)?;
+    let key = current.credential_hash32()?;
+    let drep = governance.dreps.get_mut(&key)?;
+    drep.delegs.remove(&stake_cred);
+    Some(key)
+}
+
+/// Haskell `processDelegationInternal`'s `delegVote` — record a vote
+/// delegation on BOTH sides of the index (`Deleg.hs`).
+///
+/// ```haskell
+/// delegVote dRep cState =
+///   let cState' = processDRepUnDelegation stakeCred mCurDelegatee cState
+///                   & certDStateL . accountsL
+///                     %~ adjustAccountState (dRepDelegationAccountStateL ?~ dRep) stakeCred
+///       dReps
+///         | preserveIncorrectDelegation = cState  ^. certVStateL . vsDRepsL
+///         | otherwise                   = cState' ^. certVStateL . vsDRepsL
+///    in case dRep of
+///         DRepCredential targetDRep
+///           | Just dRepState <- Map.lookup targetDRep dReps ->
+///               let dRepState' = dRepState {drepDelegs = Set.insert stakeCred (drepDelegs dRepState)}
+///                in cState' & certVStateL . vsDRepsL .~ Map.insert targetDRep dRepState' dReps
+///         _ -> cState'
+/// ```
+///
+/// # The #4772 branch, reproduced deliberately
+///
+/// `preserve_incorrect_delegation` is `pv_major < 10`. Read the Haskell
+/// carefully: on the matching branch the ENTIRE `dReps` map is written back
+/// over `cState'`. Below PV10 that map is the one captured BEFORE the
+/// undelegation, so re-delegating from X to a REGISTERED Y silently restores
+/// the delegator into X's set. X's eventual deregistration then clears a
+/// delegation that has long since moved to Y.
+///
+/// It is a real upstream bug, `Deleg.hs` names it in a comment, and it is
+/// consensus-visible — so it is reproduced rather than corrected. Note the
+/// asymmetry the `_ -> cState'` fallthrough creates: when the new target is
+/// unregistered, `Abstain` or `NoConfidence`, no write-back happens and the
+/// undelegation SURVIVES even at PV9.
+pub(crate) fn delegate_vote(
+    preserve_incorrect_delegation: bool,
+    stake_cred: Hash32,
+    new_drep: &DRep,
+    governance: &mut GovernanceState,
+) {
+    let previous = undelegate_vote(stake_cred, governance);
+    governance
+        .vote_delegations
+        .insert(stake_cred, new_drep.clone());
+
+    let Some(target) = new_drep.credential_hash32() else {
+        // `Abstain` / `NoConfidence`: no set to join, and the `_` branch keeps
+        // the undelegation.
+        return;
+    };
+    let Some(drep) = governance.dreps.get_mut(&target) else {
+        // Unregistered target — also the `_` branch.
+        return;
+    };
+    drep.delegs.insert(stake_cred);
+
+    if preserve_incorrect_delegation {
+        if let Some(prev) = previous {
+            if prev != target {
+                if let Some(old) = governance.dreps.get_mut(&prev) {
+                    old.delegs.insert(stake_cred);
+                }
+            }
+        }
+    }
+}
+
+/// Haskell `updateDRepDelegations` — the pvMajor-10 arm of the intra-era
+/// HARDFORK rule (`Rules/HardFork.hs`).
+///
+/// ```haskell
+/// updateDRepDelegations certState =
+///   let dReps = Map.map (\dRepState -> dRepState {drepDelegs = Set.empty}) (… vsDReps)
+///       (dRepsWithDelegations, accountsWithoutUnknownDRepDelegations) =
+///         Map.mapAccumWithKey adjustDelegations dReps accountsMap
+/// ```
+///
+/// A one-shot reconciliation of the mess #4772 leaves behind: every set is
+/// emptied, every account's forward delegation is re-indexed, and a delegation
+/// pointing at a DRep that does not exist is DELETED from the account rather
+/// than merely skipped.
+///
+/// It runs inside the epoch transition, after enactment and immediately before
+/// `setFreshDRepPulsingState` (`Epoch.hs`), so the pulser frozen at that
+/// boundary already sees the cleaned-up state. Both preprod and mainnet are
+/// past this fork, so a from-genesis replay of either must perform it.
+pub(crate) fn update_drep_delegations(gov: &mut GovernanceState) {
+    for drep in gov.dreps.iter_mut() {
+        drep.1.delegs.clear();
+    }
+    let mut dangling: Vec<Hash32> = Vec::new();
+    for (stake_cred, drep) in gov.vote_delegations.iter() {
+        let Some(target) = drep.credential_hash32() else {
+            continue; // Abstain / NoConfidence are not indexed and not dangling.
+        };
+        match gov.dreps.get_mut(&target) {
+            Some(state) => {
+                state.delegs.insert(*stake_cred);
+            }
+            None => dangling.push(*stake_cred),
+        }
+    }
+    for stake_cred in dangling {
+        gov.vote_delegations.remove(&stake_cred);
+    }
+}
+
 pub(crate) fn epoch_boundary_governance_step(
     new_epoch: EpochNo,
     epochs: &EpochSubState,
@@ -4793,6 +4930,7 @@ mod tests {
                     registered_epoch: EpochNo(0),
                     drep_expiry: EpochNo(0),
                     active: true,
+                    delegs: Default::default(),
                 },
             );
             let stake_key = Hash32::from_bytes([200 + i as u8; 32]);
@@ -5680,6 +5818,7 @@ mod tests {
                 registered_epoch: EpochNo(0),
                 drep_expiry: EpochNo(u64::MAX / 2),
                 active: true,
+                delegs: Default::default(),
             },
         );
 
@@ -8123,6 +8262,220 @@ mod tests {
         );
     }
 
+    /// Deregistering a DRep must ORPHAN its delegators (#1084).
+    ///
+    /// This is the preprod divergence in miniature. Two DReps deregistered and
+    /// re-registered inside a single epoch — 37 seconds and 17 minutes apart —
+    /// and because `ConwayRegDRep` starts `drepDelegs = mempty`, cardano-node
+    /// brought them back with NO delegators while dugite kept counting the old
+    /// ones for the rest of the chain. `psDRepDistr` IS RATIFY's
+    /// `reDRepDistr`, so the stale stake sat in `dRepAcceptedRatio`'s
+    /// denominator as implicit-NO: false-reject direction.
+    ///
+    /// The assertion that matters is the one AFTER re-registration. Checking
+    /// only that the dereg cleared the delegation would still pass an
+    /// implementation that rebuilt the set from the forward map, because by
+    /// then the forward map is empty too.
+    #[test]
+    fn deregistering_a_drep_orphans_its_delegators() {
+        let mut state = gov_test_state(1, 1);
+        let drep_cred = Credential::VerificationKey(Hash28::from_bytes([0x77; 28]));
+        let drep_key = drep_cred.to_typed_hash32();
+        let staker = Hash32::from_bytes([0x88; 32]);
+
+        let gov = Arc::make_mut(&mut state.gov.governance);
+        gov.dreps.insert(
+            drep_key,
+            DRepRegistration {
+                credential: drep_cred.clone(),
+                deposit: Lovelace(500_000_000),
+                anchor: None,
+                registered_epoch: EpochNo(0),
+                drep_expiry: EpochNo(100),
+                active: true,
+                delegs: Default::default(),
+            },
+        );
+
+        // PV10 semantics: no #4772 preservation in play here.
+        delegate_vote(false, staker, &DRep::KeyHash(drep_key), gov);
+        assert_eq!(
+            gov.dreps[&drep_key].delegs.len(),
+            1,
+            "the delegation must be recorded on BOTH sides of the index"
+        );
+
+        // Deregister — Haskell clears the delegation of everyone in `delegs`.
+        if let Some(s) = gov.dreps.remove(&drep_key) {
+            for c in s.delegs.iter() {
+                gov.vote_delegations.remove(c);
+            }
+        }
+        assert!(
+            !gov.vote_delegations.contains_key(&staker),
+            "the delegator must be orphaned by the deregistration"
+        );
+
+        // Re-register in the same epoch. Upstream starts `drepDelegs = mempty`,
+        // so the DRep comes back with nobody — this is the assertion that
+        // separates a stored index from one derived after the fact.
+        gov.dreps.insert(
+            drep_key,
+            DRepRegistration {
+                credential: drep_cred,
+                deposit: Lovelace(500_000_000),
+                anchor: None,
+                registered_epoch: EpochNo(0),
+                drep_expiry: EpochNo(100),
+                active: true,
+                delegs: Default::default(),
+            },
+        );
+        assert!(
+            gov.dreps[&drep_key].delegs.is_empty(),
+            "a re-registered DRep must come back with NO delegators"
+        );
+        assert!(
+            !gov.vote_delegations.contains_key(&staker),
+            "and the orphaned delegator must not reappear"
+        );
+    }
+
+    /// Ledger #4772, reproduced bug-for-bug: below PV10 a re-delegation to a
+    /// REGISTERED DRep leaves the delegator in the OLD DRep's set.
+    ///
+    /// Upstream writes the whole pre-undelegation `vsDReps` map back, undoing
+    /// the removal. It is a real upstream bug and consensus-visible, so
+    /// "correcting" it would itself be the divergence. From PV10 the removal
+    /// stands — the same input, two answers, which is why this drives both.
+    #[test]
+    fn pv9_preserves_the_stale_delegation_and_pv10_does_not() {
+        for (pv_below_10, old_should_retain) in [(true, true), (false, false)] {
+            let mut state = gov_test_state(1, 1);
+            let gov = Arc::make_mut(&mut state.gov.governance);
+            let staker = Hash32::from_bytes([0x88; 32]);
+
+            let mut reg = |b: u8| {
+                let cred = Credential::VerificationKey(Hash28::from_bytes([b; 28]));
+                let key = cred.to_typed_hash32();
+                gov.dreps.insert(
+                    key,
+                    DRepRegistration {
+                        credential: cred,
+                        deposit: Lovelace(500_000_000),
+                        anchor: None,
+                        registered_epoch: EpochNo(0),
+                        drep_expiry: EpochNo(100),
+                        active: true,
+                        delegs: Default::default(),
+                    },
+                );
+                key
+            };
+            let old = reg(0x01);
+            let new = reg(0x02);
+
+            delegate_vote(pv_below_10, staker, &DRep::KeyHash(old), gov);
+            delegate_vote(pv_below_10, staker, &DRep::KeyHash(new), gov);
+
+            assert!(
+                gov.dreps[&new].delegs.contains(&staker),
+                "the new DRep always gains the delegator (pv_below_10={pv_below_10})"
+            );
+            assert_eq!(
+                gov.dreps[&old].delegs.contains(&staker),
+                old_should_retain,
+                "the OLD DRep must retain the stale delegator below PV10 and \
+                 lose it from PV10 (pv_below_10={pv_below_10})"
+            );
+        }
+    }
+
+    /// The `_ -> cState'` fallthrough: when the new target is not a registered
+    /// credential DRep, no write-back happens, so the undelegation SURVIVES
+    /// even below PV10. Without this the PV9 branch would look like
+    /// "never remove", which is the wrong rule and would diverge the other way.
+    #[test]
+    fn pv9_undelegation_survives_when_the_new_target_is_not_registered() {
+        let mut state = gov_test_state(1, 1);
+        let gov = Arc::make_mut(&mut state.gov.governance);
+        let staker = Hash32::from_bytes([0x88; 32]);
+
+        let cred = Credential::VerificationKey(Hash28::from_bytes([0x01; 28]));
+        let old = cred.to_typed_hash32();
+        gov.dreps.insert(
+            old,
+            DRepRegistration {
+                credential: cred,
+                deposit: Lovelace(500_000_000),
+                anchor: None,
+                registered_epoch: EpochNo(0),
+                drep_expiry: EpochNo(100),
+                active: true,
+                delegs: Default::default(),
+            },
+        );
+
+        delegate_vote(true, staker, &DRep::KeyHash(old), gov);
+        assert!(gov.dreps[&old].delegs.contains(&staker));
+
+        // Abstain is not a credential DRep, so upstream takes `_ -> cState'`.
+        delegate_vote(true, staker, &DRep::Abstain, gov);
+        assert!(
+            !gov.dreps[&old].delegs.contains(&staker),
+            "PV9 keeps the removal when the new target has no set to join"
+        );
+    }
+
+    /// `updateDRepDelegations` — the pvMajor-10 hard-fork reconciliation.
+    /// Rebuilds every set from the forward map AND deletes delegations that
+    /// point at a DRep which does not exist.
+    #[test]
+    fn hardfork_pv10_reindexes_and_drops_dangling_delegations() {
+        let mut state = gov_test_state(1, 1);
+        let gov = Arc::make_mut(&mut state.gov.governance);
+
+        let cred = Credential::VerificationKey(Hash28::from_bytes([0x01; 28]));
+        let live = cred.to_typed_hash32();
+        gov.dreps.insert(
+            live,
+            DRepRegistration {
+                credential: cred,
+                deposit: Lovelace(500_000_000),
+                anchor: None,
+                registered_epoch: EpochNo(0),
+                drep_expiry: EpochNo(100),
+                active: true,
+                // Deliberately stale: a #4772 leftover the fork must clear.
+                delegs: {
+                    let mut s = imbl::HashSet::new();
+                    s.insert(Hash32::from_bytes([0xEE; 32]));
+                    s
+                },
+            },
+        );
+
+        let real = Hash32::from_bytes([0x88; 32]);
+        gov.vote_delegations.insert(real, DRep::KeyHash(live));
+        let dangling = Hash32::from_bytes([0x99; 32]);
+        gov.vote_delegations
+            .insert(dangling, DRep::KeyHash(Hash32::from_bytes([0xAB; 32])));
+
+        update_drep_delegations(gov);
+
+        assert_eq!(
+            gov.dreps[&live].delegs.len(),
+            1,
+            "every set is emptied and rebuilt from the forward map"
+        );
+        assert!(gov.dreps[&live].delegs.contains(&real));
+        assert!(
+            !gov.vote_delegations.contains_key(&dangling),
+            "a delegation to a non-existent DRep is DELETED, not merely skipped"
+        );
+        assert!(gov.vote_delegations.contains_key(&real));
+    }
+
     /// `rsEnactState` is SELF-INCLUSIVE: it carries the roots of the actions
     /// the SAME plan will enact, one boundary before live governance state
     /// gains them.
@@ -10485,6 +10838,7 @@ mod tests {
                 registered_epoch: EpochNo(0),
                 drep_expiry: EpochNo(100),
                 active: true,
+                delegs: Default::default(),
             },
         );
 

@@ -522,6 +522,12 @@ impl LedgerState {
     //     local pre-change v38 database is NOT protected by that and must be
     //     re-replayed — the version number cannot reject a layout that shares
     //     its number.
+    //
+    //     #1084 extends 38 again with `DRepRegistration.delegs` — Haskell's
+    //     `drepDelegs`, the reverse index `ConwayUnRegDRep` uses to clear its
+    //     delegators. Same reasoning, same untagged window. The Mithril import
+    //     path rebuilds it from the forward map, which is exact at PV10+; a
+    //     chunk replay builds it from the certificates directly.
     pub(crate) const SNAPSHOT_VERSION: u8 = 38;
 
     /// Save ledger state snapshot to disk using bincode serialization.

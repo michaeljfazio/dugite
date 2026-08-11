@@ -452,6 +452,7 @@ impl LedgerState {
                         registered_epoch: self.epoch,
                         drep_expiry: expiry,
                         active: true,
+                        delegs: Default::default(),
                     },
                 );
                 Arc::make_mut(&mut self.gov.governance).drep_registration_count += 1;
