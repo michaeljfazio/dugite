@@ -199,6 +199,26 @@ replays it in minutes. The duplicate-VRF rule only bites on an adversarial
 registration, so the real gate for #1085 is a devnet negative through BOTH
 sockets, not a dump diff.
 
+**RE-GATED, and the PV11 arms are validated LIVE.** The standard preset is
+4/4, strict, admissible (`reports/devnet-validate/v2.8.0.json`) — 1030 canonical
+blocks, 0 OFFDIAG, pots byte-exact, both boundary samplers non-vacuous.
+
+But **the devnet genesis is PV10**, so those four rounds prove no regression at
+PV10 and touch #1085's PV11 paths not at all. The `hardfork-round.sh` round is
+what closes that, and it PASSED: **14 assertions, 0 FAIL**, a real
+HardForkInitiation PV10→11 proposed, voted by DRep+SPO+CC, ratified, and **both
+sockets flipped to PV11 in the SAME epoch**. That boundary is the only place
+`populateVRFKeyHashes` ever runs, and every post-fork block used #1086's
+accumulating arm — with futurePParams parity 1473 compared / 0 diffs,
+ratify-state 1472 compared / 0 diffs / 0 plan breaks, and a 37-row post-fork zoo
+smoke at 0 FAIL. 16e's constructor inverted on both sides in the same round:
+`IncorrectDepositDELEG` at PV10, `DepositIncorrectDELEG` at PV11.
+
+That round is marked release-OPTIONAL in the preset manifest. **With mainnet's
+active protocol version as the release bar it is not optional any more** — it is
+the only live evidence that the PV11 arms work, and a "4/4 PASS" on the standard
+preset says nothing about them.
+
 ### 2026-08-11 — conwayGov LANDED and cross-validated; the mainnet blocker is the SYNC, not disk
 
 `conwayGov` is emitted and validated against **real preprod Conway oracle
