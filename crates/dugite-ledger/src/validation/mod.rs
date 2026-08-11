@@ -4249,13 +4249,37 @@ pub fn validate_transaction_with_pools(
     //
     // This check is only enforced when `registered_vrf_keys` is provided (block
     // validation mode). The map is keyed by VRF key hash (Hash32) and maps to
-    // the pool ID (Hash28) that currently holds that key. (NOTE: at PV 11 the
-    // Haskell `psVRFKeyHashes` is a refcount map and a retiring pool keeps its
-    // key until POOLREAP — a refcount model will be needed then; mainnet is not
-    // yet at PV 11.)
+    // the pool ID (Hash28) that currently holds that key.
     //
     // Reference: Haskell `VRFKeyHashAlreadyRegistered` in
-    // `cardano-ledger:Cardano.Ledger.Shelley.Rules.Pool` (reused by Conway).
+    // `cardano-ledger:Cardano.Ledger.Shelley.Rules.Pool` (reused by Conway),
+    // gated by `hardforkConwayDisallowDuplicatedVRFKeys pv`.
+    //
+    // #1085 — THIS MODEL IS NARROWER THAN UPSTREAM'S, AND THE PREMISE THAT MADE
+    // THAT ACCEPTABLE HAS EXPIRED. The note here used to end "mainnet is not yet
+    // at PV 11". Mainnet epoch 648 is PV 11.0 and preview has been PV11 for
+    // longer, so every divergence below is live rather than prospective.
+    //
+    // Upstream's `psVRFKeyHashes :: Map (VRFVerKeyHash 'StakePoolVRF) (NonZero
+    // Word64)` is an occurrence COUNT, seeded at the PV11 hard fork by
+    // `populateVRFKeyHashes` from `psStakePools` AND `psFutureStakePools`, then
+    // maintained incrementally by the POOL rule. dugite instead DERIVES a
+    // single-holder map from the live `pool_params` at validation time, which
+    // differs in three ways, all in the accept-where-Haskell-rejects direction:
+    //
+    //   1. FUTURE POOLS ARE OMITTED. A re-registration lands in
+    //      `future_pool_params` until the boundary, so pool A re-registering
+    //      with VRF v2 leaves dugite's registry still showing A -> v1. Pool B
+    //      then registering with v2 is REJECTED upstream and ACCEPTED here.
+    //   2. RETIRING POOLS. Upstream keeps the key until POOLREAP; a derived map
+    //      loses it as soon as the pool leaves `pool_params`.
+    //   3. REFCOUNT vs SINGLE HOLDER. Upstream increments with a saturating
+    //      `Map.insertWith`; this map records one pool id per key.
+    //
+    // Not fixed here: it needs the state modelled, the pvMajor-11 arm of the
+    // intra-era HARDFORK rule that seeds it (`eras/conway.rs` step 12, which
+    // names its own absence), and the POOLREAP interaction — a consensus wave
+    // with its own validation, not a widening of this loop.
     // ------------------------------------------------------------------
     if params.protocol_version_major >= 11 {
         if let Some(vrf_keys) = registered_vrf_keys {

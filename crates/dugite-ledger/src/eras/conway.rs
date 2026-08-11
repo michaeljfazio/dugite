@@ -1017,11 +1017,18 @@ impl EraRules for ConwayRules {
                 11 => {
                     // NOT IMPLEMENTED, and named rather than skipped silently.
                     // The pvMajor-11 arm is `populateVRFKeyHashes`, folding an
-                    // occurrence count of every current and future pool's VRF
-                    // key into `psVRFKeyHashes`. dugite models no such map, so
-                    // there is nothing to populate — implementing it means
-                    // adding the state first, and a half-built one would be
-                    // worse than its absence (#979). Tracked under #1084.
+                    // occurrence count of every current AND FUTURE pool's VRF
+                    // key into `psVRFKeyHashes`. dugite models no such map — it
+                    // derives a narrower single-holder one from live
+                    // `pool_params` at validation time — so there is nothing to
+                    // populate, and a half-built one would be worse than its
+                    // absence (#979).
+                    //
+                    // This is NOT prospective: mainnet epoch 648 is PV 11.0.
+                    // The three resulting divergences, all
+                    // accept-where-Haskell-rejects, are enumerated at the
+                    // `VrfKeyHashAlreadyRegistered` check in
+                    // `validation/mod.rs`. Tracked as #1085.
                 }
                 _ => {}
             }
