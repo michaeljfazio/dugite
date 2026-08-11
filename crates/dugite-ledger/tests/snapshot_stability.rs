@@ -118,6 +118,8 @@ fn snapshot_format_hash_stability() {
     //   0b78b7f6df8e66b194d3578d74a9c53624742eda20fb8a7aa4685d4fa03f0089
     //     SNAPSHOT 38, #1067 fields only (never released — see
     //     xtask/tests/snapshot_one_bump_invariant.rs)
+    //   ea9ce3ba3840ac8d99da93a47062410f322ed7736466b167ca2e536ad2f48e54
+    //     SNAPSHOT 38 + #1072/Phase-1a RUPD fields, pre-#1073
     //
     // Current: SNAPSHOT 38, extended in place. #1067 added
     // `EpochSubState.non_myopic` + `PendingRewardUpdate.non_myopic`; #1072 adds
@@ -126,7 +128,12 @@ fn snapshot_format_hash_stability() {
     // additions, so both are layout changes — but 38 was never tagged, so they
     // ship as ONE re-sync rather than two. That invariant is enforced by
     // `xtask/tests/snapshot_one_bump_invariant.rs`, not by convention.
-    const EXPECTED_HASH: &str = "ea9ce3ba3840ac8d99da93a47062410f322ed7736466b167ca2e536ad2f48e54";
+    //
+    // #1073 joins them with `PulsedRatifyState.enact_state`: `rsEnactState`'s
+    // `ensCommittee` / `ensConstitution` / `ensPrevGovActionIds`, captured from
+    // the pulser's own dry run so the frozen plan is one boundary ahead of live
+    // governance state exactly as upstream's is.
+    const EXPECTED_HASH: &str = "13ccf15836c55ac86885c9c9a5d0f8aa2347351b8421143cb51e5631454301ba";
 
     if EXPECTED_HASH == "COMPUTE_ON_FIRST_RUN" {
         panic!(

@@ -649,6 +649,73 @@ pub struct PulsedRatifyState {
     /// `HardForkInitiation` — Haskell `hasChangesToPParams`, the guard that
     /// decides whether `futurePParams` becomes `Just` or stays `Nothing`.
     pub has_pparams_changes: bool,
+    /// The remaining `rsEnactState` terms, AFTER this plan's enactments.
+    ///
+    /// See [`EnactedGovTerms`] — these are the same self-inclusive projection
+    /// [`Self::cur_pparams`] already is, for the governance fields rather than
+    /// the protocol parameters.
+    pub enact_state: EnactedGovTerms,
+}
+
+/// `rsEnactState`'s governance terms as they stand AFTER the plan's own
+/// enactments have been applied.
+///
+/// # Why these cannot be read from live state
+///
+/// RATIFY threads ONE `EnactState` through the ENACT rule and returns it inside
+/// the `RatifyState` it produces (`Conway/Rules/Ratify.hs`, `ratifyTransition`):
+///
+/// ```haskell
+/// newEnactState <- trans @(EraRule "ENACT" era) $
+///                    TRC ((), rsEnactState, EnactSignal gasId govAction)
+/// let st' = st & rsEnactStateL .~ newEnactState
+///              & rsEnactedL %~ (Seq.:|> gas)
+/// trans @(ConwayRATIFY era) $ TRC (env, st', RatifySignal sigs)
+/// ```
+///
+/// so the returned `rsEnactState` is the pulser's seed PLUS the cumulative
+/// effect of every action in its own `rsEnacted`. `ensCommittee`,
+/// `ensConstitution` and `ensPrevGovActionIds` are therefore ONE BOUNDARY AHEAD
+/// of the governance state they were seeded from: an action that enacts at the
+/// E→E+1 boundary is already visible here during epoch E.
+///
+/// Measured on preprod, which is the reason this is a stored field and not a
+/// live read at the point of use. `cardano-streamer` prints this record at the
+/// first block of each epoch; its `prevGovActionIds` carries the `PParamUpdate`
+/// root from epoch **179** and the `HardFork` root from epoch **180**, while the
+/// live governance state only gains them at 180 and 181 respectively — the
+/// hard fork's protocol version does not reach `cgsCurPParams` until 181.
+/// Reading live state here would be correct in every epoch that enacts nothing
+/// and wrong in every epoch that enacts something, which is the failure shape
+/// of #977 and #1071: the interesting value occupies a phase, so a reader that
+/// samples the boring one agrees almost always.
+///
+/// # Why it is captured rather than recomputed
+///
+/// It is filled in by `compute_pulsed_ratify_state`, from the state its own dry
+/// run produced — the clone that `ratify_proposals_impl` has already applied
+/// every enactment to. Nothing is re-derived and there is no second copy of
+/// `enactGovAction` to drift (#985's N-copies trap). Recomputing at the point of
+/// use would additionally be wrong: the dump point is one block past the
+/// boundary, and the DRep and SPO terms that decide ratification have moved by
+/// then.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct EnactedGovTerms {
+    /// `ensCommittee`'s membership — cold credential → expiry epoch.
+    ///
+    /// Keyed by `Credential::to_typed_hash32`, so the credential's KIND is
+    /// recoverable from the key itself: bytes `[..28]` are the hash and byte
+    /// `[28]` is `0x01` for a script and `0x00` for a key. Consumers that
+    /// render the credential (`keyHash-…` / `scriptHash-…`) must read that byte
+    /// rather than consult a second set — which is the defect the `drepDistr`
+    /// key carried until it was corrected against real oracle output.
+    pub committee_expiration: ImblHashMap<Hash32, EpochNo>,
+    /// `ensCommittee`'s quorum threshold. `None` is `SNothing` — no committee.
+    pub committee_threshold: Option<Rational>,
+    /// `ensConstitution`.
+    pub constitution: Option<Constitution>,
+    /// `ensPrevGovActionIds` — the four governance-purpose roots.
+    pub prev_gov_action_ids: GovRelation<Option<GovActionId>>,
 }
 
 /// Frozen ratification inputs captured at epoch boundary E.

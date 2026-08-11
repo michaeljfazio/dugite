@@ -511,6 +511,17 @@ impl LedgerState {
     //     eta) have since moved. A lazy backfill would therefore not converge
     //     for ~20 epochs while looking authoritative the whole time — the #979
     //     failure mode — so existing DBs replay chunks instead.
+    //     #1073 EXTENDS 38 in place with `PulsedRatifyState.enact_state`
+    //     (`EnactedGovTerms`) — the `ensCommittee` / `ensConstitution` /
+    //     `ensPrevGovActionIds` half of `rsEnactState`, which upstream returns
+    //     from RATIFY alongside the `ensCurPParams` dugite already stored.
+    //     Another positional bincode addition. It extends rather than bumps for
+    //     the reason `xtask/tests/snapshot_one_bump_invariant.rs` exists: 38 is
+    //     committed and gate-validated but NOT tagged, so no released artefact
+    //     carries the narrower layout and operators replay exactly once. A
+    //     local pre-change v38 database is NOT protected by that and must be
+    //     re-replayed — the version number cannot reject a layout that shares
+    //     its number.
     pub(crate) const SNAPSHOT_VERSION: u8 = 38;
 
     /// Save ledger state snapshot to disk using bincode serialization.

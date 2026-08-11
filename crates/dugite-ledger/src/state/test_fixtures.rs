@@ -397,6 +397,35 @@ pub fn populated_ledger_state() -> LedgerState {
             delayed: true,
             cur_pparams: ProtocolParameters::mainnet_defaults(),
             has_pparams_changes: true,
+            // Deliberately DIFFERENT from the live governance values set above
+            // (roots 0x50-0x53, committee cold cred, constitution): this half
+            // of `rsEnactState` is one boundary ahead of live state, so a
+            // fixture that reused the live values could not tell a correct
+            // capture from a live read.
+            enact_state: super::EnactedGovTerms {
+                committee_expiration: {
+                    let mut m = imbl::HashMap::new();
+                    m.insert(h32(0x66), EpochNo(400));
+                    m
+                },
+                committee_threshold: Some(dugite_primitives::transaction::Rational {
+                    numerator: 3,
+                    denominator: 5,
+                }),
+                constitution: Some(Constitution {
+                    anchor: Anchor {
+                        url: "https://enact.example/constitution".to_string(),
+                        data_hash: h32(0x67),
+                    },
+                    script_hash: Some(h28(0x68)),
+                }),
+                prev_gov_action_ids: super::GovRelation {
+                    pparam: Some(gid(0x62)),
+                    hard_fork: Some(gid(0x63)),
+                    committee: Some(gid(0x64)),
+                    constitution: Some(gid(0x65)),
+                },
+            },
         };
     }
 

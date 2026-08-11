@@ -1,6 +1,6 @@
 use super::{
-    credential_to_hash, DRepPulsingState, FuturePParams, GovRelation, GovernanceState, LedgerState,
-    PGraph, PRoot, ProposalState, PulsedRatifyState,
+    credential_to_hash, DRepPulsingState, EnactedGovTerms, FuturePParams, GovRelation,
+    GovernanceState, LedgerState, PGraph, PRoot, ProposalState, PulsedRatifyState,
 };
 use super::{CertSubState, EpochSubState, GovSubState};
 use crate::ledger_seq::{GovernanceChange, LedgerDelta};
@@ -1825,6 +1825,10 @@ fn compute_pulsed_ratify_state(
         e.snapshots.set = e.snapshots.mark.clone();
     }
 
+    // The returned plan's `enact_state` is `rsEnactState` AFTER its own
+    // enactments — `ratify_proposals_impl` reads it off the clone it has just
+    // applied them to. See [`EnactedGovTerms`] for why that is one boundary
+    // ahead of live governance state, and why it must not be read live.
     ratify_proposals_impl(epoch, &mut e, &mut c, &mut g)
 }
 
@@ -1940,6 +1944,7 @@ fn set_fresh_drep_pulsing_state(
             delayed: false,
             cur_pparams: epochs.protocol_params.clone(),
             has_pparams_changes: false,
+            enact_state: EnactedGovTerms::default(),
         },
     });
 
@@ -3514,6 +3519,24 @@ pub(crate) fn ratify_proposals_impl(
         )
     });
 
+    // `rsEnactState`'s governance terms AFTER the fold, read off the state this
+    // function has just applied every enactment to — the same `gov` whose
+    // `cur_pparams` sibling is taken from `epochs` below. Built HERE rather
+    // than in the caller so enactment has exactly one implementation and the
+    // two halves of `rsEnactState` cannot come from different moments.
+    let gs = &gov.governance;
+    let enact_state = EnactedGovTerms {
+        committee_expiration: gs.committee_expiration.clone(),
+        committee_threshold: gs.committee_threshold.clone(),
+        constitution: gs.constitution.clone(),
+        prev_gov_action_ids: GovRelation {
+            pparam: gs.enacted_pparam_update.clone(),
+            hard_fork: gs.enacted_hard_fork.clone(),
+            committee: gs.enacted_committee.clone(),
+            constitution: gs.enacted_constitution.clone(),
+        },
+    };
+
     PulsedRatifyState {
         computed_at_epoch: epoch,
         enacted: ratified,
@@ -3522,6 +3545,7 @@ pub(crate) fn ratify_proposals_impl(
         // `ensCurPParams` AFTER the enactments.
         cur_pparams: epochs.protocol_params.clone(),
         has_pparams_changes,
+        enact_state,
     }
 }
 
@@ -8099,6 +8123,98 @@ mod tests {
         );
     }
 
+    /// `rsEnactState` is SELF-INCLUSIVE: it carries the roots of the actions
+    /// the SAME plan will enact, one boundary before live governance state
+    /// gains them.
+    ///
+    /// This is the assertion that separates the frozen plan from live state.
+    /// The two agree in every epoch that enacts nothing, so a reader that took
+    /// the live value would be correct almost always and wrong exactly when
+    /// something happens — #977's and #1071's failure shape, and the reason
+    /// `EnactedGovTerms` is captured rather than derived at the point of use.
+    ///
+    /// Measured on the preprod oracle, which is what this pins in miniature:
+    /// cardano-streamer prints the `PParamUpdate` root at epoch 179 and the
+    /// `HardFork` root at 180, while the live governance state gains them at
+    /// 180 and 181.
+    #[test]
+    fn frozen_plan_carries_its_own_enactment_roots_before_live_state_does() {
+        let mut state = gov_test_state(10, 10);
+
+        let tx_hash = Hash32::from_bytes([51u8; 32]);
+        state.process_proposal(
+            &tx_hash,
+            0,
+            &ProposalProcedure {
+                deposit: Lovelace(100_000_000_000),
+                return_addr: vec![0u8; 29],
+                gov_action: GovAction::ParameterChange {
+                    prev_action_id: None,
+                    protocol_param_update: Box::new(ProtocolParamUpdate {
+                        max_tx_ex_units: Some(ExUnits {
+                            mem: 16_500_000,
+                            steps: 10_000_000_000,
+                        }),
+                        ..Default::default()
+                    }),
+                    policy_hash: None,
+                },
+                anchor: make_anchor(),
+            },
+        );
+        let action_id = make_action_id(51, 0);
+        for i in 0..7 {
+            drep_vote(&mut state, i, &action_id, Vote::Yes);
+        }
+        for i in 0..6 {
+            spo_vote(&mut state, i, &action_id, Vote::Yes);
+        }
+        cc_vote_yes(&mut state, &action_id);
+
+        // Freeze the pulser the way the boundary does. The plan it computes
+        // decides what enacts at the NEXT boundary — nothing has been applied.
+        state.freeze_prior_boundary_pulser();
+
+        let plan = state
+            .gov
+            .governance
+            .ratify_plan()
+            .expect("the boundary must have frozen a plan")
+            .clone();
+
+        assert!(
+            plan.enacted.contains(&action_id),
+            "fixture is wrong: the plan must ratify the proposal, else this \
+             test cannot distinguish the frozen value from the live one"
+        );
+        assert_eq!(
+            plan.enact_state.prev_gov_action_ids.pparam.as_ref(),
+            Some(&action_id),
+            "rsEnactState must carry the root of the action its OWN plan \
+             enacts — this is `ratifyTransition` threading ENACT's output back \
+             into the RatifyState it returns"
+        );
+        // The other half of the same claim, and the half that actually goes
+        // red if this is ever sourced from live state: at this instant the
+        // ledger has NOT enacted anything.
+        assert_eq!(
+            state.gov.governance.enacted_pparam_update, None,
+            "live governance state must NOT yet carry the root — if it does, \
+             the frozen and live values are indistinguishable here and this \
+             test proves nothing"
+        );
+
+        // One boundary later the live state catches up, and the two agree
+        // again — which is why a point sample cannot see this.
+        state.process_epoch_transition(EpochNo(1));
+        assert_eq!(
+            state.gov.governance.enacted_pparam_update.as_ref(),
+            Some(&action_id),
+            "the enactment must reach live governance state at the boundary \
+             that applies the plan"
+        );
+    }
+
     /// Confirms that a ParameterChange ex-unit update does NOT ratify when the
     /// CC vote is missing, even if DRep and SPO thresholds are met. This
     /// ensures the CC approval gate is functioning correctly.
@@ -10651,6 +10767,7 @@ mod pulser_tests {
             delayed: true,
             cur_pparams: state.epochs.protocol_params.clone(),
             has_pparams_changes: false,
+            enact_state: EnactedGovTerms::default(),
         };
         set_plan(&mut state, plan);
 
@@ -10776,6 +10893,7 @@ mod pulser_tests {
                 delayed: false,
                 cur_pparams: pp,
                 has_pparams_changes: false,
+                enact_state: EnactedGovTerms::default(),
             },
         );
 
