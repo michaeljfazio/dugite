@@ -219,16 +219,40 @@ format!("drep-keyHash-{}", &hash.to_hex()[..30])
    entries and one `drep-scriptHash-763ef7…`, and that script DRep holds
    5,007,783,823,575 lovelace, more than all nine keyHash DReps combined.
 
-The second has a root cause one layer down: `build_drep_power_cache` returns
-`ImblHashMap<Hash32, u64>`, so the credential KIND is erased before the dump
-ever sees it. Upstream keys `psDRepDistr` by `DRep`, a sum type over
-KeyHash / ScriptHash / AlwaysAbstain / AlwaysNoConfidence.
+**CORRECTION (2026-08-11): the credential kind is NOT erased, and the claim
+that it was is withdrawn.** An earlier revision of this document — and the
+adversarial review that accepted it — said `build_drep_power_cache` returns
+`ImblHashMap<Hash32, u64>` and therefore loses the kind, making a
+consensus-adjacent ledger type change a prerequisite. That is wrong.
 
-Stated honestly: the *dump* defect is certain and would have produced confusing
-divergences in the tip run. Whether the erasure is a *consensus* difference is
-not established — merging a key-hash DRep with a script-hash DRep requires the
-same 28 bytes to appear as both, which is not practically reachable. Do not
-file it as a consensus bug on this evidence.
+The key is a **typed** Hash32. `DRep::credential_hash32`
+(`dugite-primitives/src/transaction.rs:312`) writes the 28-byte credential into
+`bytes[..28]` and the discriminator into `bytes[28]` — `0x00` for a key hash
+(by zero-padding) and `0x01` for a script hash:
+
+```rust
+DRep::ScriptHash(h) => { bytes[..28].copy_from_slice(h.as_bytes()); bytes[28] = 0x01; }
+```
+
+So the kind is recoverable at the dump layer and must be READ, not assumed.
+`drepDistr` is therefore a **dump-only** change with no ledger surface, and no
+consensus review is required for it. Reading the type rather than the map's
+signature is what settled this — the same lesson as decoding a whole record
+instead of its head.
+
+**FIXED and cross-validated.** Both key defects are corrected, and the result
+is checked against real cardano-streamer output rather than asserted: dugite
+replayed 2,702,108 preprod blocks into Conway and its `drepDistr` is
+**byte-identical to the oracle in all 6 paired Conway epochs**, including the
+script DRep that was previously mislabelled as a key hash.
+
+One further difference surfaced and is also fixed: upstream omits a pseudo-DRep
+nobody has delegated to (`psDRepDistr` is a Map with no entry), while dugite
+emitted `drep-alwaysNoConfidence: 0` unconditionally — one spurious key in
+every such epoch, which is the constant-noise shape that hid a real defect in
+#1078. Now emitted only when non-zero, with the limitation stated at the code:
+the cache returns the two pseudo-DReps as plain counters, so dugite cannot
+distinguish "absent" from "present with zero".
 
 ## Remaining work, in order
 

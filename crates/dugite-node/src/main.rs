@@ -1424,23 +1424,63 @@ fn build_epoch_snapshot(
         .sum();
     let deposit_total = deposit_stake_key + deposit_pool + deposit_drep + deposit_proposal;
 
-    // DRep distribution for cross-validation.
+    // DRep distribution, keyed exactly as cardano-streamer's
+    // `Map.map fromCompact (psDRepDistr snap)` renders it:
+    //   drep-keyHash-<56 hex> | drep-scriptHash-<56 hex>
+    //   drep-alwaysAbstain    | drep-alwaysNoConfidence
+    //
+    // The cache key is a TYPED Hash32, not a bare hash:
+    // `DRep::credential_hash32` writes the 28-byte credential into
+    // `bytes[..28]` and the discriminator into `bytes[28]` — 0x00 for a key
+    // hash (by zero-padding) and 0x01 for a script hash. So the kind is
+    // recoverable here and must be READ rather than assumed.
+    //
+    // Both halves of the previous key were wrong, and each would have produced
+    // a confident false divergence against the oracle:
+    //   * `&hash.to_hex()[..30]` truncated to 15 of the 28 bytes;
+    //   * every entry was labelled `keyHash`, including script DReps. Real
+    //     preprod data has both — epoch 166 carries 9 key-hash DReps and one
+    //     script DRep holding more lovelace than all nine combined.
     let (drep_cache, drep_no_conf, drep_abstain_val) = ledger.build_drep_power_cache();
     let mut drep_distr_map = serde_json::Map::new();
     for (hash, power) in &drep_cache {
+        let bytes = hash.as_bytes();
+        let kind = if bytes[28] == 0x01 {
+            "scriptHash"
+        } else {
+            "keyHash"
+        };
         drep_distr_map.insert(
-            format!("drep-keyHash-{}", &hash.to_hex()[..30]),
+            format!("drep-{kind}-{}", hex::encode(&bytes[..28])),
             serde_json::Value::Number((*power).into()),
         );
     }
-    drep_distr_map.insert(
-        "drep-alwaysNoConfidence".to_string(),
-        serde_json::Value::Number(drep_no_conf.into()),
-    );
-    drep_distr_map.insert(
-        "drep-alwaysAbstain".to_string(),
-        serde_json::Value::Number(drep_abstain_val.into()),
-    );
+    // The two pseudo-DReps are emitted only when they carry stake.
+    //
+    // `psDRepDistr` is a Map, so upstream simply has NO entry for a pseudo-DRep
+    // nobody delegated to — measured on preprod epoch 166, where the oracle
+    // emits `drep-alwaysAbstain` and omits `drep-alwaysNoConfidence` entirely.
+    // Emitting a zero unconditionally produced exactly one spurious key in
+    // every such epoch, and a per-epoch constant difference is the noise that
+    // hid a real IPv6 defect in #1078.
+    //
+    // STATED LIMITATION: `build_drep_power_cache` returns the two as plain
+    // counters, so dugite cannot distinguish "absent from the map" from
+    // "present with zero". A genuinely-zero-but-present entry would therefore
+    // be omitted here. Every sample observed so far is absent-when-zero, and
+    // guessing the other way would invent a key upstream does not have.
+    if drep_no_conf > 0 {
+        drep_distr_map.insert(
+            "drep-alwaysNoConfidence".to_string(),
+            serde_json::Value::Number(drep_no_conf.into()),
+        );
+    }
+    if drep_abstain_val > 0 {
+        drep_distr_map.insert(
+            "drep-alwaysAbstain".to_string(),
+            serde_json::Value::Number(drep_abstain_val.into()),
+        );
+    }
     let drep_distr = serde_json::Value::Object(drep_distr_map);
 
     // Proposal details for cross-validation debugging.
