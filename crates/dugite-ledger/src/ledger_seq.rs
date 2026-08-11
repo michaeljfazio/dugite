@@ -1509,12 +1509,20 @@ fn apply_governance_change(state: &mut LedgerState, change: &GovernanceChange) {
             }
         }
         GovernanceChange::DRepUnregister { credential_hash } => {
-            gov.dreps.remove(credential_hash);
-            gov.vote_delegations.retain(|_, d| {
-                // Remove delegations to this DRep (key credential).
-                // Note: DRep::KeyHash is matched by credential_hash.
-                !matches!(d, DRep::KeyHash(h) if h == credential_hash)
-            });
+            // Driven by the DRep's own `delegs`, exactly as the block-apply
+            // path is (#1084). This arm has NO producer today — governance
+            // reconstruction goes through `gov_snapshot` — but it read as an
+            // implemented deregistration while doing something else, which is
+            // #985's hazard sitting beside a consensus path.
+            //
+            // What it did instead: matched `DRep::KeyHash` ONLY, so every
+            // SCRIPT DRep's delegators survived; and scanned the forward map
+            // rather than the reverse index, which is the wrong set below PV10.
+            if let Some(state) = gov.dreps.remove(credential_hash) {
+                for stake_cred in state.delegs.iter() {
+                    gov.vote_delegations.remove(stake_cred);
+                }
+            }
         }
         GovernanceChange::VoteDelegate {
             credential_hash,
