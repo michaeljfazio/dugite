@@ -2404,6 +2404,106 @@ async fn run_node(args: RunArgs, log_handle: Option<logging::LogHandle>) -> Resu
     Ok(())
 }
 
+/// Shapes the preprod cross-validation could NOT reach.
+///
+/// The conwayGov emission was validated against 22 epochs of real
+/// cardano-streamer output, but preprod exercised only some of each sum type:
+/// its whole committee is script-credentialled and never resigns, its
+/// constitution always has a guardrail script, and no `NoConfidence` ever
+/// enacted. Those arms are taken from the cardano-ledger `ToJSON` instances
+/// rather than from observed data, so they are pinned here — an unobserved arm
+/// that nothing asserts is a guess with no way to notice it went wrong, which
+/// is exactly how the `enactedRoots` string format survived 16 null epochs.
+#[cfg(test)]
+mod conway_gov_shape_tests {
+    use super::{committee_json, constitution_json, credential_key, gov_action_id_json};
+    use dugite_primitives::hash::Hash32;
+    use dugite_primitives::time::EpochNo;
+    use dugite_primitives::transaction::{Anchor, Constitution, GovActionId, Rational};
+
+    /// Byte 28 is the credential-kind discriminator, and BOTH arms matter.
+    /// preprod only ever exercised `scriptHash`; mainnet's committee is
+    /// key-credentialled, so the other arm is what the tip run will use.
+    #[test]
+    fn credential_key_renders_both_kinds() {
+        let mut key = [0u8; 32];
+        key[..28].copy_from_slice(&[0xab; 28]);
+        assert_eq!(
+            credential_key(&Hash32::from_bytes(key)),
+            format!("keyHash-{}", "ab".repeat(28)),
+        );
+
+        key[28] = 0x01;
+        assert_eq!(
+            credential_key(&Hash32::from_bytes(key)),
+            format!("scriptHash-{}", "ab".repeat(28)),
+        );
+    }
+
+    /// `SNothing` committee — after an enacted `NoConfidence` — is `null`, not
+    /// an object with an empty member map.
+    #[test]
+    fn committee_is_null_without_a_threshold() {
+        let members = imbl::HashMap::new();
+        assert!(committee_json(&members, None).is_null());
+    }
+
+    #[test]
+    fn committee_renders_members_and_threshold() {
+        let mut members = imbl::HashMap::new();
+        let mut key = [0u8; 32];
+        key[..28].copy_from_slice(&[0x11; 28]);
+        key[28] = 0x01;
+        members.insert(Hash32::from_bytes(key), EpochNo(229));
+        let t = Rational {
+            numerator: 2,
+            denominator: 3,
+        };
+        let v = committee_json(&members, Some(&t));
+        assert_eq!(v["members"][format!("scriptHash-{}", "11".repeat(28))], 229);
+        assert_eq!(v["threshold"]["numerator"], 2);
+        assert_eq!(v["threshold"]["denominator"], 3);
+    }
+
+    /// The guardrail-less constitution OMITS `script` — upstream builds the
+    /// pair list with a comprehension guard, so the key is absent rather than
+    /// null. Emitting `"script": null` would be a schema gap on one side in
+    /// every epoch of a chain that has no guardrail.
+    #[test]
+    fn constitution_omits_the_script_key_when_absent() {
+        let c = Constitution {
+            anchor: Anchor {
+                url: "ipfs://x".to_string(),
+                data_hash: Hash32::from_bytes([0x22; 32]),
+            },
+            script_hash: None,
+        };
+        let v = constitution_json(Some(&c));
+        assert!(
+            v.get("script").is_none(),
+            "script must be ABSENT, not null: {v}"
+        );
+        assert_eq!(v["anchor"]["url"], "ipfs://x");
+        assert_eq!(v["anchor"]["dataHash"], "22".repeat(32));
+        assert!(constitution_json(None).is_null());
+    }
+
+    /// A gov action id is an OBJECT. dugite emitted `"<txid>#<ix>"` under a
+    /// top-level key upstream does not have, and 16 consecutive all-null
+    /// preprod epochs would have "confirmed" either format.
+    #[test]
+    fn gov_action_id_is_an_object_not_a_string() {
+        let id = GovActionId {
+            transaction_id: Hash32::from_bytes([0x33; 32]),
+            action_index: 7,
+        };
+        let v = gov_action_id_json(Some(&id));
+        assert_eq!(v["txId"], "33".repeat(32));
+        assert_eq!(v["govActionIx"], 7);
+        assert!(gov_action_id_json(None).is_null());
+    }
+}
+
 #[cfg(test)]
 mod digest_tests {
     use super::digest_of_map;
