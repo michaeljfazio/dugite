@@ -128,6 +128,77 @@ dugite-lsm (LSM-tree on-disk storage for UTxO-HD)
 
 ## Current Focus
 
+### 2026-08-12 — PV11 compatibility is now a RELEASE REQUIREMENT, and the sweep found two gaps
+
+**Standing requirement: any release must be fully compatible up to the protocol
+version ACTIVE ON MAINNET.** That is **PV 11.0** — mainnet crossed between
+epochs 640 and 644 and is at 648 (confirmed against Koios, not assumed), which
+is why a code comment reading *"mainnet is not yet at PV 11"* had only just gone
+stale. Preprod is PV11 from ~epoch 293 (now 306); preview longer.
+
+An EXHAUSTIVE sweep of PV11 gates in the pinned ledger
+(`faa7a9dc347697b11d4da5b7818b1731e11aeeef`, conway 1.20.0.0) — every
+`natVersion @11`, every `hardfork*` predicate, every `pvMajor` comparison —
+found **eleven** behaviours keyed to 11. Nine were already correct. Two were
+not, and both are consensus:
+
+| item | status |
+|---|---|
+| duplicate-VRF rejection + `psVRFKeyHashes` + the pv11 HARDFORK arm | **#1085 FIXED** |
+| BBODY ref-script size fold, PV-gated | **#1086 FIXED** |
+| `UnelectedCommitteeVoters` (GOV tag 18, elected-AND-authorized set) | already correct |
+| refInputs disjointness relaxed at 11, re-added in V3/V4 `TxInfo` | already correct — gated to exactly `8 < PV < 11` |
+| DELEG deposit/refund constructors (tag 1 → 7/8) | already correct |
+| script-integrity constructor (UTXOW 13 → 18) | already correct (#1058) |
+| CBOR framing | **nothing changes 10→11** — version-conditional encoding exists only at 2/7/9/12 |
+
+**#1085 — the duplicate-VRF registry was DERIVED and upstream's is STATE.**
+dugite had the predicate and the PV gate; it folded a single-holder map over
+live `pool_params` at validation time. Upstream's `psVRFKeyHashes` is an
+occurrence COUNT seeded at the fork from `psStakePools` AND
+`psFutureStakePools`, then maintained by POOL and POOLREAP. Three
+accept-where-Haskell-rejects gaps: a pending re-registration's key looked
+unclaimed until the boundary; a retiring pool released its key before POOLREAP;
+and a pre-PV11 duplicate could not be represented at all.
+
+*It is genuinely not derivable*, and the counter-example is the reason it is
+stored: a key shared by two pools since before the fork, where one re-registers,
+is removed OUTRIGHT at POOLREAP as "dangling" — `Map.withoutKeys` does not care
+that the other pool still holds it. Upstream then has no entry and a third pool
+may claim it; a derived count says 1 and rejects. Same input, opposite verdicts.
+
+Two things #1085 exposed that would have stayed silent: the per-block
+validation-registry CACHE was keyed on `pool_params` identity alone, while a
+re-registration moves `vrf_key_hashes` WITHOUT touching `pool_params` — it now
+requires both ptr-eq hits; and the Mithril import decoded PState's
+`vrfKeyHashes` field and discarded it for want of a destination (#1067's shape
+again).
+
+**#1086 — `totalRefScriptSizeInBlock` is PV-gated and dugite's was not.** Below
+PV11 every transaction is measured against the BLOCK-INITIAL UTxO, so a
+reference to an output created earlier in the same block contributes ZERO.
+dugite accumulated at every protocol version, which can only push the total up
+— **rejecting blocks cardano-node accepts**, in every Conway epoch before the
+PV11 fork. That is mainnet 507→~643, preprod 163→290, and all of preview's
+earlier Conway history — i.e. exactly the range the exactness replay covers.
+Two further defects inside the accumulating arm: the overlay was pre-built from
+ALL transactions (so one could see its own and later outputs), and `IsValid
+False` transactions contributed nothing where upstream folds in `collOuts`.
+
+**Do NOT implement `hardforkConwayMoveWithdrawalsAndDRepChecksToLedgerRule`.**
+It exists on cardano-ledger master and NOT at this pin. At `faa7a9dc` — what
+cardano-node 11.0.1 ships and what mainnet PV11 runs — the CERTS-level
+`WithdrawalsNotInRewardsCERTS` check is ungated and remains live. Aligning to
+master's PV11 list would run the check in the wrong rule and emit the wrong
+failure.
+
+**Where PV11 can be validated.** NOT by a full-chain mainnet replay: reaching
+epoch 644 needs ~183 more epochs ≈ 275 GiB against ~115 free. **preprod is the
+ground** — PV11 since ~293, the Mithril DB already covers it, and dugite
+replays it in minutes. The duplicate-VRF rule only bites on an adversarial
+registration, so the real gate for #1085 is a devnet negative through BOTH
+sockets, not a dump diff.
+
 ### 2026-08-11 — conwayGov LANDED and cross-validated; the mainnet blocker is the SYNC, not disk
 
 `conwayGov` is emitted and validated against **real preprod Conway oracle

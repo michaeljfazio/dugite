@@ -68,6 +68,7 @@
 - [bounded-ratio-decode-bounds-and-enact-totality.md](bounded-ratio-decode-bounds-and-enact-totality.md) — UnitInterval rejects n>d; ENACT is total field-merge, no re-validation
 
 ## Version Pinning (which commit does a cardano-node release actually ship)
+- [pv11-gates-exhaustive-at-faa7a9dc.md](pv11-gates-exhaustive-at-faa7a9dc.md) — ALL PV11 gates at cn 11.0.1's ledger pin: 9 deltas, POOL tag6/GOV tag18/UTXOW 13→18/DELEG 1→7,8, psVRFKeyHashes, zero CBOR gates at v10/v11; withdrawal-split is POST-pin
 - [chap-dependency-pinning-methodology.md](chap-dependency-pinning-methodology.md) — cn 11.x has no git pin; resolve via CHaP meta.toml github.rev + timestamp
 - [poolreap-active-purge-verified-11-0-1.md](poolreap-active-purge-verified-11-0-1.md) — removeStakePoolDelegations clears delegation pointer same-transition; live since shelley 1.17.0.0
 
