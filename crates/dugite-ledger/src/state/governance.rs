@@ -1899,8 +1899,22 @@ pub(crate) fn undelegate_vote(
     let current = governance.vote_delegations.get(&stake_cred)?;
     let key = current.credential_hash32()?;
     let drep = governance.dreps.get_mut(&key)?;
-    drep.delegs.remove(&stake_cred);
-    Some(key)
+    // Report the key ONLY when an entry was actually removed.
+    //
+    // Upstream's `preserveIncorrectDelegation` branch restores the whole
+    // pre-undelegation `vsDReps` map, so it restores exactly what the removal
+    // took — and if the removal took nothing, it restores nothing. Returning
+    // the key unconditionally made the caller re-insert a credential that had
+    // never been in the set.
+    //
+    // Reachable at PV9, where delegating to an UNREGISTERED DRep is legal
+    // (`Deleg.hs` skips `DelegateeDRepNotRegisteredDELEG` during
+    // `hardforkConwayBootstrapPhase`): delegate s→X while X is unregistered
+    // (forward set, no reverse entry), register X (`drepDelegs = mempty`), then
+    // re-delegate s→Y. Upstream leaves `X.delegs` empty; without this check
+    // dugite would put s in it, and X's later deregistration would then destroy
+    // s's delegation to Y.
+    drep.delegs.remove(&stake_cred).map(|_| key)
 }
 
 /// Haskell `processDelegationInternal`'s `delegVote` — record a vote
@@ -8424,6 +8438,68 @@ mod tests {
         assert!(
             !gov.dreps[&old].delegs.contains(&staker),
             "PV9 keeps the removal when the new target has no set to join"
+        );
+    }
+
+    /// The PV9 write-back restores what the removal TOOK — and if the removal
+    /// took nothing, it restores nothing.
+    ///
+    /// Upstream's preserve branch reinstates the whole pre-undelegation
+    /// `vsDReps` map, so a forward delegation with no matching reverse entry
+    /// leaves the old DRep's set untouched. Modelling that as "re-insert
+    /// whenever there was a previous delegation" invents an entry.
+    ///
+    /// The state is reachable only at PV9, where delegating to an UNREGISTERED
+    /// DRep is legal (`Deleg.hs` skips `DelegateeDRepNotRegisteredDELEG` in the
+    /// bootstrap phase): delegate to X while X is unregistered, register X with
+    /// an empty set, then re-delegate away. Left wrong, X's later
+    /// deregistration destroys a delegation it never held — which is #1084's
+    /// own failure mode, re-created by its fix.
+    #[test]
+    fn pv9_write_back_does_not_invent_a_delegation_the_removal_never_took() {
+        let mut state = gov_test_state(1, 1);
+        let gov = Arc::make_mut(&mut state.gov.governance);
+        let staker = Hash32::from_bytes([0x88; 32]);
+
+        let x_cred = Credential::VerificationKey(Hash28::from_bytes([0x01; 28]));
+        let x_key = x_cred.to_typed_hash32();
+        let y_cred = Credential::VerificationKey(Hash28::from_bytes([0x02; 28]));
+        let y_key = y_cred.to_typed_hash32();
+
+        // Delegate to X while X is UNREGISTERED — legal at PV9. The forward
+        // entry is written; there is no set to join.
+        delegate_vote(true, staker, &DRep::KeyHash(x_key), gov);
+        assert!(!gov.dreps.contains_key(&x_key));
+
+        // X registers now, with `drepDelegs = mempty`.
+        for (cred, key) in [(x_cred, x_key), (y_cred, y_key)] {
+            gov.dreps.insert(
+                key,
+                DRepRegistration {
+                    credential: cred,
+                    deposit: Lovelace(500_000_000),
+                    anchor: None,
+                    registered_epoch: EpochNo(0),
+                    drep_expiry: EpochNo(100),
+                    active: true,
+                    delegs: Default::default(),
+                },
+            );
+        }
+        assert!(gov.dreps[&x_key].delegs.is_empty());
+
+        // Re-delegate to Y. Upstream's removal is a no-op, so the write-back
+        // restores an EMPTY set.
+        delegate_vote(true, staker, &DRep::KeyHash(y_key), gov);
+
+        assert!(
+            gov.dreps[&y_key].delegs.contains(&staker),
+            "Y gains the delegator"
+        );
+        assert!(
+            gov.dreps[&x_key].delegs.is_empty(),
+            "X must stay empty — it never held this delegator, so there is \
+             nothing for the PV9 write-back to restore"
         );
     }
 

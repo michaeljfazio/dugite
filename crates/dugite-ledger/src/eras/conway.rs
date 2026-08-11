@@ -983,10 +983,21 @@ impl EraRules for ConwayRules {
         // The ordering is load-bearing: the pulser frozen at this boundary must
         // see the POST-cleanup state, so this cannot move below step 13.
         //
-        // Dispatch is on the NEW major version. Comparing majors alone is
-        // equivalent to upstream's full `ProtVer` inequality here, because both
-        // arms test `== 10` / `== 11` exactly — a minor-only bump enters the
-        // rule and matches neither, which is the identity it would have been.
+        // Dispatch is on the NEW major version.
+        //
+        // Upstream's trigger compares the FULL `ProtVer`, and dugite compares
+        // majors only. A minor-only bump — `pvCanFollow` permits (m,n)→(m,n+1)
+        // — therefore re-runs the arm upstream and does not here. That is
+        // outcome-identical for the pv10 arm ONLY because
+        // `updateDRepDelegations` is idempotent under the PV10+ invariant: it
+        // rebuilds each set from the forward map, so running it twice gives the
+        // same answer.
+        //
+        // It does NOT generalise, and the pv11 arm is the counter-example
+        // waiting to happen: `populateVRFKeyHashes` folds with `Map.insertWith`
+        // and a saturating `+1`, so a second fire DOUBLE-COUNTS every VRF key.
+        // Whoever implements `psVRFKeyHashes` must widen this predicate to the
+        // full protocol version at the same time.
         if epochs.protocol_params.protocol_version_major != old_proto_major {
             match epochs.protocol_params.protocol_version_major {
                 10 => {
@@ -3172,6 +3183,139 @@ mod tests {
             !gov.governance.vote_delegations.contains_key(&staker_key),
             "the delegation must be gone too — leaving it is #1084, and it \
              feeds RATIFY's denominator as implicit-NO stake"
+        );
+    }
+
+    /// The LEGACY deregistration route must clear the reverse index too.
+    ///
+    /// Conway's decoder maps legacy wire indices 0-2 onto the Shelley shape and
+    /// index 1 IS `ConwayUnRegCert`, so a deposit-less deregistration lands in
+    /// `apply_shelley_cert`, not in the `ConwayStakeDeregistration` arm — and
+    /// Conway runs BOTH handlers for every certificate.
+    ///
+    /// This is the divergence #1084's own fix created: with the forward entry
+    /// cleared but the DRep's `delegs` left stale, the wipe reads that set as
+    /// truth and destroys a delegation that has since moved to another DRep.
+    /// The sequence below is the one that breaks, and it is reachable at PV11
+    /// where the pv10 reconciliation can no longer repair it.
+    #[test]
+    fn legacy_stake_dereg_clears_the_reverse_index_so_a_later_wipe_cannot_overreach() {
+        let rules = ConwayRules::new();
+        let params = ProtocolParameters::mainnet_defaults();
+        let ctx = make_conway_ctx(&params);
+
+        let mut utxo = make_utxo_sub(vec![]);
+        let mut certs = make_cert_sub();
+        let mut gov = make_gov_sub();
+        let mut epochs = make_epoch_sub();
+
+        let x_cred = Credential::VerificationKey(Hash28::from_bytes([0xD1; 28]));
+        let x_key = x_cred.to_typed_hash32();
+        let y_cred = Credential::VerificationKey(Hash28::from_bytes([0xD2; 28]));
+        let y_key = y_cred.to_typed_hash32();
+        let staker_cred = Credential::VerificationKey(Hash28::from_bytes([0xAA; 28]));
+        let staker_key = staker_cred.to_typed_hash32();
+
+        let apply = |rules: &ConwayRules,
+                     certificates: Vec<Certificate>,
+                     id: u8,
+                     utxo: &mut _,
+                     certs: &mut _,
+                     gov: &mut _,
+                     epochs: &mut _| {
+            let mut tx = make_tx(id, vec![], vec![], 0);
+            tx.body.certificates = certificates;
+            rules
+                .apply_valid_tx(
+                    &tx,
+                    BlockValidationMode::ApplyOnly,
+                    &ctx,
+                    utxo,
+                    certs,
+                    gov,
+                    epochs,
+                )
+                .expect("cert batch applies");
+        };
+
+        // Register both DReps, then delegate s -> X.
+        apply(
+            &rules,
+            vec![
+                Certificate::RegDRep {
+                    credential: x_cred.clone(),
+                    deposit: Lovelace(500_000_000),
+                    anchor: None,
+                },
+                Certificate::RegDRep {
+                    credential: y_cred,
+                    deposit: Lovelace(500_000_000),
+                    anchor: None,
+                },
+                Certificate::VoteDelegation {
+                    credential: staker_cred.clone(),
+                    drep: DRep::KeyHash(x_key),
+                },
+            ],
+            0x01,
+            &mut utxo,
+            &mut certs,
+            &mut gov,
+            &mut epochs,
+        );
+        assert!(
+            gov.governance.dreps[&x_key].delegs.contains(&staker_key),
+            "fixture is wrong: X must hold the delegator, or nothing below can \
+             overreach"
+        );
+
+        // LEGACY deregistration of the staking credential (wire index 1).
+        apply(
+            &rules,
+            vec![Certificate::StakeDeregistration(staker_cred.clone())],
+            0x02,
+            &mut utxo,
+            &mut certs,
+            &mut gov,
+            &mut epochs,
+        );
+        assert!(
+            !gov.governance.dreps[&x_key].delegs.contains(&staker_key),
+            "the legacy route must run processDRepUnDelegation — leaving the \
+             stale entry is what lets the wipe destroy an unrelated delegation"
+        );
+
+        // The credential comes back and delegates to a DIFFERENT DRep.
+        apply(
+            &rules,
+            vec![Certificate::VoteDelegation {
+                credential: staker_cred,
+                drep: DRep::KeyHash(y_key),
+            }],
+            0x03,
+            &mut utxo,
+            &mut certs,
+            &mut gov,
+            &mut epochs,
+        );
+
+        // Deregistering X must not touch a delegation that now points at Y.
+        apply(
+            &rules,
+            vec![Certificate::UnregDRep {
+                credential: x_cred,
+                refund: Lovelace(500_000_000),
+            }],
+            0x04,
+            &mut utxo,
+            &mut certs,
+            &mut gov,
+            &mut epochs,
+        );
+        assert_eq!(
+            gov.governance.vote_delegations.get(&staker_key),
+            Some(&DRep::KeyHash(y_key)),
+            "X's deregistration must not destroy a delegation that moved to Y"
         );
     }
 

@@ -611,9 +611,27 @@ pub(crate) fn apply_shelley_cert(
             certs.reward_accounts.remove(&key);
             // Remove DRep delegation -- Haskell's unified map clears all credential
             // data on deregistration, including vote delegations.
-            Arc::make_mut(&mut gov.governance)
-                .vote_delegations
-                .remove(&key);
+            //
+            // BOTH directions. Conway's decoder maps legacy wire indices 0-2
+            // through the Shelley shape, and index 1 IS `ConwayUnRegCert`
+            // (`TxCert.hs`: `mkUnRegTxCert c = ConwayTxCertDeleg $
+            // ConwayUnRegCert c SNothing`), which runs
+            // `processDRepUnDelegation` like any other. Conway applies every
+            // certificate through BOTH this handler and `apply_conway_cert`, so
+            // a deposit-less deregistration reaches here and NOT the
+            // `ConwayStakeDeregistration` arm.
+            //
+            // Clearing only the forward map leaves a stale credential in the
+            // DRep's `delegs`, and #1084's wipe then reads that set as truth:
+            // the DRep's eventual deregistration would destroy a delegation
+            // that has since MOVED to another DRep — a fresh divergence, in the
+            // opposite direction, created by the fix itself. Live-reachable at
+            // PV11, where the PV10 reconciliation can no longer repair it.
+            {
+                let governance = Arc::make_mut(&mut gov.governance);
+                crate::state::governance::undelegate_vote(key, governance);
+                governance.vote_delegations.remove(&key);
+            }
             certs.script_stake_credentials.remove(&key);
             certs.pointer_map.retain(|_, v| *v != key);
             debug!("Stake key deregistered: {}", key.to_hex());
