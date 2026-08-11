@@ -513,22 +513,47 @@ oracle output.
 
 ### v2.8.0 IS VALIDATED AND READY TO TAG (not tagged)
 
+**RE-GATED 2026-08-11** over the conwayGov (#1073) and #1084 commits, at
+`a8b3411c4f`, which is what `xtask::qa_report_covers_shipped_code` now agrees
+with — it had been correctly FAILING, because the previous report was generated
+at `e8fc90c3c3` and every commit since touched `crates/`.
+
 `reports/devnet-validate/v2.8.0.json` — standard preset, 4/4 rounds vs
 cardano-node 11.0.1, `gate_integrity {strict: true, admissible: true,
-missing: []}`, and **zero tx failures across the whole gate**.
+missing: []}`. 993 canonical blocks, 0 off-diagonal parity cells.
 
 - baseline — tx-zoo 151 PASS / 3 SKIP / **0 FAIL** (154); cli-parity 23 EQUAL +
-  3 COMPARED / 0 divergent; adversarial N2N 26/26; UTxO RPC 27/27; chaos 4/4
+  3 COMPARED / 0 divergent / 0 ERROR; adversarial N2N 26/26, 0 PANIC, 0
+  SILENT_SKIP; UTxO RPC 0 FAIL; chaos 0 FAIL / 0 ENV_SKIP; tip-parity 24/24
 - parity-oracle — 99 scripts through BOTH sockets: 96 MATCH / 2 STATEFUL /
   1 KNOWNDIFF, **0 OFFDIAG, 0 CLASSDIFF**
-- epoch-boundary — 103 scripts, 0 FAIL; pots BYTE-EXACT vs Haskell (treasury
-  `7089901042545`, reserves `5992882049461532`); futurePParams AND ratify-state
-  parity both reached NON-VACUITY
-- restart — tip 28 → 56
+- epoch-boundary — pots BYTE-EXACT vs Haskell (treasury `6694132634172`,
+  reserves `5993280253030267`); **59 `PotentialPParamsUpdate` window samples**
+  and 961 ratify samples, 0 DIFF, 0 PLAN_NOT_APPLIED — both samplers reached
+  NON-VACUITY, which matters more than the zero
+- restart — tip 28 → 58
 
-Workspace 8172/8172, clippy and fmt clean, `SNAPSHOT_VERSION 38` (RE-SYNC),
+**The 4 tx-zoo failures are VERIFIED, not pattern-matched.** All four are
+`01a-simple-pay`, from the Round 2 trickle racing itself and the concurrent
+gov-lifecycle run on one funding address. The relay log carries both arms of the
+single mechanism — `Input conflict: input already claimed by mempool tx …` (a
+competitor still in the mempool) and `InputNotFound` (one already in a block) —
+i.e. the mempool input-conflict check working as designed. The
+cross-implementation question that shape could otherwise raise is answered
+directly by the parity-oracle round's 0 OFFDIAG over 99 scripts.
+
+Workspace 8185/8185, clippy and fmt clean, `SNAPSHOT_VERSION 38` (RE-SYNC,
+extended in place TWICE more — #1073's `enact_state` and #1084's `delegs`),
 workspace version and Helm `appVersion` both 2.8.0. Tagging is a release-lead
 job and has deliberately not been started.
+
+**A mainnet exactness run is ARMED and waiting**, launched detached under
+`caffeinate` with `TARGET_EPOCH=512`: it polls the oracle's tip, then stops the
+node, clones the chain CoW, replays both sides and diffs. Mainnet Conway begins
+at epoch **507**, so nothing in the conwayGov work is exercised at mainnet scale
+until the sync passes it — from 456 at ~5 epochs/hour that is 10-14 hours, and
+the SYNC is the binding constraint, not disk. Log:
+`mainnet-exactness.log`.
 
 **Round 2 MUST use the `epoch-long.json` overlay.** SKILL.md's body does not
 mention it and a driver written from that alone produces `FPP_RC=1`: at
