@@ -42,6 +42,18 @@
 #      both PV>=11 only.
 #   5. crates/dugite-ledger/src/validation/mod.rs:2605-2614 —
 #      `UnelectedCommitteeVoters` is PV>=11 only.
+#   6. crates/dugite-ledger/src/eras/conway.rs — the pvMajor-11 arm of the
+#      intra-era HARDFORK rule, `populateVRFKeyHashes` (#1085). THE
+#      BOUNDARY THIS ROUND CROSSES IS THE ONLY PLACE IT EVER RUNS: it
+#      seeds `psVRFKeyHashes` from every current and future pool, once,
+#      and every later duplicate-VRF verdict reads what it produced. A
+#      unit test can drive the function; only this round drives it from a
+#      real ratified HardForkInitiation with cardano-node watching.
+#   7. crates/dugite-ledger/src/eras/conway.rs — `totalRefScriptSizeInBlock`
+#      switches from measuring every tx against the BLOCK-INITIAL UTxO to
+#      an accumulating fold at PV>=11 (#1086). Both arms decide BLOCK
+#      validity, so a divergence here is a forge that Haskell peers
+#      reject; steps before and after the fork exercise one arm each.
 #
 # The live half of the pre-flight — does cardano-node 11.0.1 actually
 # ratify a PV11 HardForkInitiation at all — is NOT something a static read
