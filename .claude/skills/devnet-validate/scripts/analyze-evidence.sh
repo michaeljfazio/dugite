@@ -74,10 +74,38 @@ fi
 TOTAL_FORGES=0; CANONICAL=0; ORPHANS=0
 ORPHAN_RATE=0
 if [ -f "$EVD/blocks.csv" ]; then
-    TOTAL_FORGES=$(awk -F, 'NR>1 && $3=="forge" {print $4","$5}' "$EVD/blocks.csv" | sort -u | grep -c '^' || true)
-    # Canonical = forged AND received by the other BP
-    CANONICAL=$(awk -F, '
-        NR>1 && $3=="forge"  && $2=="dugite-bp"  {f[$4","$5]=1}
+    # Forges ABOVE cardano-bp's last observed slot are EXCLUDED: sampling
+    # stopped before it could record them, so "not received" carries no
+    # information about them.
+    #
+    # Without this the metric counts its own sampling TAIL as orphans.
+    # Measured on three consecutive 1800s rounds: 27, 47, 65 "orphans" — and in
+    # the 65 case ALL of them sat in the final 120 slots (34 in the final 60)
+    # while every forged block had in fact been received by another observer.
+    # It crossed the 5% threshold twice and failed two healthy rounds.
+    #
+    # `verify.sh` p1 already excludes exactly this population, and its comment
+    # gives the reason: on a single-forger topology nothing competes, so an
+    # unmatched forge "simply had not propagated yet when the check ran", and
+    # calling it an orphan on a topology that structurally cannot orphan sends
+    # the reader hunting forks that do not exist. (That same comment asserts
+    # analyze computes orphans "from the CHAIN" — it does not; it compares the
+    # same two event sets p1 does, which is why the two counters disagreed in
+    # opposite directions on 2026-08-07 and again on 2026-08-11.)
+    #
+    # Self-calibrating rather than a fixed window, so it stays correct if the
+    # sampler cadence or round length changes.
+    LAST_OBS=$(awk -F, 'NR>1 && $3=="recv" && $2=="cardano-bp" && $4+0>m {m=$4+0} END{print m+0}' "$EVD/blocks.csv")
+    UNJUDGEABLE=$(awk -F, -v last="$LAST_OBS" \
+        'NR>1 && $3=="forge" && $4+0>last {print $4","$5}' "$EVD/blocks.csv" \
+        | sort -u | grep -c '^' || true)
+    TOTAL_FORGES=$(awk -F, -v last="$LAST_OBS" \
+        'NR>1 && $3=="forge" && $4+0<=last {print $4","$5}' "$EVD/blocks.csv" \
+        | sort -u | grep -c '^' || true)
+    # Canonical = forged AND received by the other BP, over the same judgeable
+    # window as TOTAL_FORGES above.
+    CANONICAL=$(awk -F, -v last="$LAST_OBS" '
+        NR>1 && $3=="forge"  && $2=="dugite-bp"  && $4+0<=last {f[$4","$5]=1}
         NR>1 && $3=="recv"   && $2=="cardano-bp" {r[$4","$5]=1}
         END { c=0; for (k in f) if (k in r) c++; print c }
     ' "$EVD/blocks.csv")
@@ -203,9 +231,10 @@ devnet-validate — evidence analysis: $TS
 git=$GIT_REV  cardano-node=$CN_VER  cardano-cli=$CCLI_VER  duration=${DUR}s
 
 Blocks
-  total forges            : $TOTAL_FORGES
+  total forges            : $TOTAL_FORGES  (judgeable: forged at or below cardano-bp's last observed slot ${LAST_OBS:-?})
   canonical               : $CANONICAL
   orphans                 : $ORPHANS  (rate=$ORPHAN_RATE, threshold≤$ORPHAN_RATE_MAX)
+  unjudgeable (tail)      : ${UNJUDGEABLE:-0}  (forged after sampling stopped — excluded, never silently)
   chain_density           : $DENSITY  (p99.9 binomial band [${LOW:-?},${HIGH:-?}] over n=${SLOTS:-?} slots, p=$ACTIVE_SLOT_COEFF)
 
 Tip-age
