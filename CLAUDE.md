@@ -223,6 +223,39 @@ Reviewed and NOT changed: `DelegateeDRepNotRegisteredDELEG` is present and
 raised with tests, contrary to the review's tentative concern — worth recording
 so it is not re-audited.
 
+### #1085 — the duplicate-VRF registry is narrower than upstream's (CONSENSUS, OPEN)
+
+Found by asking whether the pvMajor-11 HARDFORK arm #1084 left unimplemented
+actually matters. It does, and **the premise that said it did not has expired**:
+the check's own comment ended *"mainnet is not yet at PV 11"*. Mainnet epoch 648
+is **PV 11.0**, confirmed against Koios, and preview has been PV11 longer. Every
+divergence below is live, not prospective. A stale precondition sitting on a
+consensus path is how the next reader concludes "not reachable yet".
+
+dugite HAS the predicate — `VrfKeyHashAlreadyRegistered`, gated `pv >= 11`, with
+tests — so this is not a missing check. It is a narrower REGISTRY. Upstream's
+`psVRFKeyHashes :: Map (VRFVerKeyHash 'StakePoolVRF) (NonZero Word64)` is an
+occurrence COUNT, seeded at the fork by `populateVRFKeyHashes` from
+`psStakePools` **and `psFutureStakePools`**, then maintained by the POOL rule
+(`Map.notMember ppVrf psVRFKeyHashes ?! VRFKeyHashAlreadyRegistered`, guarded by
+`hardforkConwayDisallowDuplicatedVRFKeys pv`). dugite derives a single-holder
+map from live `pool_params` at validation time. Three differences, ALL
+accept-where-Haskell-rejects:
+
+1. **Future pools omitted.** A re-registration lands in `future_pool_params`
+   until the boundary (`eras/common.rs`, applied at `eras/conway.rs`), so pool A
+   re-registering with VRF v2 leaves dugite's registry showing A→v1. Pool B then
+   registering with v2 is REJECTED upstream and ACCEPTED here.
+2. **Retiring pools** keep their key until POOLREAP upstream; a derived map
+   loses it the moment the pool leaves `pool_params`.
+3. **Refcount vs single holder.**
+
+Reachable as a forging wedge, #996's class: dugite admits the tx, forges a block
+containing it, and Haskell peers reject the block. Fixing it means modelling the
+state, implementing the pvMajor-11 HARDFORK arm that seeds it, and handling
+POOLREAP — a consensus wave with its own validation, deliberately not started
+here.
+
 #### The original defect
 
 `ConwayUnRegDRep` has TWO state mutations (`GovCert.hs:229-249`): remove the
