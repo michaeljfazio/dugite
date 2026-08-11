@@ -580,6 +580,16 @@ extended in place TWICE more — #1073's `enact_state` and #1084's `delegs`),
 workspace version and Helm `appVersion` both 2.8.0. Tagging is a release-lead
 job and has deliberately not been started.
 
+**The report is STALE AGAIN, deliberately, and must be regenerated before any
+tag.** #1085's commit is comment-only, but it touches `crates/` and
+`xtask::qa_report_covers_shipped_code` cannot tell a comment from a behaviour
+change — nor should it, since "it's only a comment" is precisely the judgement
+that let #945's all-zero reports through. The trade was made knowingly: the
+comment it corrects said *"mainnet is not yet at PV 11"* on a consensus-path
+check, and mainnet is PV 11. A false premise on that path is worse than a report
+that has to be re-run, and re-running costs a devnet gate — which also means
+stopping the mainnet sync, since the devnet needs port 12798.
+
 **A mainnet exactness run is ARMED and waiting**, launched detached under
 `caffeinate` with `TARGET_EPOCH=512`: it polls the oracle's tip, then stops the
 node, clones the chain CoW, replays both sides and diffs. Mainnet Conway begins
