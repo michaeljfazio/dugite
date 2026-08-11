@@ -128,6 +128,139 @@ dugite-lsm (LSM-tree on-disk storage for UTxO-HD)
 
 ## Current Focus
 
+### 2026-08-11 — conwayGov LANDED and cross-validated; the mainnet blocker is the SYNC, not disk
+
+`conwayGov` is emitted and validated against **real preprod Conway oracle
+output**: 184 epochs replayed, diffed against 181 cardano-streamer dumps,
+**2,112,766 leaf comparisons of which 29,641 are `conwayGov`**, one divergent
+path (below). Report: `reports/preprod-conway-conwaygov.json`.
+
+**The fact that decided the design was not in the shapes.**
+`nextEnactState` is the pulser's **self-inclusive** `rsEnactState`:
+`ratifyTransition` threads one `EnactState` through ENACT and puts the result
+back into the `RatifyState` it returns, so `ensCommittee` / `ensConstitution` /
+`ensPrevGovActionIds` are **one boundary AHEAD** of live governance state. An
+action enacting at E→E+1 appears at epoch **E**. Reading live state there is
+right in every epoch that enacts nothing and wrong in every epoch that enacts
+something — #977's and #1071's shape.
+
+*Verified against the oracle, not taken from the source read.* The rival
+reading predicts epoch 180's cur/prev PParams differ in `protocolVersion`
+alone; measured they differ in `{costModels, protocolVersion}`. Its three
+further predictions all hold (179 costModels only, 181 protocolVersion only,
+182 nothing), which also dates the preprod events: the ParameterChange enacts
+at 179→180 and the hard fork at 180→181, so **preprod runs PV10 from 181**.
+dugite's `prevGovActionIds` is byte-identical to the oracle at BOTH enactment
+epochs.
+
+dugite stores it as `PulsedRatifyState.enact_state`, captured from the state
+its own dry run produced — `compute_pulsed_ratify_state` already clones and
+runs `ratify_proposals_impl`, and that clone has had every enactment applied by
+the same `enact_gov_action_impl` the real boundary uses. Nothing is re-derived.
+**SNAPSHOT_VERSION stays 38, EXTENDED in place** per
+`xtask/tests/snapshot_one_bump_invariant.rs` — 38 is gate-validated but never
+tagged, so operators still replay once. A local pre-change v38 DB is NOT
+protected by that and must be re-replayed.
+
+`proposals` and `enactedRoots` are **removed, not excluded**. Neither has an
+upstream counterpart, so each was an unconditional schema gap; an exclusion is
+for a field that IS compared and whose difference is known-benign.
+`enactedRoots` was also wrong twice — live instead of frozen, and `txid#ix`
+where upstream emits `{govActionIx, txId}`.
+
+**The sweep found two things that are NOT this change**, which is the argument
+for sweeping rather than sampling:
+
+* **Pool reward-account credentials were hardcoded `keyHash`** in the dump's
+  `poolParams` serialiser, so every script-credentialled reward account was
+  mislabelled — three schema-gap paths × ~105 preprod epochs. Bit 4 of the
+  address header selects the kind and the ledger's own
+  `reward_account_to_hash` has always read it; only the serialiser did not.
+  Confirmed pre-existing in the older dumps. FIXED.
+* **#1084 — a DRep deregistration does not clear its delegators (CONSENSUS).**
+  Found as a `drepDistr` membership divergence, preprod 172-184, in
+  `psDRepDistr` — the map RATIFY consumes as `reDRepDistr`. See below.
+
+**Exit code is still 2 and that is correct.** `instantaneousRewards` remains a
+deliberate honest gap (an epoch-PHASE field whose interesting phase contains no
+dump point; 0 of 66 oracle dumps carry a value), and the two DRep keys are a
+real finding rather than a schema problem.
+
+### #1084 — DRep deregistration does not clear its delegators (CONSENSUS, OPEN)
+
+`ConwayUnRegDRep` has TWO state mutations (`GovCert.hs:229-249`): remove the
+credential from `vsDReps`, **and clear the DRep delegation of every account in
+that DRep's `drepDelegs` reverse index**. dugite's production path does only
+the first:
+
+```rust
+// eras/conway.rs, Certificate::UnregDRep
+let key = credential.to_typed_hash32();
+governance.dreps.remove(&key);      // and nothing else
+```
+
+**The wipe DOES exist — in the path nobody runs.** `certificates.rs`'s legacy
+`process_certificate` clears the delegations correctly, and its own comment
+says the production path "has always matched Haskell". It does not. This is
+#977's shape exactly: the correct implementation in the test-only path while
+production does nothing, and a comment asserting the opposite.
+
+**Why it is consensus and not reporting.** `finishDRepPulser` puts the SAME
+map into the `PulsingSnapshot` and into `RatifyEnv.reDRepDistr`. A stale
+delegation to a *registered, unexpired* DRep therefore lands in
+`dRepAcceptedRatio`'s DENOMINATOR as implicit-NO stake — the **false-reject**
+direction, and a near-threshold action flips. Measured on preprod: dugite's
+denominator carried an extra ~38-42e9 through epochs 176-181, which includes
+the pulsers that decided the ParameterChange enacted at 179→180 and the
+hard fork at 180→181. Those margins absorbed it; a closer vote is a split.
+
+**Both measured shapes are the ONE mechanism**, and neither is what it looks
+like. Both credentials did a **deregister-then-re-register inside one epoch**
+(A 37 s apart in epoch 171, B 17 min apart in 175, from on-chain certificates).
+Haskell wipes at the dereg and the re-registration starts `drepDelegs =
+mempty`, so the DRep returns with ZERO delegators and has no map entry at all —
+membership is delegator-driven, not registration-driven. dugite kept the wiped
+delegations forever. Epoch 181's 7,652,894 is not hard-fork numerology: it is
+the stake of the FRESH delegation made during epoch 180, which is all Haskell
+has, against dugite's stale 42.7e9 set.
+
+*Corroborated by a third implementation*: db-sync via Koios
+`drep_voting_power_history` agrees with cardano-streamer at every epoch,
+including the exact `7652894`.
+
+**Do NOT fix this with `vote_delegations.retain(|_, d| d != this)`.** That
+wipes the CURRENT delegators, which is right at PV10+ and WRONG at PV9:
+upstream's index can hold STALE entries (a delegator who has since moved to
+another DRep), and `processDelegationInternal` preserves that bug below PV10
+(`Deleg.hs:264,295-328`, ledger #4772), so the dereg collaterally wipes a
+delegation that had already moved away. Reproducing the number without the
+mechanism is the trap this repo's process exists to prevent.
+
+Full scope, none of it started: the `drepDelegs` reverse index (it is also
+`DRepState`'s 4th CBOR field, so snapshots and `GetDRepState` are affected),
+the wipe on the production path, PV-gated delegation processing bug-for-bug at
+PV9, and the **intra-era HARDFORK rule** dugite has no equivalent of at all —
+`updateDRepDelegations` at pvMajor 10 and `populateVRFKeyHashes` at 11
+(`Rules/HardFork.hs:74-124`), run after enactment and BEFORE
+`setFreshDRepPulsingState` (`Epoch.hs:371-379`). Preprod and mainnet are both
+past those forks.
+
+Not proven either way by this dataset: dugite's equivalent of the
+`Map.member cred regDReps` guard, because both credentials were registered at
+every divergent boundary.
+
+**The mainnet blocker is the SYNC.** Mainnet Conway begins at **epoch 507**, so
+none of this is exercised at mainnet scale until the oracle node passes it.
+Measured 2026-08-11: **641 slots/s** over a 90-minute idle window, 473 slots/s
+over a short window during a cargo build — so ~4-5 epochs/hour, and from epoch
+453 that is **11-14 hours to 507**. Disk (126 GiB free, ~0.9 GiB/epoch) reaches
+~520 comfortably; it is not what gates reaching Conway. Quote the rate WITH the
+window it was measured over.
+
+`db-preprod` (17 GiB, Mithril, ~10 min) plus a CoW clone replays to Conway in
+**1m53s** — that loop is fast enough to iterate on, and it is what caught both
+findings above.
+
 ### 2026-08-10 — mainnet is byte-exact through ALONZO; the endgame is a 40h sync
 
 **Epochs 208-316 vs cardano-streamer: 109 paired, 14,988 leaf comparisons,
