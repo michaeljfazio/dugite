@@ -177,16 +177,53 @@ for sweeping rather than sampling:
   address header selects the kind and the ledger's own
   `reward_account_to_hash` has always read it; only the serialiser did not.
   Confirmed pre-existing in the older dumps. FIXED.
-* **#1084 — a DRep deregistration does not clear its delegators (CONSENSUS).**
+* **#1084 — a DRep deregistration did not clear its delegators (CONSENSUS).**
   Found as a `drepDistr` membership divergence, preprod 172-184, in
-  `psDRepDistr` — the map RATIFY consumes as `reDRepDistr`. See below.
+  `psDRepDistr` — the map RATIFY consumes as `reDRepDistr`. FIXED; see below.
 
 **Exit code is still 2 and that is correct.** `instantaneousRewards` remains a
 deliberate honest gap (an epoch-PHASE field whose interesting phase contains no
 dump point; 0 of 66 oracle dumps carry a value), and the two DRep keys are a
 real finding rather than a schema problem.
 
-### #1084 — DRep deregistration does not clear its delegators (CONSENSUS, OPEN)
+### #1084 — DRep deregistration did not clear its delegators (CONSENSUS, FIXED)
+
+**Fixed and cross-validated.** `conwayGov.drepDistr` went from two schema gaps
+plus a 5,580x value divergence to **29,642 leaf comparisons, ZERO divergent
+paths, ZERO gaps** across all 22 preprod Conway epochs. The whole comparison is
+2,112,766 leaves with 4 divergent paths, all the known definitional epoch-4/5
+ones, and one deliberate gap (`instantaneousRewards`).
+
+**The adversarial review found TWO more divergences, and one was created BY the
+fix** — the #1072 pattern exactly, and the reason that review is not optional:
+
+* **The LEGACY deregistration route.** Conway's decoder maps legacy wire
+  indices 0-2 onto the Shelley shape and index 1 IS `ConwayUnRegCert`, so a
+  deposit-less deregistration lands in `apply_shelley_cert`, not in
+  `ConwayStakeDeregistration` — and Conway runs BOTH handlers for every cert.
+  That arm cleared only the forward map. Every forward-map WRITER got the
+  reverse-index treatment; of the REMOVERS, exactly this one was missed. With
+  the new wipe reading `delegs` as truth, the DRep's dereg then destroys a
+  delegation that has since MOVED elsewhere — #1084 inverted, live-reachable at
+  PV11 where the pv10 reconciliation can no longer repair it. **The 181-epoch
+  preprod validation is structurally blind to it**: the dump compares
+  `drepDistr`, which only moves at the final step.
+* **The PV9 write-back restored what was never taken.** `undelegate_vote`
+  reported its key unconditionally, discarding the removal result, so the
+  preserve branch invented an entry. Reachable at PV9 where delegating to an
+  unregistered DRep is legal. Mainnet 507-531 is un-replayed — exactly where it
+  would land.
+* And a comment that was FALSE: "a minor-only bump matches neither arm". A 10.x
+  bump has major 10 and does match. Harmless for pv10 (idempotent) but the pv11
+  arm `populateVRFKeyHashes` folds with a saturating `+1`, so a re-fire
+  double-counts. Widening the predicate is now a stated precondition of
+  implementing `psVRFKeyHashes`.
+
+Reviewed and NOT changed: `DelegateeDRepNotRegisteredDELEG` is present and
+raised with tests, contrary to the review's tentative concern — worth recording
+so it is not re-audited.
+
+#### The original defect
 
 `ConwayUnRegDRep` has TWO state mutations (`GovCert.hs:229-249`): remove the
 credential from `vsDReps`, **and clear the DRep delegation of every account in

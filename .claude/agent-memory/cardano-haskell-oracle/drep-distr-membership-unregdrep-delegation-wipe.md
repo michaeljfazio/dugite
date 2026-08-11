@@ -80,5 +80,46 @@ per-epoch power — agreed with cstreamer at EVERY epoch incl. the weird 7,652,8
 Epoch mapping: preprod epoch N starts at unix `1654041600 + N*432000`.
 CIP-129 bech32: header 0x22 keyhash / 0x23 scripthash, hrp `drep`.
 
+## Legacy wire certs route through the SAME Conway rules (TxCert.hs, verified 2026-08-11)
+
+Conway `DecCBOR (ConwayTxCert era)` (TxCert.hs:653-660): `0 <= t && t < 3 ->
+shelleyTxCertDelegDecoder t`, and `mkUnRegTxCert c = ConwayTxCertDeleg $
+ConwayUnRegCert c SNothing` (TxCert.hs:156). So a LEGACY stake-deregistration
+(wire idx 1 — still what deposit-less dereg txs carry on live Conway chains) IS
+`ConwayUnRegCert` and RUNS `processDRepUnDelegation` (Deleg.hs:258). Any
+implementation with a separate "legacy cert" code path must clear the
+`drepDelegs` reverse index there too — dugite missed exactly this (review of
+#1084's fix, 2026-08-11).
+
+## #4772 preserve branch: the write-back restores a MAP, not an element
+
+`delegVote` with `preserveIncorrectDelegation`: `dReps = cState ^. vsDRepsL`
+(pre-undelegation map) and the final state is `Map.insert target dRepState'
+dReps` — the WHOLE pre-map written back. Consequence a point-model gets wrong:
+if the undelegation was a NO-OP (delegator not in the old DRep's set — the
+missing-reverse state created at PV9 by delegating to an unregistered DRep that
+registers later), the write-back restores NOTHING. A point-model that
+"re-inserts into the previous DRep whenever a forward entry existed" ADDS the
+delegator where upstream does not. Re-insert only what the removal actually
+removed.
+
+## HARDFORK trigger + arms (Epoch.hs:374-379, HardFork.hs:70-84)
+
+`govState1` sets `cgsPrevPParamsL .~ curPParams` at EVERY boundary (Epoch.hs
+~330), so the trigger `curPv /= prevPv` on epochState1 means exactly "ProtVer
+changed at THIS boundary" — but it is a FULL ProtVer inequality, and
+`hardforkTransition` dispatches on `pvMajor newPv == 10 / == 11 / otherwise id`.
+A minor-only HFI (legal: pvCanFollow allows (m,n)->(m,n+1)) at major 10 RE-RUNS
+`updateDRepDelegations` (identity, given the PV10+ invariant); at major 11
+RE-RUNS `populateVRFKeyHashes`, which is NOT idempotent — `Map.insertWith
+(saturating +1)` double-counts every VRF key. A major-only trigger is
+outcome-equivalent for the 10-arm ONLY.
+
+`updateDRepDelegations` fine print: guard matches `Just (DRepCredential d)`
+only (Abstain/NoConfidence kept, not indexed); dangling forward delegations are
+DELETED from the account (`dRepDelegationAccountStateL .~ Nothing`) while the
+account itself is kept; runs on epochState1 (post-enactment) and its output
+feeds `setFreshDRepPulsingState` directly.
+
 See also [[drep-pulser-ratification]] (lifecycle) and
 [[drep-dormant-epoch-expiry-exact-mechanism]] (dormant arithmetic).

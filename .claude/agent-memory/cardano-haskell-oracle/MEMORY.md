@@ -55,7 +55,7 @@
 - [conway-gov-rule-verbatim-checks.md](conway-gov-rule-verbatim-checks.md) — conwayGovTransition order; UnelectedCommitteeVoters vs VotersDoNotExist use DIFFERENT committee sets
 
 ## Governance (Conway / CIP-1694)
-- [drep-distr-membership-unregdrep-delegation-wipe.md](drep-distr-membership-unregdrep-delegation-wipe.md) — UnRegDRep WIPES delegations via drepDelegs; #4772 PV9 stale-index bug; PV10 HARDFORK updateDRepDelegations; NO expiry filter in psDRepDistr
+- [drep-distr-membership-unregdrep-delegation-wipe.md](drep-distr-membership-unregdrep-delegation-wipe.md) — UnRegDRep WIPES via drepDelegs; legacy idx-1 dereg = ConwayUnRegCert (also wipes); #4772 write-back restores a MAP not an element; PV10 HARDFORK reconciles; PV11 arm NOT idempotent
 - [conway-nextenactstate-dump-semantics.md](conway-nextenactstate-dump-semantics.md) — rsEnactState is SELF-INCLUSIVE: forced-pulser dump shows an enacting id/PV ONE epoch early; EnactState JSON prints 5/7 fields (no treasury/withdrawals)
 - [drep-dormant-epoch-expiry-exact-mechanism.md](drep-dormant-epoch-expiry-exact-mechanism.md) — numDormantEpochs bump-at-submission (NOT ratify-check)
 - [drep-pulser-ratification.md](drep-pulser-ratification.md) — pulser snapshot at END of EPOCH rule, pulse spreads 4k blocks
