@@ -1410,6 +1410,7 @@ mod tests {
             pool_params: Arc::new(HashMap::new()),
             future_pool_params: HashMap::new(),
             pending_retirements: HashMap::new(),
+            vrf_key_hashes: Default::default(),
             reward_accounts: imbl::HashMap::new(),
             stake_key_deposits: imbl::HashMap::new(),
             pool_deposits: HashMap::new(),

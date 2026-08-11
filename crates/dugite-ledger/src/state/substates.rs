@@ -52,6 +52,56 @@ pub struct CertSubState {
     pub pool_params: Arc<HashMap<Hash28, PoolRegistration>>,
     pub future_pool_params: HashMap<Hash28, PoolRegistration>,
     pub pending_retirements: HashMap<Hash28, EpochNo>,
+    /// `psVRFKeyHashes` — how many pools hold each VRF key hash (#1085).
+    ///
+    /// From protocol version 11 a pool may not register with a VRF key another
+    /// pool already holds (`hardforkConwayDisallowDuplicatedVRFKeys`,
+    /// `Shelley.Rules.Pool`):
+    ///
+    /// ```haskell
+    /// Map.notMember ppVrf psVRFKeyHashes ?! VRFKeyHashAlreadyRegistered ppId ppVrf
+    /// ```
+    ///
+    /// # Why this is stored rather than derived from `pool_params`
+    ///
+    /// dugite derived the registry from the live pool set at validation time,
+    /// which is narrower than upstream's in three ways, each of them
+    /// accept-where-Haskell-rejects (#1085):
+    ///
+    /// * upstream seeds it from `psStakePools` **and `psFutureStakePools`**, so
+    ///   a re-registration's new key is claimed the moment the certificate
+    ///   applies — while dugite's `future_pool_params` kept it invisible until
+    ///   the boundary;
+    /// * a retiring pool keeps its key until POOLREAP, not until it leaves the
+    ///   pool set;
+    /// * it is an occurrence COUNT, not a single holder. Counts above one exist
+    ///   because duplicates were LEGAL before PV11, and `populateVRFKeyHashes`
+    ///   preserves them at the fork rather than collapsing them — so a
+    ///   pre-existing duplicate must survive one retirement and only stop
+    ///   blocking new registrations when the last holder reaps.
+    ///
+    /// Maintained at exactly four sites, mirroring upstream: seeded by the
+    /// pvMajor-11 arm of the intra-era HARDFORK rule, inserted on pool
+    /// registration, insert-and-supersede on re-registration, and at POOLREAP
+    /// where superseded ("dangling") keys are DELETED outright while retiring
+    /// pools' keys are DECREMENTED. That asymmetry is upstream's and is only
+    /// observable when a count exceeds one.
+    ///
+    /// Empty below PV11, where the rule does not exist and nothing reads it.
+    ///
+    /// # It is genuinely NOT derivable, and the counter-example is subtle
+    ///
+    /// Counting occurrences over `pool_params ∪ future_pool_params` at load
+    /// reproduces this map in every ordinary case, which is exactly what makes
+    /// the shortcut tempting. It breaks on the dangling/retired asymmetry:
+    /// take a key shared by pools A and B since before the fork (count 2), and
+    /// let A re-register with a fresh key. At POOLREAP the shared key is A's
+    /// "dangling" old key, so upstream removes it with `Map.withoutKeys` —
+    /// which deletes it OUTRIGHT, even though B still holds it. Upstream's map
+    /// then has no entry and a new pool C may claim that key; a derived count
+    /// would say 1 and reject C. Same input, opposite verdicts, on a consensus
+    /// path.
+    pub vrf_key_hashes: ImblHashMap<Hash32, u64>,
     /// Reward account balances: stake credential hash → accumulated rewards.
     ///
     /// Uses `imbl::HashMap` for O(1) clone semantics — see `delegations`

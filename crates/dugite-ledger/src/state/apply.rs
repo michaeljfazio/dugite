@@ -969,12 +969,7 @@ impl LedgerState {
         ): (
             std::sync::Arc<std::collections::HashSet<dugite_primitives::hash::Hash28>>,
             std::sync::Arc<std::collections::HashSet<dugite_primitives::hash::Hash32>>,
-            std::sync::Arc<
-                std::collections::HashMap<
-                    dugite_primitives::hash::Hash32,
-                    dugite_primitives::hash::Hash28,
-                >,
-            >,
+            std::sync::Arc<crate::validation::VrfKeyRegistry>,
             std::sync::Arc<std::collections::HashSet<dugite_primitives::hash::Hash32>>,
             std::sync::Arc<std::collections::HashSet<dugite_primitives::hash::Hash32>>,
             std::sync::Arc<std::collections::HashSet<dugite_primitives::hash::Hash32>>,
@@ -1013,25 +1008,36 @@ impl LedgerState {
             let cached = self.cached_validation_registry.take();
 
             // `pools` + `vrf_keys` ← `certs.pool_params` (Arc ptr-eq).
+            // BOTH sources must match, not just `pool_params` — see
+            // `CachedValidationRegistry::vrf_key_hashes_src` (#1085).
             let pp_hit = cached
                 .as_ref()
                 .is_some_and(|c| Arc::ptr_eq(&c.pool_params_src, &self.certs.pool_params));
-            let (pools, vrf_keys) = if pp_hit {
-                let c = cached.as_ref().expect("pp_hit implies Some");
-                (Arc::clone(&c.pools), Arc::clone(&c.vrf_keys))
+            let vrf_hit = cached
+                .as_ref()
+                .is_some_and(|c| c.vrf_key_hashes_src.ptr_eq(&self.certs.vrf_key_hashes));
+            let pools = if pp_hit {
+                Arc::clone(&cached.as_ref().expect("pp_hit implies Some").pools)
             } else {
-                let pools: Arc<HashSet<dugite_primitives::hash::Hash28>> =
-                    Arc::new(self.certs.pool_params.keys().copied().collect());
-                let vrf_keys: Arc<
-                    HashMap<dugite_primitives::hash::Hash32, dugite_primitives::hash::Hash28>,
-                > = Arc::new(
-                    self.certs
+                Arc::new(self.certs.pool_params.keys().copied().collect())
+            };
+            let vrf_keys: Arc<crate::validation::VrfKeyRegistry> = if pp_hit && vrf_hit {
+                Arc::clone(&cached.as_ref().expect("hit implies Some").vrf_keys)
+            } else {
+                Arc::new(crate::validation::VrfKeyRegistry {
+                    occurrences: self
+                        .certs
+                        .vrf_key_hashes
+                        .iter()
+                        .map(|(h, c)| (*h, *c))
+                        .collect(),
+                    pool_current_vrf: self
+                        .certs
                         .pool_params
                         .values()
-                        .map(|reg| (reg.vrf_keyhash, reg.pool_id))
+                        .map(|reg| (reg.pool_id, reg.vrf_keyhash))
                         .collect(),
-                );
-                (pools, vrf_keys)
+                })
             };
 
             // `dreps` ← `gov.dreps` (imbl ptr-eq).
@@ -1145,6 +1151,7 @@ impl LedgerState {
             // local Arcs; the assignment target is a disjoint field.
             self.cached_validation_registry = Some(crate::state::CachedValidationRegistry {
                 pool_params_src: Arc::clone(&self.certs.pool_params),
+                vrf_key_hashes_src: self.certs.vrf_key_hashes.clone(),
                 pools: Arc::clone(&pools),
                 vrf_keys: Arc::clone(&vrf_keys),
                 dreps_src: self.gov.governance.dreps.clone(),
@@ -1175,7 +1182,7 @@ impl LedgerState {
             (
                 Arc::new(HashSet::new()),
                 Arc::new(HashSet::new()),
-                Arc::new(HashMap::new()),
+                Arc::new(crate::validation::VrfKeyRegistry::default()),
                 Arc::new(HashSet::new()),
                 Arc::new(HashSet::new()),
                 Arc::new(HashSet::new()),
@@ -1386,7 +1393,9 @@ impl LedgerState {
                         ))
                         .with_pools_arc(std::sync::Arc::clone(&block_registered_pool_ids))
                         .with_dreps_arc(std::sync::Arc::clone(&block_registered_drep_ids))
-                        .with_vrf_keys_arc(std::sync::Arc::clone(&block_registered_vrf_keys))
+                        .with_vrf_key_registry_arc(std::sync::Arc::clone(
+                            &block_registered_vrf_keys,
+                        ))
                         .with_committee_members_arc(std::sync::Arc::clone(
                             &block_committee_member_keys,
                         ))
@@ -1814,13 +1823,21 @@ impl LedgerState {
                 if mode == BlockValidationMode::ValidateAll && !tx.body.certificates.is_empty() {
                     block_registered_pool_ids =
                         std::sync::Arc::new(self.certs.pool_params.keys().copied().collect());
-                    block_registered_vrf_keys = std::sync::Arc::new(
-                        self.certs
-                            .pool_params
-                            .values()
-                            .map(|reg| (reg.vrf_keyhash, reg.pool_id))
-                            .collect(),
-                    );
+                    block_registered_vrf_keys =
+                        std::sync::Arc::new(crate::validation::VrfKeyRegistry {
+                            occurrences: self
+                                .certs
+                                .vrf_key_hashes
+                                .iter()
+                                .map(|(h, c)| (*h, *c))
+                                .collect(),
+                            pool_current_vrf: self
+                                .certs
+                                .pool_params
+                                .values()
+                                .map(|reg| (reg.pool_id, reg.vrf_keyhash))
+                                .collect(),
+                        });
                     block_registered_drep_ids =
                         std::sync::Arc::new(self.gov.governance.dreps.keys().copied().collect());
                     block_vote_delegation_keys = std::sync::Arc::new(
