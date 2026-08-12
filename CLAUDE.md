@@ -219,6 +219,36 @@ active protocol version as the release bar it is not optional any more** — it 
 the only live evidence that the PV11 arms work, and a "4/4 PASS" on the standard
 preset says nothing about them.
 
+**And the PV11 arms are byte-exact on REAL chain data.** dugite replayed the
+whole of preprod — genesis to tip, **306 epochs in 4m06s** — crossing preprod's
+own PV10→PV11 hard fork, with one warning (the expected first-Conway-boundary
+pulser notice) and no errors, no rejected blocks, no stall. The pots at epoch
+306, twelve epochs INTO PV11, are byte-identical to db-sync via Koios:
+
+```
+treasury  1959103174719172
+reserves 12979123112128607
+```
+
+That is the strongest evidence available for #1085 and #1086 short of mainnet:
+`populateVRFKeyHashes` seeded from preprod's real ~500-pool set rather than a
+two-pool fixture, twelve epochs of post-fork blocks ran #1086's accumulating
+arm, and post-fork pool registrations ran the duplicate-VRF predicate against a
+populated registry — with the monetary state landing exactly where an
+independent implementation says it should. A corrupted registry or a wrongly
+rejected block does not produce that number.
+
+*Still not covered, and worth naming rather than implying:* nothing yet asserts
+that a duplicate-VRF registration is REJECTED identically by dugite and
+cardano-node. Preprod's history contains no such attempt — the rule is only
+reachable adversarially. That needs a tx-zoo negative in `16-cert-negatives`
+modelled on 16e (which already inverts on PV): accepted at PV≤10, rejected with
+`VRFKeyHashAlreadyRegistered` at PV≥11, run through BOTH sockets, and picked up
+automatically by the parity oracle. It is NOT written, because a zoo script must
+be exercised on a live devnet before it is committed and doing that requires
+port 12798 — the same port the mainnet sync holds. Write it in the next window
+that already has the devnet up.
+
 ### 2026-08-11 — conwayGov LANDED and cross-validated; the mainnet blocker is the SYNC, not disk
 
 `conwayGov` is emitted and validated against **real preprod Conway oracle
