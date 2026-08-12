@@ -332,13 +332,38 @@ worth naming rather than discovering on mainnet:
 | arm | preprod 163-184 | note |
 |---|---|---|
 | `scriptHash-` credential keys | YES — the whole committee | key kind read from byte 28 of the typed hash, not a side set |
-| `keyHash-` credential keys | NO | mainnet's committee will exercise it |
+| `keyHash-` COMMITTEE keys | NO, and the prediction that mainnet would cover it is **WRONG** | see the correction below |
 | `committeeState` non-empty | YES — grows 0 → 4 | all `CommitteeHotCredential` |
 | `CommitteeMemberResigned` | NO | shape taken from the ToJSON instance, unobserved |
 | `constitution.script` present | YES | absent-arm (key omitted, not null) unobserved |
 | `committee = null` (SNothing) | NO | needs an enacted `NoConfidence` |
 | `prevGovActionIds` non-null | YES — 2 of 4 lanes | `Committee`/`Constitution` lanes unobserved |
 | `curPParams` ≠ `prevPParams` | YES — at 179, 180, 181 | covers costModels and protocolVersion |
+
+### CORRECTION (2026-08-12): mainnet does not cover the `keyHash-` committee arm
+
+The table above predicted mainnet would. Measured from dugite's own mainnet
+dumps at epochs 507, 510, 515 and 519: the committee is **7 members, 7
+`scriptHash-`, 0 `keyHash-`** at every one. Cardano's interim constitutional
+committee is script-credentialled by design, on mainnet exactly as on preprod,
+so that arm is not reachable on any live network today and may never be. It
+stays unit-tested (`credential_key_renders_both_kinds`) and that is the honest
+state — the prediction was an assumption dressed as coverage, which is worse
+than a blank, because the next reader stops looking.
+
+What mainnet DOES cover that preprod could not, at scale:
+
+| arm | mainnet 507-519 |
+|---|---|
+| `drep-keyHash-` | **369 → 468** entries |
+| `drep-scriptHash-` | 2 → 4 entries |
+| `committeeState` non-empty | 0 → 7 authorizations |
+
+So the both-kinds handling in `drepDistr` — the defect that started this whole
+thread — is exercised on hundreds of real credentials of both kinds, and the
+tagged `CommitteeHotCredential` sum on seven real authorizations. Note these are
+statements about what dugite EMITS: the oracle side had not reached epoch 507
+when they were taken, so they are structural confirmation, not yet agreement.
 
 ## Remaining work, in order
 
