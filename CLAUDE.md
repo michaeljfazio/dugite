@@ -450,7 +450,14 @@ window it was measured over.
 
 `db-preprod` (17 GiB, Mithril, ~10 min) plus a CoW clone replays to Conway in
 **1m53s** — that loop is fast enough to iterate on, and it is what caught both
-findings above.
+findings above. A full replay to preprod's tip (306 epochs) is 4m06s.
+
+**Set `DUGITE_DUMP_DIGEST=1` on any ad-hoc replay.** `dugite-mainnet-dump.sh`
+sets it; a hand-rolled `dump-snapshot` invocation does not, and the raw
+`stake`/`delegations` maps dominate the output — 306 preprod epochs cost 3.1 GB
+undigested against ~0.4 GB digested, and mainnet is far worse. The comparator
+digests those two fields anyway, so the raw form buys nothing unless something
+is being drilled into.
 
 ### 2026-08-10 — mainnet is byte-exact through ALONZO; the endgame is a 40h sync
 
