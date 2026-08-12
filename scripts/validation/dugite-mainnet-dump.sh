@@ -16,7 +16,22 @@ set -uo pipefail
 DUGITE_ROOT=${DUGITE_ROOT:-/Users/michaelfazio/Source/dugite}
 WT=${WT:-$DUGITE_ROOT/.claude/worktrees/nonmyopic-1067}
 BIN=${BIN:-$WT/target/release/dugite-node}
-CFG=${CFG:-$DUGITE_ROOT/config/mainnet/config.json}
+# The config comes from the SAME TREE as the binary.
+#
+# This defaulted to `$DUGITE_ROOT/config/mainnet/config.json` — the main
+# checkout — while the binary came from `$WT`. Those are different trees at
+# different commits, and the main checkout's config was stale: it pinned
+# `ByronGenesisHash: dbbdaeab…` where mainnet's is `5f20df93…`, and carried no
+# Alonzo or Conway genesis pin at all. A tip run that had waited 16 hours for
+# the oracle to reach its target epoch then died instantly on
+#
+#   Byron genesis hash mismatch … refusing to start rather than build a ledger
+#   from an unverified genesis
+#
+# which is the guard behaving exactly as intended — the failure was pointing it
+# at a config the code under test does not ship. Sourcing both from `$WT` makes
+# the pairing structural instead of coincidental.
+CFG=${CFG:-$WT/config/mainnet/config.json}
 DB=${DB:-$DUGITE_ROOT/db-mainnet-avvm}
 OUT=${OUT:-$DUGITE_ROOT/reports/mainnet-exactness/dugite-digest}
 STOP_SLOT=${STOP_SLOT:-}
