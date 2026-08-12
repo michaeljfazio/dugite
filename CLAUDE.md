@@ -150,7 +150,19 @@ not, and both are consensus:
 | refInputs disjointness relaxed at 11, re-added in V3/V4 `TxInfo` | already correct — gated to exactly `8 < PV < 11` |
 | DELEG deposit/refund constructors (tag 1 → 7/8) | already correct |
 | script-integrity constructor (UTXOW 13 → 18) | already correct (#1058) |
+| plutus-side PV11 (batch-6 builtins, the V1 vanRossem unfreeze) | already correct — see below |
 | CBOR framing | **nothing changes 10→11** — version-conditional encoding exists only at 2/7/9/12 |
+
+The plutus-side item is the one worth recording as a NEGATIVE, because
+`project_uplc_conformance_2026_05_23` says the UPLC corpus is variant-E/no-PV
+and structurally cannot catch a PV-gate bug — so "conformance 100%" is not
+evidence here. dugite carries the full `builtinsIntroducedIn` table per language
+per protocol version, including batch 6 arriving at PV11 and PlutusV1 gaining
+every later batch at once at `vanRossemPV` (V1 has exactly two map entries
+upstream, not a staggered series), and it is ENFORCED in production — the flat
+decoder's term validation rejects an unavailable builtin with a typed
+`FlatDecode` error, alongside the vanRossem constant-size bound. Verified by
+finding the call site, not by reading the table.
 
 **#1085 — the duplicate-VRF registry was DERIVED and upstream's is STATE.**
 dugite had the predicate and the PV gate; it folded a single-holder map over
