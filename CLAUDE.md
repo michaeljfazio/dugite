@@ -128,6 +128,54 @@ dugite-lsm (LSM-tree on-disk storage for UTxO-HD)
 
 ## Current Focus
 
+### 2026-08-13 — MAINNET IS BYTE-EXACT THROUGH CONWAY, and conwayGov compares at scale
+
+`reports/mainnet-exactness/report.json` — **312 paired epochs (208-519), 50,996
+leaf comparisons, and ZERO dugite-side value divergences.** 207 Byron epochs
+correctly oracle-silent. Exit 2, which is the right verdict, from the single
+deliberate `instantaneousRewards` gap.
+
+**`conwayGov` compares at mainnet scale: 21,972 leaf comparisons, 0 divergent
+paths, 0 schema gaps** over the 13 Conway epochs (507-519). That is what #1073
+was for — before it, ~140 Conway epochs would have compared vacuously and a tip
+run could have reported a false PASS.
+
+Every one of the 9 divergent paths is accounted for, and the windows were
+CHECKED rather than assumed:
+
+| path | epochs | attribution |
+|---|---|---|
+| `rupdNext.deltaR2` / `.totalDistributed` | 212-236 | **#1077, ORACLE-side** |
+| `rupdApplied.deltaR2` / `.totalDistributed` | 213-237 | the SAME defect, shifted one |
+| `rupdNext`, `rupdApplied`, `snapshots.set` | 208-210 | definitional first-Shelley |
+| `eta`, `expectedBlocks` | see below | **reporting mismatch, NOT consensus** |
+
+100 of the 109 divergent (path, epoch) instances are #1077 counted twice by
+construction, exactly as predicted — `rupdApplied[E] == rupdNext[E-1]`, so one
+oracle defect appears in two fields one epoch apart. Reading 61 → 109 as a
+regression would be wrong.
+
+**The two that did NOT match the prediction, and why they are still not
+consensus.** `eta` is GAPPY (208, 209, 216, 221, 244, 268) and `expectedBlocks`
+appears at 212-213, neither of which the definitional story explains. They are
+real numeric disagreements, not absences: dugite reports `eta` capped at 1/1
+where the oracle reports the raw ratio (2855/2808, 871/864, 5201/5184,
+3617/3600 — every one slightly ABOVE one), and `expectedBlocks` as 0 where the
+oracle has 2160/4320.
+
+Settled by measurement, not by argument: **at epoch 244 every `rupdNext`
+monetary term is byte-identical** — deltaR1 38788698364101, rPot
+38802066557477, rewardPot 31041653245982, totalDistributed 16575985915645, all
+six matching. The reward math agrees exactly, so only the REPORTED value
+differs. dugite's dump caps `eta` at 1 and zeroes `expectedBlocks` in the
+`d >= 4/5` regime; upstream reports the raw inputs and caps at the point of use.
+
+That is the `epochFees` defect's class — a definitional mismatch that shows up
+as a divergence and would MASK a real difference in the same field. The fix is
+dump-only: emit both as the oracle defines them. NOT done here, because it
+touches `crates/` and would stale a QA report that was just regenerated; batch
+it with the next code change.
+
 ### 2026-08-12 — PV11 compatibility is now a RELEASE REQUIREMENT, and the sweep found two gaps
 
 **Standing requirement: any release must be fully compatible up to the protocol
