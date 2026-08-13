@@ -292,6 +292,61 @@ WAIT-LOOP's own command line, so the watcher reports the watched as still
 running forever. The replay had finished five minutes earlier. Grep the log for
 the completion line instead of polling for the process.
 
+### 2026-08-13 — Byron's protocol parameters are ON-CHAIN, and dugite tracks none of them
+
+Found by building the Byron comparison and running it — the point of a
+comparison is to be wrong somewhere, and this one was, three times over.
+
+**dugite pinned Byron's fee policy while PARSING it from genesis and throwing it
+away.** `eras/byron.rs`'s `ByronFeePolicy::canonical()` hardcodes
+`a = 155381`, `b = 21973/500`, under a comment reading *"dugite does not yet
+parse the Byron `txFeePolicy`"*. It does: `genesis.rs` deserialised it into
+`_summand` / `_multiplier` — underscore-prefixed, discarded. #1067's shape, a
+field decoded for want of a destination. Any network whose genesis carries
+different values would have been validated against mainnet's from block 1.
+
+The de-scaling was also mis-documented in the opposite direction: the struct said
+*"both values are x1e12"* and the ledger said 1e9. **1e9 is right** —
+`155381000000000/1e9 = 155381`, and 1e12 would have made every Byron minimum fee
+a THOUSANDFOLD too small, i.e. accepted transactions cardano-node rejects. Two
+comments disagreeing about a consensus constant, and only arithmetic against the
+real file settles it. Now derived, with five tests including a refusal to round a
+non-integral summand and an explicit assertion that the scale is nano not pico.
+
+**But genesis is NOT sufficient, and the comparison is what proved it.** At
+mainnet Byron epoch 100:
+
+| field | dugite (from genesis) | oracle (from ledger state) |
+|---|---|---|
+| `txFeePolicy` | summand 155381, mult 21973/500 | **identical** |
+| `maxBlockSize` | 2000000 | **32768** |
+| `maxTxSize` | 4096 | **8192** |
+| `byronDelegation.count` | 0 | **7** |
+
+Byron's UPDATE SYSTEM changed the size limits on-chain, so the adopted parameters
+are not the genesis ones. The fee policy matching is therefore **luck, not
+correctness** — mainnet simply never changed it. And dugite's `genesis_delegates`
+is loaded from the SHELLEY genesis, so it is empty for all 207 Byron epochs.
+
+**The real requirement is Byron's `UPI.State`**, not a better constant: adopted
+protocol parameters, proposals and votes, maintained across the era. Deriving
+from genesis is strictly better than pinning and is what landed, but it is a
+floor, not the fix. Recorded as such rather than claimed as done.
+
+Sequencing deliberately chosen: the genesis-derived values are emitted in the
+DUMP first, so the comparison proves them against the oracle, and only then does
+the consensus path move onto them. `ByronFeePolicy::canonical()` is still what
+validation calls — swapping it before the values were verified would have put an
+unproven number on a consensus path, which is the thing this repo's process
+exists to prevent.
+
+**Validated NEGATIVES from the same sweep, so they are not re-audited:**
+`byron_epoch_length` IS correctly derived (`10 * k` from Byron genesis, at
+`main.rs` and `node/mod.rs`; the `21600` in the struct is a test default).
+Conway's 1 MiB block-body limit, 25 KiB ref-script cap and 1.2x tier are
+hardcoded IN CARDANO-LEDGER — Dijkstra re-parameterises them — so pinning them
+matches upstream and is correct.
+
 ### 2026-08-13 — the ORACLE now dumps Byron, and it is on OUR fork
 
 **`github.com/michaeljfazio/cardano-streamer`, branch

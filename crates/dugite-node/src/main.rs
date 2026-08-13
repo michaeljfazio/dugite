@@ -649,12 +649,32 @@ async fn run_dump_snapshot(args: DumpSnapshotArgs) -> Result<()> {
                                                   // Byron replay and are correctly purged by `returnRedeemAddrsToReserves` at the
                                                   // Shelley→Allegra boundary (epoch 236 on mainnet, ~299M ADA returned to reserves).
     let mut byron_genesis_utxos: Vec<(Vec<u8>, u64)> = Vec::new();
+    // Byron's on-chain protocol parameters, DERIVED from genesis rather than
+    // pinned. `eras/byron.rs`'s `ByronFeePolicy` still hardcodes mainnet's
+    // `a = 155381` / `b = 21973/500` on the VALIDATION path; these are the same
+    // values read from the file, emitted in the dump so the comparison against
+    // cardano-streamer's `byronProtocolParams` proves they agree BEFORE the
+    // consensus path is switched over to them. Proving first, then swapping, is
+    // the order that avoids putting an unverified value on a consensus path.
+    let mut byron_pparams: Option<serde_json::Value> = None;
     if let Some(ref genesis_path) = node_config.byron_genesis_file {
         let genesis_path = config_dir.join(genesis_path);
         if let Ok((genesis, _hash)) = genesis::ByronGenesis::load_with_hash(&genesis_path) {
             let k = genesis.security_param();
             byron_epoch_length = 10 * k;
             byron_slot_duration_ms = genesis.slot_duration_ms();
+            let bvd = &genesis.block_version_data;
+            byron_pparams = bvd.tx_fee_policy.to_exact().map(|(summand, (num, den))| {
+                serde_json::json!({
+                    "scriptVersion": bvd.script_version,
+                    "maxBlockSize": bvd.max_block_size.parse::<u64>().unwrap_or_default(),
+                    "maxTxSize": bvd.max_tx_size.parse::<u64>().unwrap_or_default(),
+                    "txFeePolicy": {
+                        "summand": summand,
+                        "multiplier": { "numerator": num, "denominator": den },
+                    },
+                })
+            });
             let utxos = genesis.initial_utxos();
             let total: u64 = utxos.iter().map(|e| e.lovelace).sum();
             info!(
@@ -968,6 +988,7 @@ async fn run_dump_snapshot(args: DumpSnapshotArgs) -> Result<()> {
                 epoch_fees,
                 max_lovelace_supply,
                 prev_rupd_next.clone(),
+                byron_pparams.clone(),
             );
             // Thread this epoch's `rupdNext` forward to become the next
             // epoch's `rupdApplied`, mirroring upstream's `(json, rupdData)`
@@ -1620,6 +1641,10 @@ fn build_epoch_snapshot(
     // informative and would no longer match the oracle, manufacturing
     // divergences that are definitional.
     prev_rupd_next: serde_json::Value,
+    // Byron's on-chain protocol parameters, DERIVED from the Byron genesis file.
+    // `None` when the config declares no Byron genesis, i.e. a
+    // Shelley-from-genesis chain that has no Byron era to describe.
+    byron_pparams: Option<serde_json::Value>,
 ) -> serde_json::Value {
     // `epochFees` must be the LEDGER's `ssFee`, not a fee total the dump driver
     // accumulated for itself.
@@ -2011,6 +2036,167 @@ fn build_epoch_snapshot(
         })
     };
 
+    // ── Era-common and era-GATED protocol parameters ────────────────────────
+    //
+    // The dump published a seven-field subset (rho/tau/d/a0/nOpt/minPoolCost/
+    // protocolVersion) — the era-common intersection — so everything an era
+    // INTRODUCED compared against nothing. The oracle now emits these
+    // (michaeljfazio/cardano-streamer, dugite/full-era-ledger-dumps); these are
+    // dugite's matching side, and the shapes are matched deliberately field for
+    // field, because a comparison of differently-shaped objects is a schema gap
+    // dressed up as a comparison.
+    //
+    // Era-gated the same way the oracle gates it: ABSENT, not zero, in eras
+    // that lack the parameter. Alonzo has no `coinsPerUTxOByte` — that is
+    // Babbage's parameter, and Alonzo's `coinsPerUTxOWord` is a different one
+    // with a different unit (#919). Emitting a zero for a parameter an era does
+    // not have manufactures a value.
+    let rat = |r: &dugite_primitives::transaction::Rational| serde_json::json!({ "numerator": r.numerator, "denominator": r.denominator });
+    let common_protocol_params = serde_json::json!({
+        "minFeeA": prev_pp.min_fee_a,
+        "minFeeB": prev_pp.min_fee_b,
+        "maxBlockBodySize": prev_pp.max_block_body_size,
+        "maxTxSize": prev_pp.max_tx_size,
+        "maxBlockHeaderSize": prev_pp.max_block_header_size,
+        "keyDeposit": prev_pp.key_deposit.0,
+        "poolDeposit": prev_pp.pool_deposit.0,
+        "eMax": prev_pp.e_max,
+    });
+    let era_protocol_params: serde_json::Value = {
+        use dugite_primitives::era::Era;
+        let era = ledger.era;
+        if era < Era::Alonzo {
+            serde_json::Value::Null
+        } else {
+            let mut m = serde_json::Map::new();
+            // Alonzo+
+            m.insert(
+                "costModels".into(),
+                serde_json::to_value(&prev_pp.cost_models).unwrap_or(serde_json::Value::Null),
+            );
+            m.insert(
+                "executionUnitPrices".into(),
+                serde_json::json!({
+                    "priceMemory": rat(&prev_pp.execution_costs.mem_price),
+                    "priceSteps": rat(&prev_pp.execution_costs.step_price),
+                }),
+            );
+            m.insert(
+                "maxTxExUnits".into(),
+                serde_json::json!({
+                    "memory": prev_pp.max_tx_ex_units.mem,
+                    "steps": prev_pp.max_tx_ex_units.steps,
+                }),
+            );
+            m.insert(
+                "maxBlockExUnits".into(),
+                serde_json::json!({
+                    "memory": prev_pp.max_block_ex_units.mem,
+                    "steps": prev_pp.max_block_ex_units.steps,
+                }),
+            );
+            m.insert("maxValueSize".into(), prev_pp.max_val_size.into());
+            m.insert(
+                "collateralPercentage".into(),
+                prev_pp.collateral_percentage.into(),
+            );
+            m.insert(
+                "maxCollateralInputs".into(),
+                prev_pp.max_collateral_inputs.into(),
+            );
+            if era >= Era::Babbage {
+                m.insert(
+                    "coinsPerUTxOByte".into(),
+                    prev_pp.ada_per_utxo_byte.0.into(),
+                );
+            }
+            if era >= Era::Conway {
+                // Named keys, not a positional record: #951 shifted six of the
+                // ten DRep thresholds and appended `constitution` where
+                // `treasuryWithdrawal` belongs. Named keys catch a mislabelled
+                // field; an array cannot tell a wrong order from a wrong value.
+                m.insert(
+                    "poolVotingThresholds".into(),
+                    serde_json::json!({
+                        "motionNoConfidence": rat(&prev_pp.pvt_motion_no_confidence),
+                        "committeeNormal": rat(&prev_pp.pvt_committee_normal),
+                        "committeeNoConfidence": rat(&prev_pp.pvt_committee_no_confidence),
+                        "hardForkInitiation": rat(&prev_pp.pvt_hard_fork),
+                        "ppSecurityGroup": rat(&prev_pp.pvt_pp_security_group),
+                    }),
+                );
+                m.insert(
+                    "dRepVotingThresholds".into(),
+                    serde_json::json!({
+                        "motionNoConfidence": rat(&prev_pp.dvt_no_confidence),
+                        "committeeNormal": rat(&prev_pp.dvt_committee_normal),
+                        "committeeNoConfidence": rat(&prev_pp.dvt_committee_no_confidence),
+                        "updateToConstitution": rat(&prev_pp.dvt_constitution),
+                        "hardForkInitiation": rat(&prev_pp.dvt_hard_fork),
+                        "ppNetworkGroup": rat(&prev_pp.dvt_pp_network_group),
+                        "ppEconomicGroup": rat(&prev_pp.dvt_pp_economic_group),
+                        "ppTechnicalGroup": rat(&prev_pp.dvt_pp_technical_group),
+                        "ppGovGroup": rat(&prev_pp.dvt_pp_gov_group),
+                        "treasuryWithdrawal": rat(&prev_pp.dvt_treasury_withdrawal),
+                    }),
+                );
+                m.insert("committeeMinSize".into(), prev_pp.committee_min_size.into());
+                m.insert(
+                    "committeeMaxTermLength".into(),
+                    prev_pp.committee_max_term_length.into(),
+                );
+                m.insert(
+                    "govActionLifetime".into(),
+                    prev_pp.gov_action_lifetime.into(),
+                );
+                m.insert(
+                    "govActionDeposit".into(),
+                    prev_pp.gov_action_deposit.0.into(),
+                );
+                m.insert("dRepDeposit".into(), prev_pp.drep_deposit.0.into());
+                m.insert("dRepActivity".into(), prev_pp.drep_activity.into());
+                m.insert(
+                    "minFeeRefScriptCostPerByte".into(),
+                    rat(&prev_pp.min_fee_ref_script_cost_per_byte),
+                );
+            }
+            serde_json::Value::Object(m)
+        }
+    };
+
+    // `instantaneousRewards` — the PENDING MIR transfers, which the boundary
+    // applies and clears.
+    //
+    // Left as a deliberate gap until now, on the argument that both sides dump
+    // at the first block of the new epoch, so the interesting PHASE contains no
+    // dump point and emitting it converts a gap into `{}` vs `{}`. That
+    // reasoning was about EVIDENCE, and it holds — but a gap also means the
+    // field is never compared at all, so a dugite-side value appearing where
+    // upstream has none would go unseen. Emitting dugite's real map is not a
+    // fabrication: the map genuinely is empty at this point, and if it ever is
+    // not, that is exactly what wants to be visible.
+    // FOUR keys, and the names are upstream's — `iRReserves`, `iRTreasury`,
+    // `deltaReserves`, `deltaTreasury`, the fields of Haskell's
+    // `InstantaneousRewards`. Verified against real oracle output rather than
+    // assumed: a first cut emitted `reserves`/`treasury`, which pairs with
+    // nothing and would have turned one gap into four while looking like a fix.
+    let instantaneous_rewards = serde_json::json!({
+        "iRReserves": ledger
+            .certs
+            .pending_mir_reserves
+            .iter()
+            .map(|(k, v)| (hex::encode(k.as_bytes()), *v))
+            .collect::<std::collections::BTreeMap<_, _>>(),
+        "iRTreasury": ledger
+            .certs
+            .pending_mir_treasury
+            .iter()
+            .map(|(k, v)| (hex::encode(k.as_bytes()), *v))
+            .collect::<std::collections::BTreeMap<_, _>>(),
+        "deltaReserves": ledger.certs.pending_mir_delta_reserves,
+        "deltaTreasury": ledger.certs.pending_mir_delta_treasury,
+    });
+
     // Byron's own shape, paired against the oracle's Byron dump.
     //
     // Byron used to be ORACLE-SILENT — cardano-streamer's `buildSnapshotJson`
@@ -2039,9 +2225,33 @@ fn build_epoch_snapshot(
         serde_json::Value::Null
     };
 
+    // Byron-only, matching the oracle's key set for the era. `lastSlot` and the
+    // genesis delegation count are Byron ledger state; `byronProtocolParams` is
+    // the genesis-derived fee policy and size limits.
+    let (byron_last_slot, byron_delegation, byron_protocol_params) =
+        if ledger.era == dugite_primitives::era::Era::Byron {
+            (
+                serde_json::json!(ledger.tip.point.slot().map(|s| s.0).unwrap_or(0)),
+                serde_json::json!({ "count": ledger.genesis_delegates.len() }),
+                byron_pparams.unwrap_or(serde_json::Value::Null),
+            )
+        } else {
+            (
+                serde_json::Value::Null,
+                serde_json::Value::Null,
+                serde_json::Value::Null,
+            )
+        };
+
     serde_json::json!({
         "epoch": epoch,
         "utxo": byron_utxo,
+        "lastSlot": byron_last_slot,
+        "byronDelegation": byron_delegation,
+        "byronProtocolParams": byron_protocol_params,
+        "commonProtocolParams": common_protocol_params,
+        "eraProtocolParams": era_protocol_params,
+        "instantaneousRewards": instantaneous_rewards,
         "epochFees": epoch_fees,
         "reserves": ledger.epochs.reserves.0,
         "treasury": ledger.epochs.treasury.0,
