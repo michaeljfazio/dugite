@@ -592,11 +592,13 @@ pub fn compute_reward_update(
 
         // expectedBlocks = floor((1 - d) * f * slotsPerEpoch), in exact
         // Rational arithmetic — multiply first, floor once at the very end.
-        let one_minus_d_num = d_den - d_num;
-        let one_minus_d = Rat::from_i128(one_minus_d_num, d_den);
-        let f = Rat::from_i128(f_num as i128, f_den as i128);
-        let slots = Rat::from_i128(epoch_length as i128, 1);
-        let raw_expected_blocks = one_minus_d.mul(&f).mul(&slots).floor_u64();
+        // Shared with the pulser's freeze and the dump's reported value: this
+        // was the third hand-written copy of the formula.
+        let raw_expected_blocks = crate::state::reward_pulser::expected_blocks_raw(
+            (prev_d.numerator, prev_d.denominator),
+            (f_num, f_den),
+            epoch_length,
+        );
         if raw_expected_blocks == 0 {
             warn!(
                 "expected_blocks rounded to 0 (d={}/{}, f_num={f_num}, f_den={f_den}, \
@@ -1232,9 +1234,14 @@ pub struct ForcedRewardUpdate {
     pub reward_pot: u64,
     /// Total actually distributed to stake credentials.
     pub total_distributed: u64,
-    /// `expectedBlocks = (1 - d) * f * epochLength`, clamped to >= 1; `0` when
-    /// the `d >= 4/5` branch made it irrelevant.
-    pub expected_blocks: u64,
+    //
+    // There is deliberately NO `expected_blocks` here. It used to be carried
+    // through from `MonetaryStep`, whose copy is post-processed for the division
+    // it feeds — clamped to `>= 1`, and `0` as a marker for the `d >= 4/5`
+    // branch — and the dump published that instead of upstream's raw binding.
+    // The field's only consumer was that dump; removing it makes reading the
+    // marker as a reported value inexpressible rather than merely discouraged.
+    // Use `reward_pulser::start_step_eta` to REPORT `eta`/`expectedBlocks`.
 }
 
 /// Force a complete reward update from the CURRENT epoch state — dugite's
@@ -1326,7 +1333,6 @@ pub fn forced_reward_update(state: &LedgerState) -> Option<ForcedRewardUpdate> {
             .saturating_add(state.epochs.snapshots.ss_fee.0),
         reward_pot: monetary.r,
         total_distributed,
-        expected_blocks: monetary.expected_blocks,
     })
 }
 

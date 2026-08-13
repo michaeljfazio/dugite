@@ -13,6 +13,7 @@ pub use plutus::{
     evaluate_plutus_scripts, evaluate_plutus_scripts_with_reports, PlutusError, RedeemerReport,
     SlotConfig,
 };
+pub use state::reward_pulser::{start_step_eta, StartStepEta};
 #[doc(hidden)]
 pub use state::Rat;
 pub use state::{

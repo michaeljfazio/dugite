@@ -11,7 +11,15 @@
 # dump; the digest is the same canonical form the comparator and cstreamer
 # reducer use, verified against a shared test vector, so a mismatch is still
 # caught — it just does not cost tens of GB to store.
+#
+# It is DEFAULTED here rather than only documented. This comment described the
+# variable as if the script set it while only `mainnet-exactness-run.sh` did, so
+# every hand-rolled invocation of this driver silently paid the undigested cost
+# — measured at 3.1 GB against 0.4 GB for 306 preprod epochs, and mainnet is far
+# worse. Export `DUGITE_DUMP_DIGEST=0` to opt out when drilling into the raw
+# maps.
 set -uo pipefail
+export DUGITE_DUMP_DIGEST=${DUGITE_DUMP_DIGEST:-1}
 
 DUGITE_ROOT=${DUGITE_ROOT:-/Users/michaelfazio/Source/dugite}
 WT=${WT:-$DUGITE_ROOT/.claude/worktrees/nonmyopic-1067}
