@@ -240,12 +240,125 @@ previous dugite run?** The change routed `compute_reward_update`'s floor through
 the shared helper, which is a consensus path, so a green `eta` with a dirty
 anything-else would be a report bought at the ledger's expense.
 
+Measured, mainnet, 269 epochs replayed genesis → slot 30.9M:
+
+| check | result |
+|---|---|
+| `eta`/`expectedBlocks` vs oracle | **124 comparisons, 0 divergent** |
+| the 7 rows that were divergent | all carry the oracle's exact values |
+| Byron epochs emitting either field | **0 of 207** |
+| every OTHER field vs the previous run | 5,458,651 leaves, **only `eta` (2), `eta.{num,den}` (4), `expectedBlocks` (209)** |
+
+The 209 tallies exactly as 207 Byron (`0` → null) + 212 + 213, and the 4 are the
+capped epochs — so every changed leaf is accounted for and no monetary term
+moved.
+
+**Why stopping at 269 still covers 208-519, argued rather than assumed.** The new
+value can differ from the old one in exactly three cases: Byron (none above 207),
+`forced == None` (only 208-210 ever had a null `rupdNext`), and
+`blocksMade >= expectedBlocks` — and that last one *would have been divergent
+under the old code*, since the old code clamped there. The archived 312-epoch
+report lists `eta` divergent at exactly {208, 209, 216, 221, 244, 268} and
+`expectedBlocks` at {212, 213}, all ≤ 268. So no epoch in 269-519 satisfies any
+of the three, and for that range old == new == oracle. A full re-replay would
+re-confirm 0 divergences it cannot change.
+
+**And on preprod, an INDEPENDENT network: 362 comparisons, 0 divergent.** It
+carried four divergent rows on the old binary, and only two of them had been
+recorded — epochs 4/5 (the `forced` gate, filed as "definitional") and **epochs
+7 and 11 (361/360 and 2413/2400, the clamp), which the spec never mentioned at
+all.** Same absorption, second network. Note preprod has 3 Byron epochs (its
+Shelley transition is at epoch 4), so the Byron gate is exercised there too;
+*preview* is the Shelley-from-genesis chain.
+
+**Named, not fixed**: `poolDistribution` is emitted in NONDETERMINISTIC order —
+60 of 269 epochs differ in order alone between two runs of the same binary over
+the same chain, with 0 differing in content. It is built from a hash map and
+never sorted, which is `likelihoodsNM`'s defect exactly. Harmless today only
+because the comparator digests that field after canonicalising; anyone comparing
+raw `poolDistribution` bytes across runs would see hundreds of false
+divergences. Left alone deliberately — it is outside this change and fixing it
+would move 60 epochs of output that was just validated.
+
 **Harness defect found on the way**: `dugite-mainnet-dump.sh`'s header comment
 described `DUGITE_DUMP_DIGEST=1` as though the script set it, while only
 `mainnet-exactness-run.sh` did — so every hand-rolled invocation of the driver
 silently paid the undigested cost (3.1 GB vs 0.4 GB for 306 preprod epochs, and
 mainnet is far worse). It now defaults the variable, making the comment true.
 CLAUDE.md carried the same wrong claim.
+
+**A trap worth keeping**: `pgrep -f dump-snapshot` in a wait-loop matches the
+WAIT-LOOP's own command line, so the watcher reports the watched as still
+running forever. The replay had finished five minutes earlier. Grep the log for
+the completion line instead of polling for the process.
+
+### RE-GATED at the eta commit — 4/4, strict, admissible, and the PV11 round too
+
+`reports/devnet-validate/v2.8.0.json`, `git_rev 8841fca72b` — the eta commit
+itself, so `xtask::qa_report_covers_shipped_code` agrees with the tree.
+`gate_integrity {strict: true, admissible: true, missing: []}`. 1017 canonical
+blocks, **0 off-diagonal parity cells**, 0 ERROR lines on any node in any round.
+
+- **baseline** — cli-parity 23 EQUAL + 3 COMPARED / 0 divergent / 0 ERROR;
+  adversarial N2N 26/26 (22 correctly REJECTED, 4 PASS), 0 PANIC, 0 SILENT_SKIP;
+  UTxO RPC 27/27; chaos 5 rows / 0 FAIL / 0 ENV_SKIP; tip-parity 24/24
+- **parity-oracle** — 99 scripts through BOTH sockets: **96 MATCH / 2 STATEFUL /
+  1 KNOWNDIFF, 0 OFFDIAG, 0 CLASSDIFF**
+- **epoch-boundary** — pots BYTE-EXACT vs Haskell (treasury `7197836256150`,
+  reserves `5992774040447897`); futurePParams 1318 compared / 0 diffs / **372
+  `PotentialPParamsUpdate` window samples**; ratify-state 936 compared / 0 diffs /
+  1 PLAN_APPLIED / 0 breaks. Both samplers NON-VACUOUS, and 372 against the
+  previous gate's 59 is the `epoch-long` overlay earning its place
+- **restart** — tip 29 → 61
+- **hardfork (PV10→PV11)** — **14 assertions, 0 FAIL.** Real HardForkInitiation
+  proposed, voted by DRep+SPO+CC, ratified, and both sockets flipped to PV11 in
+  the SAME epoch (2). futurePParams 1366 / 0 diffs, ratify-state 1353 / 0 diffs /
+  0 plan breaks, 37-row post-fork zoo smoke 0 FAIL, and 16e inverted its
+  constructor across the fork (`IncorrectDepositDELEG` → `DepositIncorrectDELEG`).
+  Not optional any more, since mainnet's active PV is the release bar
+
+**The zoo carries 7 failures and they are NOT one story — read both.** Six are in
+the epoch-boundary round and are the documented self-race, VERIFIED not
+pattern-matched: 5× `01a-simple-pay` plus `04h`'s funding submit, against exactly
+10 `already claimed by mempool tx` lines in that round's relay log, and p3
+records "45 txs submitted; 35 accepted/10 rejected — **all 3 nodes agree**". A
+dugite defect appears as disagreement, never as a shared verdict.
+
+The seventh is different and must not be filed with them: `11e-tx-chain-depth`
+in the baseline round, which found a **real pre-existing defect** — see below. It
+is the first time this gate has produced a zoo failure that is not a harness
+race, which is exactly why the count alone must never be the summary.
+
+### OPEN — tx admission maps LOCK CONTENTION to a rejection (found by the re-gate)
+
+`serve.rs:545` acquires the ledger with `try_read()` and maps failure to
+`TxValidationError::LedgerStateUnavailable`. `try_read` fails when the write lock
+is held — i.e. while a block is being applied — so a perfectly valid transaction
+submitted in that window is REJECTED, and the client is told
+`ConwayMempoolFailure "transaction validation failed"` when **no validation ran
+at all**. Nothing about the transaction decided its fate.
+
+Found by Round 1's `11e-tx-chain-depth`, which fires 100 dependent txs and so
+gets ~100 chances at the window: it stopped at position 14 with the generic
+reason, and the relay log carries `reason=LedgerStateUnavailable` at the same
+instant. It fired **exactly once in the whole round**, which is why previous
+gates passed 11e — this is a narrow race, not a regression, and `serve.rs` is
+untouched by the eta change.
+
+Two things make it worse than a retry-able hiccup. The reason reaching the client
+is the generic C8 fallback, so a transient internal condition is indistinguishable
+from real invalidity (#925/#979's family). And 11e's failure mode is a *false
+reject* on a path where dugite is the only implementation that can produce it —
+though note the upstream comparison has NOT been established here; what is
+measured is dugite's own behaviour, and whether cardano-node's LocalTxSubmission
+has any equivalent give-up-if-busy path still needs the oracle.
+
+Deliberately NOT fixed in this window. `try_read` may be load-bearing for the
+reason the same file documents at length two functions above — parking tokio
+workers on a contended lock starves the async pool — so the fix is a design
+choice between blocking, retrying, and returning a TYPED transient reason, on a
+tx-admission path. That earns its own independent analysis and its own gate
+rather than a one-word edit inside an unrelated change.
 
 ### 2026-08-12 — PV11 compatibility is now a RELEASE REQUIREMENT, and the sweep found two gaps
 
