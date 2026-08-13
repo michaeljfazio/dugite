@@ -2085,10 +2085,25 @@ fn build_epoch_snapshot(
         } else {
             let mut m = serde_json::Map::new();
             // Alonzo+
-            m.insert(
-                "costModels".into(),
-                serde_json::to_value(&prev_pp.cost_models).unwrap_or(serde_json::Value::Null),
-            );
+            // Upstream's key names, not serde's snake_case. `to_value` renders
+            // dugite's field names — `plutus_v1` — and cardano-ledger's
+            // `CostModels` ToJSON keys on the LANGUAGE, `PlutusV1`. The arrays
+            // themselves already matched to the element; only the key differed,
+            // so every cost model was a schema gap rather than a comparison
+            // across 243 preprod epochs. Absent languages are omitted, exactly
+            // as upstream omits a language the era has no model for.
+            let mut cm = serde_json::Map::new();
+            for (name, model) in [
+                ("PlutusV1", &prev_pp.cost_models.plutus_v1),
+                ("PlutusV2", &prev_pp.cost_models.plutus_v2),
+                ("PlutusV3", &prev_pp.cost_models.plutus_v3),
+                ("PlutusV4", &prev_pp.cost_models.plutus_v4),
+            ] {
+                if let Some(v) = model {
+                    cm.insert(name.into(), serde_json::json!(v));
+                }
+            }
+            m.insert("costModels".into(), serde_json::Value::Object(cm));
             m.insert(
                 "executionUnitPrices".into(),
                 serde_json::json!({
