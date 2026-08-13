@@ -1240,9 +1240,41 @@ driver as a `--watch` sidecar, with `--all` for the final pass) takes 8.3 GB to
 divergent, same field breakdown before and after. Extrapolate from the LAST
 epoch, not the average: the average was 126 MB while the newest was 374 MB.
 
-**The 10.7.1 cardano-streamer port is NOT needed** — mainnet is PV11 and the
-already-validated 10.6.2 branch pins `cardano-ledger-conway 1.20.0.0`, whose
-released changelog bumps `ProtVerHigh ConwayEra` to 11. Parked at `d0ebc95`.
+**RETRACTED 2026-08-14 — the 10.7.1 port IS needed, and this claim was wrong.**
+It reasoned from the LEDGER package's `ProtVerHigh` and missed that the
+CONSENSUS header-envelope check caps independently. Measured: the pinned 10.6.2
+oracle dies on preprod's first PV11 block, epoch 293, with
+
+    ObsoleteNode (Version 11) (Version 10)
+
+after 3h34m of replay. The build really does resolve
+`cardano-ledger-conway 1.20.0.0` (ProtVerHigh 11) — and still supports max
+PV10 — so a version number in a changelog is not evidence about what a node
+ACCEPTS. Only running a real PV11 block through it is.
+
+Consequences: PV11 ledger state is unverifiable with this oracle on ANY network,
+and **the mainnet tip run walls at ~epoch 640** (where mainnet crossed PV11), not
+649. Upstream has nothing to reuse — `lehins` has no 11.x branch and its `master`
+pins the same CHaP index-state as our 10.6.2.
+
+The port now BUILDS (fork branch `10.7.1-dump-snapshot`, cardano-api
+10.23.0.0 → 10.26.0.0). The parked WIP's "4 constraint errors" were two
+unrelated classes: encoding-version bounds (`MinVersion <= ProtVerHigh era`)
+that had to become `EraApp` superclasses, plus an explicit signature on
+`extractSnapshotData` — an unsignatured where-binding does not inherit the
+caller's constraint; and the SnapShot API moving AND changing shape, 3 fields to
+2 with delegations merged into the stake entry, which is dugite's own #1057 seen
+from the other side (`sumAllStake` → `sumAllActiveStake`, returning `NonZero
+Coin`, i.e. #1027's typing).
+
+**INCOMPLETE, deliberately**: `delegations` and `poolParams` are STUBBED to `()`
+in `snapshotInfo` and must be re-expressed against the two-field SnapShot before
+the port is usable — emitting `()` where 10.6.2 emits real maps would silently
+empty two compared fields, which is worse than having no port.
+
+**Still unproven**: whether 10.26.0.0 actually lifts the cap. Do NOT infer it
+from the version bump — that is exactly the mistake this entry retracts. A
+preprod replay to epoch 293 settles it.
 The oracle binary is pinned at `oracle-bin/cstreamer-10.6.2` with its sha256,
 because both branches build to ghc-9.6.5 and share one dist-newstyle directory.
 
