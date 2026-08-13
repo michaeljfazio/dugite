@@ -183,6 +183,39 @@ impl ByronGenesis {
     /// Returns decoded address bytes and lovelace amounts for all non-zero balances.
     /// For nonAvvmBalances, addresses are base58-decoded directly.
     /// For avvmDistr, base64url Ed25519 public keys are converted to Byron redeem addresses.
+    /// The genesis UTxO, including ZERO-VALUE entries.
+    ///
+    /// cardano-ledger keeps them, and both maps go through the same unfiltered
+    /// path:
+    ///
+    /// ```haskell
+    /// -- Cardano/Chain/UTxO/GenesisUTxO.hs
+    /// genesisUtxo config = UTxO.fromBalances (avvmBalances <> nonAvvmBalances)
+    /// -- Cardano/Chain/UTxO/UTxO.hs
+    /// fromBalances = ... . concat . fmap (fromTxOut . uncurry TxOut)
+    /// fromTxOut out = fromList [(TxInUtxo (coerce . serializeCborHash $ txOutAddress out) 0, out)]
+    /// -- Cardano/Chain/Common/Lovelace.hs
+    /// mkLovelace c | c <= maxLovelaceVal = Right (Lovelace c)
+    /// ```
+    ///
+    /// a plain `M.toList` with no filter, and zero IS a valid Lovelace — only
+    /// the upper bound is checked. Each TxIn is derived by hashing the output
+    /// ADDRESS, so N distinct addresses give N distinct TxIns.
+    ///
+    /// dugite used to `continue` past zero-value entries, which made its UTxO
+    /// set SMALLER than cardano-node's. Measured on preprod, whose Byron genesis
+    /// carries 8 `nonAvvmBalances` entries of which SEVEN are zero:
+    /// cardano-node's own dump reports count 8 at Byron epochs 1-3 where dugite
+    /// reported 1. The balances agreed to the lovelace, which is exactly why
+    /// every check that sums was blind to it.
+    ///
+    /// It is a false REJECT on block validity: a transaction spending one of
+    /// those outputs is accepted by cardano-node — the UTxO exists — and was
+    /// rejected here with `InputNotFound`, because it was never created.
+    ///
+    /// Shelley's `initialFunds` has the same property and the same fix; see
+    /// `Cardano/Ledger/Shelley/Genesis.hs::genesisUTxO`, another unfiltered
+    /// comprehension.
     pub fn initial_utxos(&self) -> Vec<GenesisUtxoEntry> {
         let mut entries = Vec::new();
         let protocol_magic = self.protocol_consts.protocol_magic;
@@ -193,9 +226,6 @@ impl ByronGenesis {
                 Ok(v) => v,
                 Err(_) => continue,
             };
-            if lovelace == 0 {
-                continue;
-            }
 
             // Decode base58 Byron address
             match bs58::decode(addr_str).into_vec() {
@@ -223,9 +253,6 @@ impl ByronGenesis {
                 Ok(v) => v,
                 Err(_) => continue,
             };
-            if lovelace == 0 {
-                continue;
-            }
 
             match Self::avvm_to_address(pubkey_b64, protocol_magic) {
                 Ok(addr_bytes) => {
@@ -631,9 +658,11 @@ impl ShelleyGenesis {
     pub fn initial_utxos(&self) -> Vec<GenesisUtxoEntry> {
         let mut entries = Vec::with_capacity(self.initial_funds.len());
         for (addr_str, lovelace) in &self.initial_funds {
-            if *lovelace == 0 {
-                continue;
-            }
+            // No zero-value skip, for the same reason as Byron's:
+            // `Cardano/Ledger/Shelley/Genesis.hs::genesisUTxO` is an unfiltered
+            // comprehension over `sgInitialFunds`, keying each TxIn on the
+            // address via `initialFundsPseudoTxIn`. Omitting a zero-value entry
+            // leaves an input cardano-node has and dugite does not.
             // Try bech32 first, then hex (Haskell accepts both formats)
             let address = if let Ok((_hrp, data)) = bech32::decode(addr_str) {
                 data
