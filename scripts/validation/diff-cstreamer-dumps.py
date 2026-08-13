@@ -82,6 +82,46 @@ def era_index(name: str) -> int:
         return -1
 
 
+# Keys that exist ONLY in Byron. Byron is not a cut-down Shelley — it has no
+# treasury, reserves, reward pot, stake distribution or pools — so it is dumped
+# in its own shape, and these are that shape.
+BYRON_ONLY_KEYS = frozenset(
+    {
+        "utxo",
+        "byronDelegation",
+        "byronProtocolParams",
+        "byronUpdateEpoch",
+        "lastSlot",
+    }
+)
+
+# Keys that exist from Shelley onwards and have no Byron counterpart. Before the
+# oracle learned to dump Byron these never had to be gated: Byron produced no
+# oracle file at all, so the whole era was skipped as ORACLE-SILENT and the
+# question never arose. Now that Byron IS dumped, every one of these would be
+# reported as a schema gap in all 207 mainnet Byron epochs — ~1,600 false gaps
+# that say only "Byron has no treasury", which is not news.
+SHELLEY_ONWARD_KEYS = frozenset(
+    {
+        "activeStake",
+        "commonProtocolParams",
+        "deposits",
+        "epochFees",
+        "eta",
+        "expectedBlocks",
+        "poolDistribution",
+        "protocolParams",
+        "reserves",
+        "rupdApplied",
+        "rupdNext",
+        "snapshots",
+        "totalPools",
+        "totalStake",
+        "treasury",
+    }
+)
+
+
 def era_applicable(top_key: str, era: str) -> bool:
     """Is `top_key` expected to carry a value in `era`?"""
     i = era_index(era)
@@ -91,6 +131,15 @@ def era_applicable(top_key: str, era: str) -> bool:
         return era_index("Shelley") <= i <= era_index("Babbage")
     if top_key == "epochNonce":
         return i >= era_index("Shelley")
+    if top_key in BYRON_ONLY_KEYS:
+        return i == era_index("Byron")
+    if top_key in SHELLEY_ONWARD_KEYS:
+        return i >= era_index("Shelley")
+    # Alonzo introduced cost models, execution units and collateral; Babbage and
+    # Conway add to the same object. Gated at Alonzo because that is the earliest
+    # era in which the key carries anything.
+    if top_key == "eraProtocolParams":
+        return i >= era_index("Alonzo")
     return True
 
 

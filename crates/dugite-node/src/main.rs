@@ -2011,8 +2011,37 @@ fn build_epoch_snapshot(
         })
     };
 
+    // Byron's own shape, paired against the oracle's Byron dump.
+    //
+    // Byron used to be ORACLE-SILENT — cardano-streamer's `buildSnapshotJson`
+    // returned Nothing for the whole era — so dugite's Byron dumps compared
+    // against nothing at all. That is 207 mainnet epochs sitting UNDER every
+    // Shelley-onward result, and the field that matters most is the circulating
+    // supply: the Shelley translation computes
+    // `reserves = maxLovelaceSupply - circulating`, so epoch 208's reserves —
+    // and therefore every reward calculation in every later era — rests on it.
+    //
+    // Note what the Shelley-shaped fields report during Byron: `reserves` and
+    // `totalStake` hold their GENESIS values for all 207 epochs, because Byron
+    // has no reserves concept and dugite derives the real value at the
+    // translation. So they are constants here, not measurements — which is
+    // precisely why the UTxO has to be reported directly rather than inferred
+    // from `totalStake`.
+    //
+    // `total_lovelace()` folds the whole set; it runs once per epoch boundary at
+    // ~715k entries by Byron's end, which is negligible beside the reward fold.
+    let byron_utxo: serde_json::Value = if ledger.era == dugite_primitives::era::Era::Byron {
+        serde_json::json!({
+            "count": ledger.utxo.utxo_set.len(),
+            "balance": ledger.utxo.utxo_set.total_lovelace().0,
+        })
+    } else {
+        serde_json::Value::Null
+    };
+
     serde_json::json!({
         "epoch": epoch,
+        "utxo": byron_utxo,
         "epochFees": epoch_fees,
         "reserves": ledger.epochs.reserves.0,
         "treasury": ledger.epochs.treasury.0,
