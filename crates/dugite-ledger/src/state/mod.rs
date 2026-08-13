@@ -2510,9 +2510,25 @@ impl LedgerState {
         let mut total_lovelace = 0u64;
 
         for (address, lovelace) in entries {
-            if *lovelace == 0 {
-                continue;
-            }
+            // No zero-value skip. This was the SECOND copy of that filter — the
+            // genesis parser had one too — and removing only the parser's left
+            // the count unchanged, which is how a duplicated guard hides a fix.
+            //
+            // cardano-ledger keeps zero-value genesis entries:
+            // `genesisUtxo = fromBalances (avvmBalances <> nonAvvmBalances)` is a
+            // plain `M.toList` with no filter, `mkLovelace` bounds only from
+            // above, and `fromTxOut` keys each TxIn on the output ADDRESS
+            // (`Cardano/Chain/UTxO/GenesisUTxO.hs`, `UTxO.hs`,
+            // `Common/Lovelace.hs`). Shelley's `genesisUTxO` is the same shape.
+            //
+            // Measured on preprod, whose Byron genesis has 8 `nonAvvmBalances`
+            // entries of which SEVEN are zero: cardano-node reports UTxO count 8
+            // at Byron epochs 1-3, dugite reported 1, and the BALANCES agreed to
+            // the lovelace — which is why every check that sums was blind.
+            //
+            // False reject on block validity: a transaction spending one of
+            // those outputs is accepted by cardano-node and was rejected here
+            // with `InputNotFound`.
 
             // Derive a deterministic tx hash from the address (matches Byron genesis UTxO format)
             let tx_hash = dugite_primitives::hash::blake2b_256(address);
