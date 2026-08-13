@@ -292,6 +292,69 @@ WAIT-LOOP's own command line, so the watcher reports the watched as still
 running forever. The replay had finished five minutes earlier. Grep the log for
 the completion line instead of polling for the process.
 
+### 2026-08-13 — the ORACLE now dumps Byron, and it is on OUR fork
+
+**`github.com/michaeljfazio/cardano-streamer`, branch
+`dugite/full-era-ledger-dumps`.** All four customisations live there:
+`dump-epoch-snapshots`, the `isFirstSlotOfNewEpoch` contiguity fix, Byron
+dumping, and era/PV-gated protocol parameters. `oracle-bin/` is gitignored (a
+231 MB binary); its provenance stays here.
+
+**Byron was oracle-silent for 207 mainnet epochs, and it took TWO changes, not
+one.** `buildSnapshotJson` returned Nothing for Byron — but simply adding an
+extractor would still have produced nothing, because **Byron cannot report its
+own epoch.** `isFirstSlotOfNewEpoch` compares epoch numbers and Byron's only
+source, `UPI.State.currentEpoch`, reads 0 for the whole era, so the trigger was
+structurally dead. The epoch is now derived from the SLOT via the HFC's own
+`EpochInfo` (which knows Byron's length is `10*k` from genesis — no hardcoded
+constant), and Byron's stuck counter is emitted beside it as
+`byronUpdateEpoch`, so the evidence for why travels with the data.
+
+Byron is emitted in **Byron's** shape, not a cut-down Shelley: no treasury, no
+reserves, no reward pot, no pools. Back-projecting a later era's shape onto an
+earlier one is what disqualified Koios.
+
+**Validated on mainnet, and the numbers are independent of the dump itself:**
+
+| check | result |
+|---|---|
+| epochs dumped | **208, epochs 0-207, no gaps** |
+| `byronUpdateEpoch` across all 208 | `[0]` |
+| monotone decline (Byron burns fees, no treasury) | **0 non-monotone steps** |
+| epoch 0 balance | **31112484745000000 = genesis `initial_funds` EXACTLY** |
+| epoch 0 utxo count | **14505 = the AVVM count in dugite's own genesis log** |
+| epoch 207 vs `45e15 - reserves(208)` | +8077 ADA still to burn — positive, as required |
+
+The epoch-0 row is the one that matters: reproducing genesis `initial_funds` and
+the AVVM count to the unit means the UTxO read is COMPLETE. That was the real
+risk — the dump is handed a `DiffMK` state and the call site carries an explicit
+invariant against reading the UTxO. It does not reach Byron (`cvsUtxo` is an
+ordinary field of `ChainValidationState`, not a ledger table), and this is the
+measurement that proves it rather than a type argument.
+
+`utxo.balance` is the load-bearing field: the Shelley translation computes
+`reserves = maxLovelaceSupply - circulating`, so **every reward calculation in
+every later era rests on a number that until now nothing checked.**
+
+**Era/PV parameter coverage.** The dump carried a SEVEN-field era-common subset
+(rho, tau, d, a0, nOpt, minPoolCost, protocolVersion); everything an era
+introduced was invisible. Now added, gated per era via one traversal per group
+(the `applyConwayNewEpochState` idiom): `commonProtocolParams` (minFee A/B, the
+three size caps, key/pool deposit, eMax) and `eraProtocolParams` — Alonzo+ cost
+models / exUnits / prices / collateral / maxValueSize, Babbage+
+`coinsPerUTxOByte`, Conway's gov thresholds, deposits, lifetimes and
+`minFeeRefScriptCostPerByte`. Absent, not zero, in eras that lack them.
+
+Chosen for defect history, not completeness for its own sake: `costModels` is
+#1046's fabricated V2 default and #938's framing; `coinsPerUTxOByte` vs Alonzo's
+`coinsPerUTxOWord` is #919; and the two Conway threshold records are #951, where
+ten elements were encoded in the wrong ORDER while the decoder was right.
+
+**Still owed for these to be a real comparison, not just richer oracle output:**
+dugite must emit the matching Byron shape and the same era-gated params. Until
+then the new fields are dugite-side schema gaps — the exit code is already 2, so
+nothing regresses, but nothing is verified either.
+
 ### RE-GATED at the eta commit — 4/4, strict, admissible, and the PV11 round too
 
 `reports/devnet-validate/v2.8.0.json`, `git_rev 8841fca72b` — the eta commit
