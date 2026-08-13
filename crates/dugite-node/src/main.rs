@@ -664,11 +664,26 @@ async fn run_dump_snapshot(args: DumpSnapshotArgs) -> Result<()> {
             byron_epoch_length = 10 * k;
             byron_slot_duration_ms = genesis.slot_duration_ms();
             let bvd = &genesis.block_version_data;
+            // ONLY the fee policy, and only because dugite genuinely derives it.
+            //
+            // `maxBlockSize`, `maxTxSize` and `scriptVersion` are ADOPTED
+            // parameters that Byron's update system changes on-chain — measured
+            // at mainnet Byron epoch 100, the oracle reports 32768 / 8192 where
+            // genesis says 2000000 / 4096. dugite models no Byron update system,
+            // so it HAS no adopted value for them.
+            //
+            // Emitting the genesis figure under a name that means "adopted"
+            // would report a false DIVERGENCE — "dugite has a value and it is
+            // wrong" — when the truth is a GAP: dugite has no value at all. The
+            // two carry different meanings to whoever reads the report, and the
+            // gap is the one that names the real work (Byron `UPI.State`).
+            //
+            // The fee policy is emitted because it IS derived here. Note the
+            // consensus path still uses `ByronFeePolicy::canonical()`; the two
+            // agree on mainnet, which is what this comparison confirms before
+            // validation is moved onto the derived value.
             byron_pparams = bvd.tx_fee_policy.to_exact().map(|(summand, (num, den))| {
                 serde_json::json!({
-                    "scriptVersion": bvd.script_version,
-                    "maxBlockSize": bvd.max_block_size.parse::<u64>().unwrap_or_default(),
-                    "maxTxSize": bvd.max_tx_size.parse::<u64>().unwrap_or_default(),
                     "txFeePolicy": {
                         "summand": summand,
                         "multiplier": { "numerator": num, "denominator": den },
@@ -2232,7 +2247,13 @@ fn build_epoch_snapshot(
         if ledger.era == dugite_primitives::era::Era::Byron {
             (
                 serde_json::json!(ledger.tip.point.slot().map(|s| s.0).unwrap_or(0)),
-                serde_json::json!({ "count": ledger.genesis_delegates.len() }),
+                // NOT `genesis_delegates.len()`. That map is loaded from the
+                // SHELLEY genesis and is empty for all 207 Byron epochs, so
+                // emitting its length reports `0` where the oracle has Byron's
+                // 7 heavy delegates — a false divergence claiming dugite counted
+                // zero, when dugite does not track Byron's delegation map at
+                // all. Null reports the truth: no value here yet.
+                serde_json::Value::Null,
                 byron_pparams.unwrap_or(serde_json::Value::Null),
             )
         } else {

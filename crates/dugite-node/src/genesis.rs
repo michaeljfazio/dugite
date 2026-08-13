@@ -46,10 +46,22 @@ pub struct ByronGenesis {
 pub struct ByronBlockVersionData {
     #[serde(default)]
     pub slot_duration: String,
+    // Parsed and deliberately NOT consumed, with the reason stated rather than
+    // the fields hidden behind a `_` prefix — hiding them is how the fee policy
+    // sat parsed-and-discarded while the ledger hardcoded its own copy.
+    //
+    // These are the GENESIS values, and Byron's update system changes them
+    // on-chain: measured at mainnet Byron epoch 100, cardano-node reports
+    // maxBlockSize 32768 / maxTxSize 8192 where genesis says 2000000 / 4096.
+    // Using them as if they were the adopted parameters would be wrong, so they
+    // wait here, visible, until Byron's `UPI.State` is modelled.
+    #[allow(dead_code)]
     #[serde(default, rename = "maxBlockSize")]
     pub max_block_size: String,
+    #[allow(dead_code)]
     #[serde(default, rename = "maxTxSize")]
     pub max_tx_size: String,
+    #[allow(dead_code)]
     #[serde(default, rename = "scriptVersion")]
     pub script_version: u64,
     #[serde(default, rename = "txFeePolicy")]
@@ -97,7 +109,7 @@ impl ByronTxFeePolicy {
         let summand_nano: u128 = self.summand.parse().ok()?;
         let mult_nano: u128 = self.multiplier.parse().ok()?;
         let nano = BYRON_FEE_POLICY_NANO as u128;
-        if summand_nano % nano != 0 {
+        if !summand_nano.is_multiple_of(nano) {
             return None;
         }
         let summand = u64::try_from(summand_nano / nano).ok()?;
