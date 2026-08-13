@@ -171,10 +171,81 @@ differs. dugite's dump caps `eta` at 1 and zeroes `expectedBlocks` in the
 `d >= 4/5` regime; upstream reports the raw inputs and caps at the point of use.
 
 That is the `epochFees` defect's class — a definitional mismatch that shows up
-as a divergence and would MASK a real difference in the same field. The fix is
-dump-only: emit both as the oracle defines them. NOT done here, because it
-touches `crates/` and would stale a QA report that was just regenerated; batch
-it with the next code change.
+as a divergence and would MASK a real difference in the same field. **FIXED —
+see below.**
+
+### 2026-08-13 — the `eta` report was THREE defects, and the independent read found the third
+
+Both fields now match the oracle at **every** paired epoch. Fixed in the dump
+only; the reward arithmetic was never wrong, and that was established before the
+change rather than assumed.
+
+`eta` and `expectedBlocks` are **let-bindings inside `startStep`, not fields of
+any persisted record** — `PulsingReward.hs:117-141`, one definition and exactly
+one use each, absent from `RewardUpdate`, `RewardSnapShot` and `FreeVars`. That
+single fact decides the design: a dump field of these names is NECESSARILY a
+recomputation, so reading it off a stored struct is the defect, not an
+optimisation.
+
+dugite read both off the frozen `MonetaryStep`, whose copy is **post-processed
+for the division it feeds**. Three wrongs, and only the first was the one I set
+out to fix:
+
+| # | epochs | what was published |
+|---|---|---|
+| 1 | 216, 221, 244, 268 | `eta` capped at `1/1`. `min 1` lives inside `deltaR1` ALONE; the binding is raw and legitimately exceeds 1 when the chain outruns `f·(1-d)` — 5710/5616, 7839/7776, 15603/15552, 21702/21600 |
+| 2 | 212, 213 | `expectedBlocks` = 0. That is `start_step_monetary`'s **marker** for the `d >= 4/5` branch, not a value; upstream computes the floor unconditionally and has 2160/4320 |
+| 3 | 208, 209 | nothing at all. Both were gated on `forced.is_some()`, which is `None` until a `go` snapshot exists — but both are functions of pparams and `nesBprev` only |
+
+Defect 3 is the one the independent Fable pass surfaced and I had not scoped: I
+had recorded 208/209 as part of the "definitional first-Shelley" bucket, and for
+`rupdNext` it is, but `eta` has no business inheriting that gate.
+
+**Why it is provably reporting and not arithmetic**, argued two ways rather than
+one. Quantitatively: `deltaR1 = floor(min 1 eta · rho · reserves)` with
+rho = 3/1000, so at epoch 216 **any reserves divergence ≥ 334 lovelace would
+change it** — and deltaR1/rPot/rewardPot/totalDistributed are byte-identical at
+all four capped epochs, four different reserves values. Structurally, for
+defect 2: `expectedBlocks` has exactly one consumer upstream, `eta`'s `otherwise`
+branch, which is not evaluated in the `d >= 4/5` regime at all (Haskell is lazy,
+so upstream never even forces the thunk there) — a wrong value in that regime
+cannot move a lovelace.
+
+**The fix removes the field rather than documenting it.**
+`ForcedRewardUpdate.expected_blocks` had exactly ONE consumer, this dump, and the
+value it carried was the clamped/marker form — i.e. precisely the wrong thing to
+report. It is deleted, so reading the marker as a reported value is now
+inexpressible instead of merely discouraged. `reward_pulser::start_step_eta` is
+the one place that binds either field, and `expected_blocks_raw` is now the ONE
+implementation of the floor — there were **three** hand-written copies.
+
+`eta` is `null` in exactly one case, and only because upstream has no value
+either: `d < 4/5` with `expectedBlocks == 0` makes `blocksMade % expectedBlocks`
+throw `Ratio has zero denominator`. Emitting `1/1` or `0/1` there would be a
+fabrication that reads as agreement. It needs `f·slotsPerEpoch < 5`, which no
+real network approaches.
+
+**Validated on real mainnet data, not only by unit test.** The five unit tests
+are pinned to cardano-streamer's own output and were proven RED by disarming
+each defect separately — and one of them was WRONG on the first attempt in an
+instructive way: `expected_blocks_is_unconditional_…` asserted the property on
+`expected_blocks_raw` while the value that gets REPORTED comes from
+`start_step_eta`, so reinstating the marker left it green. A test bounds the
+function it calls ([[feedback_red_proven_unit_test_bounds_the_function_not_the_system]]).
+
+The decisive check is a bounded replay: a fresh CoW clone of the cn chain,
+genesis → slot 30.9M, diffed against the ARCHIVED oracle dumps. It answers two
+questions, and the second matters more — **did any other field move against the
+previous dugite run?** The change routed `compute_reward_update`'s floor through
+the shared helper, which is a consensus path, so a green `eta` with a dirty
+anything-else would be a report bought at the ledger's expense.
+
+**Harness defect found on the way**: `dugite-mainnet-dump.sh`'s header comment
+described `DUGITE_DUMP_DIGEST=1` as though the script set it, while only
+`mainnet-exactness-run.sh` did — so every hand-rolled invocation of the driver
+silently paid the undigested cost (3.1 GB vs 0.4 GB for 306 preprod epochs, and
+mainnet is far worse). It now defaults the variable, making the comment true.
+CLAUDE.md carried the same wrong claim.
 
 ### 2026-08-12 — PV11 compatibility is now a RELEASE REQUIREMENT, and the sweep found two gaps
 
@@ -513,7 +584,10 @@ window it was measured over.
 findings above. A full replay to preprod's tip (306 epochs) is 4m06s.
 
 **Set `DUGITE_DUMP_DIGEST=1` on any ad-hoc replay.** `dugite-mainnet-dump.sh`
-sets it; a hand-rolled `dump-snapshot` invocation does not, and the raw
+now DEFAULTS it — this line used to claim it "sets it" when only
+`mainnet-exactness-run.sh` did, so the driver's own header comment was false and
+every hand-rolled driver run paid the full cost. A bare `dump-snapshot`
+invocation still does not, and the raw
 `stake`/`delegations` maps dominate the output — 306 preprod epochs cost 3.1 GB
 undigested against ~0.4 GB digested, and mainnet is far worse. The comparator
 digests those two fields anyway, so the raw form buys nothing unless something

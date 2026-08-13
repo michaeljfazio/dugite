@@ -18,6 +18,19 @@ type: reference
 - NewEpoch transition: `eras/shelley/impl/src/Cardano/Ledger/Shelley/Rules/NewEpoch.hs:151-198`
 - Formal spec createRUpd: `eras/shelley/formal-spec/epoch.tex:1427-1458`
 
+## VERIFIED VERBATIM at pin faa7a9dc (cn 11.0.1's ledger) — eta clamp location
+
+`eras/shelley/impl/src/Cardano/Ledger/Shelley/LedgerState/PulsingReward.hs`:
+- L120 `pr = es ^. prevPParamsEpochStateL` (d/rho/tau all from PREVIOUS pparams)
+- L121-125 `deltaR1 = rationalToCoinViaFloor $ min 1 eta * rho * reserves` — **the ONLY clamp on eta, at the point of USE**
+- L126-129 `expectedBlocks = floor $ (1-d) * f * slotsPerEpoch` — **UNCONDITIONAL, no min clamp, computed even when d>=0.8** (lazily: nothing forces it in that regime except a dump)
+- L132 `blocksMade = Map.foldr (+) 0 b'` where b = nesBprev (Tick.hs:262/:277 `RupdEnv bprev es`)
+- L133-138 `eta | d >= 0.8 = 1 | otherwise = blocksMade % expectedBlocks` — **UNCLAMPED at definition; can exceed 1** (mainnet 216: 2855/2808, 221: 871/864, 244: 5201/5184, 268: 3617/3600). Guard compares d (Rational) >= 0.8 = 4/5 EXACTLY, so d=4/5 hits the guard.
+- eta's only use in the whole file is L123. expectedBlocks' only use is L138.
+- eta/expectedBlocks are LET-BINDINGS, not fields of RewardUpdate/RewardSnapShot/FreeVars — any dump of them is a recomputation. A dump must emit the RAW (possibly >1, gcd-reduced) eta and the unconditional expectedBlocks to match cstreamer.
+- `%` with denominator 0 throws (GHC ratioZeroDenominatorError); unreachable when d<0.8 on mainnet since expB >= floor(0.2*21600)=4320. Source comment: "We use unsafe division here".
+- Allegra/Mary/Alonzo/Babbage/Conway all `type instance EraRule "RUPD" = ShelleyRUPD` (e.g. conway Era.hs:162), so ONE code path for every era.
+
 ## Critical Formulas (from startStep in PulsingReward.hs)
 
 ### eta computation

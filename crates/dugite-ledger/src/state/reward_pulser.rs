@@ -224,13 +224,9 @@ pub fn start_step_monetary(
             0,
         )
     } else {
-        let one_minus_d = Rat::from_i128(d_den - d_num, d_den);
-        let f = Rat::from_i128(
-            active_slot_coeff.0 as i128,
-            active_slot_coeff.1.max(1) as i128,
-        );
-        let slots = Rat::from_i128(slots_per_epoch as i128, 1);
-        let expected = one_minus_d.mul(&f).mul(&slots).floor_u64().max(1);
+        // Clamped to >= 1 for the division below; the RAW value is what the
+        // dump reports, via `expected_blocks_raw` directly.
+        let expected = expected_blocks_raw(d, active_slot_coeff, slots_per_epoch).max(1);
         // Capping blocks_made at expected is equivalent to `min 1 eta`.
         let effective = blocks_made.min(expected);
         (
@@ -256,6 +252,132 @@ pub fn start_step_monetary(
         // which is what makes `pending_avvm_return` unnecessary.
         total_stake: max_lovelace_supply.saturating_sub(reserves),
     }
+}
+
+/// `expectedBlocks` exactly as `startStep` binds it — UNCONDITIONAL in `d`, and
+/// with no minimum clamp.
+///
+/// ```haskell
+/// -- PulsingReward.hs:127-129
+/// expectedBlocks =
+///   floor $
+///     (1 - d) * unboundRational (activeSlotVal asc) * fromIntegral (unEpochSize slotsPerEpoch)
+/// ```
+///
+/// The `d >= 0.8` guard three lines below belongs to `eta` ALONE. Upstream
+/// computes this binding for every `d`, so `d = 1` yields a legitimate `0` and
+/// `d = 9/10` on mainnet yields `2160` — not a marker, a value.
+///
+/// The one implementation of the formula: [`start_step_monetary`] clamps the
+/// result to `>= 1` for its own division, and the dump reports it raw. Two
+/// copies of a floor whose consumers want different post-processing is how the
+/// clamped form ends up published as the definitional one.
+///
+/// Exact `Rat` throughout: Haskell multiplies in `Rational` and floors once.
+pub fn expected_blocks_raw(
+    d: (u64, u64),
+    active_slot_coeff: (u64, u64),
+    slots_per_epoch: u64,
+) -> u64 {
+    use super::Rat;
+
+    let (d_num, d_den) = (d.0 as i128, d.1.max(1) as i128);
+    let one_minus_d = Rat::from_i128(d_den - d_num, d_den);
+    let f = Rat::from_i128(
+        active_slot_coeff.0 as i128,
+        active_slot_coeff.1.max(1) as i128,
+    );
+    let slots = Rat::from_i128(slots_per_epoch as i128, 1);
+    one_minus_d.mul(&f).mul(&slots).floor_u64()
+}
+
+/// `eta` and `expectedBlocks` as `startStep` BINDS them, for REPORTING.
+///
+/// Neither is a field of `RewardUpdate`, `RewardSnapShot` or `FreeVars` —
+/// upstream they are let-bindings with exactly one use each, so any dump field
+/// of these names is necessarily a recomputation, and the bindings below are
+/// the only definition of what it must contain.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StartStepEta {
+    /// `floor((1 - d) * f * slotsPerEpoch)`, raw.
+    pub expected_blocks: u64,
+    /// `eta` as `(numerator, denominator)` in lowest terms, or `None` in the
+    /// one configuration where upstream cannot produce a value at all.
+    pub eta: Option<(u64, u64)>,
+}
+
+/// Bind `eta` and `expectedBlocks` the way `startStep` does.
+///
+/// ```haskell
+/// -- PulsingReward.hs:121-138
+/// deltaR1 = rationalToCoinViaFloor $ min 1 eta * unboundRational (pr ^. ppRhoL) * ...
+/// d = unboundRational (pr ^. ppDG)
+/// expectedBlocks = floor $ (1 - d) * unboundRational (activeSlotVal asc) * ...
+/// blocksMade = fromIntegral $ Map.foldr (+) 0 b' :: Integer
+/// eta
+///   | d >= 0.8 = 1
+///   | otherwise =
+///       -- We use unsafe division here, because any sane configuration
+///       -- should never have expectedBlocks anywhere close to zero
+///       blocksMade % expectedBlocks
+/// ```
+///
+/// **`eta` is NOT clamped here.** `min 1` appears once, inside `deltaR1`, so a
+/// chain that outruns `f * (1 - d)` has `eta > 1` at the binding and a capped
+/// contribution at the point of use. Reporting the capped value instead is
+/// lossy in exactly the field that would reveal a block-counting or
+/// `expectedBlocks` defect: post-clamp, "1/1 because `d >= 4/5`", "1/1 because
+/// the chain over-produced" and "1/1 because something inflated eta" are
+/// indistinguishable.
+///
+/// `blocks_made` is `nesBprev` summed — the blocks of the epoch that just
+/// ended, rotated at the boundary.
+///
+/// # The `None` case
+///
+/// `d < 4/5` with `expectedBlocks == 0` makes upstream's `%` throw
+/// `Ratio has zero denominator`, so **upstream has no value to emit** and
+/// neither should we: `1/1` and `0/1` would each be a fabrication that reads
+/// as agreement. It needs `f * slotsPerEpoch < 5`, which no real network comes
+/// near — mainnet's floor in that branch is 4320 — so this is a pathological
+/// genesis only.
+pub fn start_step_eta(
+    d: (u64, u64),
+    active_slot_coeff: (u64, u64),
+    blocks_made: u64,
+    slots_per_epoch: u64,
+) -> StartStepEta {
+    let expected_blocks = expected_blocks_raw(d, active_slot_coeff, slots_per_epoch);
+
+    // `d >= 4/5` in exact rational form, matching Haskell's `d >= 0.8` on a
+    // `UnitInterval`. A float comparison here is the #629 defect. Note `4/5`
+    // itself takes this branch (mainnet epoch 213).
+    let (d_num, d_den) = (d.0 as i128, d.1.max(1) as i128);
+    let eta = if 5 * d_num >= 4 * d_den {
+        Some((1, 1))
+    } else if expected_blocks == 0 {
+        None
+    } else {
+        let g = gcd(blocks_made, expected_blocks);
+        Some((blocks_made / g, expected_blocks / g))
+    };
+
+    StartStepEta {
+        expected_blocks,
+        eta,
+    }
+}
+
+/// Reduce to lowest terms, as Haskell's `Rational` always is.
+///
+/// `gcd(0, n) == n`, so a zero numerator reduces to `0/1` — which is the right
+/// answer for the first Shelley epochs, where no blocks were made.
+fn gcd(a: u64, b: u64) -> u64 {
+    let (mut a, mut b) = (a, b);
+    while b != 0 {
+        (a, b) = (b, a % b);
+    }
+    a.max(1)
 }
 
 /// Haskell `PulsingRewUpdate` — `NewEpochState[4]` (`nesRu`).
@@ -326,6 +448,214 @@ impl PulsingRewUpdate {
     /// cardano-cli renders `Pulsing` as JSON `null`, like `SNothing`.
     pub fn is_json_visible(&self) -> bool {
         matches!(self, PulsingRewUpdate::Complete(_))
+    }
+}
+
+#[cfg(test)]
+mod start_step_eta_tests {
+    use super::*;
+
+    /// Mainnet geometry: `epochLength = 432000`, `f = 1/20`.
+    const MAINNET_SLOTS: u64 = 432_000;
+    const MAINNET_F: (u64, u64) = (1, 20);
+    /// `maxLovelaceSupply`, mainnet.
+    const MAX_SUPPLY: u64 = 45_000_000_000_000_000;
+
+    /// Every mainnet epoch where `eta` or `expectedBlocks` is interesting,
+    /// with the values **cardano-streamer emitted** for it.
+    ///
+    /// `(epoch, d, blocksMade, expectedBlocks, eta)`. These are oracle output,
+    /// not values re-derived from dugite's own formula — a same-implementation
+    /// round trip is satisfied by any self-consistent wrong answer, and the
+    /// clamped/marker form this replaced was exactly that.
+    ///
+    /// The rows are chosen to make each defect individually fatal:
+    ///
+    /// * 208/209 — `blocksMade = 0` at the first Shelley epochs. Both fields
+    ///   are functions of pparams and `nesBprev` only, so a value is owed here
+    ///   even though no reward update exists yet to hang them off.
+    /// * 212/213 — `d >= 4/5` with a NON-ZERO `expectedBlocks`. Reporting `0`
+    ///   as a branch marker fails here and only here; `d = 4/5` also pins that
+    ///   the comparison is inclusive.
+    /// * 216/221/244/268 — `blocksMade > expectedBlocks`, so `eta > 1`. A
+    ///   `min(1, ·)` anywhere on the reporting path fails these four.
+    /// * 214/215/217 — `blocksMade < expectedBlocks`. Present so the fix
+    ///   cannot pass by reporting something monotonically larger.
+    #[allow(clippy::type_complexity)]
+    const MAINNET_ROWS: &[(u32, (u64, u64), u64, u64, Option<(u64, u64)>)] = &[
+        (208, (1, 1), 0, 0, Some((1, 1))),
+        (209, (1, 1), 0, 0, Some((1, 1))),
+        (210, (1, 1), 0, 0, Some((1, 1))),
+        (211, (1, 1), 0, 0, Some((1, 1))),
+        (212, (9, 10), 1_991, 2_160, Some((1, 1))),
+        (213, (4, 5), 4_230, 4_320, Some((1, 1))),
+        (214, (39, 50), 4_625, 4_752, Some((4_625, 4_752))),
+        (215, (19, 25), 5_120, 5_184, Some((80, 81))),
+        (216, (37, 50), 5_710, 5_616, Some((2_855, 2_808))),
+        (217, (18, 25), 5_965, 6_048, Some((5_965, 6_048))),
+        (221, (16, 25), 7_839, 7_776, Some((871, 864))),
+        (244, (7, 25), 15_603, 15_552, Some((5_201, 5_184))),
+        (268, (0, 1), 21_702, 21_600, Some((3_617, 3_600))),
+    ];
+
+    #[test]
+    fn eta_and_expected_blocks_match_the_mainnet_oracle_row_for_row() {
+        for &(epoch, d, blocks_made, want_expected, want_eta) in MAINNET_ROWS {
+            let got = start_step_eta(d, MAINNET_F, blocks_made, MAINNET_SLOTS);
+            assert_eq!(
+                got.expected_blocks, want_expected,
+                "epoch {epoch}: expectedBlocks (d = {}/{})",
+                d.0, d.1
+            );
+            assert_eq!(
+                got.eta, want_eta,
+                "epoch {epoch}: eta (d = {}/{}, blocksMade = {blocks_made})",
+                d.0, d.1
+            );
+        }
+    }
+
+    /// The assertion a clamp cannot satisfy, stated separately from the table.
+    ///
+    /// Four mainnet epochs have `blocksMade > expectedBlocks`, so upstream's
+    /// binding exceeds 1 — `min 1` lives inside `deltaR1`, not at the
+    /// definition. A table row is easy to "fix" by widening a tolerance; this
+    /// asserts the STRUCTURAL property that the reported numerator is greater
+    /// than its denominator.
+    #[test]
+    fn eta_is_reported_above_one_when_the_chain_outran_expected_blocks() {
+        let mut above_one = 0;
+        for &(epoch, d, blocks_made, expected, _) in MAINNET_ROWS {
+            if blocks_made <= expected || expected == 0 {
+                continue;
+            }
+            let (num, den) = start_step_eta(d, MAINNET_F, blocks_made, MAINNET_SLOTS)
+                .eta
+                .expect("a non-zero expectedBlocks always yields an eta");
+            assert!(
+                num > den,
+                "epoch {epoch}: eta must be reported RAW and so exceed 1 here, got {num}/{den}"
+            );
+            above_one += 1;
+        }
+        assert_eq!(
+            above_one, 4,
+            "the fixture must still contain the four over-production epochs; \
+             without them nothing distinguishes a raw eta from a clamped one"
+        );
+    }
+
+    /// `expectedBlocks` does not depend on which `eta` branch is taken.
+    ///
+    /// Upstream binds it unconditionally; the `d >= 0.8` guard is `eta`'s
+    /// alone. Sweeping `d` across the boundary must produce a value that only
+    /// ever DECREASES in `d`, with no discontinuity at 4/5.
+    #[test]
+    fn expected_blocks_is_unconditional_in_d_and_monotone_across_the_guard() {
+        // d = 100/100 .. 0/100, i.e. straight through 80/100 = 4/5.
+        //
+        // Asserted on `start_step_eta` and not only on `expected_blocks_raw`:
+        // the REPORTED value comes from the former, and a first version of this
+        // test drove only the latter — so reinstating the branch marker inside
+        // `start_step_eta` left it green. A test bounds the function it calls.
+        let mut prev: Option<u64> = None;
+        for d_num in (0..=100).rev() {
+            let want = (100 - d_num) * 216;
+            let raw = expected_blocks_raw((d_num, 100), MAINNET_F, MAINNET_SLOTS);
+            let reported = start_step_eta((d_num, 100), MAINNET_F, 0, MAINNET_SLOTS);
+            assert_eq!(
+                raw, want,
+                "d = {d_num}/100 must give floor((1 - d) * 1/20 * 432000)"
+            );
+            assert_eq!(
+                reported.expected_blocks, want,
+                "d = {d_num}/100: the REPORTED expectedBlocks must equal the raw \
+                 binding — the eta guard is not allowed to zero it"
+            );
+            if let Some(p) = prev {
+                assert!(raw >= p, "expectedBlocks must not decrease as d decreases");
+            }
+            prev = Some(raw);
+        }
+        // The two sides of the guard, spelled out: 4/5 is INSIDE it.
+        assert_eq!(expected_blocks_raw((4, 5), MAINNET_F, MAINNET_SLOTS), 4_320);
+        assert_eq!(
+            start_step_eta((4, 5), MAINNET_F, 4_230, MAINNET_SLOTS).eta,
+            Some((1, 1))
+        );
+        assert_eq!(
+            start_step_eta((39, 50), MAINNET_F, 4_625, MAINNET_SLOTS).eta,
+            Some((4_625, 4_752))
+        );
+    }
+
+    /// Where upstream throws, dugite emits nothing — it does not invent a
+    /// rational.
+    ///
+    /// `d < 4/5` with `expectedBlocks == 0` makes `blocksMade % expectedBlocks`
+    /// raise `Ratio has zero denominator`, so the oracle has no value to
+    /// compare against. `1/1` or `0/1` there would read as agreement.
+    #[test]
+    fn eta_is_none_only_where_upstream_would_divide_by_zero() {
+        // f * slotsPerEpoch = 4, so floor((1 - 0) * 4) = 4 and (1 - d) < 1/4
+        // cannot reach 1. No real network is near this; a genesis could be.
+        let pathological = start_step_eta((7, 10), (1, 1), 3, 4);
+        assert_eq!(pathological.expected_blocks, 1);
+        assert_eq!(pathological.eta, Some((3, 1)));
+
+        let zero = start_step_eta((7, 10), (1, 100), 3, 4);
+        assert_eq!(zero.expected_blocks, 0, "floor(0.3 * 1/100 * 4) = 0");
+        assert_eq!(
+            zero.eta, None,
+            "upstream throws here, so there is no value to report"
+        );
+
+        // The SAME zero with d >= 4/5 is not pathological at all: the guard
+        // answers before the division, exactly as mainnet 208-211 does.
+        let guarded = start_step_eta((9, 10), (1, 100), 3, 4);
+        assert_eq!(guarded.expected_blocks, 0);
+        assert_eq!(guarded.eta, Some((1, 1)));
+    }
+
+    /// The reported `eta` and the `eta` the ARITHMETIC uses are deliberately
+    /// different, and this pins that the fix did not conflate them.
+    ///
+    /// #1072's lesson: a change on a reporting path three lines from a
+    /// consensus path. `deltaR1` must still be `floor(min 1 eta * rho *
+    /// reserves)`, so at epoch 216 — where the report is `2855/2808` — the
+    /// expansion must equal the un-scaled `floor(rho * reserves)` and NOT the
+    /// 1.7% larger value a raw eta would give.
+    #[test]
+    fn the_monetary_step_still_clamps_eta_where_the_report_does_not() {
+        const RESERVES: u64 = 13_195_566_185_493_400;
+        const RHO: (u64, u64) = (3, 1000);
+        let d = (37, 50);
+        let blocks_made = 5_710;
+
+        let reported = start_step_eta(d, MAINNET_F, blocks_made, MAINNET_SLOTS);
+        assert_eq!(reported.eta, Some((2_855, 2_808)), "report is raw");
+
+        let step = start_step_monetary(
+            RHO,
+            (2, 10),
+            d,
+            MAINNET_F,
+            RESERVES,
+            0,
+            blocks_made,
+            MAINNET_SLOTS,
+            MAX_SUPPLY,
+        );
+        let unscaled = RESERVES as u128 * RHO.0 as u128 / RHO.1 as u128;
+        assert_eq!(
+            step.delta_r1 as u128, unscaled,
+            "deltaR1 must use min(1, eta) = 1; a raw eta would inflate it by ~1.7%"
+        );
+        let raw = unscaled * 2_855 / 2_808;
+        assert!(
+            raw > unscaled,
+            "sanity: the raw-eta value really is larger, so this test can fail"
+        );
     }
 }
 

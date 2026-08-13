@@ -1866,8 +1866,9 @@ fn build_epoch_snapshot(
     // which is the gross expansion.
     //
     // Computed ONCE — this runs the whole member fold, which is ~2.55 s at
-    // mainnet scale, so a second call to populate `eta`/`expectedBlocks` would
-    // double every epoch's dump cost.
+    // mainnet scale, so a second call would double every epoch's dump cost.
+    // `eta` / `expectedBlocks` used to be read off it and are not any more;
+    // see below.
     let forced = dugite_ledger::forced_reward_update(ledger);
     let rupd_next: serde_json::Value = match forced {
         None => serde_json::Value::Null,
@@ -1881,10 +1882,55 @@ fn build_epoch_snapshot(
         }),
     };
 
-    // `expectedBlocks` and `eta` are siblings of `rupdNext` in cardano-streamer's
-    // schema and fall out of the same frozen monetary step, so they are emitted
-    // from it rather than recomputed.
-    let expected_blocks = forced.map(|r| r.expected_blocks).unwrap_or(0);
+    // `expectedBlocks` and `eta` are siblings of `rupdNext` in
+    // cardano-streamer's schema. They are NOT fields of any upstream record —
+    // `startStep` binds them locally with one use each, so a dump field of
+    // these names is necessarily a recomputation from `startStep`'s own inputs,
+    // and `start_step_eta` is that recomputation.
+    //
+    // They USED to be read off the frozen `MonetaryStep`, which reported three
+    // things wrong at once. `MonetaryStep.expected_blocks` is post-processed for
+    // the division it feeds — clamped to `>= 1`, and set to `0` as a MARKER for
+    // the `d >= 4/5` branch — so mainnet epochs 212/213 published `0` where the
+    // oracle has 2160/4320. `eta` was then derived from that marker AND capped
+    // at 1, so the four epochs where mainnet outran `f * (1 - d)` published
+    // `1/1` against the oracle's raw ratio. And both were gated on
+    // `forced.is_some()`, which is `None` until a `go` snapshot exists, so the
+    // first two Shelley epochs published nothing for two fields that are
+    // functions of pparams and `nesBprev` alone.
+    //
+    // None of the three was a reward-arithmetic defect — every monetary term is
+    // byte-identical to the oracle at all four capped epochs, which it could not
+    // be if `min 1 eta` were missing where it matters. They were `epochFees`'s
+    // class: a definitional mismatch that shows up as a divergence and would
+    // MASK a real difference in the same field.
+    // Byron emits NOTHING for either, on the same reasoning `epochNonce` below
+    // spells out: `startStep` is a Shelley rule and `eta` is a (T)Praos concept,
+    // so Byron has no value for it and the oracle is silent for the whole era
+    // (`buildSnapshotJson` returns `Nothing`).
+    //
+    // Computing one anyway would fabricate a value — and it did: the first cut
+    // of this change published `eta = 1/1` for all 207 Byron epochs, because
+    // `prev_d` defaults to 1/1 there and hits the `d >= 4/5` guard. Uncompared,
+    // therefore invisible, therefore exactly the shape of the defect this
+    // change exists to remove.
+    let start_step_eta = if ledger.era == dugite_primitives::era::Era::Byron {
+        None
+    } else {
+        Some(dugite_ledger::start_step_eta(
+            (
+                ledger.epochs.prev_d.numerator,
+                ledger.epochs.prev_d.denominator,
+            ),
+            prev_pp.active_slot_coeff_rational(),
+            ledger.epochs.snapshots.bprev_blocks_by_pool.values().sum(),
+            ledger.epoch_length,
+        ))
+    };
+    let expected_blocks: serde_json::Value = match start_step_eta {
+        Some(s) => serde_json::Value::Number(s.expected_blocks.into()),
+        None => serde_json::Value::Null,
+    };
 
     // Era-dependent, per cardano-streamer's schema: "`null` for the neutral
     // nonce or Byron era".
@@ -1903,23 +1949,11 @@ fn build_epoch_snapshot(
             serde_json::Value::String(hex::encode(n))
         }
     };
-    let blocks_made: u64 = ledger.epochs.snapshots.bprev_blocks_by_pool.values().sum();
-    let eta: serde_json::Value = match forced {
-        // `expected_blocks == 0` is start_step_monetary's marker for the
-        // `d >= 4/5` branch, where Haskell sets eta = 1 outright.
-        Some(_) if expected_blocks == 0 => serde_json::json!({
-            "numerator": 1, "denominator": 1
-        }),
-        Some(_) => {
-            // eta = min(1, blocksMade / expectedBlocks), as an exact rational.
-            let (num, den) = if blocks_made >= expected_blocks {
-                (1u64, 1u64)
-            } else {
-                let g = gcd(blocks_made.max(1), expected_blocks);
-                (blocks_made / g, expected_blocks / g)
-            };
-            serde_json::json!({ "numerator": num, "denominator": den })
-        }
+    // `null` ONLY where upstream has no value to emit either — `d < 4/5` with
+    // `expectedBlocks == 0`, where `blocksMade % expectedBlocks` throws. Any
+    // rational put there would be a fabrication that reads as agreement.
+    let eta: serde_json::Value = match start_step_eta.and_then(|s| s.eta) {
+        Some((num, den)) => serde_json::json!({ "numerator": num, "denominator": den }),
         None => serde_json::Value::Null,
     };
 

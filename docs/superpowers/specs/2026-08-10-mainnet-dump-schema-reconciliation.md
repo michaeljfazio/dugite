@@ -205,6 +205,18 @@ shape mainnet shows at 208, 208–209 and 208 respectively. Both are the first
 Shelley epoch of their chain. `rupdApplied` diverges at preprod 5–6, i.e.
 `rupdNext`'s 4–5 shifted by exactly one, which is the threading proving itself.
 
+> **CORRECTION (2026-08-13): `eta` was NOT definitional, and grouping it with
+> the other two is what hid it.** The three were listed together because they
+> share a *symptom* — dugite `null` at the first Shelley epoch — but not a
+> cause. `rupdNext` and `snapshots.set` genuinely have no first-epoch
+> counterpart. `eta` was `null` only because the dump gated it on
+> `forced.is_some()`, and upstream binds `eta` from prevPParams and `nesBprev`
+> alone (`PulsingReward.hs:127-138`), with no dependency on a reward update
+> existing. So a value was owed at preprod 4 and mainnet 208/209 all along.
+> One shared symptom, two causes, and the definitional half lent its
+> exemption to the half that had not earned it. Fixed; see CLAUDE.md
+> 2026-08-13.
+
 ## Consequence to expect on the next mainnet run
 
 Adding `rupdApplied` will roughly DOUBLE the #1077-attributable divergence
