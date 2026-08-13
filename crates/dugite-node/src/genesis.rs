@@ -47,22 +47,72 @@ pub struct ByronBlockVersionData {
     #[serde(default)]
     pub slot_duration: String,
     #[serde(default, rename = "maxBlockSize")]
-    pub _max_block_size: String,
+    pub max_block_size: String,
     #[serde(default, rename = "maxTxSize")]
-    _max_tx_size: String,
+    pub max_tx_size: String,
+    #[serde(default, rename = "scriptVersion")]
+    pub script_version: u64,
     #[serde(default, rename = "txFeePolicy")]
-    _tx_fee_policy: ByronTxFeePolicy,
+    pub tx_fee_policy: ByronTxFeePolicy,
 }
 
+/// Byron's on-chain `txFeePolicy`, as the genesis file stores it.
+///
+/// These were parsed into `_summand` / `_multiplier` and DISCARDED, while
+/// `ByronFeePolicy` in dugite-ledger hardcoded mainnet's values — and its comment
+/// claimed "dugite does not yet parse the Byron `txFeePolicy`", which was not
+/// true: it parsed it and dropped it. That is #1067's shape, a field decoded for
+/// want of a destination, and it means any network whose genesis carries
+/// DIFFERENT values would have been validated against mainnet's from block 1.
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
-// Fields populated by serde deserialization from cardano-node genesis JSON
 pub struct ByronTxFeePolicy {
-    /// Fee = summand + multiplier * tx_size (both values are x1e12)
+    /// `a`, the constant summand, in NANO scale (value x 1e9).
     #[serde(default, rename = "summand")]
-    _summand: String,
+    pub summand: String,
+    /// `b`, the per-byte multiplier, in NANO scale (value x 1e9).
     #[serde(default, rename = "multiplier")]
-    _multiplier: String,
+    pub multiplier: String,
+}
+
+/// The nano scale both `txFeePolicy` values are stored in.
+///
+/// The struct's previous comment said "both values are x1e12". It is 1e9, and
+/// the arithmetic settles it against the real files: mainnet and preprod both
+/// carry `summand = 155381000000000` and `multiplier = 43946000000`, and only
+/// 1e9 yields Byron's documented `a = 155381` lovelace and
+/// `b = 43.946 = 21973/500`. Using 1e12 would have made every Byron minimum fee
+/// a thousandfold too small — i.e. accepted transactions cardano-node rejects.
+const BYRON_FEE_POLICY_NANO: u64 = 1_000_000_000;
+
+impl ByronTxFeePolicy {
+    /// `(summand_lovelace, (mult_num, mult_den))` in exact rational form.
+    ///
+    /// Returns `None` if either field is absent/unparseable, or if the summand is
+    /// not a whole number of lovelace after de-scaling — Byron's `a` is a
+    /// `Lovelace`, so a fractional value means the genesis is not one this code
+    /// can honour, and silently truncating it would put a wrong fee on a
+    /// consensus path.
+    pub fn to_exact(&self) -> Option<(u64, (u64, u64))> {
+        let summand_nano: u128 = self.summand.parse().ok()?;
+        let mult_nano: u128 = self.multiplier.parse().ok()?;
+        let nano = BYRON_FEE_POLICY_NANO as u128;
+        if summand_nano % nano != 0 {
+            return None;
+        }
+        let summand = u64::try_from(summand_nano / nano).ok()?;
+        // Reduce mult_nano / 1e9 to lowest terms; the multiplier is genuinely
+        // fractional (mainnet's is 21973/500) and must stay exact, because the
+        // fee is `a + ceiling(size * b)` over exact rationals.
+        let g = gcd_u128(mult_nano, nano).max(1);
+        Some((
+            summand,
+            (
+                u64::try_from(mult_nano / g).ok()?,
+                u64::try_from(nano / g).ok()?,
+            ),
+        ))
+    }
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -1437,6 +1487,85 @@ mod float_to_rational_tests {
 }
 
 #[cfg(test)]
+mod byron_fee_policy_tests {
+    use super::*;
+
+    /// The values mainnet AND preprod both carry, verbatim from their
+    /// `byron-genesis.json`. Pinned as a FIXTURE of what the files say, not as
+    /// the policy dugite uses — the point of the change these test is that the
+    /// policy comes from the file.
+    const REAL_SUMMAND_NANO: &str = "155381000000000";
+    const REAL_MULTIPLIER_NANO: &str = "43946000000";
+
+    fn policy(summand: &str, multiplier: &str) -> ByronTxFeePolicy {
+        ByronTxFeePolicy {
+            summand: summand.to_string(),
+            multiplier: multiplier.to_string(),
+        }
+    }
+
+    /// The de-scaling reproduces Byron's documented `a = 155381` and
+    /// `b = 21973/500`, which is what fixes the 1e9-vs-1e12 question the struct's
+    /// old comment got wrong.
+    #[test]
+    fn real_genesis_descales_to_byrons_documented_a_and_b() {
+        let (summand, (num, den)) = policy(REAL_SUMMAND_NANO, REAL_MULTIPLIER_NANO)
+            .to_exact()
+            .expect("the real mainnet/preprod policy must parse");
+        assert_eq!(summand, 155_381, "a, in lovelace");
+        assert_eq!((num, den), (21_973, 500), "b, exact and in lowest terms");
+        // 21973/500 == 43.946, cross-multiplied so the check stays in integers:
+        // a float comparison could pass on a value that merely rounds the same.
+        assert_eq!(num * 1_000, den * 43_946, "b must be exactly 43.946");
+    }
+
+    /// The scale is 1e9. If it were 1e12 the summand would de-scale to 155
+    /// lovelace instead of 155381 — a thousandfold-too-small minimum fee, i.e.
+    /// accepting transactions cardano-node rejects. This is the assertion that
+    /// goes red if anyone "corrects" the scale back to the old comment's claim.
+    #[test]
+    fn the_scale_is_nano_not_pico() {
+        let (summand, _) = policy(REAL_SUMMAND_NANO, REAL_MULTIPLIER_NANO)
+            .to_exact()
+            .unwrap();
+        assert_eq!(summand, 155_381);
+        assert_ne!(summand, 155, "155 is what a 1e12 scale would produce");
+    }
+
+    /// A fractional summand is REFUSED rather than truncated. Byron's `a` is a
+    /// `Lovelace`; rounding one silently would put a wrong fee on a consensus
+    /// path, which is precisely what a pinned constant did before.
+    #[test]
+    fn a_non_integral_summand_is_refused_not_rounded() {
+        assert_eq!(
+            policy("155381000000001", REAL_MULTIPLIER_NANO).to_exact(),
+            None
+        );
+        // And the boundary just below, so the check is not accidentally lenient.
+        assert_eq!(policy("999999999", REAL_MULTIPLIER_NANO).to_exact(), None);
+    }
+
+    /// A multiplier that is a whole number still reduces correctly, and one that
+    /// is not stays exact — no float anywhere in the path.
+    #[test]
+    fn multiplier_stays_exact_whole_or_fractional() {
+        // 2e9 / 1e9 = 2/1
+        let (_, mult) = policy(REAL_SUMMAND_NANO, "2000000000").to_exact().unwrap();
+        assert_eq!(mult, (2, 1));
+        // 1 / 1e9 — the smallest representable, must NOT collapse to 0
+        let (_, mult) = policy(REAL_SUMMAND_NANO, "1").to_exact().unwrap();
+        assert_eq!(mult, (1, 1_000_000_000));
+    }
+
+    #[test]
+    fn garbage_and_empty_are_refused() {
+        assert_eq!(policy("", REAL_MULTIPLIER_NANO).to_exact(), None);
+        assert_eq!(policy(REAL_SUMMAND_NANO, "not-a-number").to_exact(), None);
+        assert_eq!(ByronTxFeePolicy::default().to_exact(), None);
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -1676,7 +1805,7 @@ mod tests {
         assert_eq!(genesis.non_avvm_balances.len(), 2);
         assert_eq!(genesis.avvm_distr.len(), 1);
         assert_eq!(genesis.block_version_data.slot_duration, "20000");
-        assert_eq!(genesis.block_version_data._max_block_size, "2000000");
+        assert_eq!(genesis.block_version_data.max_block_size, "2000000");
 
         // Test initial_utxos extraction
         let utxos = genesis.initial_utxos();
