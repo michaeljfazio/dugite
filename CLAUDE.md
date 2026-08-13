@@ -1272,9 +1272,30 @@ in `snapshotInfo` and must be re-expressed against the two-field SnapShot before
 the port is usable — emitting `()` where 10.6.2 emits real maps would silently
 empty two compared fields, which is worse than having no port.
 
-**Still unproven**: whether 10.26.0.0 actually lifts the cap. Do NOT infer it
-from the version bump — that is exactly the mistake this entry retracts. A
-preprod replay to epoch 293 settles it.
+**MEASURED, and the port does NOT lift the cap.** The 10.7.1 build
+(cardano-api 10.26.0.0) dies at the SAME preprod block, epoch 293, with the
+identical `ObsoleteNode (Version 11) (Version 10)`, after 290 epochs of replay.
+So the cap does not move between cardano-api 10.23 and 10.26, and refusing to
+infer it from the version bump was worth the two hours it cost to check.
+
+**What this means.** PV11 support arrived with cardano-node **11.x**, and every
+cardano-streamer branch — ours and upstream's — targets 10.x. There is no 11.x
+branch anywhere, and `lehins/master` pins the same CHaP index-state as our
+10.6.2. So closing PV11 needs a streamer built against a cardano-node 11.x
+dependency set: a new port, not a version bump, and materially larger than this
+one (the 10.6.2 -> 10.7.1 step alone moved the SnapShot record's shape).
+
+**Standing consequences until that exists:**
+
+* PV11 ledger state is **unverifiable against this oracle on any network**.
+* The mainnet tip run **walls at ~epoch 640**, not 649. Everything below 640 is
+  still reachable and worth banking.
+* preprod is verifiable only to epoch **292** (PV11 begins at 295; dugite's own
+  dumps cover 295-306 but have nothing to compare against).
+
+The port is still worth keeping — it builds, and it is the starting point for an
+11.x port rather than dead work. It stays INCOMPLETE at the stubbed
+`delegations`/`poolParams`.
 The oracle binary is pinned at `oracle-bin/cstreamer-10.6.2` with its sha256,
 because both branches build to ghc-9.6.5 and share one dist-newstyle directory.
 
