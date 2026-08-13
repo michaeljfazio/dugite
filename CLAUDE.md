@@ -292,6 +292,41 @@ WAIT-LOOP's own command line, so the watcher reports the watched as still
 running forever. The replay had finished five minutes earlier. Grep the log for
 the completion line instead of polling for the process.
 
+### OPEN — dugite SKIPS zero-value genesis UTxOs; cardano-node creates them
+
+Found by the 1-to-1 preprod comparison, and only because the Byron dump emits
+`utxo.count` ALONGSIDE `utxo.balance`. The balances agree to the lovelace at
+every Byron epoch; the COUNTS do not.
+
+| preprod Byron epoch | dugite | oracle |
+|---|---:|---:|
+| 1, 2, 3 | `count: 1` | **`count: 8`** |
+
+preprod's Byron genesis has 8 `nonAvvmBalances` entries and no AVVM. **Seven of
+the eight are worth 0**, and `genesis.rs:196` does `if lovelace == 0 { continue }`
+— so dugite seeds one UTxO where cardano-node seeds eight. The same filter sits
+at `:634` for Shelley `initialFunds`.
+
+The oracle's count of 8 IS the evidence that upstream does not filter: it is a
+measurement of cardano-node's own UTxO set, not a reading of its source.
+
+**Why it is consensus and not cosmetic.** A transaction spending one of those
+zero-value genesis outputs is ACCEPTED by cardano-node — the UTxO exists — and
+rejected by dugite with `InputNotFound`, because dugite never created it. That is
+a false reject on block validity: dugite would refuse a block cardano-node
+accepts. Nobody spends a zero-value genesis output in practice, but "in practice"
+is not a correctness argument, and this repo has been burned by exactly that
+reasoning before.
+
+The balance being right is what makes it invisible to every check that sums:
+this is the case the `count` field was added for, and its comment predicted it —
+"count catches a lost or duplicated output even when the values happen to net
+out".
+
+NOT fixed here. It is a one-line removal, but it changes the genesis UTxO set —
+ledger state, on a consensus path — so it wants canonical grounding and its own
+validation rather than being folded into a dump change.
+
 ### 2026-08-13 — Byron's protocol parameters are ON-CHAIN, and dugite tracks none of them
 
 Found by building the Byron comparison and running it — the point of a
