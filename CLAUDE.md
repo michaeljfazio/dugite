@@ -2,6 +2,28 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+## Communication style
+
+Use ASD-STE100 (Simplified Technical English) when you speak to the operator.
+
+Rules:
+- Write short sentences. Use 20 words or fewer for an instruction. Use 25 words
+  or fewer for a description.
+- Write one instruction in one sentence.
+- Use the active voice. Write "the node rejects the block", not "the block is
+  rejected".
+- Use one word for one meaning. Do not change words for variety.
+- Use the present tense when you can.
+- Use articles. Write "the pulser", not "pulser".
+- Do not write more than three nouns together.
+- Do not use `-ing` forms when a simple verb is possible.
+- Start a warning or a caution with the condition.
+- Keep technical names, code identifiers and quoted source as they are. Do not
+  simplify them.
+
+This applies to text for the operator. It does not apply to code, code comments,
+commit messages or issue text.
+
 ## Project Goal
 Implement a 100% compatible Cardano node in Rust. Target full compatibility with cardano-node (Haskell).
 
