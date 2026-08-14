@@ -1310,10 +1310,9 @@ after 3h34m of replay. The build really does resolve
 PV10 — so a version number in a changelog is not evidence about what a node
 ACCEPTS. Only running a real PV11 block through it is.
 
-Consequences: PV11 ledger state is unverifiable with this oracle on ANY network,
-and **the mainnet tip run walls at ~epoch 640** (where mainnet crossed PV11), not
-649. Upstream has nothing to reuse — `lehins` has no 11.x branch and its `master`
-pins the same CHaP index-state as our 10.6.2.
+Consequences AT THE TIME (all three retired later the same day — see below):
+PV11 ledger state unverifiable on any network, and the mainnet tip run walling at
+~epoch 640.
 
 The port now BUILDS (fork branch `10.7.1-dump-snapshot`, cardano-api
 10.23.0.0 → 10.26.0.0). The parked WIP's "4 constraint errors" were two
@@ -1370,12 +1369,21 @@ step, and Conway rather than the last era because Dijkstra has not shipped and a
 oracle that accepted an era whose rules it cannot check would report agreement it
 never established.
 
-**UNVALIDATED until preprod slot 125366409 replays clean**, and that is the whole
-lesson of the two retractions: a source read is not evidence either. That block —
-the first the old binary refused, the first block of epoch **294**, not 293 as
-first recorded — is preserved with the `NewEpochState` immediately before it at
-`reports/preprod-first-pv11-block/`, so the next attempt starts from the block
-rather than from a 3h replay.
+**VALIDATED 2026-08-14 on the block that killed both previous binaries.** preprod
+slot **125366409** — the first block of epoch **294**, not 293 as first recorded —
+replayed CLEAN, and the run continued to epoch 300+ with **0 errors**. Both
+earlier builds died on exactly that block. The block and the `NewEpochState`
+immediately before it are preserved at `reports/preprod-first-pv11-block/`.
+
+**Standing consequences, all three now retired:**
+
+* PV11 ledger state is **verifiable on every network**.
+* The mainnet tip run **no longer walls at ~640** — 649 is reachable.
+* preprod is verifiable to **tip**, not to 292.
+
+The oracle binary is `oracle-bin/cstreamer-full-era-pv11`; `cstreamer-10.6.2` is
+kept beside it, and both are recorded in `PROVENANCE.txt`. **Check the sha256
+before trusting a run** — the two branches share one dist-newstyle.
 
 **Also note the oracle binary was STALE.** `oracle-bin/cstreamer-10.6.2` is
 `10.6.2-dump-snapshot` at 8c5b285, built Aug 9 — it predates Byron dumping, the

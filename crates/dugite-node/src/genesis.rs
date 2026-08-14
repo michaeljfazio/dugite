@@ -97,6 +97,14 @@ pub struct ByronTxFeePolicy {
 /// a thousandfold too small — i.e. accepted transactions cardano-node rejects.
 const BYRON_FEE_POLICY_NANO: u64 = 1_000_000_000;
 
+/// The protocol major version at which the Conway era begins.
+///
+/// Used to decide whether a genesis file *starts* in Conway. A network below
+/// this reaches Conway through the Babbage->Conway translation, which is where
+/// upstream injects Conway's upgrade parameters; one at or above it never makes
+/// that hop and needs them from genesis.
+const CONWAY_PROTOCOL_MAJOR: u64 = 9;
+
 impl ByronTxFeePolicy {
     /// `(summand_lovelace, (mult_num, mult_den))` in exact rational form.
     ///
@@ -1170,13 +1178,52 @@ impl ConwayGenesis {
             };
         }
 
-        // PlutusV3 cost model from Conway genesis
+        // PlutusV3 cost model from Conway genesis — ONLY when genesis itself
+        // declares a Conway-or-later protocol version.
+        //
+        // Upstream never puts V3 into the initial parameters. It arrives with
+        // the Babbage->Conway translation:
+        //
+        //   -- cardano-ledger, Conway/PParams.hs :: upgradeConwayPParams
+        //   cppCostModels = updateCostModels bppCostModels
+        //                     (mkCostModels [(PlutusV3, ucppPlutusV3CostModel)])
+        //
+        // a per-language INSERT over Babbage's {V1,V2}. dugite applied it at
+        // STARTUP instead, so every pre-Conway epoch carried a V3 cost model
+        // cardano-node does not have. MEASURED on preprod against the node's own
+        // state: epochs 7-13 (Alonzo and early Babbage) read
+        // `costModels {PlutusV1, PlutusV3}` where the oracle reads `{PlutusV1}`.
+        // #1046's mechanism exactly, one language later — an era's genesis field
+        // applied outside the era that introduces it.
+        //
+        // It cannot simply be deleted: `ConwayRules::on_era_transition` seeds V3
+        // only for `from_era == Babbage`, and a devnet whose genesis IS Conway
+        // never makes that hop, so nothing would ever seed it there — which is
+        // #764's failure (empty `language_views` => wrong `script_data_hash` on
+        // every V3 transaction).
+        //
+        // The condition is DERIVED from genesis rather than pinned to a network:
+        // Conway is protocol version 9, so a genesis declaring major >= 9 begins
+        // in Conway and will get no Babbage->Conway translation; anything lower
+        // reaches Conway through that translation and must not have V3 early.
+        // Measured across the real files — mainnet 2, preprod 2, preview 6,
+        // devnet 10 — so the split lands exactly on the networks that need each
+        // branch.
         if let Some(v3) = &self.plutus_v3_cost_model {
-            debug!(
-                count = v3.len(),
-                "Loaded PlutusV3 cost model from Conway genesis"
-            );
-            params.cost_models.plutus_v3 = Some(v3.clone());
+            if params.protocol_version_major >= CONWAY_PROTOCOL_MAJOR {
+                debug!(
+                    count = v3.len(),
+                    pv = params.protocol_version_major,
+                    "Loaded PlutusV3 cost model from Conway genesis (genesis begins in Conway)"
+                );
+                params.cost_models.plutus_v3 = Some(v3.clone());
+            } else {
+                debug!(
+                    pv = params.protocol_version_major,
+                    "Conway genesis carries a PlutusV3 cost model, but genesis begins \
+                     before Conway — leaving it to the Babbage->Conway translation"
+                );
+            }
         }
 
         // #1046: NO default PlutusV2 injection.
@@ -1646,6 +1693,81 @@ mod tests {
         assert!(ledger_const.script_hash.is_none());
         // initialDReps absent → empty
         assert!(genesis.initial_dreps_as_entries().is_empty());
+    }
+
+    /// A Conway genesis carrying a PlutusV3 cost model, minimal but complete
+    /// enough to deserialise.
+    fn conway_genesis_with_v3() -> ConwayGenesis {
+        let json = r#"{
+            "poolVotingThresholds": {
+                "committeeNormal": 0.51, "committeeNoConfidence": 0.51,
+                "hardForkInitiation": 0.51, "motionNoConfidence": 0.51,
+                "ppSecurityGroup": 0.51
+            },
+            "dRepVotingThresholds": {
+                "motionNoConfidence": 0.67, "committeeNormal": 0.67,
+                "committeeNoConfidence": 0.6, "updateToConstitution": 0.75,
+                "hardForkInitiation": 0.6, "ppNetworkGroup": 0.67,
+                "ppEconomicGroup": 0.67, "ppTechnicalGroup": 0.67,
+                "ppGovGroup": 0.75, "treasuryWithdrawal": 0.67
+            },
+            "committeeMinSize": 0, "committeeMaxTermLength": 365,
+            "govActionLifetime": 6, "govActionDeposit": 1000000000,
+            "dRepDeposit": 500000000, "dRepActivity": 20,
+            "plutusV3CostModel": [11, 22, 33]
+        }"#;
+        serde_json::from_str(json).expect("conway genesis parses")
+    }
+
+    /// A genesis that begins BEFORE Conway must not carry a PlutusV3 cost model
+    /// in its initial parameters. Upstream inserts V3 in `upgradeConwayPParams`,
+    /// i.e. at the Babbage->Conway translation, so any earlier epoch has none.
+    ///
+    /// RED under the previous code, which applied the field unconditionally:
+    /// measured on preprod, epochs 7-13 read `{PlutusV1, PlutusV3}` against
+    /// cardano-node's `{PlutusV1}`.
+    #[test]
+    fn conway_genesis_v3_cost_model_is_withheld_before_conway() {
+        let g = conway_genesis_with_v3();
+        // mainnet and preprod declare major 2; preview declares 6.
+        for pv in [2u64, 6, 8] {
+            let mut params = ProtocolParameters::mainnet_defaults();
+            params.protocol_version_major = pv;
+            params.cost_models.plutus_v3 = None;
+
+            g.apply_to_protocol_params(&mut params);
+
+            assert_eq!(
+                params.cost_models.plutus_v3, None,
+                "genesis at protocol major {pv} begins before Conway, so V3 must \
+                 wait for the Babbage->Conway translation that introduces it"
+            );
+        }
+    }
+
+    /// The other half, and the reason the field cannot simply be dropped:
+    /// `ConwayRules::on_era_transition` seeds V3 only for `from_era == Babbage`,
+    /// so a devnet whose genesis IS Conway never makes that hop. Withholding it
+    /// there would leave `language_views` empty and give every PlutusV3
+    /// transaction a wrong `script_data_hash` — #764's failure.
+    #[test]
+    fn conway_genesis_v3_cost_model_is_applied_when_genesis_begins_in_conway() {
+        let g = conway_genesis_with_v3();
+        // `create-testnet-data` writes major 10.
+        for pv in [CONWAY_PROTOCOL_MAJOR, 10, 11] {
+            let mut params = ProtocolParameters::mainnet_defaults();
+            params.protocol_version_major = pv;
+            params.cost_models.plutus_v3 = None;
+
+            g.apply_to_protocol_params(&mut params);
+
+            assert_eq!(
+                params.cost_models.plutus_v3,
+                Some(vec![11, 22, 33]),
+                "genesis at protocol major {pv} begins in Conway, so nothing else \
+                 will ever seed V3"
+            );
+        }
     }
 
     #[test]
