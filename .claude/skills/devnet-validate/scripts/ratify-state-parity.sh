@@ -156,6 +156,29 @@ while [ "$(date +%s)" -lt "$deadline" ]; do
         # now report the NEXT plan, so the check is against cardano-node's
         # freshly-applied state rather than against dugite's own memory of it.
         if [ -n "$pending_plan" ]; then
+            # A DELAYED plan is not due at this boundary.
+            #
+            # Conway ratification and enactment are one step, but a proposal
+            # submitted in epoch E is ratifiable no earlier than E+1 and enacts
+            # at E+2, and the pulser reports the plan carrying `delayed: true`
+            # across the boundary in between. Requiring the action to be gone
+            # there asserts something neither implementation does.
+            #
+            # Measured on the PV10->PV11 hardfork round: the HardForkInitiation
+            # was reported `delayed: true` by BOTH nodes at the 0->1 boundary
+            # with `socket_agree=true`, and `still_live` was read from
+            # CARDANO-NODE's socket — so the check was failing the reference
+            # implementation for its own correct behaviour, then passing
+            # PLAN_APPLIED for the same action at 1->2 where PV11 duly flipped
+            # on both sockets. A harness invariant that the oracle itself
+            # violates is measuring the wrong thing.
+            #
+            # Recorded as its own verdict rather than silently skipped: a
+            # boundary that legitimately had nothing due must not read the same
+            # as one that applied a plan.
+            if [ "$(echo "$pending_plan" | jq -r '.delayed // false')" = "true" ]; then
+                echo "$(date -u +%Y-%m-%dT%H:%M:%SZ),$s0d,$epoch,true,$pending_plan,,PLAN_DELAYED" >> "$OUT"
+            else
             plan_checks=$((plan_checks + 1))
             enacted_now=$(echo "$pending_plan" | jq -c '.enacted')
             # An action the pulser planned to enact must no longer be a live
@@ -172,6 +195,7 @@ while [ "$(date +%s)" -lt "$deadline" ]; do
                 echo "$(date -u +%Y-%m-%dT%H:%M:%SZ),$s0d,$epoch,true,$pending_plan,$still_live,PLAN_NOT_APPLIED" >> "$OUT"
             else
                 echo "$(date -u +%Y-%m-%dT%H:%M:%SZ),$s0d,$epoch,true,$pending_plan,,PLAN_APPLIED" >> "$OUT"
+            fi
             fi
         fi
         pending_plan=""
