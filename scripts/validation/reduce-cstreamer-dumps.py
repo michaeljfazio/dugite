@@ -95,7 +95,8 @@ def reduce_file(p: pathlib.Path) -> int:
     return before - p.stat().st_size
 
 
-def pass_once(d: pathlib.Path, verbose: bool, include_newest: bool = False) -> int:
+def pass_once(d: pathlib.Path, verbose: bool, include_newest: bool = False,
+              done: set | None = None) -> int:
     files = sorted((f for f in d.glob("*.json") if epoch_of(f) is not None),
                    key=epoch_of)
     if not files or (len(files) == 1 and not include_newest):
@@ -105,12 +106,28 @@ def pass_once(d: pathlib.Path, verbose: bool, include_newest: bool = False) -> i
     # where the last epoch is complete and would otherwise stay raw — that is
     # the single largest file in the set at tip scale.
     targets = files if include_newest else files[:-1]
+    # Skip files already handled in this process.
+    #
+    # `reduce_file` reads and PARSES a whole file before it can discover there
+    # is nothing to do, so without this every 30 s pass re-parsed the entire
+    # dump set. Measured on the mainnet tip run at 474 epochs: a sustained 99%
+    # of one core and ~3.3 GB of re-reads per pass, against two replays that
+    # were themselves only at ~35% CPU. The cost grows with the run, so it is
+    # worst exactly when the run is longest.
+    #
+    # Correct because cstreamer writes each epoch file ONCE and never rewrites
+    # it, and `targets` excludes the newest file while the producer is alive —
+    # so anything processed here is already complete.
+    if done is not None:
+        targets = [f for f in targets if f not in done]
     saved = 0
     for f in targets:
         s = reduce_file(f)
         if s and verbose:
             print(f"  {f.name}: -{s / 1048576:.1f} MB")
         saved += s
+        if done is not None:
+            done.add(f)
     return saved
 
 
@@ -131,8 +148,12 @@ def main() -> int:
         return 2
 
     total = 0
+    # Only the watch loop needs the memo. A one-shot pass visits each file once
+    # anyway, and `--all` must be free to revisit the newest file the watch loop
+    # deliberately left alone.
+    done: set | None = set() if (args.watch and not args.all) else None
     while True:
-        total += pass_once(d, not args.quiet, include_newest=args.all)
+        total += pass_once(d, not args.quiet, include_newest=args.all, done=done)
         if not args.watch:
             break
         time.sleep(args.interval)
