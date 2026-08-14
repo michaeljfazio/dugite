@@ -128,6 +128,100 @@ dugite-lsm (LSM-tree on-disk storage for UTxO-HD)
 
 ## Current Focus
 
+### 2026-08-14 — the oracle reaches PV11, and preprod finds FOUR dugite defects
+
+**The PV10 cap was one literal in cardano-api, not a dependency set.** Detail
+below; the consequence is that PV11 ledger state is now verifiable on every
+network, preprod compares to TIP, and the mainnet run no longer walls at ~640.
+
+**preprod is now the cleanest comparison this repo has ever had: 306 paired
+epochs, 4,622,661 leaf comparisons**, and the only remaining items are #1084's
+five Byron fields (3 epochs each) plus the definitional first-Shelley
+`rupdNext`/`rupdApplied`/`snapshots.set` at epochs 4-5. It is also the FIRST
+comparison to cover PV11 at all (epochs 293-306).
+
+Getting there took four fixes, and **every one was found by comparing a field
+nobody had compared before** — three of them beyond epoch 186, which is exactly
+where prior validation stopped.
+
+| # | defect | class |
+|---|---|---|
+| 1 | `psDRepDistr` shed DReps cardano-node keeps — 10,578 missing (epoch, DRep) pairs over 143 Conway epochs | **CONSENSUS-adjacent**, fixed |
+| 2 | PlutusV3 cost model held through Alonzo/Babbage | state divergence, fixed |
+| 3 | `poolParams.owners` emitted unsorted | dump, fixed |
+| 4 | `poolDistribution` emitted nondeterministically | dump, fixed |
+
+**#1 was TWO defects and the second did the damage.** `computeDRepDistr` applies
+exactly four predicates and for a `DRepCredential` the only one is
+`Map.member cred regDReps` — no expiry, no votes, no `drepDelegs`. Expiry enters
+at exactly ONE point, `dRepAcceptedRatio`, which tests `reCurrentEpoch` against
+the FROZEN `dpDRepState`; dugite applied it at capture. The two placements are
+arithmetically identical at a single boundary — **which is why the RATIO was
+right while the DISTRIBUTION was wrong** — and part company when the judgement
+drifts, because upstream compares the epoch RATIFY runs in, one boundary AFTER
+the freeze. A boolean decided at capture cannot express that, so
+`PulsingSnapshot` now carries frozen expiries.
+
+Fixing that barely moved the number, and *that* is what exposed the real cause:
+**the dump read `build_drep_power_cache()` — the RATIO INPUT — where the oracle
+reads `psDRepDistr snap`.** That helper filters expired DReps by design.
+`GetDRepStakeDistr` already read the frozen snapshot directly, so **the wire was
+right and only the dump was wrong**: two readers of one concept, and the
+uncompared one drifted. #977 and #996's shape.
+
+**The safety property was measured, not assumed.** Separating the distribution
+from the ratio denominator is only correct if the ratio is unchanged: across 306
+preprod epochs, 157 paths moved inside `conwayGov.drepDistr` and **ZERO moved
+anywhere else** — no `nextEnactState`, no pots, no thresholds — with epoch 306's
+treasury and reserves still byte-identical to db-sync. #1072's fix came from a
+correct diagnosis and still introduced two new consensus bugs three lines away.
+
+**A correction worth keeping.** I claimed a dropped-then-returning DRep carrying
+a LARGER value proved delegations were never lost. It proves no such thing — a
+later re-delegation explains it equally well — and that over-claim is precisely
+what made the first fix look sufficient. The discriminator that actually worked
+was mechanical: fix one candidate, measure, and let the residual point at the
+next.
+
+**#2 is #1046 one language later.** `upgradeConwayPParams` inserts V3 at the
+Babbage->Conway translation; dugite applied the same genesis field at STARTUP, so
+every pre-Conway epoch carried it. It cannot simply be deleted —
+`on_era_transition` seeds V3 only for `from_era == Babbage` and a Conway-genesis
+devnet never makes that hop (#764) — so the condition is DERIVED: Conway is
+protocol major 9, and the real files split cleanly (mainnet 2, preprod 2,
+preview 6, devnet 10). The independent analysis corrected one framing of mine:
+that missing hop is **dugite's** gap, not upstream's. Consensus runs the whole
+translation chain even when every fork triggers at epoch 0 —
+`injectInitialExtLedgerState` calls `extendToSlot (SlotNo 0)`, which walks the
+telescope one era at a time. It also sharpened the reachability: the benignity
+rests entirely on V3 being an UNUSABLE language pre-Conway, since
+`mkScriptIntegrity` hashes only the languages a transaction USES. The same defect
+with V1/V2 *values* would be a Phase-1 consensus divergence.
+
+**#3/#4 are the same shape as the reward-account credential bug in the same
+function: the ledger and the LSQ encoder were right, only the dump serialiser was
+not.** `ppOwners` is a `Set` and `n2c_query/encoding.rs` already sorted it;
+`poolDistribution` came straight off a hash map, so the same binary over the same
+chain emitted different bytes on consecutive runs. CLAUDE.md had recorded that as
+harmless. It stops being harmless the moment anything asks "did any other field
+move between two runs" — which is the check that proved #2 moved only V3, and it
+came back with 95,617 leaf mismatches of pure reordering.
+
+**Found on the way, and filed rather than fixed:**
+* **#1084** — dugite models neither Byron's delegation map nor its update system.
+  `era_byron.rs:444` skips `dlg_payload` AND `upd_payload` at DECODE time, so it
+  never sees either subsystem's inputs. Exactly five fields, measured.
+* **#1088** — `snapshot_format_hash_stability` is only stable because every map
+  field in the fixture holds at most ONE entry. Adding a two-entry map made the
+  digest differ across two runs of identical code; `drep_expiry` therefore ships
+  as an ORDERED map. A guard that cannot fail for multi-entry maps is weaker than
+  it reads.
+* **Issue numbers 1084-1086 were RENUMBERED** — see the note below; three
+  defects were written up under numbers never actually filed.
+
+`SNAPSHOT_VERSION` stays **38**, extended in place: 38 is gate-validated but
+never tagged, so operators replay once regardless.
+
 > **Issue numbers 1084-1086 were RENUMBERED on 2026-08-14.** Three defects were
 > written up here and in commit messages as #1084 / #1085 / #1086 and **never
 > actually filed**, so those numbers were free — and #1084 was then taken by an
