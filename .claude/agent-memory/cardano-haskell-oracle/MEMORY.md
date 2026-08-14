@@ -138,6 +138,7 @@
 - [dblock-directory-locking.md](dblock-directory-locking.md) — DbLock.hs: `<db-path>/lock`, OS flock, runs AFTER checkDbMarker
 
 ## Misc / Ledger Semantics
+- [costmodels-lifecycle-entry-points-and-ppu-semantics.md](costmodels-lifecycle-entry-points-and-ppu-semantics.md) — V1@Mary→Alonzo, V3@Babbage→Conway ONLY; pre-Conway PPU=whole-field REPLACE, Conway=merge; HFC init state is ALWAYS Byron, epoch-0 forks translate at slot 0
 - [metadatum-codec-definite-indefinite-gates.md](metadatum-codec-definite-indefinite-gates.md) — decode: TypeTag rejected, byte-chunk PV12 indef-leniency; encoder always definite
 - [v1-txinfo-wdrl-encoding.md](v1-txinfo-wdrl-encoding.md) — V1 txInfoWdrl=List[Constr0[cred,amt]] (NOT Map, that's V2)
 - [native-script-hash-original-bytes-not-reencode.md](native-script-hash-original-bytes-not-reencode.md) — hashScript=prefix<>originalBytes, never re-encode
