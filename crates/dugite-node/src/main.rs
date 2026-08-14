@@ -1791,7 +1791,35 @@ fn build_epoch_snapshot(
     //   * every entry was labelled `keyHash`, including script DReps. Real
     //     preprod data has both — epoch 166 carries 9 key-hash DReps and one
     //     script DRep holding more lovelace than all nine combined.
-    let (drep_cache, drep_no_conf, drep_abstain_val) = ledger.build_drep_power_cache();
+    // Read `psDRepDistr` STRAIGHT OFF THE FROZEN PULSER, exactly as the oracle
+    // does (`drepDistr = Map.map fromCompact (psDRepDistr snap)`).
+    //
+    // This used to call `build_drep_power_cache()`, which is the RATIO input:
+    // `dRepAcceptedRatio` folds the distribution and skips expired DReps, so
+    // that helper applies expiry. Reading it here published the ratio's view as
+    // though it were the distribution, and the two are not the same map.
+    // Measured against cardano-node on preprod: exact through epoch 186, then
+    // dugite shed entries to 150 missing of 182 by epoch 306 — 10,578 missing
+    // (epoch, DRep) pairs over 143 Conway epochs, with nothing ever extra.
+    //
+    // `GetDRepStakeDistr` already read the snapshot directly, so the wire was
+    // right and only the dump was wrong. Two readers of one concept, and the
+    // one nobody compared drifted.
+    let (drep_cache, drep_no_conf, drep_abstain_val) = match ledger
+        .gov
+        .governance
+        .pulsing_snapshot()
+    {
+        Some(s) => (
+            s.drep_distr.clone(),
+            s.drep_no_confidence,
+            s.drep_abstain,
+        ),
+        // No pulser yet (first Conway epoch). Haskell's `Default` is
+        // `DRComplete def def`, an empty map, so the live fallback is only
+        // reachable before the first freeze.
+        None => ledger.build_drep_power_cache(),
+    };
     let mut drep_distr_map = serde_json::Map::new();
     for (hash, power) in &drep_cache {
         let bytes = hash.as_bytes();

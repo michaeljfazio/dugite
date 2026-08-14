@@ -396,6 +396,14 @@ pub fn populated_ledger_state() -> LedgerState {
             .as_mut()
             .expect("the fixture must carry a frozen pulser");
         pulser.snapshot.drep_distr.insert(h32(0x41), 1_000_000);
+        // Frozen `dpDRepState`. Two entries on purpose, straddling the
+        // consumption epoch, so the fixture exercises both arms of
+        // `drep_is_expired` rather than only the live one.
+        pulser
+            .snapshot
+            .drep_expiry
+            .insert(h32(0x41), EpochNo(9_999));
+        pulser.snapshot.drep_expiry.insert(h32(0x42), EpochNo(1));
         pulser.snapshot.drep_no_confidence = 10;
         pulser.snapshot.drep_abstain = 20;
         pulser.snapshot.drep_no_confidence_delegated = true;

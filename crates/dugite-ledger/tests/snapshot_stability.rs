@@ -147,7 +147,7 @@ fn snapshot_format_hash_stability() {
     // `psVRFKeyHashes`, the occurrence count that makes the PV11
     // duplicate-VRF-key rejection possible. Also not derivable: POOLREAP
     // deletes a superseded key outright even when another pool still holds it.
-    const EXPECTED_HASH: &str = "4408444e5df5244c3a36d86a7af305a1e3836b0c79ba41296ee651ebe92e5574";
+    const EXPECTED_HASH: &str = "31b8e00a73cff022c544943c4c7cbf53053ed3e5694891f6f9822fbfe8a7c479";
 
     if EXPECTED_HASH == "COMPUTE_ON_FIRST_RUN" {
         panic!(

@@ -2162,7 +2162,11 @@ fn build_pulsing_snapshot(
         let stake = credential_stake_from(stake_cred, certs)
             .saturating_add(proposal_deposits.get(stake_cred).copied().unwrap_or(0));
         if let Some(hash32) = drep.credential_hash32() {
-            if gov.governance.dreps.get(&hash32).is_some_and(|d| d.active) {
+            // REGISTRATION, not activity. `computeDRepDistr`'s only predicate
+            // for a `DRepCredential` is `Map.member cred regDReps`; expiry is
+            // applied later, in `dRepAcceptedRatio`. Filtering here is what made
+            // dugite shed DReps that cardano-node keeps.
+            if gov.governance.dreps.contains_key(&hash32) {
                 *drep_distr.entry(hash32).or_default() += stake;
             }
         } else {
@@ -2201,6 +2205,15 @@ fn build_pulsing_snapshot(
         // boundary's post-RUPD treasury, exactly one boundary stale.
         treasury,
         drep_distr,
+        // Haskell `dpDRepState`, frozen with the rest of the pulser. Carried so
+        // `dRepAcceptedRatio` can apply expiry at CONSUMPTION against the epoch
+        // it runs in, which a boolean decided here cannot express.
+        drep_expiry: gov
+            .governance
+            .dreps
+            .iter()
+            .map(|(k, d)| (*k, d.drep_expiry))
+            .collect(),
         drep_no_confidence,
         drep_abstain,
         drep_no_confidence_delegated,
@@ -2658,10 +2671,19 @@ fn compute_total_drep_stake_from(gov: &GovSubState, certs: &CertSubState) -> u64
     // DReps registered during the epoch that just ended, which is precisely the
     // one-boundary-early error of #922 / #950 / #966.
     if let Some(snap) = gov.governance.pulsing_snapshot() {
+        // Expiry is applied HERE, not at capture — `dRepAcceptedRatio` folds
+        // `reDRepDistr` and skips a DRep whose frozen `drepExpiry` is behind
+        // `reCurrentEpoch`. The distribution itself holds every registered DRep.
+        //
+        // The two placements are arithmetically identical at a single boundary,
+        // which is why the ratio was right while the distribution was wrong.
+        // They part company when the judgement drifts: the epoch compared here
+        // is the one RATIFY runs in, one boundary AFTER the freeze.
         let drep_sum: u64 = snap
             .drep_distr
-            .values()
-            .fold(0u64, |acc, v| acc.saturating_add(*v));
+            .iter()
+            .filter(|(cred, _)| !snap.drep_is_expired(cred))
+            .fold(0u64, |acc, (_, v)| acc.saturating_add(*v));
         let total = drep_sum
             .saturating_add(snap.drep_no_confidence)
             .saturating_add(snap.drep_abstain);
@@ -2722,11 +2744,16 @@ fn build_drep_power_cache_from(
     // one for it would count DReps that registered during the epoch that just
     // ended.
     if let Some(snap) = gov.governance.pulsing_snapshot() {
-        return (
-            snap.drep_distr.clone(),
-            snap.drep_no_confidence,
-            snap.drep_abstain,
-        );
+        // Same split as `compute_total_drep_stake_from`: the frozen
+        // distribution holds every registered DRep, and expiry is applied here,
+        // where `dRepAcceptedRatio` applies it.
+        let live: ImblHashMap<Hash32, u64> = snap
+            .drep_distr
+            .iter()
+            .filter(|(cred, _)| !snap.drep_is_expired(cred))
+            .map(|(k, v)| (*k, *v))
+            .collect();
+        return (live, snap.drep_no_confidence, snap.drep_abstain);
     }
 
     // Fallback: compute from live state.
