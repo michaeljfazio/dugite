@@ -58,7 +58,30 @@ updateNumDormantEpochs currentEpoch ps vState =
 A dormant epoch = at the epoch boundary, there are zero proposals whose `gasExpiresAfter >= currentEpoch`
 (i.e., zero live proposals to vote on).
 Called with `eNo` = the NEW epoch number (signal to EPOCH rule).
-vsNumDormantEpochs is CUMULATIVE since Conway genesis — never reset.
+**CORRECTION (live-verified 2026-08-14 @ faa7a9dc, Certs.hs:283-303): vsNumDormantEpochs IS reset to 0**
+by `updateDormantDRepExpiry`, which fires in the CERTS rule's empty-certificates base case whenever a tx
+carries a proposal while the counter is > 0. It bulk-bumps EVERY DRep's expiry by the dormant count,
+WITH a no-resurrection clamp: `if numDormant + currentExpiry < currentEpoch then currentExpiry else bumped`
+— a DRep expired beyond the credit keeps its old expiry. The earlier claim here ("never reset") was wrong.
+
+## Vote-time refresh location (verified @ faa7a9dc)
+
+The per-voter expiry refresh lives in **CERTS** (Certs.hs:238-250, empty-certs base case), not GOVCERT:
+every `DRepVoter` in the tx's VotingProcedures gets
+`drepExpiryL .~ computeDRepExpiry drepActivity currentEpoch numDormantEpochs`. Mutually exclusive with
+the dormancy bump in practice (votes imply live proposals ⇒ counter already 0 or just reset).
+
+## Expiry NEVER affects psDRepDistr membership
+
+`drepExpiry`/`ppDRepActivity` occur ZERO times in DRepPulser.hs; `setFreshDRepPulsingState` seeds
+`dpDRepState = vsDReps` UNFILTERED. Expiry is consumed at exactly one point: Ratify.hs:266
+(`reCurrentEpoch > drepExpiry` ⇒ skip both numerator and denominator — arithmetically identical to an
+ABSENT entry for that one boundary). The only vsDReps deletion anywhere is ConwayUnRegDRep
+(GovCert.hs:229-249, which also clears delegators' forward pointers). psDRepDistr membership is
+delegator-driven: ≥1 registered account with `dRepDelegation = Just`, plus `Map.member cred regDReps`
+for credential DReps; zero-delegator registered DReps have NO entry. An implementation that filters
+membership by expiry sheds entries progressively while upstream accumulates — and is RATIFY-neutral
+exactly as long as its expiry values match Haskell's, so it passes outcome gates and fails dump diffs.
 
 ## Expiry check in Ratify (drepAccepted)
 

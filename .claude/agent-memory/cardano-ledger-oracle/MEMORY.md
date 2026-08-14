@@ -58,7 +58,7 @@
 ## Governance / Epoch Boundary Corrections
 - [Obligations type + totalObligation composition](obligations-type-and-totalobligation-composition.md) — verbatim 4-field record (oblStake/oblPool/oblDRep/oblProposal), Shelley-vs-Conway obligationCertState/obligationGovState split, no committee-deposit field exists. Dugite audited clean (live-verified 2026-08-05 @ 4849c13d).
 - [Conway proposal deposit epoch boundary](feedback_proposal_deposit_epoch_boundary.md) — returnProposalDeposits scope, expiry off-by-one, no silent drops
-- [DRep expiry and vsNumDormantEpochs mechanics](drep-expiry-numDormantEpochs.md) — computeDRepExpiry formula, cumulative counter, delta-only correction
+- [DRep expiry and vsNumDormantEpochs mechanics](drep-expiry-numDormantEpochs.md) — computeDRepExpiry formula; counter RESETS via updateDormantDRepExpiry (no-resurrection clamp); expiry NEVER affects psDRepDistr membership (@ faa7a9dc)
 - [Conway RATIFY/GOV precision facts](conway-ratify-precision-facts.md) — pvCanFollow modulus (point 2 SUPERSEDED below), reorderActions stability, committee zero-threshold gate (live-verified 2026-07-04)
 - [computeDRepDistr composition + deposit attribution](drep-distr-deposit-attribution.md) — stake = InstantStake+ProposalDeposits+AccountBalance per credential; deposit keys, ppKeyDeposit excluded (live-verified 2026-07-26)
 - [pvCanFollow/preceedingHardFork/ProposalCantFollow exact mechanics](hardfork-pvcanfollow-exact-mechanics.md) — corrects conway-ratify-precision-facts.md #2; 3-way base resolution; GOV=block-apply time (raw-source-verified 2026-07-06)
