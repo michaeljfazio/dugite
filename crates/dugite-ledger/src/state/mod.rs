@@ -790,9 +790,37 @@ pub struct PulsingSnapshot {
     ///
     /// Haskell's `finishDRepPulser` computes this with `computeDRepDistr` over
     /// the pulser's own frozen `dpInstantStake` / `dpDRepState` /
-    /// `dpProposalDeposits`, and RATIFY consumes it as `reDRepDistr`. Only
-    /// active DReps appear.
+    /// `dpProposalDeposits`, and RATIFY consumes it as `reDRepDistr`.
+    ///
+    /// EVERY REGISTERED DRep with delegated stake appears — `computeDRepDistr`
+    /// applies exactly four predicates (`Conway/Governance/DRepPulser.hs`), and
+    /// for a `DRepCredential` the only one is `Map.member cred regDReps`. There
+    /// is no expiry, no vote and no `drepDelegs` condition. This doc previously
+    /// said "only active DReps appear", and the code matched the doc: expiry was
+    /// applied HERE instead of at the ratio, so dugite shed entries over time.
+    /// Measured on preprod — exact through epoch 186, then 150 of 182 entries
+    /// missing by 306, with a dropped DRep reappearing later carrying a LARGER
+    /// value, i.e. filtered out rather than destroyed.
     pub drep_distr: ImblHashMap<Hash32, u64>,
+    /// Frozen `drepExpiry` per registered DRep — Haskell's `dpDRepState`.
+    ///
+    /// Expiry enters the pipeline at exactly ONE point, `dRepAcceptedRatio`
+    /// (`Conway/Rules/Ratify.hs`), which tests `reCurrentEpoch` against the
+    /// expiry held in this FROZEN state. Both halves matter: the state is as of
+    /// the freeze, the epoch is the one RATIFY runs in — one boundary later — so
+    /// a boolean decided at capture cannot express it. A DRep whose expiry
+    /// equals the capture epoch is counted at capture and excluded at
+    /// consumption.
+    ///
+    /// An ORDERED map, unlike its siblings here, and deliberately: the snapshot
+    /// serialiser writes map fields in iteration order, and `imbl::HashMap`
+    /// iterates in hash order, which varies between processes. Adding this field
+    /// as a hash map made `snapshot_format_hash_stability` produce a DIFFERENT
+    /// digest on two runs of identical code. Every other map field in the
+    /// fixture happens to hold at most one entry, so that check has never had
+    /// the chance to observe the nondeterminism it would otherwise catch — see
+    /// the issue filed alongside this change.
+    pub drep_expiry: ImblOrdMap<Hash32, EpochNo>,
     /// Total stake delegated to `AlwaysNoConfidence` at freeze time.
     pub drep_no_confidence: u64,
     /// Total stake delegated to `AlwaysAbstain` at freeze time.
@@ -814,6 +842,27 @@ pub struct PulsingSnapshot {
     /// with a value of zero.
     pub drep_no_confidence_delegated: bool,
     pub drep_abstain_delegated: bool,
+}
+
+impl PulsingSnapshot {
+    /// Is this DRep expired as of the epoch RATIFY is running in?
+    ///
+    /// Haskell `dRepAcceptedRatio` (`Conway/Rules/Ratify.hs`) skips a DRep when
+    /// its frozen `drepExpiry` is behind `reCurrentEpoch`. The pulser frozen at
+    /// boundary N is consumed at boundary N+1, so the comparison epoch is
+    /// `snapshot_epoch + 1` — NOT the capture epoch. A DRep whose expiry equals
+    /// the capture epoch is therefore counted at capture and excluded here,
+    /// which is exactly the drift a boolean decided at capture cannot express.
+    ///
+    /// A credential absent from `drep_expiry` is treated as NOT expired: absence
+    /// means the frozen registry had no entry, and a DRep with no registration
+    /// never reaches the distribution in the first place.
+    pub fn drep_is_expired(&self, cred: &Hash32) -> bool {
+        match self.drep_expiry.get(cred) {
+            Some(expiry) => self.snapshot_epoch.0.saturating_add(1) > expiry.0,
+            None => false,
+        }
+    }
 }
 
 /// Haskell `DRepPulsingState`, always in its `DRComplete` form (#988).
