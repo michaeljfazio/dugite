@@ -292,7 +292,7 @@ WAIT-LOOP's own command line, so the watcher reports the watched as still
 running forever. The replay had finished five minutes earlier. Grep the log for
 the completion line instead of polling for the process.
 
-### OPEN — dugite SKIPS zero-value genesis UTxOs; cardano-node creates them
+### FIXED (c0556c4e64) — dugite SKIPPED zero-value genesis UTxOs; cardano-node creates them
 
 Found by the 1-to-1 preprod comparison, and only because the Byron dump emits
 `utxo.count` ALONGSIDE `utxo.balance`. The balances agree to the lovelace at
@@ -323,9 +323,25 @@ this is the case the `count` field was added for, and its comment predicted it �
 "count catches a lost or duplicated output even when the values happen to net
 out".
 
-NOT fixed here. It is a one-line removal, but it changes the genesis UTxO set —
-ledger state, on a consensus path — so it wants canonical grounding and its own
-validation rather than being folded into a dump change.
+**FIXED**, grounded in `GenesisUTxO.hs`/`UTxO.hs`/`Lovelace.hs` (`fromBalances` is
+an unfiltered fold and `mkLovelace` bounds only ABOVE, so zero is valid; Shelley's
+`genesisUTxO` has the same shape). preprod Byron epochs 1-3 now read `count: 8`
+against the oracle's 8, and mainnet is a measured NO-OP — 207 paired Byron epochs,
+`utxo.count` and `utxo.balance` 0-divergent before and after, because mainnet's
+Byron genesis carries no zero-value entries. A consensus fix that repairs one
+network and breaks another is worse than the defect, so both were measured.
+
+**The guard was DUPLICATED and that nearly hid the fix.** Removing the filter in
+`genesis.rs` left the count at 1, because `seed_genesis_utxos` in dugite-ledger
+carried a SECOND copy — the seeding log said `count=8` while the dump still said
+1, i.e. a fix that looks applied and is not. N-copies again; both are gone.
+
+Process debt, recorded rather than glossed: the independent Fable review this repo
+mandates for divergence fixes could NOT be obtained (the agent API returned 529
+twice), so the refutation angles were worked by hand. The one way this could be
+actively harmful is `fromBalances`'s panic on duplicate addresses, refuted by
+measurement — preprod's 8 addresses are distinct and cardano-node processes all 8.
+**Worth a second pair of eyes before tagging.**
 
 ### 2026-08-13 — Byron's protocol parameters are ON-CHAIN, and dugite tracks none of them
 
@@ -1278,26 +1294,61 @@ identical `ObsoleteNode (Version 11) (Version 10)`, after 290 epochs of replay.
 So the cap does not move between cardano-api 10.23 and 10.26, and refusing to
 infer it from the version bump was worth the two hours it cost to check.
 
-**What this means.** PV11 support arrived with cardano-node **11.x**, and every
-cardano-streamer branch — ours and upstream's — targets 10.x. There is no 11.x
-branch anywhere, and `lehins/master` pins the same CHaP index-state as our
-10.6.2. So closing PV11 needs a streamer built against a cardano-node 11.x
-dependency set: a new port, not a version bump, and materially larger than this
-one (the 10.6.2 -> 10.7.1 step alone moved the SnapShot record's shape).
+**RETRACTED IN TURN, 2026-08-14 — there is no 11.x dependency set to find. The
+cap is ONE LITERAL.** "PV11 support arrived with cardano-node 11.x, so this needs
+a new port" was the second wrong conclusion drawn from a version number, and it
+cost two builds and two ~3h replays. The bound lives in the single function
+cardano-streamer calls to build its `ProtocolInfo`:
 
-**Standing consequences until that exists:**
+```haskell
+-- cardano-api, Cardano/Api/LedgerState.hs :: mkProtocolInfoCardano
+, Consensus.cardanoProtocolVersion = ProtVer (natVersion @10) 0
+```
 
-* PV11 ledger state is **unverifiable against this oracle on any network**.
-* The mainnet tip run **walls at ~epoch 640**, not 649. Everything below 640 is
-  still reachable and worth banking.
-* preprod is verifiable only to epoch **292** (PV11 begins at 295; dugite's own
-  dumps cover 295-306 but have nothing to compare against).
+**byte-identical in 10.23.0.0 and 10.26.0.0** — which is exactly why the port did
+not move it. Consensus turns that one field into the bound every header is
+checked against, and says so in its own comment:
 
-The port is still worth keeping — it builds, and it is the starting point for an
-11.x port rather than dead work. It stays INCOMPLETE at the stubbed
-`delegations`/`poolParams`.
-The oracle binary is pinned at `oracle-bin/cstreamer-10.6.2` with its sha256,
-because both branches build to ghc-9.6.5 and share one dist-newstyle directory.
+```haskell
+-- Ouroboros/Consensus/Cardano/Node.hs
+-- The major protocol version of the last era is the maximum major protocol
+-- version we support.
+maxMajorProtVer = MaxMajorProtVer $ pvMajor cardanoProtocolVersion
+```
+
+with the field's haddock spelling out the consequence: setting it low *"will mark
+that last era as experimental because the obsolete node checks determine that the
+highest version we support is @8 0@"*.
+
+**The fix is `mkProtocolInfoCardanoAtLedgerMaxPV`** (fork branch
+`dugite/full-era-ledger-dumps`, c6aeff9): the same `CardanoProtocolParams`
+cardano-api builds, with the bound taken from `ProtVerHigh ConwayEra` — DERIVED,
+so it tracks the pinned ledger instead of becoming a second constant to keep in
+step, and Conway rather than the last era because Dijkstra has not shipped and an
+oracle that accepted an era whose rules it cannot check would report agreement it
+never established.
+
+**UNVALIDATED until preprod slot 125366409 replays clean**, and that is the whole
+lesson of the two retractions: a source read is not evidence either. That block —
+the first the old binary refused, the first block of epoch **294**, not 293 as
+first recorded — is preserved with the `NewEpochState` immediately before it at
+`reports/preprod-first-pv11-block/`, so the next attempt starts from the block
+rather than from a 3h replay.
+
+**Also note the oracle binary was STALE.** `oracle-bin/cstreamer-10.6.2` is
+`10.6.2-dump-snapshot` at 8c5b285, built Aug 9 — it predates Byron dumping, the
+era/PV-gated parameters, the named+exact governance thresholds and exact
+`executionUnitPrices`, all four of which live on `dugite/full-era-ledger-dumps`.
+A tip run launched against it would have compared every one of those fields as a
+dugite-side schema gap. The rebuilt binary is
+`oracle-bin/cstreamer-full-era-pv11`; both are recorded in `PROVENANCE.txt`, and
+the 10.6.2 pin is kept rather than overwritten — a file named for a build it is
+not is #1070's mislabel exactly.
+
+The 10.7.1 port is now surplus rather than a starting point, and it stays
+INCOMPLETE at the stubbed `delegations`/`poolParams`. Both branches build to
+ghc-9.6.5 and share one dist-newstyle, so ALWAYS check the sha256 against
+`PROVENANCE.txt` before trusting a run.
 
 **Still owed before the tip run can be trusted**: `conwayGov` schema
 reconciliation. dugite emits `drepDistr`/`proposals`/`enactedRoots` at top level;
