@@ -128,6 +128,23 @@ dugite-lsm (LSM-tree on-disk storage for UTxO-HD)
 
 ## Current Focus
 
+> **Issue numbers 1084-1086 were RENUMBERED on 2026-08-14.** Three defects were
+> written up here and in commit messages as #1084 / #1085 / #1086 and **never
+> actually filed**, so those numbers were free — and #1084 was then taken by an
+> unrelated Byron issue. Anyone reading commit bodies from this branch needs the
+> map:
+>
+> | prose in commit history | real issue |
+> |---|---|
+> | "#1084" DRep deregistration did not clear its delegators | **#1085** |
+> | "#1085" duplicate-VRF registry narrower than upstream's | **#1086** |
+> | "#1086" `totalRefScriptSizeInBlock` not PV-gated | **#1087** |
+> | — | **#1084** is Byron delegation/update state, filed 2026-08-14 |
+>
+> This document uses the REAL numbers throughout. No `Closes` trailer ever
+> referenced the phantoms, so nothing merges into the wrong issue — checked, not
+> assumed.
+
 ### 2026-08-13 — MAINNET IS BYTE-EXACT THROUGH CONWAY, and conwayGov compares at scale
 
 `reports/mainnet-exactness/report.json` — **312 paired epochs (208-519), 50,996
@@ -382,7 +399,32 @@ is loaded from the SHELLEY genesis, so it is empty for all 207 Byron epochs.
 **The real requirement is Byron's `UPI.State`**, not a better constant: adopted
 protocol parameters, proposals and votes, maintained across the era. Deriving
 from genesis is strictly better than pinning and is what landed, but it is a
-floor, not the fix. Recorded as such rather than claimed as done.
+floor, not the fix. Recorded as such rather than claimed as done — **now filed as
+#1084 with the surface MEASURED** rather than estimated.
+
+**The Byron gap is exactly FIVE fields, and the rest of Byron compares clean.**
+Mainnet, dugite vs the full-era oracle, 344 leaf comparisons over the first 43
+paired epochs:
+
+| verdict | fields |
+|---|---|
+| 43/43 **match** | `epoch`, `lastSlot`, `snapshotEraName`, `utxo.balance`, `utxo.count`, `byronProtocolParams.txFeePolicy.{summand,multiplier}` |
+| absent from dugite | `byronProtocolParams.{maxBlockSize,maxTxSize,scriptVersion}`, `byronUpdateEpoch` |
+| divergent | `byronDelegation` — dugite `null` vs oracle `{count: 7}` |
+
+The root cause is one line earlier than expected: `era_byron.rs:444` **skips
+`dlg_payload` and `upd_payload` at DECODE time**, so dugite never sees either
+subsystem's inputs. That is #1067's shape one level up — there a field was
+decoded and discarded for want of a destination; here it is not decoded at all.
+Closing it needs the decoder, `ByronDelegationState`, `UPI.State`, a
+`SNAPSHOT_VERSION` bump with `LedgerDelta` representation for both, and its own
+validation. A feature wave, not a fix, and deliberately not started inside a
+release window.
+
+`utxo.count` matching at every Byron epoch is the positive worth naming: it is
+the field that catches a lost or duplicated genesis output when the balances net
+out, and it is what proves the zero-value genesis UTxO fix is a measured no-op on
+mainnet.
 
 Sequencing deliberately chosen: the genesis-derived values are emitted in the
 DUMP first, so the comparison proves them against the oracle, and only then does
@@ -545,8 +587,8 @@ not, and both are consensus:
 
 | item | status |
 |---|---|
-| duplicate-VRF rejection + `psVRFKeyHashes` + the pv11 HARDFORK arm | **#1085 FIXED** |
-| BBODY ref-script size fold, PV-gated | **#1086 FIXED** |
+| duplicate-VRF rejection + `psVRFKeyHashes` + the pv11 HARDFORK arm | **#1086 FIXED** |
+| BBODY ref-script size fold, PV-gated | **#1087 FIXED** |
 | `UnelectedCommitteeVoters` (GOV tag 18, elected-AND-authorized set) | already correct |
 | refInputs disjointness relaxed at 11, re-added in V3/V4 `TxInfo` | already correct — gated to exactly `8 < PV < 11` |
 | DELEG deposit/refund constructors (tag 1 → 7/8) | already correct |
@@ -565,7 +607,7 @@ decoder's term validation rejects an unavailable builtin with a typed
 `FlatDecode` error, alongside the vanRossem constant-size bound. Verified by
 finding the call site, not by reading the table.
 
-**#1085 — the duplicate-VRF registry was DERIVED and upstream's is STATE.**
+**#1086 — the duplicate-VRF registry was DERIVED and upstream's is STATE.**
 dugite had the predicate and the PV gate; it folded a single-holder map over
 live `pool_params` at validation time. Upstream's `psVRFKeyHashes` is an
 occurrence COUNT seeded at the fork from `psStakePools` AND
@@ -580,14 +622,14 @@ is removed OUTRIGHT at POOLREAP as "dangling" — `Map.withoutKeys` does not car
 that the other pool still holds it. Upstream then has no entry and a third pool
 may claim it; a derived count says 1 and rejects. Same input, opposite verdicts.
 
-Two things #1085 exposed that would have stayed silent: the per-block
+Two things #1086 exposed that would have stayed silent: the per-block
 validation-registry CACHE was keyed on `pool_params` identity alone, while a
 re-registration moves `vrf_key_hashes` WITHOUT touching `pool_params` — it now
 requires both ptr-eq hits; and the Mithril import decoded PState's
 `vrfKeyHashes` field and discarded it for want of a destination (#1067's shape
 again).
 
-**#1086 — `totalRefScriptSizeInBlock` is PV-gated and dugite's was not.** Below
+**#1087 — `totalRefScriptSizeInBlock` is PV-gated and dugite's was not.** Below
 PV11 every transaction is measured against the BLOCK-INITIAL UTxO, so a
 reference to an output created earlier in the same block contributes ZERO.
 dugite accumulated at every protocol version, which can only push the total up
@@ -609,7 +651,7 @@ failure.
 epoch 644 needs ~183 more epochs ≈ 275 GiB against ~115 free. **preprod is the
 ground** — PV11 since ~293, the Mithril DB already covers it, and dugite
 replays it in minutes. The duplicate-VRF rule only bites on an adversarial
-registration, so the real gate for #1085 is a devnet negative through BOTH
+registration, so the real gate for #1086 is a devnet negative through BOTH
 sockets, not a dump diff.
 
 **RE-GATED, and the PV11 arms are validated LIVE.** The standard preset is
@@ -617,11 +659,11 @@ sockets, not a dump diff.
 blocks, 0 OFFDIAG, pots byte-exact, both boundary samplers non-vacuous.
 
 But **the devnet genesis is PV10**, so those four rounds prove no regression at
-PV10 and touch #1085's PV11 paths not at all. The `hardfork-round.sh` round is
+PV10 and touch #1086's PV11 paths not at all. The `hardfork-round.sh` round is
 what closes that, and it PASSED: **14 assertions, 0 FAIL**, a real
 HardForkInitiation PV10→11 proposed, voted by DRep+SPO+CC, ratified, and **both
 sockets flipped to PV11 in the SAME epoch**. That boundary is the only place
-`populateVRFKeyHashes` ever runs, and every post-fork block used #1086's
+`populateVRFKeyHashes` ever runs, and every post-fork block used #1087's
 accumulating arm — with futurePParams parity 1473 compared / 0 diffs,
 ratify-state 1472 compared / 0 diffs / 0 plan breaks, and a 37-row post-fork zoo
 smoke at 0 FAIL. 16e's constructor inverted on both sides in the same round:
@@ -643,9 +685,9 @@ treasury  1959103174719172
 reserves 12979123112128607
 ```
 
-That is the strongest evidence available for #1085 and #1086 short of mainnet:
+That is the strongest evidence available for #1086 and #1087 short of mainnet:
 `populateVRFKeyHashes` seeded from preprod's real ~500-pool set rather than a
-two-pool fixture, twelve epochs of post-fork blocks ran #1086's accumulating
+two-pool fixture, twelve epochs of post-fork blocks ran #1087's accumulating
 arm, and post-fork pool registrations ran the duplicate-VRF predicate against a
 populated registry — with the monetary state landing exactly where an
 independent implementation says it should. A corrupted registry or a wrongly
@@ -711,7 +753,7 @@ for sweeping rather than sampling:
   address header selects the kind and the ledger's own
   `reward_account_to_hash` has always read it; only the serialiser did not.
   Confirmed pre-existing in the older dumps. FIXED.
-* **#1084 — a DRep deregistration did not clear its delegators (CONSENSUS).**
+* **#1085 — a DRep deregistration did not clear its delegators (CONSENSUS).**
   Found as a `drepDistr` membership divergence, preprod 172-184, in
   `psDRepDistr` — the map RATIFY consumes as `reDRepDistr`. FIXED; see below.
 
@@ -720,7 +762,7 @@ deliberate honest gap (an epoch-PHASE field whose interesting phase contains no
 dump point; 0 of 66 oracle dumps carry a value), and the two DRep keys are a
 real finding rather than a schema problem.
 
-### #1084 — DRep deregistration did not clear its delegators (CONSENSUS, FIXED)
+### #1085 — DRep deregistration did not clear its delegators (CONSENSUS, FIXED)
 
 **Fixed and cross-validated.** `conwayGov.drepDistr` went from two schema gaps
 plus a 5,580x value divergence to **29,642 leaf comparisons, ZERO divergent
@@ -738,7 +780,7 @@ fix** — the #1072 pattern exactly, and the reason that review is not optional:
   That arm cleared only the forward map. Every forward-map WRITER got the
   reverse-index treatment; of the REMOVERS, exactly this one was missed. With
   the new wipe reading `delegs` as truth, the DRep's dereg then destroys a
-  delegation that has since MOVED elsewhere — #1084 inverted, live-reachable at
+  delegation that has since MOVED elsewhere — #1085 inverted, live-reachable at
   PV11 where the pv10 reconciliation can no longer repair it. **The 181-epoch
   preprod validation is structurally blind to it**: the dump compares
   `drepDistr`, which only moves at the final step.
@@ -757,9 +799,9 @@ Reviewed and NOT changed: `DelegateeDRepNotRegisteredDELEG` is present and
 raised with tests, contrary to the review's tentative concern — worth recording
 so it is not re-audited.
 
-### #1085 — the duplicate-VRF registry is narrower than upstream's (CONSENSUS, OPEN)
+### #1086 — the duplicate-VRF registry is narrower than upstream's (CONSENSUS, OPEN)
 
-Found by asking whether the pvMajor-11 HARDFORK arm #1084 left unimplemented
+Found by asking whether the pvMajor-11 HARDFORK arm #1085 left unimplemented
 actually matters. It does, and **the premise that said it did not has expired**:
 the check's own comment ended *"mainnet is not yet at PV 11"*. Mainnet epoch 648
 is **PV 11.0**, confirmed against Koios, and preview has been PV11 longer. Every
@@ -1090,7 +1132,7 @@ oracle output.
 
 ### v2.8.0 IS VALIDATED AND READY TO TAG (not tagged)
 
-**RE-GATED 2026-08-11** over the conwayGov (#1073) and #1084 commits, at
+**RE-GATED 2026-08-11** over the conwayGov (#1073) and #1085 commits, at
 `a8b3411c4f`, which is what `xtask::qa_report_covers_shipped_code` now agrees
 with — it had been correctly FAILING, because the previous report was generated
 at `e8fc90c3c3` and every commit since touched `crates/`.
@@ -1120,12 +1162,12 @@ cross-implementation question that shape could otherwise raise is answered
 directly by the parity-oracle round's 0 OFFDIAG over 99 scripts.
 
 Workspace 8185/8185, clippy and fmt clean, `SNAPSHOT_VERSION 38` (RE-SYNC,
-extended in place TWICE more — #1073's `enact_state` and #1084's `delegs`),
+extended in place TWICE more — #1073's `enact_state` and #1085's `delegs`),
 workspace version and Helm `appVersion` both 2.8.0. Tagging is a release-lead
 job and has deliberately not been started.
 
 **The report is STALE AGAIN, deliberately, and must be regenerated before any
-tag.** #1085's commit is comment-only, but it touches `crates/` and
+tag.** #1086's commit is comment-only, but it touches `crates/` and
 `xtask::qa_report_covers_shipped_code` cannot tell a comment from a behaviour
 change — nor should it, since "it's only a comment" is precisely the judgement
 that let #945's all-zero reports through. The trade was made knowingly: the
