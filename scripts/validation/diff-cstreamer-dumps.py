@@ -432,6 +432,11 @@ def collapse_path(path: str) -> str:
     return "".join(out)
 
 
+def _is_empty(v) -> bool:
+    """Absent, null, or an empty container — the three ways a dump says nothing."""
+    return v is _MISSING or v is None or v == {} or v == []
+
+
 def walk(res: Result, epoch: int, era: str, path: str, a, b, top: str) -> None:
     """Compare two JSON subtrees leaf-by-leaf."""
     if path.rsplit(".", 1)[-1] in EXCLUDED_SUFFIXES:
@@ -439,6 +444,20 @@ def walk(res: Result, epoch: int, era: str, path: str, a, b, top: str) -> None:
 
     a_missing, b_missing = a is _MISSING, b is _MISSING
     if a_missing and b_missing:
+        return
+
+    # An era-inapplicable key that is EMPTY on both sides says the same thing
+    # twice: "this era has no such field". The two sides spell it differently —
+    # dugite writes `null`, cardano-streamer writes `{}` — and until this ran
+    # before the value comparison rather than only before the absence check,
+    # `eraProtocolParams` was reported divergent at every pre-Alonzo epoch on
+    # that spelling alone. Measured at 208 and 209 the moment the oracle reached
+    # Shelley; it would have grown to every Shelley/Allegra/Mary epoch.
+    #
+    # Deliberately narrow: only when BOTH sides are empty. A key that carries
+    # real content in an era it does not belong to is a genuine finding, and
+    # still falls through to be reported.
+    if not era_applicable(top, era) and _is_empty(a) and _is_empty(b):
         return
 
     # An absence is only a gap if the field belongs in this era.
