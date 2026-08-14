@@ -1202,6 +1202,14 @@ impl ConwayGenesis {
         // #764's failure (empty `language_views` => wrong `script_data_hash` on
         // every V3 transaction).
         //
+        // Note that gap is DUGITE'S, not upstream's. Consensus runs the whole
+        // translation chain even when every fork triggers at epoch 0:
+        // `injectInitialExtLedgerState` calls `State.extendToSlot ... (SlotNo 0)`,
+        // which walks the telescope one era at a time and so still executes
+        // Babbage->Conway (`HardFork/Combinator/Embed/Nary.hs`). dugite collapses
+        // that into a single hop, which is why it needs a startup seed where
+        // upstream needs none.
+        //
         // The condition is DERIVED from genesis rather than pinned to a network:
         // Conway is protocol version 9, so a genesis declaring major >= 9 begins
         // in Conway and will get no Babbage->Conway translation; anything lower

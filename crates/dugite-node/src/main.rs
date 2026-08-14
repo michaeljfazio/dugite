@@ -1464,12 +1464,24 @@ fn serialize_stake_snapshot(
         .map(|(pool_id, reg)| {
             let key = hex::encode(pool_id.as_bytes());
 
-            // Owners: list of 28-byte key hash hex strings
-            let owners: Vec<serde_json::Value> = reg
-                .owners
-                .iter()
-                .map(|o| serde_json::Value::String(hex::encode(o.as_bytes())))
-                .collect();
+            // Owners: 28-byte key hashes, SORTED.
+            //
+            // `ppOwners :: Set (KeyHash 'Staking)` upstream, so its canonical
+            // rendering is ascending by hash — and the LSQ encoder in
+            // `n2c_query/encoding.rs` already sorts for exactly that reason.
+            // This serialiser did not, and dugite stores them in wire order, so
+            // any pool with two or more owners registered out of order compared
+            // as divergent while holding the IDENTICAL set. Measured on preprod:
+            // two pools, ~28 epochs each across all three snapshots, both a pure
+            // transposition.
+            //
+            // Same shape as the reward-account credential bug in this function —
+            // the ledger and the encoder had it right and only the dump did not.
+            let mut owner_hexes: Vec<String> =
+                reg.owners.iter().map(|o| hex::encode(o.as_bytes())).collect();
+            owner_hexes.sort();
+            let owners: Vec<serde_json::Value> =
+                owner_hexes.into_iter().map(serde_json::Value::String).collect();
 
             // margin as f64 ratio
             let margin = if reg.margin_denominator == 0 {
@@ -1696,14 +1708,26 @@ fn build_epoch_snapshot(
         .map(|s| s.pool_stake.values().map(|v| v.0).sum::<u64>())
         .unwrap_or(0);
 
+    // Emitted in POOL-ID ORDER. `pool_stake` is a hash map, so iterating it
+    // directly makes the same binary over the same chain produce different
+    // bytes on consecutive runs — measured at 60 of 269 epochs differing in
+    // ORDER alone, with zero differing in content. Harmless only because the
+    // comparator canonicalises this field before digesting it; anyone diffing
+    // raw dumps sees hundreds of false divergences, and a "did any other field
+    // move?" check between two runs drowns in them.
+    //
+    // Upstream's `PoolDistr` is a `Map`, so ascending key order is also the
+    // canonical rendering — the same reason `poolParams.owners` is sorted.
     let pool_distribution: Vec<serde_json::Value> = ledger
         .epochs
         .snapshots
         .set
         .as_ref()
         .map(|s| {
-            s.pool_stake
-                .iter()
+            let mut entries: Vec<_> = s.pool_stake.iter().collect();
+            entries.sort_by_key(|(pool_id, _)| *pool_id.as_bytes());
+            entries
+                .into_iter()
                 .map(|(pool_id, stake_lovelace)| {
                     let lv = stake_lovelace.0;
                     let pct = if total_active_stake > 0 {
