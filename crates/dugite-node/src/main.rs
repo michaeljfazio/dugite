@@ -1805,21 +1805,14 @@ fn build_epoch_snapshot(
     // `GetDRepStakeDistr` already read the snapshot directly, so the wire was
     // right and only the dump was wrong. Two readers of one concept, and the
     // one nobody compared drifted.
-    let (drep_cache, drep_no_conf, drep_abstain_val) = match ledger
-        .gov
-        .governance
-        .pulsing_snapshot()
-    {
-        Some(s) => (
-            s.drep_distr.clone(),
-            s.drep_no_confidence,
-            s.drep_abstain,
-        ),
-        // No pulser yet (first Conway epoch). Haskell's `Default` is
-        // `DRComplete def def`, an empty map, so the live fallback is only
-        // reachable before the first freeze.
-        None => ledger.build_drep_power_cache(),
-    };
+    let (drep_cache, drep_no_conf, drep_abstain_val) =
+        match ledger.gov.governance.pulsing_snapshot() {
+            Some(s) => (s.drep_distr.clone(), s.drep_no_confidence, s.drep_abstain),
+            // No pulser yet (first Conway epoch). Haskell's `Default` is
+            // `DRComplete def def`, an empty map, so the live fallback is only
+            // reachable before the first freeze.
+            None => ledger.build_drep_power_cache(),
+        };
     let mut drep_distr_map = serde_json::Map::new();
     for (hash, power) in &drep_cache {
         let bytes = hash.as_bytes();
