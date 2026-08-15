@@ -56,6 +56,7 @@
 - [Certifying/Rewarding/Voting/Proposing witness matrix + scriptsNeeded indexing](conway-plutus-purpose-witness-and-indexing.md) — per-TxCert witness table; guardrails hash is STRICT EQUALITY; hidden CertificateNotSupported restricts V1/V2 to plain certs only (live-verified 2026-08-02)
 
 ## Governance / Epoch Boundary Corrections
+- [TreasuryWithdrawals enactment verbatim](treasury-withdrawal-enactment-mechanics.md) — ENACT only accumulates ensWithdrawals; EPOCH applies AFTER SNAP; ensTreasury frozen at pulser set; SPO threshold auto-yes; rsDelayed latch; dump signature of one-boundary-early enactment (live-verified 2026-08-15 @ faa7a9dc)
 - [Obligations type + totalObligation composition](obligations-type-and-totalobligation-composition.md) — verbatim 4-field record (oblStake/oblPool/oblDRep/oblProposal), Shelley-vs-Conway obligationCertState/obligationGovState split, no committee-deposit field exists. Dugite audited clean (live-verified 2026-08-05 @ 4849c13d).
 - [Conway proposal deposit epoch boundary](feedback_proposal_deposit_epoch_boundary.md) — returnProposalDeposits scope, expiry off-by-one, no silent drops
 - [DRep expiry and vsNumDormantEpochs mechanics](drep-expiry-numDormantEpochs.md) — computeDRepExpiry formula; counter RESETS via updateDormantDRepExpiry (no-resurrection clamp); expiry NEVER affects psDRepDistr membership (@ faa7a9dc)
