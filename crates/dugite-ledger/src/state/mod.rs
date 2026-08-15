@@ -845,21 +845,31 @@ pub struct PulsingSnapshot {
 }
 
 impl PulsingSnapshot {
-    /// Is this DRep expired as of the epoch RATIFY is running in?
+    /// Is this DRep expired, as `dRepAcceptedRatio` judges it?
     ///
-    /// Haskell `dRepAcceptedRatio` (`Conway/Rules/Ratify.hs`) skips a DRep when
-    /// its frozen `drepExpiry` is behind `reCurrentEpoch`. The pulser frozen at
-    /// boundary N is consumed at boundary N+1, so the comparison epoch is
-    /// `snapshot_epoch + 1` — NOT the capture epoch. A DRep whose expiry equals
-    /// the capture epoch is therefore counted at capture and excluded here,
-    /// which is exactly the drift a boolean decided at capture cannot express.
+    /// Haskell (`Conway/Rules/Ratify.hs`) skips a DRep when
+    /// `reCurrentEpoch > drepExpiry`. **BOTH sides of that comparison are
+    /// FROZEN.** `reCurrentEpoch` is the pulser's own `dpCurrentEpoch`, set by
+    /// `setFreshDRepPulsingState eNo` at capture — it is NOT the epoch RATIFY
+    /// runs in. The pulser frozen entering epoch N is consumed at the boundary
+    /// entering N+1, and it still compares against N.
+    ///
+    /// So the comparison epoch is `snapshot_epoch`, with no adjustment. An
+    /// earlier version of this method added 1, reasoning that RATIFY runs one
+    /// boundary later. That excluded every DRep whose expiry equals the capture
+    /// epoch. A non-voting registered DRep counts as **No**, so dropping one
+    /// shrinks `dRepAcceptedRatio`'s DENOMINATOR and RAISES the accepted ratio —
+    /// the accept-early direction. It enacted a mainnet `TreasuryWithdrawals`
+    /// action one boundary before cardano-node (#1089), which then halted the
+    /// replay at epoch 577 when a later transaction withdrew the account's true
+    /// balance.
     ///
     /// A credential absent from `drep_expiry` is treated as NOT expired: absence
     /// means the frozen registry had no entry, and a DRep with no registration
     /// never reaches the distribution in the first place.
     pub fn drep_is_expired(&self, cred: &Hash32) -> bool {
         match self.drep_expiry.get(cred) {
-            Some(expiry) => self.snapshot_epoch.0.saturating_add(1) > expiry.0,
+            Some(expiry) => self.snapshot_epoch.0 > expiry.0,
             None => false,
         }
     }

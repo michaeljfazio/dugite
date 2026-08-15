@@ -18767,3 +18767,73 @@ fn first_pulse_applies_the_pv6_prefilter_to_the_queue_head() {
         entries.get(&cred32(UNREGISTERED))
     );
 }
+
+// ── #1089: the DRep-expiry comparison epoch is FROZEN ───────────────────────
+
+/// A `PulsingSnapshot` carrying only what `drep_is_expired` reads.
+fn expiry_snapshot(capture: u64, entries: &[(Hash32, u64)]) -> PulsingSnapshot {
+    PulsingSnapshot {
+        proposals: Default::default(),
+        votes_by_action: Default::default(),
+        committee_hot_keys: Default::default(),
+        committee_expiration: Default::default(),
+        committee_resigned: Default::default(),
+        committee_threshold: None,
+        no_confidence: false,
+        enacted_pparam_update: None,
+        enacted_hard_fork: None,
+        enacted_committee: None,
+        enacted_constitution: None,
+        snapshot_epoch: EpochNo(capture),
+        treasury: 0,
+        vote_delegations: Default::default(),
+        drep_distr: Default::default(),
+        drep_expiry: entries.iter().map(|(k, e)| (*k, EpochNo(*e))).collect(),
+        drep_no_confidence: 0,
+        drep_abstain: 0,
+        drep_no_confidence_delegated: false,
+        drep_abstain_delegated: false,
+    }
+}
+
+/// `dRepAcceptedRatio` skips a DRep when `reCurrentEpoch > drepExpiry`, and
+/// `reCurrentEpoch` is the pulser's own FROZEN `dpCurrentEpoch` — the epoch the
+/// pulser was created for, not the boundary it is consumed at.
+///
+/// The boundary case IS the defect: a DRep whose expiry EQUALS the capture epoch
+/// is not expired. An earlier version compared `snapshot_epoch + 1` and excluded
+/// exactly those. A non-voting registered DRep counts as No, so dropping one
+/// shrinks the ratio's DENOMINATOR and RAISES the accepted ratio — accept-early.
+/// On mainnet that enacted a `TreasuryWithdrawals` action one boundary before
+/// cardano-node and halted the replay at epoch 577 (#1089).
+///
+/// RED under the `+ 1` form, at `expiry == capture`.
+#[test]
+fn drep_expiry_is_judged_against_the_frozen_capture_epoch() {
+    let live = Hash32::from_bytes([0x11; 32]);
+    let boundary = Hash32::from_bytes([0x22; 32]);
+    let expired = Hash32::from_bytes([0x33; 32]);
+    let snap = expiry_snapshot(576, &[(live, 600), (boundary, 576), (expired, 575)]);
+
+    assert!(!snap.drep_is_expired(&live), "expiry 600 > capture 576: live");
+    assert!(
+        !snap.drep_is_expired(&boundary),
+        "expiry 576 == capture 576 must be LIVE: Haskell tests \
+         `reCurrentEpoch > drepExpiry` STRICTLY against the frozen \
+         dpCurrentEpoch. Excluding this DRep drops No-stake from \
+         dRepAcceptedRatio's denominator and accepts early (#1089)."
+    );
+    assert!(
+        snap.drep_is_expired(&expired),
+        "expiry 575 < capture 576: expired"
+    );
+}
+
+/// Absence is not expiry. A credential the frozen registry never held never
+/// reaches the distribution, and treating it as expired would drop stake from
+/// the denominator in the same accept-early direction.
+#[test]
+fn drep_absent_from_the_frozen_registry_is_not_expired() {
+    let snap = expiry_snapshot(576, &[]);
+    assert!(!snap.drep_is_expired(&Hash32::from_bytes([0x44; 32])));
+}
