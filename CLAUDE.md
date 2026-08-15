@@ -150,6 +150,64 @@ dugite-lsm (LSM-tree on-disk storage for UTxO-HD)
 
 ## Current Focus
 
+### 2026-08-15 — the ORACLE REACHES MAINNET TIP, and the replay catches a bug I wrote
+
+**cardano-streamer replayed mainnet to 649 — 650 epoch files, 0 errors, 20h28m,
+13,804,380 blocks.** It crossed mainnet's own PV11 fork near 640, where both
+earlier binaries died. The whole "port to cardano-node 11.x" plan was
+unnecessary; the cap was one literal in cardano-api (below).
+
+**#1089 — dugite REJECTED a mainnet block, and the defect was mine, twelve hours
+old.** The genesis-to-tip replay halted at epoch 577:
+
+```
+slot 163962988  WithdrawalAmountMismatch:
+  withdrawal 18000000000000 != reward balance 18592780000000
+```
+
+A withdrawal must drain the whole balance and the block is on mainnet, so
+cardano-node's balance was exactly 18,000,000 ADA and dugite's was 592,780 ADA
+higher. **One rejected block in 12,274,194.**
+
+`dRepAcceptedRatio` skips a DRep when `reCurrentEpoch > drepExpiry`, and **BOTH
+SIDES ARE FROZEN**: `reCurrentEpoch` is the pulser's own `dpCurrentEpoch`, set at
+capture, NOT the epoch RATIFY runs in. `drep_is_expired` compared
+`snapshot_epoch + 1`. **The code it replaced was right about this** — the old
+`active` flag was `new_epoch > drep_expiry`. The same change that correctly moved
+the filter's PLACEMENT broke its EPOCH. #1072's pattern, again.
+
+The `+1` excludes every DRep whose expiry equals the capture epoch; a non-voting
+DRep counts as No, so dropping one shrinks `dRepAcceptedRatio`'s DENOMINATOR and
+raises the ratio — accept-early. At 576→577 it ratified a `TreasuryWithdrawals`
+cardano-node did not: treasury −592,780 ADA, reward account +592,780 ADA,
+`drepDistr` sum +592,780 ADA, one 100,000 ADA deposit released early.
+
+**Two lessons bigger than the bug.**
+
+* **An exactness comparison over AGGREGATES does not bound per-account
+  correctness.** The dump carries pots, totals and digests — no per-account
+  rewards. This error moved no aggregate until it moved treasury. A real
+  transaction whose validity depended on the exact balance is what caught it.
+* **A green validation network can be structurally blind.** preprod passed the
+  BUGGY change (306 epochs, zero leaves outside `drepDistr`) and passed the FIX
+  identically (zero leaves). It holds no DRep expiring exactly at a capture epoch
+  during a near-threshold vote. Ask what case a green actually exercised.
+
+**Refuted on the way, so they are not re-tried**: treasury sufficiency (#966's
+class, and my first instinct) — the pot at the decision boundary is 1.584 BILLION
+ADA against a 592,780 ADA withdrawal; and the `rsDelayed` latch —
+`prevGovActionIds` is byte-identical at 576 and 577. Also corrected: a wrong
+reward balance canNOT move the same epoch's stake digest, because `SNAP` runs
+BEFORE `applyEnactedWithdrawals` while the fresh pulser is built AFTER it.
+
+**Two harness defects fixed the same day, both scaling with the run.** The dump
+reducer re-parsed every file every pass — 99% of a core and ~3.3 GB of re-reads
+per pass at 474 epochs, and the oracle went 38% → 78% CPU once fixed. And **two
+replays on one SSD starve each other**: dugite ran 5.7 epochs/h at 15% CPU
+alongside the oracle, and 14.7 epochs/h at 68% alone. Run them SEQUENTIALLY,
+`SIGSTOP` the other, and always arm an automatic resume — a forgotten SIGSTOP
+stalls the whole run.
+
 ### 2026-08-14 — the oracle reaches PV11, and preprod finds FOUR dugite defects
 
 **The PV10 cap was one literal in cardano-api, not a dependency set.** Detail
