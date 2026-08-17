@@ -375,6 +375,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32637268377fc7b10a8c6d51de3e7fba1ce5dd371a96e342b34e6078db558e7f"
 
 [[package]]
+name = "bech32"
+version = "0.12.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "efbd3e1070bbdf4cd88a75264e18e8a26f7cb5c6949eadf0ceb85fb159cf08f8"
+
+[[package]]
 name = "bincode"
 version = "1.3.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1448,7 +1454,7 @@ name = "dugite-cli"
 version = "2.8.0"
 dependencies = [
  "anyhow",
- "bech32",
+ "bech32 0.12.0",
  "blake2 0.10.6",
  "blake2b_simd",
  "bs58",
@@ -1702,7 +1708,7 @@ dependencies = [
  "arc-swap",
  "async-trait",
  "base64 0.22.1",
- "bech32",
+ "bech32 0.12.0",
  "bs58",
  "chrono",
  "clap",
@@ -1755,7 +1761,7 @@ dependencies = [
 name = "dugite-primitives"
 version = "2.8.0"
 dependencies = [
- "bech32",
+ "bech32 0.12.0",
  "blake2 0.10.6",
  "blake2b_simd",
  "bytes",
@@ -3475,7 +3481,7 @@ checksum = "0399524c347d2e59663fb1251e72bb81affa69264a1deefb1c468f11660bf688"
 dependencies = [
  "anyhow",
  "async-trait",
- "bech32",
+ "bech32 0.11.1",
  "bincode 2.0.1",
  "blake2 0.10.6",
  "chrono",
