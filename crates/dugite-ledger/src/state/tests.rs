@@ -18815,7 +18815,10 @@ fn drep_expiry_is_judged_against_the_frozen_capture_epoch() {
     let expired = Hash32::from_bytes([0x33; 32]);
     let snap = expiry_snapshot(576, &[(live, 600), (boundary, 576), (expired, 575)]);
 
-    assert!(!snap.drep_is_expired(&live), "expiry 600 > capture 576: live");
+    assert!(
+        !snap.drep_is_expired(&live),
+        "expiry 600 > capture 576: live"
+    );
     assert!(
         !snap.drep_is_expired(&boundary),
         "expiry 576 == capture 576 must be LIVE: Haskell tests \
