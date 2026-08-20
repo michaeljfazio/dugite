@@ -1161,46 +1161,59 @@ pub fn seed_byron_genesis(
 }
 
 /// Whether `key_hash` currently carries genesis-key standing to act in the
-/// update-proposal system — either directly (it IS a `bootStakeholders`
-/// key) or indirectly (it is CURRENTLY the delegate of one, per `lookupR`).
+/// update-proposal system — i.e. whether it is CURRENTLY the active delegate
+/// of some genesis key, per the delegation bimap's reverse map.
 ///
-/// **A measured finding from real mainnet data, not (yet) independently
-/// verified against Haskell source.** A pure `lookupR`-only resolution —
-/// the mechanically faithful reading of "Bimap.insert replaces both
-/// directions" the design doc's §2.5 describes — could not resolve ANY
-/// endorsement on mainnet's real Byron chain: every block issuer's key
-/// hashes to a `bootStakeholders` entry DIRECTLY, even for genesis keys
-/// whose own heavyweight delegation certificate has already activated. That
-/// is what this function's OR-clause exists to catch. It can only WIDEN
-/// acceptance relative to `lookupR` alone, so relative to that baseline it
-/// cannot introduce a new accept-where-Haskell-rejects gap — only narrow a
-/// possible reject-where-Haskell-accepts one. Flagged for independent
-/// verification against `Endorsement.hs`/`Voting.hs`/`Registration.hs`
-/// before this mechanism is wired into anything consensus-critical (it is
-/// not currently — see the design doc §3.6).
+/// **Independently verified against `cardano-ledger-byron-1.2.0.0`'s
+/// `Registration.hs`/`Voting.hs`/`Endorsement.hs` (pinned tarball).** All
+/// three rules are PURE bimap reverse-map lookups over `Delegation.Map =
+/// Bimap KeyHash KeyHash` (forward: genesis key -> delegate key):
+///
+/// - `Registration.hs:338`: `Delegation.memberR proposerId delegationMap`
+/// - `Voting.hs:184`: `Delegation.lookupR voter delegationMap`
+/// - `Endorsement.hs:210`: `Delegation.lookupR vk delegationMap`
+///
+/// `memberR` and `lookupR` are the SAME query, Bool vs `Maybe` forms of it:
+/// the `bimap-0.5.0` package (`Data/Bimap.hs:177-178,368-373`, the exact
+/// version `cardano-ledger-byron` pins) defines
+/// `memberR y (MkBimap _ right) = M.member y right` and
+/// `lookupR y (MkBimap _ right) = ... M.lookup y right` — both query the
+/// identical `right :: Map KeyHash KeyHash` field with the identical key, so
+/// `memberR y m == isJust (lookupR y m)` by construction. There is no
+/// separate "is this key a direct genesis-key member" rule anywhere in
+/// upstream; `dugite`'s `delegation_map_rev` IS that `right` map (keyed
+/// delegate -> genesis key, `eras/byron.rs`'s `activate_delegations`), so a
+/// single `.get()` implements every one of the three call sites above.
+///
+/// An UNDELEGATED genesis key still resolves via this alone: `DI.initialState`
+/// (Interface.hs — the delegation-state one, not the update one) seeds the
+/// bimap with `zip allowedDelegators allowedDelegators`, i.e. every genesis
+/// key mapped to itself, and `seed_byron_genesis` mirrors that identity
+/// seeding into `delegation_map_rev`. Once a genesis key delegates away,
+/// `Bimap.insert` (via `activate_delegations`'s `old_delegate` removal)
+/// destroys that self-pair, and the raw genesis key correctly loses ALL
+/// standing from that point on — permanently, for both proposals and votes.
+/// The previous version of this function had an `allowed_delegators.contains`
+/// fallback that made that standing permanent instead, which is a genuine
+/// accept-where-Haskell-rejects gap: real on mainnet, where all 7 genesis
+/// keys delegate away at slot 0
+/// (`config/mainnet/byron-genesis.json`'s `heavyDelegation`).
 fn resolve_genesis_authority(
     key_hash: &Hash28,
-    allowed_delegators: &BTreeSet<Hash28>,
     delegation_map_rev: &BTreeMap<Hash28, Hash28>,
 ) -> Option<Hash28> {
-    if allowed_delegators.contains(key_hash) {
-        return Some(*key_hash);
-    }
     delegation_map_rev.get(key_hash).copied()
 }
 
 /// `Update.Validation.Registration::registerProposal` (Registration.hs:330+).
 fn register_proposal(
     update: &mut ByronUpdateState,
-    allowed_delegators: &BTreeSet<Hash28>,
     delegation_map_rev: &BTreeMap<Hash28, Hash28>,
     current_slot: u64,
     proposal: &dugite_primitives::block::ByronUpdProposal,
 ) -> Result<(), ByronUpdateError> {
     let proposer_key_hash = byron_key_hash(&proposal.proposer_vk);
-    if resolve_genesis_authority(&proposer_key_hash, allowed_delegators, delegation_map_rev)
-        .is_none()
-    {
+    if resolve_genesis_authority(&proposer_key_hash, delegation_map_rev).is_none() {
         return Err(ByronUpdateError::NotGenesisDelegate);
     }
     if proposal.params_update.tx_fee_policy.is_some() {
@@ -1273,24 +1286,37 @@ fn register_proposal(
 
 /// `Voting::registerVote` + `pastThreshold` + confirmation
 /// (Voting.hs:126-208).
+///
+/// The registered-proposal membership check (`registerVote`'s
+/// `upId `Set.member` registeredProposals`, Voting.hs:180-181) is against
+/// `vreRegisteredUpdateProposal`, which `Interface.hs::registerVote`
+/// (:390,:396) sets to `M.keysSet proposalRegistrationSlot` — NOT
+/// `registeredProtocolUpdateProposals`. `proposalRegistrationSlot` gets an
+/// entry for EVERY successful registration regardless of whether it was a
+/// protocol update, a software update, or both
+/// (`Interface.hs::registerProposal`'s unconditional
+/// `M.insert (recoverUpId proposal) currentSlot proposalRegistrationSlot`,
+/// :274-276) — `registeredProtocolUpdateProposals` only gets an entry when
+/// the PROTOCOL half changed. A vote for a software-only proposal therefore
+/// exists in `proposalRegistrationSlot` but never in
+/// `registeredProtocolUpdateProposals`, and checking the narrower map
+/// wrongly rejects it (issue #1093).
 fn register_vote(
     update: &mut ByronUpdateState,
-    allowed_delegators: &BTreeSet<Hash28>,
     delegation_map_rev: &BTreeMap<Hash28, Hash28>,
     num_gen_keys: usize,
     current_slot: u64,
     vote: &ByronUpdVote,
 ) -> Result<(), ByronUpdateError> {
     if !update
-        .registered_protocol_update_proposals
+        .proposal_registration_slot
         .contains_key(&vote.proposal_id)
     {
         return Err(ByronUpdateError::ProposalNotRegistered);
     }
     let voter_key_hash = byron_key_hash(&vote.voter_vk);
-    let genesis_key =
-        resolve_genesis_authority(&voter_key_hash, allowed_delegators, delegation_map_rev)
-            .ok_or(ByronUpdateError::NotGenesisDelegate)?;
+    let genesis_key = resolve_genesis_authority(&voter_key_hash, delegation_map_rev)
+        .ok_or(ByronUpdateError::NotGenesisDelegate)?;
 
     let votes = update.proposal_votes.entry(vote.proposal_id).or_default();
     if !votes.insert(genesis_key) {
@@ -1319,12 +1345,33 @@ fn register_vote(
     Ok(())
 }
 
-/// `Endorsement::registerEndorsement` + `Interface.hs::registerEndorsement`
+/// `Endorsement::register` + `Interface.hs::registerEndorsement`
 /// (Endorsement.hs:148-236, Interface.hs:408-479).
+///
+/// Ordering matches upstream exactly, which matters for two independent
+/// reasons (both found by a review of the previous version of this
+/// function):
+///
+/// 1. `Endorsement.register`'s confirm/threshold/candidate logic
+///    (`isConfirmedAndStable`, `numberOfEndorsements`, FADS) runs against
+///    the PRE-prune state — `Interface.hs::registerEndorsement`'s `subEnv`
+///    is built from `st` BEFORE this call's own prune, since the prune is a
+///    separate step the WRAPPER performs afterward.
+/// 2. That wrapper's prune of `pidsKeep` (Interface.hs:418-444) is
+///    UNCONDITIONAL: it runs after `Endorsement.register` regardless of
+///    which of that function's branches fired — including the `[] -> pure
+///    st` "no proposal registered for this protocol version" branch, and
+///    regardless of whether `issuer_key_hash` resolved to a genesis key at
+///    all. `Endorsement.hs:210-218`'s own comment: *"we do not throw an
+///    error if there is no corresponding delegate for the given endorsement
+///    keyHash. This is consistent with the @UPEND@ rules."* The previous
+///    version of this function pruned only on its own success path (an
+///    early `return` on an unresolvable key skipped pruning entirely),
+///    which silently disabled the proposal TTL whenever an endorsement's
+///    key did not resolve.
 #[allow(clippy::too_many_arguments)]
 fn register_endorsement(
     update: &mut ByronUpdateState,
-    allowed_delegators: &BTreeSet<Hash28>,
     delegation_map_rev: &BTreeMap<Hash28, Hash28>,
     current_slot: u64,
     security_param_k: u64,
@@ -1332,67 +1379,75 @@ fn register_endorsement(
     endorsed_version: (u16, u16, u8),
     issuer_key_hash: Hash28,
 ) {
-    // Unresolvable issuer key: SILENTLY IGNORED (the UPEND comment).
-    let Some(genesis_key) =
-        resolve_genesis_authority(&issuer_key_hash, allowed_delegators, delegation_map_rev)
-    else {
-        return;
-    };
-    update
-        .registered_endorsements
-        .insert((endorsed_version, genesis_key));
-
-    prune_stale_proposals(update, current_slot);
-
-    let confirmed_slot = update
+    // `Endorsement.register`'s `case M.toList (M.filter ...) of` — a
+    // registered protocol proposal that DOES propose `endorsed_version`.
+    // `[] -> pure st`: no match means nothing below is even attempted
+    // (Haskell never forces the `registeredEndorsements'` where-binding in
+    // that branch, so the endorsement is not recorded either).
+    let matching = update
         .registered_protocol_update_proposals
         .iter()
         .find(|(_, (pv, _))| *pv == endorsed_version)
-        .and_then(|(upid, _)| update.confirmed_proposals.get(upid).copied());
-    let Some(confirmed_slot) = confirmed_slot else {
-        return;
-    };
-    if confirmed_slot.saturating_add(2 * security_param_k) > current_slot {
-        return; // not yet stable
+        .map(|(upid, (pv, params))| (*upid, *pv, params.clone()));
+
+    if let Some((up_id, pv, params)) = matching {
+        // `isConfirmedAndStable upId` (Endorsement.hs:194-197):
+        // `addSlotCount (kSlotSecurityParam k) confirmedSlot <= currentSlot`,
+        // `kSlotSecurityParam = 2 * k` (ProtocolConstants.hs:19).
+        let is_confirmed_and_stable = update
+            .confirmed_proposals
+            .get(&up_id)
+            .is_some_and(|&s| s.saturating_add(2 * security_param_k) <= current_slot);
+
+        if is_confirmed_and_stable {
+            // `registeredEndorsements'` (Endorsement.hs:210-218) — forced
+            // only in this branch. Unresolvable issuer key: silently
+            // ignored per the UPEND comment quoted above.
+            if let Some(genesis_key) =
+                resolve_genesis_authority(&issuer_key_hash, delegation_map_rev)
+            {
+                update
+                    .registered_endorsements
+                    .insert((endorsed_version, genesis_key));
+            }
+            let endorsement_count = update
+                .registered_endorsements
+                .iter()
+                .filter(|(v, _)| *v == endorsed_version)
+                .count() as u64;
+            let threshold = up_adpt_thd(num_gen_keys as u64, &update.adopted_protocol_parameters);
+            if endorsement_count >= threshold {
+                // FADS: prepend only if this version strictly exceeds the
+                // current head's.
+                let should_prepend = update
+                    .candidate_protocol_updates
+                    .first()
+                    .map(|c| pv > c.protocol_version)
+                    .unwrap_or(true);
+                if should_prepend {
+                    tracing::debug!(
+                        slot = current_slot,
+                        protocol_version = ?pv,
+                        endorsement_count,
+                        "byron CANDIDATE created"
+                    );
+                    update.candidate_protocol_updates.insert(
+                        0,
+                        ByronCandidate {
+                            slot: current_slot,
+                            protocol_version: pv,
+                            protocol_parameters: params,
+                        },
+                    );
+                }
+            }
+        }
+        // else: not yet confirmed-and-stable — `pure st`, unchanged.
     }
-    let endorsement_count = update
-        .registered_endorsements
-        .iter()
-        .filter(|(v, _)| *v == endorsed_version)
-        .count() as u64;
-    if endorsement_count < up_adpt_thd(num_gen_keys as u64, &update.adopted_protocol_parameters) {
-        return;
-    }
-    let Some((pv, params)) = update
-        .registered_protocol_update_proposals
-        .values()
-        .find(|(pv, _)| *pv == endorsed_version)
-        .cloned()
-    else {
-        return;
-    };
-    // FADS: prepend only if this version strictly exceeds the current head's.
-    let should_prepend = update
-        .candidate_protocol_updates
-        .first()
-        .map(|c| pv > c.protocol_version)
-        .unwrap_or(true);
-    if should_prepend {
-        tracing::debug!(
-            slot = current_slot,
-            protocol_version = ?pv,
-            endorsement_count,
-            "byron CANDIDATE created"
-        );
-        update.candidate_protocol_updates.insert(
-            0,
-            ByronCandidate {
-                slot: current_slot,
-                protocol_version: pv,
-                protocol_parameters: params,
-            },
-        );
-    }
+
+    // `Interface.hs::registerEndorsement`'s UNCONDITIONAL prune — always
+    // runs, regardless of every branch above.
+    prune_stale_proposals(update, current_slot);
 }
 
 /// Per-endorsement-registration pruning (`Interface.hs`): proposals older
@@ -1534,16 +1589,19 @@ pub fn apply_delegation_payload(
 ///
 /// Same failure posture as [`apply_delegation_payload`]: a rule violation on
 /// a single proposal or vote is logged and skipped rather than failing the
-/// whole block. Measured necessary, not merely convenient — a real mainnet
-/// block (slot 73486) carries an update vote whose `proposalId` this
-/// implementation's registered-proposal map does not contain (most likely
-/// this implementation's TTL pruning, or its registration-authority
-/// resolution, diverging from upstream's exact timing in some historical
-/// corner this design's synthetic tests do not reach); treating that as
-/// block-fatal desynced every subsequent block. Filed for follow-up rather
-/// than guessed at, per this repo's divergence-fix process — the fields this
-/// implementation reports are honest about what state it actually holds
-/// either way.
+/// whole block. Measured necessary, not merely convenient — treating a
+/// single item as block-fatal desyncs every subsequent block. Issue #1093
+/// found a real mainnet block (slot 73486) tripping exactly this path, with
+/// two suspected causes, both since fixed here: `resolve_genesis_authority`
+/// carried an OR-clause with no upstream counterpart (see its doc), and
+/// `register_vote`'s registered-proposal membership check read the wrong
+/// map (`registered_protocol_update_proposals`, protocol-only, instead of
+/// `proposal_registration_slot`, every successful registration — see
+/// `register_vote`'s doc). This skip-and-log posture is kept regardless,
+/// since a Byron sub-rule this implementation may still not have modelled
+/// byte-for-byte in some historical corner is a lesser failure than
+/// desyncing the whole replay over `ByronSubState`, which nothing in
+/// validation or block production reads yet (design doc §3.6).
 #[allow(clippy::too_many_arguments)]
 pub fn apply_update_payload(
     update: &mut ByronUpdateState,
@@ -1556,13 +1614,7 @@ pub fn apply_update_payload(
     let num_gen_keys = allowed_delegators.len();
 
     if let Some(proposal) = &aux.upd_proposal {
-        if let Err(e) = register_proposal(
-            update,
-            allowed_delegators,
-            delegation_map_rev,
-            current_slot,
-            proposal,
-        ) {
+        if let Err(e) = register_proposal(update, delegation_map_rev, current_slot, proposal) {
             tracing::warn!(
                 slot = current_slot,
                 up_id = %proposal.up_id.to_hex(),
@@ -1572,14 +1624,8 @@ pub fn apply_update_payload(
         }
     }
     for vote in &aux.upd_votes {
-        if let Err(e) = register_vote(
-            update,
-            allowed_delegators,
-            delegation_map_rev,
-            num_gen_keys,
-            current_slot,
-            vote,
-        ) {
+        if let Err(e) = register_vote(update, delegation_map_rev, num_gen_keys, current_slot, vote)
+        {
             tracing::warn!(
                 slot = current_slot,
                 proposal_id = %vote.proposal_id.to_hex(),
@@ -1589,17 +1635,19 @@ pub fn apply_update_payload(
         }
     }
     // Every main block registers an endorsement of the protocol version its
-    // OWN header advertises, keyed by the issuer.
-    let issuer_key_hash = byron_key_hash(&aux.issuer_pubkey);
+    // OWN header advertises, keyed by `headerIssuer` — the DELEGATE key
+    // recovered from `block_sig`'s embedded certificate, NOT the raw
+    // `issuer_pubkey` (the genesis key doing the delegating) read from
+    // consensus-data field 1. See `ByronBlockAux::delegate_pubkey`'s doc.
+    let delegate_key_hash = byron_key_hash(&aux.delegate_pubkey);
     register_endorsement(
         update,
-        allowed_delegators,
         delegation_map_rev,
         current_slot,
         security_param_k,
         num_gen_keys,
         aux.protocol_version,
-        issuer_key_hash,
+        delegate_key_hash,
     );
 }
 
@@ -2880,7 +2928,6 @@ mod byron_update_state_tests {
 
         register_proposal(
             &mut sub.update,
-            &sub.allowed_delegators,
             &sub.delegation.delegation_map_rev,
             100,
             &proposal,
@@ -2910,7 +2957,6 @@ mod byron_update_state_tests {
             };
             register_vote(
                 &mut sub.update,
-                &sub.allowed_delegators,
                 &sub.delegation.delegation_map_rev,
                 7,
                 slot,
@@ -2930,7 +2976,6 @@ mod byron_update_state_tests {
         };
         register_vote(
             &mut sub.update,
-            &sub.allowed_delegators,
             &sub.delegation.delegation_map_rev,
             7,
             104,
@@ -2951,7 +2996,6 @@ mod byron_update_state_tests {
         };
         let err = register_vote(
             &mut sub.update,
-            &sub.allowed_delegators,
             &sub.delegation.delegation_map_rev,
             7,
             105,
@@ -2966,7 +3010,6 @@ mod byron_update_state_tests {
             let issuer_hash = byron_key_hash(&pk(i));
             register_endorsement(
                 &mut sub.update,
-                &sub.allowed_delegators,
                 &sub.delegation.delegation_map_rev,
                 endorse_stable_slot - 1,
                 MAINNET_K,
@@ -2984,7 +3027,6 @@ mod byron_update_state_tests {
             let issuer_hash = byron_key_hash(&pk(i));
             register_endorsement(
                 &mut sub.update,
-                &sub.allowed_delegators,
                 &sub.delegation.delegation_map_rev,
                 endorse_stable_slot,
                 MAINNET_K,
@@ -3040,7 +3082,6 @@ mod byron_update_state_tests {
         let g0 = byron_key_hash(&pk(0));
         let mut delegation_map_rev = BTreeMap::new();
         delegation_map_rev.insert(g0, g0);
-        let allowed_delegators: BTreeSet<Hash28> = BTreeSet::new();
         let mut update = ByronUpdateState {
             current_epoch: 0,
             adopted_protocol_version: (1, 0, 0),
@@ -3065,14 +3106,7 @@ mod byron_update_state_tests {
             software_version: ("x".to_string(), 1),
             proposer_vk: pk(99), // not a genesis delegate
         };
-        let err = register_proposal(
-            &mut update,
-            &allowed_delegators,
-            &delegation_map_rev,
-            100,
-            &proposal,
-        )
-        .unwrap_err();
+        let err = register_proposal(&mut update, &delegation_map_rev, 100, &proposal).unwrap_err();
         assert_eq!(err, ByronUpdateError::NotGenesisDelegate);
     }
 
@@ -3081,7 +3115,6 @@ mod byron_update_state_tests {
         let g0 = byron_key_hash(&pk(0));
         let mut delegation_map_rev = BTreeMap::new();
         delegation_map_rev.insert(g0, g0);
-        let allowed_delegators: BTreeSet<Hash28> = BTreeSet::new();
         let mut update = ByronUpdateState {
             current_epoch: 0,
             adopted_protocol_version: (1, 0, 0),
@@ -3106,14 +3139,7 @@ mod byron_update_state_tests {
             software_version: ("x".to_string(), 1),
             proposer_vk: pk(0),
         };
-        let err = register_proposal(
-            &mut update,
-            &allowed_delegators,
-            &delegation_map_rev,
-            100,
-            &proposal,
-        )
-        .unwrap_err();
+        let err = register_proposal(&mut update, &delegation_map_rev, 100, &proposal).unwrap_err();
         assert_eq!(err, ByronUpdateError::UnsupportedTxFeePolicyOverride);
     }
 
@@ -3122,7 +3148,6 @@ mod byron_update_state_tests {
         let g0 = byron_key_hash(&pk(0));
         let mut delegation_map_rev = BTreeMap::new();
         delegation_map_rev.insert(g0, g0);
-        let allowed_delegators: BTreeSet<Hash28> = BTreeSet::new();
         let params = mainnet_genesis_params();
         let mut update = ByronUpdateState {
             current_epoch: 0,
@@ -3153,14 +3178,7 @@ mod byron_update_state_tests {
             software_version: ("cardano-sl".to_string(), 0),
             proposer_vk: pk(0),
         };
-        let err = register_proposal(
-            &mut update,
-            &allowed_delegators,
-            &delegation_map_rev,
-            100,
-            &proposal,
-        )
-        .unwrap_err();
+        let err = register_proposal(&mut update, &delegation_map_rev, 100, &proposal).unwrap_err();
         assert_eq!(err, ByronUpdateError::NullUpdate);
     }
 
@@ -3181,26 +3199,41 @@ mod byron_update_state_tests {
 
     #[test]
     fn endorsement_from_unresolvable_key_is_silently_ignored() {
+        // Endorsement.hs:210-218's own comment: an endorsement whose issuer
+        // key does not resolve via `lookupR` is silently ignored, NOT an
+        // error — but that branch is only reached once a MATCHING,
+        // confirmed-and-stable proposal exists (`Endorsement.register`'s
+        // `[] -> pure st` short-circuits before ever consulting the
+        // delegation map at all). So this fixture must seed exactly that,
+        // with an EMPTY reverse delegation map, to actually exercise the
+        // silent-ignore path rather than the unrelated no-match path.
+        let up_id = Hash32::from_bytes([0x11; 32]);
+        let registered_protocol_update_proposals: BTreeMap<_, _> =
+            [(up_id, ((1u16, 1u16, 0u8), mainnet_genesis_params()))]
+                .into_iter()
+                .collect();
+        let mut confirmed_proposals = BTreeMap::new();
+        confirmed_proposals.insert(up_id, 0); // confirmed well before current_slot -> stable
         let mut update = ByronUpdateState {
             current_epoch: 0,
             adopted_protocol_version: (1, 0, 0),
             adopted_protocol_parameters: mainnet_genesis_params(),
             candidate_protocol_updates: Vec::new(),
             app_versions: BTreeMap::new(),
-            registered_protocol_update_proposals: BTreeMap::new(),
+            registered_protocol_update_proposals,
             registered_software_update_proposals: BTreeMap::new(),
-            confirmed_proposals: BTreeMap::new(),
+            confirmed_proposals,
             proposal_votes: BTreeMap::new(),
             registered_endorsements: BTreeSet::new(),
             proposal_registration_slot: BTreeMap::new(),
         };
-        let empty_allowed: BTreeSet<Hash28> = BTreeSet::new();
         let empty_rev = BTreeMap::new();
         // No panic, no error type to check — the point IS that nothing
-        // observable happens.
+        // observable happens: the endorsement is not recorded and no
+        // candidate is created, even though a matching stable proposal
+        // exists.
         register_endorsement(
             &mut update,
-            &empty_allowed,
             &empty_rev,
             10_000,
             MAINNET_K,

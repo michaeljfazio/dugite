@@ -264,12 +264,30 @@ pub struct ByronBlockAux {
     /// the issuer key below.
     pub protocol_version: (u16, u16, u8),
     /// Header consensus-data field 1 (`issuer_pubkey`) — the 64-byte extended
-    /// verification key of the block's issuer. Needed to key the per-block
-    /// endorsement (`hashKey issuer_pubkey`); NOT copied into
-    /// `BlockHeader.issuer_vkey` (that field feeds the Shelley `bprev`
-    /// overlay-schedule read at the era seam and must stay empty for Byron —
-    /// see the design doc §3.1).
+    /// verification key of the GENESIS key doing the delegating (the block's
+    /// header carries this directly). NOT the key that keys the per-block
+    /// update endorsement — see [`Self::delegate_pubkey`] for that, and its
+    /// doc for why the two differ. NOT copied into `BlockHeader.issuer_vkey`
+    /// (that field feeds the Shelley `bprev` overlay-schedule read at the era
+    /// seam and must stay empty for Byron — see the design doc §3.1).
     pub issuer_pubkey: Vec<u8>,
+    /// `block_sig`'s embedded delegation certificate's DELEGATE key
+    /// (`Delegation.delegateVK cert`, `Header.hs:648-650`) — this is
+    /// upstream's `headerIssuer`/`blockIssuer`
+    /// (`headerIssuer h = case headerSignature h of ABlockSignature cert _ ->
+    /// Delegation.delegateVK cert`, `Header.hs:274-276`), the key
+    /// `apply_update_payload` hashes to register this block's per-block
+    /// update endorsement (`updateEndorsement = Endorsement
+    /// (blockProtocolVersion b) (hashKey $ blockIssuer b)`,
+    /// `Block/Validation.hs`). Deliberately a SEPARATE field from
+    /// [`Self::issuer_pubkey`] rather than a replacement for it: the two
+    /// coincide whenever the genesis key endorsing this block has not
+    /// delegated away (true of every genesis key that has never delegated),
+    /// but diverge the moment it has — every one of mainnet's 7 genesis keys
+    /// delegates away at slot 0 (`config/mainnet/byron-genesis.json`'s
+    /// `heavyDelegation`), so on mainnet `issuer_pubkey` is never the correct
+    /// endorsement key past slot 0.
+    pub delegate_pubkey: Vec<u8>,
     /// `dlgPayload` — heavyweight delegation certificates carried by this
     /// block, in wire order.
     pub dlg_certs: Vec<ByronDlgCert>,

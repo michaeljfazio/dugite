@@ -1,5 +1,8 @@
 # Tech Lead Agent Memory
 
+## #1084/#1093 Byron genesis-authority fix (2026-08-20, UNCOMMITTED)
+- [Full writeup](issue-1084-1093-byron-genesis-authority-fix.md) — memberR≡lookupR proof (bimap-0.5.0 source: same `right` map). Removed OR-clause fallback; fixed endorsement key to block_sig's delegate (not consensus-data issuer_pubkey, decoder was skipping block_sig); register_vote now checks proposal_registration_slot not registered_protocol_update_proposals (#1093); register_endorsement prune made unconditional. Mainnet replay 0-95, 0 rejections incl. slot 73486, oracle diff 0 real divergences. Left uncommitted per explicit instruction.
+
 ## #1071 nesRu wire arms — SNothing/Complete real, Pulsing deferred (2026-08-20)
 - [Full writeup](issue-1071-nesru-wire-arms.md) — kept rupd_pulser_started/rupd_monetary UNTOUCHED (40+ tests), added parallel rupd_snapshot. RewardUpdate.rs is tag-258 Set at PV>=9, threshold-23 BOTH levels (oracle-verified, not analogy). Pulsing needs StakePoolSnapShot/StakeWithDelegation/Reward types dugite doesn't have anywhere — SNothing fallback, not fabricated.
 
