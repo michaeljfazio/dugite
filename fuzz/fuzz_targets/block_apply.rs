@@ -198,6 +198,7 @@ fuzz_target!(|data: &[u8]| {
         transactions,
         era: Era::Conway,
         raw_cbor: None,
+        byron: None,
     };
 
     // Apply block to ledger state — must never panic.

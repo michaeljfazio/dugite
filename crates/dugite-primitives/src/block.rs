@@ -236,6 +236,152 @@ pub struct Block {
     pub transactions: Vec<Transaction>,
     pub era: Era,
     pub raw_cbor: Option<Vec<u8>>,
+    /// Byron-only auxiliary block data: the header's version-endorsement
+    /// fields plus the block body's delegation and update payloads (issue
+    /// #1084). `None` for every non-Byron block AND for a Byron EBB (an EBB
+    /// has no body — no `dlgPayload`/`updPayload` to carry). `Some` for a
+    /// Byron MAIN block.
+    ///
+    /// `Box`ed per the existing `Box<Block>` size discipline noted in
+    /// CLAUDE.md: the common case (every non-Byron block, every EBB) pays
+    /// only one `Option` niche.
+    #[serde(default)]
+    pub byron: Option<Box<ByronBlockAux>>,
+}
+
+/// Byron header/body fields needed for the era's update-proposal and
+/// delegation-certificate state machine (issue #1084).
+///
+/// Populated only for a Byron MAIN block (see [`Block::byron`]). Grounded in
+/// `cddl-spec/byron.cddl` (`cardano-ledger-byron` 1.2.0.0) — see
+/// `docs/superpowers/specs/2026-08-20-byron-delegation-update-state-design.md`
+/// §2.6 for the exact wire shapes this mirrors.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ByronBlockAux {
+    /// Header extra-data field 0 (`blockVersion` / `bver`) — the protocol
+    /// version this block's ISSUER endorses (`(major, minor, alt)`). Every
+    /// Byron main block registers an endorsement of this version, keyed by
+    /// the issuer key below.
+    pub protocol_version: (u16, u16, u8),
+    /// Header consensus-data field 1 (`issuer_pubkey`) — the 64-byte extended
+    /// verification key of the block's issuer. Needed to key the per-block
+    /// endorsement (`hashKey issuer_pubkey`); NOT copied into
+    /// `BlockHeader.issuer_vkey` (that field feeds the Shelley `bprev`
+    /// overlay-schedule read at the era seam and must stay empty for Byron —
+    /// see the design doc §3.1).
+    pub issuer_pubkey: Vec<u8>,
+    /// `dlgPayload` — heavyweight delegation certificates carried by this
+    /// block, in wire order.
+    pub dlg_certs: Vec<ByronDlgCert>,
+    /// `updPayload`'s optional `upprop` element — at most one update
+    /// proposal per block.
+    pub upd_proposal: Option<ByronUpdProposal>,
+    /// `updPayload`'s `votes` element — zero or more votes confirming a
+    /// previously-registered proposal.
+    pub upd_votes: Vec<ByronUpdVote>,
+}
+
+/// One `dlg` element of a Byron block's `dlgPayload`
+/// (`Cardano.Chain.Delegation.Certificate`).
+///
+/// `certificate` is captured but never verified — Byron block/certificate
+/// signature verification is a separate, deliberately out-of-scope gap; see
+/// the design doc §3.6.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ByronDlgCert {
+    /// `omega` — the certificate's target epoch.
+    pub epoch: u64,
+    /// The delegator's 64-byte extended verification key (a genesis key).
+    pub issuer_vk: Vec<u8>,
+    /// The delegate's 64-byte extended verification key.
+    pub delegate_vk: Vec<u8>,
+    /// Raw certificate signature bytes (unverified — see above).
+    pub signature: Vec<u8>,
+}
+
+/// A Byron protocol-parameter update PROPOSAL (`upprop`), the optional first
+/// element of `updPayload`.
+///
+/// `up_id` is `blake2b_256` over this proposal's own raw CBOR span
+/// (`Cardano.Chain.Update.Proposal::recoverUpId = hashDecoded`) — captured at
+/// decode time via the same `KeepRaw` discipline the tx decoder uses.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ByronUpdProposal {
+    pub up_id: Hash32,
+    /// The byte length of this proposal's raw CBOR span (the same span
+    /// `up_id` hashes). Needed for `canUpdate`'s `proposalSize <=
+    /// ppMaxProposalSize` check — not listed in the design doc's §3.1
+    /// sketch, but required by its own §2.4 registration rule.
+    pub encoded_len: u64,
+    /// `bver` — the protocol version this proposal (if adopted) would set.
+    pub protocol_version: (u16, u16, u8),
+    /// `bvermod` — the sparse protocol-PARAMETER changes this proposal
+    /// carries, overlaid on the currently-adopted parameters.
+    pub params_update: ByronParamsUpdate,
+    /// `softwareVersion` — `(application name, version number)`.
+    pub software_version: (String, u32),
+    /// `from` — the proposer's 64-byte extended verification key.
+    ///
+    /// Not listed in the design doc's §3.1 struct sketch, but required by
+    /// its own §2.4 registration rule (`registerProposal` rejects a
+    /// proposal whose `from` key does not resolve to a genesis key via the
+    /// delegation map) — captured so that check is implementable.
+    pub proposer_vk: Vec<u8>,
+}
+
+/// `bvermod` — Byron's sparse protocol-parameter update record. Every field
+/// is optional on the wire (CBOR `[? x]`, a 0- or 1-element array).
+///
+/// `tx_fee_policy` is captured as an opaque raw CBOR span rather than parsed:
+/// no field of `cddl-spec/byron.cddl` expands `txfeepol` in the design doc,
+/// and no real network (mainnet/preprod/preview) has ever exercised a
+/// non-empty value here — dugite's own genesis-derived fee policy matches the
+/// oracle 43/43 across every measured Byron epoch. A proposal that DOES carry
+/// one is therefore an input this implementation cannot honour; the
+/// registration/apply path hard-errors on it (crash rather than silently
+/// apply the wrong fee policy) instead of guessing at the wire shape.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ByronParamsUpdate {
+    pub script_version: Option<u16>,
+    pub slot_duration: Option<u64>,
+    pub max_block_size: Option<u64>,
+    pub max_header_size: Option<u64>,
+    pub max_tx_size: Option<u64>,
+    pub max_proposal_size: Option<u64>,
+    pub mpc_thd: Option<u64>,
+    pub heavy_del_thd: Option<u64>,
+    pub update_vote_thd: Option<u64>,
+    pub update_proposal_thd: Option<u64>,
+    pub update_implicit: Option<u64>,
+    pub soft_fork_rule: Option<(u64, u64, u64)>,
+    /// See the struct doc — captured raw, never applied.
+    pub tx_fee_policy: Option<Vec<u8>>,
+    pub unlock_stake_epoch: Option<u64>,
+}
+
+impl ByronParamsUpdate {
+    /// Whether this update touches ANY field. An all-`None` record is a
+    /// "null update" candidate — see `Registration.hs`'s `isNullUpdate`
+    /// check reproduced in `dugite-ledger::eras::byron`.
+    pub fn is_empty(&self) -> bool {
+        self == &ByronParamsUpdate::default()
+    }
+}
+
+/// One `upvote` element of a Byron block's `updPayload`.
+///
+/// The wire `vote: bool` is decoded and discarded, matching upstream: the
+/// pinned decoder does `void $ decCBOR @Bool` (negative voting does not
+/// exist in Byron — see the design doc §2.6), so there is no field for it
+/// here.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ByronUpdVote {
+    /// The voter's 64-byte extended verification key.
+    pub voter_vk: Vec<u8>,
+    /// The `UpId` of the proposal this vote confirms.
+    pub proposal_id: Hash32,
+    /// Raw signature bytes (unverified — see [`ByronDlgCert::signature`]).
+    pub signature: Vec<u8>,
 }
 
 impl Block {
@@ -412,6 +558,7 @@ mod tests {
                 .collect(),
             era: Era::Conway,
             raw_cbor: None,
+            byron: None,
         }
     }
 
@@ -697,6 +844,7 @@ mod tests {
             transactions,
             era: Era::Conway,
             raw_cbor: Some(raw),
+            byron: None,
         }
     }
 
@@ -762,6 +910,7 @@ mod tests {
             transactions: vec![],
             era: Era::Conway,
             raw_cbor: Some(vec![0x80]),
+            byron: None,
         };
         let ranges = block.tx_byte_ranges().expect("ranges");
         assert!(ranges.is_empty());

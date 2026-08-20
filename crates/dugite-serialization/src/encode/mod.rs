@@ -434,6 +434,7 @@ mod tests {
             transactions: vec![],
             era: Era::Conway,
             raw_cbor: None,
+            byron: None,
         };
 
         let kes_sig = vec![0u8; 448]; // KES signature placeholder

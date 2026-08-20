@@ -282,6 +282,7 @@ fn decode_shelley_block_mode(
         transactions,
         era: Era::Shelley,
         raw_cbor: None,
+        byron: None,
     })
 }
 
