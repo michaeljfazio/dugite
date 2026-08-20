@@ -175,6 +175,38 @@ pub struct PeerConnection {
     /// Cardano network magic (e.g. 2 for preview, 764824073 for mainnet).
     pub network_magic: u64,
 
+    /// Whether this connection's negotiated N2N `DataFlow` is `Duplex`
+    /// (`true`) rather than `Unidirectional` (`false`).
+    ///
+    /// Derived from the ACCEPTED version data at handshake completion —
+    /// `min(local, remote)` `diffusionMode` per
+    /// `Cardano.Network.NodeToNode.Version.acceptableVersion` — NOT from
+    /// either side's raw locally-declared `initiator_only`. `Duplex` only
+    /// when NEITHER side declared `InitiatorOnly`.
+    ///
+    /// Only meaningful for INBOUND (accepted) connections: it is what
+    /// decides whether `ConnectionLifecycleManager::register_inbound_connection`
+    /// may run its own Initiator-role protocols (KeepAlive client, ...) on
+    /// this ACCEPTED socket — Haskell's "Awake" transition reusing the same
+    /// connection rather than dialing a fresh outbound one
+    /// (`Ouroboros.Network.ConnectionManager.Core`,
+    /// `InboundIdleState _ _ _ Duplex -> OutboundState Duplex`). A
+    /// `cardano-cli ping` probe hardcodes `InitiatorOnly`
+    /// (`cardano-ping/src/Cardano/Network/Ping.hs`), so it negotiates
+    /// `Unidirectional` and must never receive an unsolicited `MsgKeepAlive`
+    /// (#1102); a genuine peer (relay<->BP, dugite<->cardano-node) negotiates
+    /// `Duplex` and expects reciprocal `MsgKeepAlive` traffic on the SAME
+    /// accepted connection, or its own KeepAlive-server times out and tears
+    /// the whole mux down (#1105).
+    ///
+    /// Always `true` for OUTBOUND connections: dialing a peer intrinsically
+    /// means we run our own client role over that connection, independent of
+    /// what DataFlow it negotiates — DataFlow only gates whether an ACCEPTED
+    /// connection may additionally be used for OUR client role.
+    ///
+    /// See `.claude/agent-memory/cardano-haskell-oracle/n2n-diffusionmode-dataflow-duplex-gating.md`.
+    pub(crate) negotiated_duplex: bool,
+
     // ── Client protocol channels ──
     // Created during mux setup, taken when protocol tasks start.
     // `None` means the channel is currently in use by a running task.
@@ -514,6 +546,10 @@ impl PeerConnection {
             direction: PeerConnectionDirection::Outbound,
             version,
             network_magic,
+            // Dialing intrinsically means we run our own client role on this
+            // connection — DataFlow only gates whether an ACCEPTED connection
+            // may ALSO be used for our client role, not an outbound one.
+            negotiated_duplex: true,
             chainsync_client_channel: Some(chainsync_client_ch),
             blockfetch_client_channel: Some(blockfetch_client_ch),
             txsubmission_client_channel: Some(txsubmission_client_ch),
@@ -683,7 +719,17 @@ impl PeerConnection {
         }
 
         let version = handshake_result.version;
-        info!(%addr, version, "N2N handshake complete (inbound)");
+        // #1105: derive the negotiated DataFlow from the ACCEPTED version
+        // data, not from our own local `initiator_only` config (which is all
+        // #1102's fix could see, and which is why it had to disable the
+        // KeepAlive client for every accepted connection unconditionally).
+        // `run_n2n_handshake_server` always returns `Some` for a completed
+        // (non-query) N2N accept; default to `false` (Unidirectional — no
+        // client protocols) if that were ever violated, since under-running
+        // a client role is silent while over-running one sends unsolicited
+        // traffic a peer may not be able to handle (#1102's exact bug).
+        let negotiated_duplex = !handshake_result.negotiated_initiator_only.unwrap_or(true);
+        info!(%addr, version, negotiated_duplex, "N2N handshake complete (inbound)");
         let mux_handle = mux_guard.disarm();
 
         Ok(Self {
@@ -692,6 +738,7 @@ impl PeerConnection {
             direction: PeerConnectionDirection::Inbound,
             version,
             network_magic,
+            negotiated_duplex,
             chainsync_client_channel: cs_cli,
             blockfetch_client_channel: bf_cli,
             txsubmission_client_channel: tx_cli,
@@ -1350,6 +1397,11 @@ impl PeerConnection {
             direction,
             version: 0,
             network_magic: 0,
+            // Generic test helper, not used to exercise duplex gating —
+            // default permissive (matches pre-#1105 behavior for every
+            // existing caller). Tests that need the gating itself use
+            // `set_negotiated_duplex_for_test`.
+            negotiated_duplex: true,
             chainsync_client_channel: None,
             blockfetch_client_channel: None,
             txsubmission_client_channel: None,
@@ -1411,6 +1463,9 @@ impl PeerConnection {
             direction: PeerConnectionDirection::Outbound,
             version: 0,
             network_magic: 0,
+            // Default permissive — callers exercising the #1105 Unidirectional
+            // case use `set_negotiated_duplex_for_test(false)`.
+            negotiated_duplex: true,
             chainsync_client_channel: Some(make_channel(PROTOCOL_N2N_CHAINSYNC)),
             blockfetch_client_channel: Some(make_channel(PROTOCOL_N2N_BLOCKFETCH)),
             txsubmission_client_channel: Some(make_channel(PROTOCOL_N2N_TXSUBMISSION)),
@@ -1456,6 +1511,9 @@ impl PeerConnection {
             direction: PeerConnectionDirection::Inbound,
             version: 0,
             network_magic: 0,
+            // Server-channels-only fake for the #980 responder-restart test —
+            // no client protocols are exercised, so the value is inert.
+            negotiated_duplex: true,
             chainsync_client_channel: None,
             blockfetch_client_channel: None,
             txsubmission_client_channel: None,
@@ -1492,14 +1550,22 @@ impl PeerConnection {
 
     /// The protocol names currently in `warm_tasks`, in push order.
     ///
-    /// Used to prove #1102's fix: `register_inbound_connection` must never
-    /// spawn a KeepAlive-client (warm) task on an ACCEPTED connection — only
-    /// a genuine outbound dial (`register_warm_connection` /
-    /// `promote_to_warm`) may. An accepted connection that starts one sends
-    /// an unsolicited `MsgKeepAlive` toward a peer that may only implement
-    /// the client role (e.g. `cardano-cli ping`), which cannot handle it.
+    /// Used to prove #1102/#1105's fix: `register_inbound_connection` must
+    /// never spawn a KeepAlive-client (warm) task on an ACCEPTED connection
+    /// that negotiated `Unidirectional` DataFlow — only a genuine outbound
+    /// dial, or an ACCEPTED connection that negotiated `Duplex`, may. A
+    /// `Unidirectional` accepted connection that starts one sends an
+    /// unsolicited `MsgKeepAlive` toward a peer that only implements the
+    /// client role (e.g. `cardano-cli ping`), which cannot handle it.
     pub fn warm_task_names_for_test(&self) -> Vec<&'static str> {
         self.warm_tasks.iter().map(|(name, _, _)| *name).collect()
+    }
+
+    /// Override the negotiated-`Duplex` flag on a fake connection, for tests
+    /// that need to drive `register_inbound_connection`'s #1105 gating
+    /// explicitly (`fake_with_hot_channels` defaults to `true`).
+    pub fn set_negotiated_duplex_for_test(&mut self, duplex: bool) {
+        self.negotiated_duplex = duplex;
     }
 
     /// Create a `PeerConnection` backed by caller-supplied channels and a real
@@ -1535,6 +1601,10 @@ impl PeerConnection {
             direction,
             version: 0,
             network_magic: 0,
+            // `tests/lifecycle_invariants.rs` helper — bypasses the N2N
+            // handshake entirely, so there is no negotiated value to derive;
+            // default permissive (matches pre-#1105 behavior).
+            negotiated_duplex: true,
             chainsync_client_channel: Some(cs_ch),
             blockfetch_client_channel: Some(bf_ch),
             txsubmission_client_channel: Some(tx_ch),
