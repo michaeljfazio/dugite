@@ -223,6 +223,44 @@ fn build_new_likelihoods(
 /// neither feeds `compute_reward_update`, which still derives its own answer
 /// from the GO snapshot at the boundary — this function's timing affects only
 /// what `nesRu` reports mid-epoch, never a credited amount.
+///
+/// # #1103 — a missing GO snapshot is EMPTY, not ABSENT
+///
+/// `ssStakeGo` is never `Maybe` in Haskell. `SnapShots`' `Default` instance
+/// (`emptySnapShots`, cardano-ledger `libs/cardano-ledger-core/src/Cardano/
+/// Ledger/State/SnapShots.hs`) seeds `ssStakeGo = emptySnapShot` — a real,
+/// empty record (`ActiveStake VMap.empty`, empty pool-params map) — from
+/// genesis, before the mark→set→go rotation has run even once, and
+/// `startStep` (`PulsingReward.hs:99-100`) reads it completely
+/// unconditionally:
+/// ```haskell
+/// let SnapShot activeStake totalActiveStake stakePoolSnapShots = ssStakeGo ss
+/// ```
+/// The pulser it builds (`RSLP pulseSize free (unActiveStake activeStake)
+/// (RewardAns Map.empty Map.empty)`) is a `Pulsable` over that map, so an
+/// EMPTY go snapshot still produces a real (empty) pulser, never a
+/// "nothing to build yet" state. `pulseStep`'s completion clause (`done
+/// pulser -> completeStep p`, checked BEFORE any new pulse) then promotes it
+/// to `Complete` on the very NEXT tick — the same one-tick lag as every other
+/// epoch — which is why cardano-node's own vendored fixture
+/// (`tests/fixtures/nesru/complete.hex`) shows `SJust (Complete
+/// emptyRewardUpdate)` already at epoch 0.
+///
+/// dugite's `Option<StakeSnapshot>` has no "rotated-but-empty" state to mirror
+/// `emptySnapShot` directly, so a missing `go` — true for the chain's first
+/// two epochs, before the rotation has run twice — is read below as
+/// `StakeSnapshot::empty`, the same substitution `compute_reward_update`
+/// above already makes for its own likelihoods computation
+/// (`build_new_likelihoods` returns `HashMap::new()` for `None`; #438's fix
+/// drains the monetary pot unconditionally on this exact path and skips only
+/// the — necessarily empty — per-pool distribution loop). This function must
+/// make the SAME substitution rather than return early: an early return never
+/// builds `epochs.rupd_fold`, so `is_complete()` below can never observe a
+/// finished fold on a later tick and `rupd_snapshot` can never leave
+/// `Pulsing` for the whole epoch — #1103's bug. It is not just an ordering
+/// slip (checking completion before returning would still find nothing to
+/// complete); the fold itself has to exist, empty, for a later tick's
+/// completion check to have anything to observe.
 pub(crate) fn pulse_rupd_member_fold(
     epochs: &mut super::substates::EpochSubState,
     prev_d: &dugite_primitives::transaction::Rational,
@@ -233,9 +271,15 @@ pub(crate) fn pulse_rupd_member_fold(
     let Some(monetary) = epochs.rupd_monetary else {
         return; // before the mark — nothing frozen, nothing to pulse
     };
-    let Some(go) = epochs.snapshots.go.clone() else {
-        return; // no GO snapshot yet (first two epochs)
-    };
+    // #1103: substitute an empty snapshot rather than skip — see this
+    // function's doc. `.epoch` is never read by anything this function calls
+    // (`build_pool_reward_table`, `build_new_likelihoods`, `RewardFold::new`
+    // all read only the map fields), so the placeholder epoch is inert.
+    let go = epochs
+        .snapshots
+        .go
+        .clone()
+        .unwrap_or_else(|| StakeSnapshot::empty(dugite_primitives::time::EpochNo(0)));
     if epochs.rupd_fold.is_complete() {
         // `completeStep`'s Pulsing -> Complete transition, for the WIRE arm
         // (#1071) ONLY — `epochs.rupd_fold`'s own `is_done()` already turned
@@ -2904,6 +2948,123 @@ mod tests {
         assert!(
             is_complete(&state),
             "one tick after the draining pulse, the wire must show Complete"
+        );
+    }
+
+    /// #1103 — RED-proven: before the fix, a missing GO snapshot (the
+    /// chain's first two epochs, before mark→set→go has rotated twice) made
+    /// this function return BEFORE the `is_complete()` promotion check, so
+    /// `rupd_fold` was never built and `rupd_snapshot` could never leave
+    /// `Pulsing` for the whole epoch. Haskell has no such gate — `ssStakeGo`
+    /// is `emptySnapShot`, not absent, from genesis (see this function's
+    /// doc), and its own vendored fixture
+    /// `tests/fixtures/nesru/complete.hex` shows `SJust (Complete
+    /// emptyRewardUpdate)` already at epoch 0.
+    ///
+    /// With `go` genuinely `None` here (never set), the credential queue an
+    /// empty substitute snapshot produces is empty, so completion needs only
+    /// the SAME two ticks Haskell's zero-credential case needs: the creation
+    /// tick builds an empty fold without pulsing (matching `startStep`'s
+    /// purity), and the very next tick's done-checked-before-pulse
+    /// promotion (`pulseStep`) completes it.
+    #[test]
+    fn pulse_rupd_member_fold_reaches_complete_with_no_go_snapshot() {
+        use crate::state::reward_pulser::{
+            FreeVars, MonetaryStep, PulsingRewUpdate, RewardSnapShot,
+        };
+        use crate::state::LedgerState;
+
+        let params = dugite_primitives::protocol_params::ProtocolParameters::mainnet_defaults();
+        let mut state = LedgerState::new(params.clone());
+        // The point of this test: `go` is left `None` — the chain's first
+        // two epochs, before the mark→set→go rotation has run twice.
+        assert!(state.epochs.snapshots.go.is_none());
+        state.epochs.prev_protocol_params = params;
+        state.epochs.prev_protocol_version_major = 11; // pv>=7: no pv<=6 prefilter gate
+        state.epochs.prev_d = rat(0, 1);
+
+        // Simulate the CREATION tick's freeze, exactly as `apply.rs` does at
+        // the 4k/f mark — unconditional on `go` being present (it isn't,
+        // there either: see the mark-crossing block around
+        // `rupd_pulser_started` in `apply.rs`).
+        let monetary = MonetaryStep {
+            delta_r1: 0,
+            delta_t1: 0,
+            r: 0,
+            expected_blocks: 0,
+            total_stake: 10_000_000_000_000,
+        };
+        state.epochs.rupd_monetary = Some(monetary);
+        state.epochs.rupd_pulser_started = true;
+        state.epochs.rupd_snapshot = Some(PulsingRewUpdate::Pulsing(Box::new(RewardSnapShot {
+            fees: Lovelace(0),
+            protocol_version: (11, 0),
+            non_myopic: Default::default(),
+            delta_r1: Lovelace(0),
+            r: Lovelace(0),
+            delta_t1: Lovelace(0),
+            likelihoods: HashMap::new(),
+            leaders: HashMap::new(),
+            free_vars: FreeVars {
+                addrs_rew: None,
+                total_stake: 10_000_000_000_000,
+                prot_ver: (11, 0),
+            },
+        })));
+
+        let k: u64 = 1;
+        let call = |state: &mut LedgerState| {
+            let prev_d = state.epochs.prev_d.clone();
+            let pv = state.epochs.prev_protocol_version_major;
+            let epoch_length = state.epoch_length;
+            super::pulse_rupd_member_fold(&mut state.epochs, &prev_d, pv, k, epoch_length);
+        };
+        let is_pulsing = |state: &LedgerState| {
+            matches!(
+                state.epochs.rupd_snapshot,
+                Some(PulsingRewUpdate::Pulsing(_))
+            )
+        };
+        let is_complete = |state: &LedgerState| {
+            matches!(
+                state.epochs.rupd_snapshot,
+                Some(PulsingRewUpdate::Complete(_))
+            )
+        };
+
+        // Tick 0 — the creation tick. Must build an (empty) fold WITHOUT
+        // pulsing, and the fold itself must actually exist now — before the
+        // fix, the function returned before this point and
+        // `rupd_fold.fold` stayed `None` forever.
+        call(&mut state);
+        assert!(
+            state.epochs.rupd_fold.fold.is_some(),
+            "#1103: the fold must be BUILT even with no GO snapshot — a \
+             missing go is an EMPTY snapshot in Haskell (`emptySnapShot`), \
+             never an absent one, so `startStep` still constructs an \
+             (empty) pulser"
+        );
+        assert_eq!(
+            state.epochs.rupd_fold.remaining(),
+            0,
+            "an empty go snapshot has no credentials to fold"
+        );
+        assert!(
+            is_pulsing(&state),
+            "wire must still read Pulsing after the creation tick"
+        );
+
+        // Tick 1 — no new pulse (nothing to pulse); the empty fold's `done`
+        // was already true the instant it was built, so THIS tick promotes
+        // it, exactly one tick after creation like every other epoch.
+        call(&mut state);
+        assert!(
+            is_complete(&state),
+            "#1103: with go=None, dugite must still reach Complete one \
+             tick after creation — cardano-node's own fixture \
+             (`tests/fixtures/nesru/complete.hex`) shows `SJust (Complete \
+             emptyRewardUpdate)` already at epoch 0. Before the fix, the \
+             early return on go=None meant this stayed Pulsing forever."
         );
     }
 
