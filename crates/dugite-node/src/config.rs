@@ -15,16 +15,24 @@ use std::path::Path;
 pub enum ConsensusMode {
     /// Standard Ouroboros Praos operation.
     ///
-    /// JSON: `"Praos"` — the cardano-node 11.0.1 canonical spelling
-    /// (`Cardano.Node.Types` accepts exactly `"Genesis"` / `"Praos"`).
-    /// `"PraosMode"` is accepted as a legacy dugite alias.
+    /// JSON: `"PraosMode"` — the cardano-node 11.0.1 canonical spelling.
+    /// `Cardano.Network.ConsensusMode`'s `FromJSON` accepts EXACTLY
+    /// `["GenesisMode", "PraosMode"]` (confirmed against a real cardano-node
+    /// 11.0.1 binary: feeding it `"Praos"` or `"Genesis"` fails with
+    /// `expected one of the tags ["GenesisMode","PraosMode"], but found tag
+    /// "Genesis"` — there is no short form upstream at all). `"Praos"` is
+    /// kept here as a dugite-only legacy alias for backward compatibility
+    /// with configs already written against the earlier (wrong) belief that
+    /// it was cardano-node's canonical spelling.
     #[default]
-    #[serde(rename = "Praos", alias = "PraosMode")]
+    #[serde(rename = "PraosMode", alias = "Praos")]
     PraosMode,
     /// Ouroboros Genesis for trustless bulk sync from untrusted peers.
     ///
-    /// JSON: `"Genesis"` (canonical), `"GenesisMode"` (legacy alias).
-    #[serde(rename = "Genesis", alias = "GenesisMode")]
+    /// JSON: `"GenesisMode"` (cardano-node 11.0.1 canonical — see
+    /// `PraosMode`'s doc for how this was verified). `"Genesis"` is a
+    /// dugite-only legacy alias, same reasoning as `PraosMode`'s `"Praos"`.
+    #[serde(rename = "GenesisMode", alias = "Genesis")]
     GenesisMode,
 }
 
@@ -516,7 +524,7 @@ pub struct NodeConfig {
     #[serde(default)]
     pub experimental_hard_forks_enabled: bool,
 
-    /// Consensus protocol mode (`"Praos"` or `"Genesis"`).
+    /// Consensus protocol mode (`"PraosMode"` or `"GenesisMode"`).
     #[serde(default)]
     pub consensus_mode: ConsensusMode,
 
@@ -1908,28 +1916,39 @@ mod tests {
 
     #[test]
     fn test_consensus_mode_cardano_node_canonical_values() {
-        // cardano-node 11.0.1 `NodeConsensusMode` accepts EXACTLY "Genesis" /
-        // "Praos" (Cardano.Node.Types). A cardano-node config file must work
-        // verbatim with dugite.
+        // Verified against a real cardano-node 11.0.1 binary: it rejects
+        // "Genesis"/"Praos" outright (`expected one of the tags
+        // ["GenesisMode","PraosMode"], but found tag "Genesis"`). A
+        // cardano-node config file must work verbatim with dugite, so these
+        // are the values that matter for that goal.
+        let config: NodeConfig =
+            serde_json::from_str(r#"{"ConsensusMode": "GenesisMode"}"#).unwrap();
+        assert_eq!(config.consensus_mode, ConsensusMode::GenesisMode);
+        let config: NodeConfig = serde_json::from_str(r#"{"ConsensusMode": "PraosMode"}"#).unwrap();
+        assert_eq!(config.consensus_mode, ConsensusMode::PraosMode);
+        // Legacy dugite-only spellings remain accepted as aliases — earlier
+        // shipped dugite configs used these under the (wrong) belief they
+        // were cardano-node's canonical spelling; real cardano-node rejects
+        // both.
         let config: NodeConfig = serde_json::from_str(r#"{"ConsensusMode": "Genesis"}"#).unwrap();
         assert_eq!(config.consensus_mode, ConsensusMode::GenesisMode);
         let config: NodeConfig = serde_json::from_str(r#"{"ConsensusMode": "Praos"}"#).unwrap();
-        assert_eq!(config.consensus_mode, ConsensusMode::PraosMode);
-        // Legacy dugite spellings remain accepted as aliases.
-        let config: NodeConfig = serde_json::from_str(r#"{"ConsensusMode": "PraosMode"}"#).unwrap();
         assert_eq!(config.consensus_mode, ConsensusMode::PraosMode);
     }
 
     #[test]
     fn test_consensus_mode_serializes_to_cardano_node_value() {
-        // Round-trip emits the cardano-node canonical strings.
+        // Round-trip emits the cardano-node canonical strings — the ones a
+        // real cardano-node binary actually accepts, not the short forms
+        // dugite used to treat as canonical (see the doc comments on
+        // `ConsensusMode` for how that was verified and corrected).
         assert_eq!(
             serde_json::to_string(&ConsensusMode::GenesisMode).unwrap(),
-            r#""Genesis""#
+            r#""GenesisMode""#
         );
         assert_eq!(
             serde_json::to_string(&ConsensusMode::PraosMode).unwrap(),
-            r#""Praos""#
+            r#""PraosMode""#
         );
     }
 
@@ -1958,7 +1977,7 @@ mod tests {
         // BlockFetchGracePeriod, BucketCapacity, BucketRate, CSJJumpSize,
         // GDDRateLimit — all optional.
         let json = r#"{
-            "ConsensusMode": "Genesis",
+            "ConsensusMode": "GenesisMode",
             "LowLevelGenesisOptions": {
                 "EnableCSJ": false,
                 "EnableLoP": true,
