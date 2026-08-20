@@ -98,6 +98,7 @@
 - [LSQ acquire pins WHOLE ExtLedgerState via ReadOnlyForker](lsq-acquire-forker-pins-whole-extledgerstate.md) — VolatileTip acquire NEVER fails; QFNoTables queries (GovState/StakePools/PParams/etc) never touch tables; forker sees chain-selection's write synchronously via shared TVar, no cadence. Feeds #1068.
 
 ## Network Wire Format (N2N / N2C)
+- [handshake-driver-msgacceptversion-negotiated-payload.md](handshake-driver-msgacceptversion-negotiated-payload.md) — Server.hs `handshakeServerPeer`: MsgAcceptVersion ALWAYS carries `Accept`-computed agreedData, never raw local/remote; acceptOrRefuse shared client+server
 - [n2n-diffusionmode-dataflow-duplex-gating.md](n2n-diffusionmode-dataflow-duplex-gating.md) — acceptableVersion `diffusionMode local \`min\` remote` (InitiatorOnly wins); DataFlow=Duplex only if BOTH declare InitiatorAndResponder; KeepAlive NOT exempt from Duplex/activation gating; cardano-ping hardcodes InitiatorOnly; BP→relay pull needs Duplex (local-root default), not InitiatorOnly
 - [nodepeermanager-orphaned-methods-upstream-audit.md](nodepeermanager-orphaned-methods-upstream-audit.md) — #1003: PeerMetric=demotion-avoidance only; no PeerCategory upstream
 - [n2n-protocols.md](n2n-protocols.md) — mini-protocol IDs, CBOR/CDDL, version negotiation (V14 Plomin mandatory, V15 SRV DNS)
