@@ -51,6 +51,23 @@ pub struct HandshakeResult {
     /// mini-protocols — the caller should close it after the reply. On the
     /// client side this is set when a `MsgQueryReply` was received.
     pub query: bool,
+    /// The negotiated (ACCEPTED) `initiator_only` / diffusion-mode flag for
+    /// N2N connections — `min(local, remote)` per
+    /// `Cardano.Network.NodeToNode.Version.acceptableVersion`, i.e. `true`
+    /// (`DataFlow::Unidirectional`) if EITHER side declared `InitiatorOnly`,
+    /// `false` (`DataFlow::Duplex`) only when NEITHER side did.
+    ///
+    /// `None` for N2C (no diffusion-mode concept exists on that transport)
+    /// and for the rare client-side query-mode reply (`MsgQueryReply`
+    /// carries a version table for enumeration, not an accepted connection —
+    /// nothing was actually negotiated).
+    ///
+    /// This is what an ACCEPTED (inbound) N2N connection's caller must
+    /// consult before running its own Initiator-role protocols (KeepAlive
+    /// client, ...) on that connection — see
+    /// `.claude/agent-memory/cardano-haskell-oracle/n2n-diffusionmode-dataflow-duplex-gating.md`
+    /// and `#1102`/`#1105`.
+    pub negotiated_initiator_only: Option<bool>,
 }
 
 // ─── CBOR Message Tags ───
@@ -139,6 +156,7 @@ pub async fn run_n2n_handshake_server(
                         version: our_version,
                         simultaneous_open: false,
                         query: true,
+                        negotiated_initiator_only: Some(accepted.initiator_only),
                     });
                 }
                 // #1104: MsgAcceptVersion must carry the NEGOTIATED
@@ -159,6 +177,7 @@ pub async fn run_n2n_handshake_server(
                     version: our_version,
                     simultaneous_open: false,
                     query: false,
+                    negotiated_initiator_only: Some(accepted.initiator_only),
                 });
             } else {
                 // Magic mismatch — use Refused (tag 2) with the matched version and a reason string
@@ -231,6 +250,8 @@ pub async fn run_n2c_handshake_server(
                         version: our_version,
                         simultaneous_open: false,
                         query: true,
+                        // N2C has no diffusion-mode/DataFlow concept.
+                        negotiated_initiator_only: None,
                     });
                 }
                 // #1104: send the NEGOTIATED (accepted) version_data, not our
@@ -250,6 +271,8 @@ pub async fn run_n2c_handshake_server(
                     version: our_version,
                     simultaneous_open: false,
                     query: false,
+                    // N2C has no diffusion-mode/DataFlow concept.
+                    negotiated_initiator_only: None,
                 });
             } else {
                 // Magic mismatch — use Refused (tag 2); wire-encode the version number
@@ -769,6 +792,14 @@ fn decode_handshake_response(
             // accepted version is one we support, so its version_data has our
             // shape and decodes cleanly; tolerate a decode failure (older shape)
             // since magic was already asserted at propose time.
+            //
+            // #1104 established that a real Handshake responder (dugite's own
+            // server, and — per the driver read pinned in
+            // handshake-driver-msgacceptversion-negotiated-payload.md — every
+            // real cardano-node) sends the AGREED (already-negotiated) data in
+            // MsgAcceptVersion, never a raw echo. So `their_data` decoded here
+            // already IS the negotiated value — no need to re-run `accept()`.
+            let mut negotiated_initiator_only = None;
             if let Ok(their_data) = N2NVersionData::decode(&mut dec) {
                 if their_data.network_magic != our_data.network_magic {
                     return Err(HandshakeError::NetworkMagicMismatch {
@@ -776,11 +807,13 @@ fn decode_handshake_response(
                         theirs: their_data.network_magic,
                     });
                 }
+                negotiated_initiator_only = Some(their_data.initiator_only);
             }
             Ok(HandshakeResult {
                 version,
                 simultaneous_open: false,
                 query: false,
+                negotiated_initiator_only,
             })
         }
         MSG_QUERY_REPLY => {
@@ -822,6 +855,9 @@ fn decode_handshake_response(
                 version,
                 simultaneous_open: false,
                 query: true,
+                // A query-mode reply enumerates the peer's version table; no
+                // connection was actually negotiated.
+                negotiated_initiator_only: None,
             })
         }
         MSG_REFUSE => Err(decode_refuse_reason(&mut dec)),
@@ -868,11 +904,12 @@ fn decode_handshake_response(
             // Find highest common version (same logic as server-side negotiation)
             for &our_version in n2n::N2N_VERSIONS {
                 if let Some(their_data) = remote_versions.get(&our_version) {
-                    if our_data.accept(their_data).is_some() {
+                    if let Some(accepted) = our_data.accept(their_data) {
                         return Ok(HandshakeResult {
                             version: our_version,
                             simultaneous_open: true,
                             query: false,
+                            negotiated_initiator_only: Some(accepted.initiator_only),
                         });
                     }
                     // Magic mismatch on a matching version — reject
@@ -930,6 +967,8 @@ fn decode_handshake_response_n2c(
                 version,
                 simultaneous_open: false,
                 query: false,
+                // N2C has no diffusion-mode/DataFlow concept.
+                negotiated_initiator_only: None,
             })
         }
         MSG_REFUSE => Err(decode_refuse_reason(&mut dec)),

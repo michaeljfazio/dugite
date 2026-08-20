@@ -4407,27 +4407,54 @@ impl ConnectionLifecycleManager {
     ///
     /// This is the entry point for connections accepted by the TCP listener.
     /// The listener performs the handshake and creates a `PeerConnection`, then
-    /// passes it here for lifecycle management. We start server protocols and
-    /// register the connection in the peer manager.
+    /// passes it here for lifecycle management. We always start server
+    /// protocols, and — since #1105 — start our own KeepAlive-client (warm)
+    /// protocol too, but ONLY when the connection negotiated `DataFlow::Duplex`
+    /// (`conn.negotiated_duplex`).
     ///
-    /// Deliberately does NOT start our own KeepAlive-client (warm) protocol on
-    /// this connection (#1102). Only an OUTBOUND connection — one dugite itself
-    /// dialed via `register_warm_connection`/`promote_to_warm` — runs a
-    /// KeepAlive-client, because peer liveness monitoring is driven by the
-    /// side that CHOSE to connect (matches Haskell's InboundGovernor, which is
-    /// responder-only: it never spontaneously pings a peer that dialed IN).
-    /// An accepted connection only ever serves — a peer that connects to us
-    /// and never dials us back may not implement a KeepAlive-server at all,
-    /// e.g. `cardano-cli ping`, whose minimal client only sends
-    /// `MsgKeepAlive`/reads `MsgKeepAliveResponse` and has no responder logic.
-    /// Starting a KeepAlive-client here sent it an unsolicited `MsgKeepAlive`
-    /// ~2s after accept (see `make_keepalive_task`'s startup delay), which it
-    /// could not handle — `cardano-cli ping --count 3` reproduced this on
-    /// every run (2 round trips finish inside the 2s window; a 3rd does not).
-    /// A genuine duplex peer (one dugite ALSO has an outbound connection to)
-    /// is already monitored by that outbound connection's own KeepAlive-client
-    /// — see the `existing_to_peer` branch below — so nothing is lost for
-    /// real peer-to-peer topologies.
+    /// ## Why gate on negotiated DataFlow, not direction (#1102 -> #1105)
+    ///
+    /// #1102 found that dugite started a KeepAlive-client on EVERY accepted
+    /// connection, unconditionally — including toward `cardano-cli ping`,
+    /// whose minimal client only sends `MsgKeepAlive`/reads
+    /// `MsgKeepAliveResponse` and has no responder logic. `cardano-ping`
+    /// hardcodes `InitiatorOnly` (`cardano-ping/src/Cardano/Network/Ping.hs`),
+    /// so its connection negotiates `DataFlow::Unidirectional`
+    /// (`Cardano.Network.NodeToNode.ntnDataFlow`) — real cardano-node never
+    /// runs a KeepAlive-client toward such a peer, because `Unidirectional`
+    /// inbound connections are never added to `InboundGovernor`'s
+    /// `freshDuplexPeers`/`matureDuplexPeers` tracking
+    /// (`Ouroboros.Network.InboundGovernor`) and so never become eligible for
+    /// the "Awake" reuse transition that runs our own Initiator-role
+    /// protocols on an accepted socket
+    /// (`Ouroboros.Network.ConnectionManager.Core`,
+    /// `InboundIdleState _ _ _ Duplex -> OutboundState Duplex`).
+    ///
+    /// #1102's first fix removed the KeepAlive-client unconditionally instead
+    /// of gating it on that negotiated value — direction (inbound vs
+    /// outbound) is NOT what Haskell keys this on. That broke the CORRECT
+    /// case: two genuinely duplex peers (dugite-relay accepting a connection
+    /// FROM cardano-bp, or dugite<->dugite) negotiate `Duplex`
+    /// (`InitiatorAndResponderDiffusionMode` on both sides, the default), and
+    /// a real cardano-node peer on the other end runs a KeepAlive-SERVER that
+    /// expects reciprocal pings on the SAME accepted connection — with none
+    /// ever sent, its server-side timeout fires
+    /// (`ExceededTimeLimit (KeepAlive) ClientHasAgency (SingClient)`) and
+    /// tears down the WHOLE mux (Haskell policy: any mini-protocol failure is
+    /// fatal to the whole connection), producing continuous ~90-112s
+    /// reconnect churn and false peer-failure backoff penalties against a
+    /// perfectly healthy peer. See
+    /// `.claude/agent-memory/cardano-haskell-oracle/n2n-diffusionmode-dataflow-duplex-gating.md`.
+    ///
+    /// `conn.negotiated_duplex` is derived at handshake completion from the
+    /// ACCEPTED (`min(local, remote)`) version data, not from either side's
+    /// raw local declaration — see `PeerConnection::accept()`. This is
+    /// Haskell's "Awake" transition modelled without a second dial: dugite
+    /// reuses the SAME accepted socket for its own KeepAlive-client instead
+    /// of relying on a separate outbound connection to the same peer, which
+    /// mirrors the fresh/mature-duplex tracking above (an inbound-only
+    /// duplex relationship, e.g. a firewalled BP dialing its relay, is
+    /// exactly the case that reuse exists for).
     ///
     /// Inbound and outbound to the same remote may coexist as long as their
     /// `(local, remote)` tuples differ — matching Haskell's
@@ -4451,7 +4478,7 @@ impl ConnectionLifecycleManager {
     /// # Errors
     ///
     /// Returns `LifecycleError::Connection` if the inbound's server protocols
-    /// fail to start.
+    /// (or, on a Duplex connection, its KeepAlive-client) fail to start.
     pub async fn register_inbound_connection(
         &mut self,
         addr: SocketAddr,
@@ -4478,11 +4505,24 @@ impl ConnectionLifecycleManager {
         // Record handshake RTT for Prometheus metrics.
         self.metrics.record_handshake_rtt(rtt_ms);
 
-        // #1102: do NOT start our own KeepAlive-client (warm protocol) on an
-        // accepted connection — see the doc comment above. Only server
-        // (responder) protocols run here; liveness pinging is the
-        // OUTBOUND connection's job.
         self.start_server_protocols_on(addr, &mut conn)?;
+
+        // #1105: start our own KeepAlive-client on this ACCEPTED connection
+        // ONLY when it negotiated Duplex DataFlow — see the doc comment
+        // above. `Unidirectional` (e.g. `cardano-cli ping`, which hardcodes
+        // `InitiatorOnly`) must NEVER receive an unsolicited `MsgKeepAlive` —
+        // that peer's minimal client has no responder logic and #1102's
+        // reproduction showed it resets the connection.
+        if conn.negotiated_duplex {
+            let keepalive_fn = self.make_keepalive_task(addr);
+            conn.start_warm_protocols(keepalive_fn)?;
+        } else {
+            debug!(
+                %cid,
+                "accepted connection negotiated Unidirectional DataFlow \
+                 (peer declared InitiatorOnly) — not starting KeepAlive-client"
+            );
+        }
 
         let existing_to_peer = self.has_any_to(addr);
         if existing_to_peer {
@@ -5630,10 +5670,12 @@ mod tests {
         assert_eq!(lc.connection_count(), 1);
     }
 
-    /// #1102: an ACCEPTED (inbound) connection must never spawn its own
-    /// KeepAlive-client (warm) task, even when a real keepalive client
-    /// channel is present on the connection object (as production's
-    /// `PeerConnection::accept()` currently subscribes unconditionally).
+    /// #1102/#1105: an ACCEPTED (inbound) connection that negotiated
+    /// `Unidirectional` DataFlow must never spawn its own KeepAlive-client
+    /// (warm) task, even when a real keepalive client channel is present on
+    /// the connection object (as production's `PeerConnection::accept()`
+    /// subscribes it regardless of negotiation — see the doc comment on
+    /// `PeerConnection::negotiated_duplex`).
     ///
     /// Root cause reproduced live: dugite sent an unsolicited `MsgKeepAlive`
     /// toward `cardano-cli ping` ~2s after accept (the startup delay in
@@ -5641,25 +5683,33 @@ mod tests {
     /// role and has no responder — the connection reset, and
     /// `cardano-cli ping --count 3` failed with
     /// `PingClientKeepAliveProtocolFailure` on every run (`--count 2`
-    /// finishes inside the 2s window and never triggers it). Fixed by
-    /// deleting the `start_warm_protocols` call from
-    /// `register_inbound_connection` — liveness pinging is exclusively the
-    /// job of a genuine OUTBOUND connection (`register_warm_connection` /
-    /// `promote_to_warm`), which is unaffected by this test.
+    /// finishes inside the 2s window and never triggers it).
+    /// `cardano-ping` hardcodes `InitiatorOnly`
+    /// (`cardano-ping/src/Cardano/Network/Ping.hs`), which negotiates
+    /// `Unidirectional` — this is the case this test drives.
+    ///
+    /// #1102's ORIGINAL fix deleted the `start_warm_protocols` call
+    /// unconditionally, for every accepted connection; #1105 replaced that
+    /// with the DataFlow gate this test now proves — see
+    /// `register_inbound_connection_duplex_starts_keepalive_client` below
+    /// for the case #1102's fix wrongly also disabled.
     ///
     /// `fake_with_hot_channels` gives a WORKING `keepalive_client_channel`
     /// (its `.direction` field says `Outbound`, but `register_inbound_connection`
     /// never reads `conn.direction` — only whether client channels are
-    /// present decides whether a warm task can be started), so this test
-    /// would have gone RED under the pre-fix code: `start_warm_protocols`
-    /// would have succeeded and pushed `"keepalive"` onto `warm_tasks`.
+    /// present, and now also `conn.negotiated_duplex`, decide whether a warm
+    /// task can be started), so with `negotiated_duplex` forced to `false`
+    /// this test would go RED under the pre-#1105 unconditional-start code
+    /// path: `start_warm_protocols` would succeed and push `"keepalive"`
+    /// onto `warm_tasks` regardless of the flag.
     #[tokio::test]
-    async fn register_inbound_connection_never_starts_keepalive_client() {
+    async fn register_inbound_connection_unidirectional_never_starts_keepalive_client() {
         let mut lc = ConnectionLifecycleManager::new_for_test();
         let mut pm = NodePeerManager::new(crate::node::networking::PeerManagerConfig::default());
 
         let addr: SocketAddr = "10.0.0.12:3001".parse().unwrap();
-        let conn = PeerConnection::fake_with_hot_channels(addr);
+        let mut conn = PeerConnection::fake_with_hot_channels(addr);
+        conn.set_negotiated_duplex_for_test(false);
         let cid = ConnectionId {
             local: conn.local_addr,
             remote: addr,
@@ -5676,8 +5726,61 @@ mod tests {
             .expect("registered connection must be present");
         assert!(
             registered.warm_task_names_for_test().is_empty(),
-            "an accepted connection must not run a KeepAlive-client warm task; \
-             found: {:?}",
+            "a Unidirectional accepted connection must not run a KeepAlive-client \
+             warm task; found: {:?}",
+            registered.warm_task_names_for_test()
+        );
+    }
+
+    /// #1105: an ACCEPTED (inbound) connection that negotiated `Duplex`
+    /// DataFlow MUST start its own KeepAlive-client (warm) task, reusing the
+    /// SAME accepted connection — Haskell's "Awake" transition
+    /// (`Ouroboros.Network.ConnectionManager.Core`,
+    /// `InboundIdleState _ _ _ Duplex -> OutboundState Duplex`).
+    ///
+    /// This is the case #1102's original (too-broad) fix wrongly also
+    /// disabled: a genuinely duplex peer (dugite-relay accepting a connection
+    /// FROM cardano-bp, or dugite<->dugite) expects reciprocal `MsgKeepAlive`
+    /// traffic on the accepted connection, and never receiving it makes the
+    /// PEER's own KeepAlive-server time out
+    /// (`ExceededTimeLimit (KeepAlive) ClientHasAgency (SingClient)`) and
+    /// tear down the whole mux — reproduced live as ~90-112s reconnect churn
+    /// against cardano-bp in a devnet-validate gate run (see
+    /// `.claude/agent-memory/cardano-node-validator/project_1102_duplex_accept_keepalive_gap_2026_08_21.md`).
+    ///
+    /// Would have gone RED under #1102's shipped fix, which removed
+    /// `start_warm_protocols` unconditionally regardless of
+    /// `negotiated_duplex`.
+    #[tokio::test]
+    async fn register_inbound_connection_duplex_starts_keepalive_client() {
+        let mut lc = ConnectionLifecycleManager::new_for_test();
+        let mut pm = NodePeerManager::new(crate::node::networking::PeerManagerConfig::default());
+
+        let addr: SocketAddr = "10.0.0.13:3001".parse().unwrap();
+        let conn = PeerConnection::fake_with_hot_channels(addr);
+        assert!(
+            conn.negotiated_duplex,
+            "fake_with_hot_channels must default to Duplex for this test to mean anything"
+        );
+        let cid = ConnectionId {
+            local: conn.local_addr,
+            remote: addr,
+        };
+
+        let result = lc
+            .register_inbound_connection(addr, conn, 1.0, &mut pm)
+            .await;
+        assert!(result.is_ok(), "inbound registration failed: {result:?}");
+
+        let registered = lc
+            .connections
+            .get(&cid)
+            .expect("registered connection must be present");
+        assert_eq!(
+            registered.warm_task_names_for_test(),
+            vec!["keepalive"],
+            "a Duplex accepted connection must run a KeepAlive-client warm task \
+             on the SAME accepted connection; found: {:?}",
             registered.warm_task_names_for_test()
         );
     }
