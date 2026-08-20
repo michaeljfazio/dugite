@@ -95,6 +95,12 @@ enum Commands {
     TextView(commands::text_view::TextViewCmd),
     /// Compute hashes to pass to the various --*-hash arguments of commands
     Hash(commands::hash::HashCmd),
+    /// CIP-related formatting utilities (CIP-0129 governance identifiers)
+    CipFormat(commands::cip_format::CipFormatCmd),
+    /// Debug commands
+    Debug(commands::debug::DebugCmd),
+    /// Ouroboros N2N/N2C connectivity probe
+    Ping(commands::ping::PingCmd),
     /// Show the dugite-cli version
     Version,
 }
@@ -129,6 +135,9 @@ impl Commands {
             Commands::Genesis(cmd) => cmd.run(),
             Commands::TextView(cmd) => cmd.run(),
             Commands::Hash(cmd) => cmd.run(),
+            Commands::CipFormat(cmd) => cmd.run(),
+            Commands::Debug(cmd) => cmd.run(),
+            Commands::Ping(cmd) => cmd.run(),
             Commands::Version => {
                 // Mirrors cardano-cli's `version` subcommand (distinct from
                 // its `--version`/`-V` flag, though both print the same

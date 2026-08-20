@@ -59,6 +59,28 @@
 # ceremony tooling, Peras BLS keys (unreleased Dijkstra-era), or this
 # project's own devnet-bootstrap-supersedes-genesis-ceremony call. Those are
 # WONTFIX below, not silently dropped.
+#
+# #1091 (2026-08-21) closed 9 of the 22 entries #1008 deferred: all 4
+# cip-format cip-129 subcommands (CIP-0129 bech32 encoding, wired into
+# dugite-primitives/governance.rs and pinned against real cardano-cli
+# captures); `key convert-byron-genesis-vkey`/`convert-byron-key` (moved to
+# their correct top-level `key` location — the original entries assumed
+# these were naming-normalization aliases of `byron key convert-*`, which
+# investigation showed was WRONG: real cardano-cli's versions take different
+# input forms — inline Base64 vs a file, a 6-way key-type selector vs none —
+# and produce different envelope types entirely); `ping` (full N2N/N2C
+# connectivity probe, including two new `dugite-network::handshake`
+# functions for `-Q`/`--query-versions`' full version-table decode);
+# `debug check-node-configuration` and `debug transaction view` (the latter
+# replacing a hand-rolled partial CBOR walker with the SAME production
+# decoder the node's sync path uses); and `key verification-key`/
+# `non-extended-key` (generic key-envelope transforms needing no BIP-39/HD
+# infrastructure). `transaction signed-transaction` was found not to exist
+# in real cardano-cli 11.0.0.0 at all and moved to WONTFIX. The remaining 12
+# — `debug log-epoch-state`, six BIP-39/ITN/cardano-address key-conversion
+# commands, and three transaction fee/cost-estimation commands — stay
+# DEFERRED with reasons updated to reflect what #1091's investigation
+# actually found, not the original placeholder text.
 
 # ── Byron era (14) — WONTFIX ────────────────────────────────────────────────
 # Byron ceremony/legacy tx tooling. Dead on every live network (mainnet,
@@ -103,45 +125,54 @@ node issue-pop-BLS	1008	WONTFIX	Peras BLS proof-of-possession, Dijkstra-era and 
 node key-gen-BLS	1008	WONTFIX	Peras BLS key generation, Dijkstra-era and unreleased
 node key-hash-BLS	1008	WONTFIX	Peras BLS key hashing, Dijkstra-era and unreleased
 
-# ── cip-format (4) — DEFERRED ───────────────────────────────────────────────
-# CIP-0129 governance-identifier bech32 formatting utilities. Genuinely
-# useful (dugite already emits CIP-0129 identifiers elsewhere, e.g.
-# `governance drep id`), just not urgent enough to have been picked up yet.
-cip-format cip-129 committee-cold-key	1008	DEFERRED	CIP-0129 formatter, useful but not yet scheduled
-cip-format cip-129 committee-hot-key	1008	DEFERRED	CIP-0129 formatter, useful but not yet scheduled
-cip-format cip-129 drep	1008	DEFERRED	CIP-0129 formatter, useful but not yet scheduled
-cip-format cip-129 governance-action-id	1008	DEFERRED	CIP-0129 formatter, useful but not yet scheduled
+# ── debug (1) — DEFERRED ────────────────────────────────────────────────────
+# `check-node-configuration` and `transaction view` closed in #1091
+# (2026-08-21) — see the changelog note above. `log-epoch-state` needs a
+# live-node streaming loop (cardano-cli's own description: "connects to a
+# local node ... will not terminate") — a genuinely different shape of work
+# from the other two, deferred rather than rushed alongside them.
+debug log-epoch-state	1008	DEFERRED	Live-node epoch-state streaming logger (non-terminating); dugite-node's own metrics/logging cover some of the same need at the node level, not as a dugite-cli command
 
-# ── debug (3) — DEFERRED ────────────────────────────────────────────────────
-# Debugging/inspection tools, useful for operators but not urgent.
-debug check-node-configuration	1008	DEFERRED	Node config sanity-checker, useful but not yet scheduled
-debug log-epoch-state	1008	DEFERRED	Epoch-state cross-validation dump; dugite-node's own metrics/logging cover some of the same need at the node level, not as a dugite-cli command
-debug transaction view	1008	DEFERRED	Offline tx pretty-printer, useful but not yet scheduled (note: dugite-cli's own `transaction view` already exists as a SUPERSET entry — this is cardano-cli's `debug`-namespaced sibling with a possibly different output shape)
+# ── key conversion (6) — DEFERRED ───────────────────────────────────────────
+# `verification-key` and `non-extended-key` closed in #1091 (2026-08-21) —
+# both are GENERIC key-envelope transforms needing no BIP-39/HD-derivation
+# infrastructure (verified live against real cardano-cli 11.0.0.0 for
+# `verification-key`; `non-extended-key`'s output shape is inferred from
+# cardano-cli's own naming convention, not independently re-verified, since
+# producing a real extended verification key needs the BIP-32 derivation
+# tooling below). The remaining six all need real BIP-39/Ed25519-BIP32/ITN
+# legacy-format crypto this repo has no implementation of anywhere — a
+# genuine crypto feature wave, not a thin CLI shim, so still deferred.
+key convert-cardano-address-key	1008	DEFERRED	cardano-address key-format import, needs Ed25519-BIP32 (CIP-1852-style) key handling this repo does not implement anywhere; genuine crypto feature, not a shim
+key convert-itn-bip32-key	1008	DEFERRED	ITN (Incentivized Testnet) legacy Ed25519Bip32 key import, needs the same BIP32 infrastructure as convert-cardano-address-key, plus ITN's own legacy wire format
+key convert-itn-extended-key	1008	DEFERRED	ITN legacy Ed25519Extended key import, needs ITN's legacy wire format (distinct from the current Byron/Shelley extended-key shapes this repo already handles)
+key convert-itn-key	1008	DEFERRED	ITN legacy non-extended Ed25519 key import, needs ITN's legacy wire format
+key derive-from-mnemonic	1008	DEFERRED	BIP-39 mnemonic to Ed25519-BIP32 extended key derivation (CIP-3/CIP-1852), needs a BIP-39 wordlist/checksum implementation and HD derivation this repo has nowhere else
+key generate-mnemonic	1008	DEFERRED	BIP-39 mnemonic generation, needs the same BIP-39 wordlist/checksum/entropy infrastructure as derive-from-mnemonic
 
-# ── key conversion (10) — DEFERRED ──────────────────────────────────────────
-# ITN/cardano-address/mnemonic import tooling, plus two naming-normalization
-# entries (see note). Useful wallet-migration tooling, not urgent.
-key convert-byron-genesis-vkey	1008	DEFERRED	Already implemented at `byron key convert-byron-genesis-vkey` (naming-normalization gap, not a true absence per #1008's own limitations note) — a root-level alias is low priority
-key convert-byron-key	1008	DEFERRED	Already implemented at `byron key convert-byron-key` (naming-normalization gap, not a true absence) — a root-level alias is low priority
-key convert-cardano-address-key	1008	DEFERRED	cardano-address key-format import, useful but not yet scheduled
-key convert-itn-bip32-key	1008	DEFERRED	ITN (Incentivized Testnet) legacy key import, useful but not yet scheduled
-key convert-itn-extended-key	1008	DEFERRED	ITN legacy extended-key import, useful but not yet scheduled
-key convert-itn-key	1008	DEFERRED	ITN legacy key import, useful but not yet scheduled
-key derive-from-mnemonic	1008	DEFERRED	BIP-39 mnemonic key derivation, useful wallet tooling, not yet scheduled
-key generate-mnemonic	1008	DEFERRED	BIP-39 mnemonic generation, useful wallet tooling, not yet scheduled
-key non-extended-key	1008	DEFERRED	Extended-to-non-extended key conversion, useful but not yet scheduled
-key verification-key	1008	DEFERRED	Signing-to-verification key derivation utility, useful but not yet scheduled
+# NOTE: `version` was closed in #1008's FIRST pass (2026-08-05); `ping`,
+# `debug check-node-configuration`, `debug transaction view`, `key
+# verification-key`, and `key non-extended-key` were closed in #1091
+# (2026-08-21) — see the changelog notes above. All are intentionally absent
+# from this file now.
 
-# ── Bare utility (2) ─────────────────────────────────────────────────────────
-ping	1008	DEFERRED	General Ouroboros N2N/N2C connectivity probe, low value, defer
-# NOTE: `version` was closed in #1008's FIRST pass (2026-08-05) — see the
-# changelog note above. It is intentionally absent from this file now.
-
-# ── transaction (4) — DEFERRED ──────────────────────────────────────────────
+# ── transaction (3) — DEFERRED ──────────────────────────────────────────────
 # Fee/cost-estimation tooling. Genuinely more involved than a thin shim
 # (needs offline fee-model + Plutus cost-model plumbing), so deferred rather
-# than rushed.
-transaction build-estimate	1008	DEFERRED	Offline fee estimation without a live node, more involved than a shim, defer
-transaction calculate-plutus-script-cost offline	1008	DEFERRED	Offline Plutus execution-cost calculator, more involved than a shim, defer
-transaction calculate-plutus-script-cost online	1008	DEFERRED	Online Plutus execution-cost calculator, more involved than a shim, defer
-transaction signed-transaction	1008	DEFERRED	Signed-transaction inspection/assembly command, more involved than a shim, defer
+# than rushed. `signed-transaction` moved to WONTFIX below — see its entry
+# for why.
+transaction build-estimate	1008	DEFERRED	Offline fee estimation without a live node — the full `transaction build-raw` flag surface (~30 option groups: Plutus refscripts, certs, withdrawals, votes, proposals) reused with a protocol-params-file instead of a live node; genuinely a near-full offline tx builder, not a shim, defer
+transaction calculate-plutus-script-cost offline	1008	DEFERRED	Offline Plutus execution-cost calculator; dugite has the CEK machine + cost models this needs, but still requires plumbing the full transaction-context/UTxO-set input surface `--tx-file`/`--protocol-params-file`/utxo args expect, defer
+transaction calculate-plutus-script-cost online	1008	DEFERRED	Online Plutus execution-cost calculator (same evaluator as offline, sourced from a live node instead of manual inputs), defer
+
+# ── transaction (1) — WONTFIX ───────────────────────────────────────────────
+# `transaction signed-transaction` does NOT EXIST in real cardano-cli
+# 11.0.0.0 — verified by enumerating every `cardano-cli latest transaction`
+# subcommand (`build-raw | build | build-estimate | sign | witness | assemble
+# | submit | policyid | calculate-min-fee | calculate-min-required-utxo |
+# calculate-plutus-script-cost | hash-script-data | txid`) and every `debug
+# transaction` subcommand (`view` only): no `signed-transaction` anywhere.
+# This entry appears to have been a stale/incorrect artifact of the original
+# #1008 surface-parity scrape, not a real cardano-cli 11 gap — there is
+# nothing to implement.
+transaction signed-transaction	1008	WONTFIX	Does not exist in real cardano-cli 11.0.0.0 (verified by enumerating its full `transaction`/`debug transaction` subcommand tree, #1091) — likely a stale #1008 scrape artifact, not a real gap

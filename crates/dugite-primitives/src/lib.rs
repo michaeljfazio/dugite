@@ -19,9 +19,11 @@ pub use address::*;
 pub use block::*;
 pub use era::Era;
 pub use governance::{
-    encode_cc_cold, encode_cc_cold_from_cbor, encode_cc_cold_key, encode_cc_cold_script,
-    encode_cc_hot, encode_cc_hot_from_cbor, encode_cc_hot_key, encode_cc_hot_script, encode_drep,
-    encode_drep_from_cbor, encode_drep_key, encode_drep_script, CredKind, GovernanceIdError,
+    encode_cc_cold, encode_cc_cold_cip129, encode_cc_cold_from_cbor, encode_cc_cold_key,
+    encode_cc_cold_script, encode_cc_hot, encode_cc_hot_cip129, encode_cc_hot_from_cbor,
+    encode_cc_hot_key, encode_cc_hot_script, encode_drep, encode_drep_cip129,
+    encode_drep_from_cbor, encode_drep_key, encode_drep_script, encode_governance_action_id_cip129,
+    CredKind, GovernanceIdError,
 };
 pub use hash::*;
 pub use mempool::*;
