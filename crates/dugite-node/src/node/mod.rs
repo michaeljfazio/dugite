@@ -1168,6 +1168,9 @@ impl Node {
         let mut byron_slot_duration_ms: u64 = 20_000; // default 20s, overridden by genesis
         let mut byron_genesis_file_hash: Option<dugite_primitives::hash::Hash32> = None;
         let mut security_param_k: usize = dugite_storage::chain_db::DEFAULT_SECURITY_PARAM_K;
+        // #1084: keep the parsed genesis around (not just its derived UTxO
+        // list) so `init_fresh_ledger` can seed Byron's UPI/DI state from it.
+        let mut byron_genesis_loaded: Option<ByronGenesis> = None;
         let byron_genesis_utxos: Vec<(Vec<u8>, u64)> =
             if let Some(ref genesis_path) = args.config.byron_genesis_file {
                 let genesis_path = config_dir.join(genesis_path);
@@ -1187,7 +1190,10 @@ impl Node {
                             "Byron genesis loaded",
                         );
                         byron_genesis_file_hash = Some(hash);
-                        utxos.into_iter().map(|e| (e.address, e.lovelace)).collect()
+                        let entries: Vec<(Vec<u8>, u64)> =
+                            utxos.into_iter().map(|e| (e.address, e.lovelace)).collect();
+                        byron_genesis_loaded = Some(genesis);
+                        entries
                     }
                     Err(e) => {
                         warn!("Failed to load Byron genesis: {e}");
@@ -1817,6 +1823,7 @@ impl Node {
                                 shelley_genesis.as_ref(),
                                 shelley_genesis_hash,
                                 &byron_genesis_utxos,
+                                byron_genesis_loaded.as_ref(),
                                 network_magic,
                                 byron_epoch_length,
                                 byron_slot_duration_ms,
@@ -1832,6 +1839,7 @@ impl Node {
                         shelley_genesis.as_ref(),
                         shelley_genesis_hash,
                         &byron_genesis_utxos,
+                        byron_genesis_loaded.as_ref(),
                         network_magic,
                         byron_epoch_length,
                         byron_slot_duration_ms,
@@ -1847,6 +1855,7 @@ impl Node {
                 shelley_genesis.as_ref(),
                 shelley_genesis_hash,
                 &byron_genesis_utxos,
+                byron_genesis_loaded.as_ref(),
                 network_magic,
                 byron_epoch_length,
                 byron_slot_duration_ms,
@@ -9344,6 +9353,7 @@ impl Node {
         shelley_genesis: Option<&ShelleyGenesis>,
         shelley_genesis_hash: Option<dugite_primitives::Hash32>,
         byron_genesis_utxos: &[(Vec<u8>, u64)],
+        byron_genesis: Option<&ByronGenesis>,
         network_magic: u64,
         byron_epoch_length: u64,
         byron_slot_duration_ms: u64,
@@ -9381,6 +9391,37 @@ impl Node {
         }
         if !byron_genesis_utxos.is_empty() {
             ledger.seed_genesis_utxos(byron_genesis_utxos);
+        }
+        // #1084: seed Byron's UPI.State (update-proposal system) + DI.State
+        // (heavyweight delegation), mirroring `UPI.initialState` +
+        // `DI.initialState`. `None` on a Shelley-from-genesis network (no
+        // Byron genesis file configured) — `ledger.byron` stays
+        // `ByronSubState::default()`.
+        if let Some(bg) = byron_genesis {
+            match bg.block_version_data.to_protocol_parameters() {
+                Some(params) => {
+                    let allowed_delegators = bg.allowed_delegators();
+                    let heavy_delegation = bg.heavy_delegation_pairs();
+                    tracing::debug!(
+                        allowed_delegators = allowed_delegators.len(),
+                        heavy_delegation = heavy_delegation.len(),
+                        "Seeding Byron UPI/DI state from genesis"
+                    );
+                    ledger.byron = dugite_ledger::eras::byron::seed_byron_genesis(
+                        allowed_delegators,
+                        &heavy_delegation,
+                        params,
+                    );
+                }
+                None => {
+                    tracing::warn!(
+                        "Byron genesis blockVersionData could not be parsed into protocol \
+                         parameters (issue #1084) — Byron UPI/DI state will start empty; \
+                         byronProtocolParams/byronDelegation dump fields will be wrong for \
+                         this run"
+                    );
+                }
+            }
         }
 
         // Seed Shelley genesis initial funds and staking (used by custom devnets;
@@ -11265,6 +11306,7 @@ mod tests {
             transactions: vec![],
             era,
             raw_cbor: None,
+            byron: None,
         }
     }
 

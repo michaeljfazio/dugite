@@ -160,6 +160,13 @@ pub struct LedgerStateSnapshot {
     /// historical bootstrap-era queue state that cannot be reconstructed
     /// from the restored tip.
     pub future_gen_delegs: BTreeMap<(u64, Hash28), (Hash28, Hash32)>,
+    /// Byron's `UPI.State` + `DI.State` (issue #1084). Already backed
+    /// end-to-end by `BTreeMap`/`BTreeSet` on the LIVE type (no `*Wire`
+    /// mirror needed — see `crate::eras::byron::ByronSubState`), so this is
+    /// a direct clone, not a re-collect. Default-empty (and therefore
+    /// zero-byte on the wire — bincode writes nothing for an empty
+    /// collection) for any network with no Byron era.
+    pub byron: crate::eras::byron::ByronSubState,
     /// Fees collected in the current epoch
     pub epoch_fees: Lovelace,
     /// Number of blocks produced by each pool in the current epoch.
@@ -458,6 +465,7 @@ impl From<&super::LedgerState> for LedgerStateSnapshot {
             genesis_hash: s.genesis_hash,
             genesis_delegates: s.genesis_delegates.iter().map(|(k, v)| (*k, *v)).collect(),
             future_gen_delegs: s.future_gen_delegs.iter().map(|(k, v)| (*k, *v)).collect(),
+            byron: s.byron.clone(),
             update_quorum: s.update_quorum,
             node_network: s.node_network,
             randomness_stabilisation_window: s.randomness_stabilisation_window,
@@ -581,6 +589,7 @@ impl From<LedgerStateSnapshot> for super::LedgerState {
             genesis_hash: s.genesis_hash,
             genesis_delegates: s.genesis_delegates.into_iter().collect(),
             future_gen_delegs: s.future_gen_delegs.into_iter().collect(),
+            byron: s.byron,
             update_quorum: s.update_quorum,
             node_network: s.node_network,
             randomness_stabilisation_window: s.randomness_stabilisation_window,
@@ -1419,6 +1428,7 @@ mod tests {
             rupd_monetary,
             rupd_snapshot,
             pending_avvm_return,
+            byron,
         } = &snap;
 
         // ── fields that are NOT serialized ──────────────────────────────
@@ -1466,6 +1476,33 @@ mod tests {
             stake_key_deposits, "stake_key_deposits";
             pool_deposits, "pool_deposits";
             stake_distribution.stake_map, "stake_distribution.stake_map";
+        );
+        // #1084: Byron's substate. Already `BTreeMap`/`BTreeSet` on the LIVE
+        // type (no `*Wire` mirror), so the same 2+-entry convention applies
+        // directly to `byron`'s nested maps.
+        at_least_two!(
+            byron.delegation.delegation_map, "byron.delegation.delegation_map";
+            byron.delegation.delegation_map_rev, "byron.delegation.delegation_map_rev";
+            byron.delegation.delegation_slots, "byron.delegation.delegation_slots";
+            byron.delegation.key_epoch_delegations, "byron.delegation.key_epoch_delegations";
+            byron.allowed_delegators, "byron.allowed_delegators";
+            byron.update.registered_protocol_update_proposals,
+                "byron.update.registered_protocol_update_proposals";
+            byron.update.registered_software_update_proposals,
+                "byron.update.registered_software_update_proposals";
+            byron.update.confirmed_proposals, "byron.update.confirmed_proposals";
+            byron.update.proposal_votes, "byron.update.proposal_votes";
+            byron.update.registered_endorsements, "byron.update.registered_endorsements";
+            byron.update.proposal_registration_slot, "byron.update.proposal_registration_slot";
+            byron.update.app_versions, "byron.update.app_versions";
+        );
+        assert!(
+            byron.delegation.scheduled.len() >= 2,
+            "byron.delegation.scheduled has fewer than 2 entries"
+        );
+        assert!(
+            byron.update.candidate_protocol_updates.len() >= 2,
+            "byron.update.candidate_protocol_updates has fewer than 2 entries"
         );
         // `pending_pp_updates`/`future_pp_updates` are `BTreeMap<EpochNo,
         // Vec<(Hash32, ProtocolParamUpdate)>>` — already ordered at both

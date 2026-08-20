@@ -117,6 +117,7 @@ fn build_era_block(
         transactions: vec![tx],
         era,
         raw_cbor: None,
+        byron: None,
     };
     (block, input)
 }

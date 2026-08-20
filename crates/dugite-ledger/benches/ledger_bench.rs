@@ -959,6 +959,7 @@ fn make_bench_block(
         transactions: txs,
         era,
         raw_cbor: None,
+        byron: None,
     }
 }
 

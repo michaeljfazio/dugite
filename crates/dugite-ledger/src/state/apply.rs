@@ -404,6 +404,14 @@ impl LedgerState {
         // import), process each intermediate epoch transition individually.
         // Dispatched through EraRulesImpl for the block's era (post-HFC).
         let block_epoch = EpochNo(self.epoch_of_slot(block.slot().0));
+        // #1084: captured BEFORE the while loop below mutates `self.epoch`.
+        // Byron's UPIEC arm (`upiec_epoch_transition`) must evaluate against
+        // the FINAL epoch this tick reaches (`block_epoch`), matching
+        // upstream's `applyChainTick` — which calls `epochTransition` ONCE
+        // per tick with `nextEpoch = slotNumberEpoch slot`, never once per
+        // intermediate epoch the catch-up loop below steps through (design
+        // doc §2.2, open question §6a).
+        let byron_tick_prev_epoch = self.epoch;
 
         // #977: `solidifyNextEpochPParams` runs FIRST, before the boundary or
         // the prediction — `validatingTickTransition` is
@@ -753,6 +761,26 @@ impl LedgerState {
         // multi-asset. Process via dedicated Byron path with per-tx sequential
         // application (earlier tx outputs visible to later txs in the same block).
         if block.era == Era::Byron {
+            // #1084: the Byron consensus TICK — UPIEC (epoch transition) +
+            // the delegation tick — runs BEFORE the block body, mirroring
+            // `Cardano.Chain.Byron.API.Validation::applyChainTick`. EBBs flow
+            // through this branch too (empty `transactions`, `block.byron ==
+            // None`), and the tick still applies to them: `applyChainTick`
+            // runs at every block's slot regardless of body shape.
+            if byron_tick_prev_epoch < block_epoch {
+                crate::eras::byron::upiec_epoch_transition(
+                    &mut self.byron.update,
+                    block_epoch.0,
+                    self.byron_epoch_length,
+                    self.security_param,
+                );
+            }
+            crate::eras::byron::tick_delegation(
+                &mut self.byron.delegation,
+                block.slot().0,
+                block_epoch.0,
+            );
+
             // Byron fee policy is a network-wide genesis constant
             // (a + ceiling(size*b), b an exact rational), not the Shelley integer
             // params carried in `protocol_params`. See `ByronFeePolicy`.
@@ -813,6 +841,35 @@ impl LedgerState {
                 total_byron_fees.0 = total_byron_fees.0.saturating_add(effect.fees.0);
             }
             self.utxo.epoch_fees += total_byron_fees;
+
+            // #1084: delegation payload, then update payload — matching
+            // `Block/Validation.hs:362-448`'s `updateBody` order (steps 2 and
+            // 4; UTxO is step 3, already applied above). `None` for an EBB
+            // (no body). The update payload's resolver reads the delegation
+            // map AS OF the tick (pre-payload) — design doc §2.4's ordering
+            // subtlety, #1074's lesson in miniature: `updateEnv`'s
+            // `delegationMap` is bound from the `BodyState`'s ORIGINAL
+            // binding, not the one certificates in THIS block produce.
+            if let Some(aux) = block.byron.as_ref() {
+                let delegation_map_rev_pre_payload =
+                    self.byron.delegation.delegation_map_rev.clone();
+                crate::eras::byron::apply_delegation_payload(
+                    &mut self.byron.delegation,
+                    &self.byron.allowed_delegators,
+                    aux,
+                    block.slot().0,
+                    block_epoch.0,
+                    self.security_param,
+                );
+                crate::eras::byron::apply_update_payload(
+                    &mut self.byron.update,
+                    &self.byron.allowed_delegators,
+                    &delegation_map_rev_pre_payload,
+                    aux,
+                    block.slot().0,
+                    self.security_param,
+                );
+            }
 
             // Track block production (Byron uses OBFT, not VRF)
             if !block.header.issuer_vkey.is_empty() {
@@ -2217,6 +2274,15 @@ impl LedgerState {
         // `RewardSnapShot`, bounded by pool/credential counts and far smaller
         // than the per-block fold pulse itself.
         let rupd_snapshot_before = self.epochs.rupd_snapshot.clone();
+        // #1084: pre-block content clone of the Byron substate, mirroring
+        // `genesis_delegates_before`. `None` for every non-Byron block in
+        // effect (the substate is inert past the Byron era, so the
+        // content-diff below is always `None` then) — the clone cost is
+        // real only while a Byron chain is being replayed, and the whole
+        // substate is a few KB at most (7 delegation pairs on mainnet, a
+        // handful of proposal/vote/endorsement entries during a real
+        // proposal window).
+        let byron_before = self.byron.clone();
 
         // Apply the block (all state mutations happen here). In deferred mode
         // this returns the captured Phase-2 work items without draining them.
@@ -2315,6 +2381,10 @@ impl LedgerState {
         // block.
         if self.future_gen_delegs != future_gen_delegs_before {
             delta.future_gen_delegs_snapshot = Some(self.future_gen_delegs.clone());
+        }
+        // #1084: same content-diffed capture for the Byron substate.
+        if self.byron != byron_before {
+            delta.byron_snapshot = Some(self.byron.clone());
         }
         // pending_pp_updates / future_pp_updates hold only currently-active
         // proposals (a handful of entries at most) — unconditional capture is
@@ -2560,6 +2630,7 @@ mod tests {
             transactions: txs,
             era,
             raw_cbor: None,
+            byron: None,
         }
     }
 

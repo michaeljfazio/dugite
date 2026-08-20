@@ -649,47 +649,21 @@ async fn run_dump_snapshot(args: DumpSnapshotArgs) -> Result<()> {
                                                   // Byron replay and are correctly purged by `returnRedeemAddrsToReserves` at the
                                                   // Shelley→Allegra boundary (epoch 236 on mainnet, ~299M ADA returned to reserves).
     let mut byron_genesis_utxos: Vec<(Vec<u8>, u64)> = Vec::new();
-    // Byron's on-chain protocol parameters, DERIVED from genesis rather than
-    // pinned. `eras/byron.rs`'s `ByronFeePolicy` still hardcodes mainnet's
-    // `a = 155381` / `b = 21973/500` on the VALIDATION path; these are the same
-    // values read from the file, emitted in the dump so the comparison against
-    // cardano-streamer's `byronProtocolParams` proves they agree BEFORE the
-    // consensus path is switched over to them. Proving first, then swapping, is
-    // the order that avoids putting an unverified value on a consensus path.
-    let mut byron_pparams: Option<serde_json::Value> = None;
+    // #1084: kept around (not just the derived UTxO list) so Byron's UPI/DI
+    // state can be seeded from it below, once `ledger` exists. This RETIRES
+    // the old genesis-derived `byron_pparams` JSON threading that used to
+    // live here (main.rs :659-692 pre-#1084, plus its two downstream
+    // consumers): the state is now the source of `byronProtocolParams`, and
+    // the genesis values reach it via `seed_byron_genesis` the same way
+    // every other genesis-derived ledger field is seeded, rather than via a
+    // side channel that bypassed the state entirely.
+    let mut byron_genesis_loaded: Option<genesis::ByronGenesis> = None;
     if let Some(ref genesis_path) = node_config.byron_genesis_file {
         let genesis_path = config_dir.join(genesis_path);
         if let Ok((genesis, _hash)) = genesis::ByronGenesis::load_with_hash(&genesis_path) {
             let k = genesis.security_param();
             byron_epoch_length = 10 * k;
             byron_slot_duration_ms = genesis.slot_duration_ms();
-            let bvd = &genesis.block_version_data;
-            // ONLY the fee policy, and only because dugite genuinely derives it.
-            //
-            // `maxBlockSize`, `maxTxSize` and `scriptVersion` are ADOPTED
-            // parameters that Byron's update system changes on-chain — measured
-            // at mainnet Byron epoch 100, the oracle reports 32768 / 8192 where
-            // genesis says 2000000 / 4096. dugite models no Byron update system,
-            // so it HAS no adopted value for them.
-            //
-            // Emitting the genesis figure under a name that means "adopted"
-            // would report a false DIVERGENCE — "dugite has a value and it is
-            // wrong" — when the truth is a GAP: dugite has no value at all. The
-            // two carry different meanings to whoever reads the report, and the
-            // gap is the one that names the real work (Byron `UPI.State`).
-            //
-            // The fee policy is emitted because it IS derived here. Note the
-            // consensus path still uses `ByronFeePolicy::canonical()`; the two
-            // agree on mainnet, which is what this comparison confirms before
-            // validation is moved onto the derived value.
-            byron_pparams = bvd.tx_fee_policy.to_exact().map(|(summand, (num, den))| {
-                serde_json::json!({
-                    "txFeePolicy": {
-                        "summand": summand,
-                        "multiplier": { "numerator": num, "denominator": den },
-                    },
-                })
-            });
             let utxos = genesis.initial_utxos();
             let total: u64 = utxos.iter().map(|e| e.lovelace).sum();
             info!(
@@ -701,6 +675,7 @@ async fn run_dump_snapshot(args: DumpSnapshotArgs) -> Result<()> {
                 "Byron genesis loaded"
             );
             byron_genesis_utxos = utxos.into_iter().map(|e| (e.address, e.lovelace)).collect();
+            byron_genesis_loaded = Some(genesis);
         }
     }
 
@@ -870,6 +845,33 @@ async fn run_dump_snapshot(args: DumpSnapshotArgs) -> Result<()> {
         }
     }
 
+    // #1084: seed Byron's UPI.State + DI.State, mirroring the running-node
+    // path in `Node::init_fresh_ledger`.
+    if let Some(ref bg) = byron_genesis_loaded {
+        match bg.block_version_data.to_protocol_parameters() {
+            Some(params) => {
+                let allowed_delegators = bg.allowed_delegators();
+                let heavy_delegation = bg.heavy_delegation_pairs();
+                info!(
+                    allowed_delegators = allowed_delegators.len(),
+                    heavy_delegation = heavy_delegation.len(),
+                    "Seeding Byron UPI/DI state from genesis"
+                );
+                ledger.byron = dugite_ledger::eras::byron::seed_byron_genesis(
+                    allowed_delegators,
+                    &heavy_delegation,
+                    params,
+                );
+            }
+            None => {
+                tracing::warn!(
+                    "Byron genesis blockVersionData could not be parsed into protocol \
+                     parameters (issue #1084) — Byron UPI/DI state will start empty"
+                );
+            }
+        }
+    }
+
     // Seed the nonce state machine from the Shelley genesis hash (matching
     // the running node path in Node::init_ledger_state). Without this,
     // evolving/candidate/epoch nonces all start as ZERO and the entire
@@ -1003,7 +1005,6 @@ async fn run_dump_snapshot(args: DumpSnapshotArgs) -> Result<()> {
                 epoch_fees,
                 max_lovelace_supply,
                 prev_rupd_next.clone(),
-                byron_pparams.clone(),
             );
             // Thread this epoch's `rupdNext` forward to become the next
             // epoch's `rupdApplied`, mirroring upstream's `(json, rupdData)`
@@ -1668,10 +1669,6 @@ fn build_epoch_snapshot(
     // informative and would no longer match the oracle, manufacturing
     // divergences that are definitional.
     prev_rupd_next: serde_json::Value,
-    // Byron's on-chain protocol parameters, DERIVED from the Byron genesis file.
-    // `None` when the config declares no Byron genesis, i.e. a
-    // Shelley-from-genesis chain that has no Byron era to describe.
-    byron_pparams: Option<serde_json::Value>,
 ) -> serde_json::Value {
     // `epochFees` must be the LEDGER's `ssFee`, not a fee total the dump driver
     // accumulated for itself.
@@ -2300,24 +2297,38 @@ fn build_epoch_snapshot(
         serde_json::Value::Null
     };
 
-    // Byron-only, matching the oracle's key set for the era. `lastSlot` and the
-    // genesis delegation count are Byron ledger state; `byronProtocolParams` is
-    // the genesis-derived fee policy and size limits.
-    let (byron_last_slot, byron_delegation, byron_protocol_params) =
+    // Byron-only, matching the oracle's key set for the era. All four are now
+    // read directly off `ledger.byron` (issue #1084) — `UPI.State` +
+    // `DI.State`, seeded from genesis at startup and (for the protocol
+    // params) moved by Byron's on-chain update system thereafter, exactly
+    // like every other ledger-state dump field. This RETIRES the old
+    // genesis-only `byron_pparams` threading: `byronDelegation` and
+    // `byronUpdateEpoch` were unconditional schema gaps before #1084 (dugite
+    // tracked neither), and `byronProtocolParams` used to report the GENESIS
+    // values under a name that means ADOPTED — see the design doc §3.5.
+    let (byron_last_slot, byron_update_epoch, byron_delegation, byron_protocol_params) =
         if ledger.era == dugite_primitives::era::Era::Byron {
+            let adopted = &ledger.byron.update.adopted_protocol_parameters;
             (
                 serde_json::json!(ledger.tip.point.slot().map(|s| s.0).unwrap_or(0)),
-                // NOT `genesis_delegates.len()`. That map is loaded from the
-                // SHELLEY genesis and is empty for all 207 Byron epochs, so
-                // emitting its length reports `0` where the oracle has Byron's
-                // 7 heavy delegates — a false divergence claiming dugite counted
-                // zero, when dugite does not track Byron's delegation map at
-                // all. Null reports the truth: no value here yet.
-                serde_json::Value::Null,
-                byron_pparams.unwrap_or(serde_json::Value::Null),
+                serde_json::json!(ledger.byron.update.current_epoch),
+                serde_json::json!({ "count": ledger.byron.delegation.delegation_map.len() }),
+                serde_json::json!({
+                    "scriptVersion": adopted.script_version,
+                    "maxBlockSize": adopted.max_block_size,
+                    "maxTxSize": adopted.max_tx_size,
+                    "txFeePolicy": {
+                        "summand": adopted.tx_fee_policy.0,
+                        "multiplier": {
+                            "numerator": adopted.tx_fee_policy.1.0,
+                            "denominator": adopted.tx_fee_policy.1.1,
+                        },
+                    },
+                }),
             )
         } else {
             (
+                serde_json::Value::Null,
                 serde_json::Value::Null,
                 serde_json::Value::Null,
                 serde_json::Value::Null,
@@ -2328,6 +2339,7 @@ fn build_epoch_snapshot(
         "epoch": epoch,
         "utxo": byron_utxo,
         "lastSlot": byron_last_slot,
+        "byronUpdateEpoch": byron_update_epoch,
         "byronDelegation": byron_delegation,
         "byronProtocolParams": byron_protocol_params,
         "commonProtocolParams": common_protocol_params,

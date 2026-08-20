@@ -1626,6 +1626,7 @@ mod tests {
             header: make_block_header(Hash32::ZERO, vec![]),
             transactions: vec![],
             raw_cbor: None,
+            byron: None,
         };
 
         assert!(rules.validate_block_body(&block, &ctx, &utxo).is_ok());

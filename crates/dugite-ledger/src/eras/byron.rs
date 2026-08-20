@@ -10,15 +10,18 @@
 ///
 /// Byron transactions always succeed when structurally valid — there is no
 /// `is_valid` flag and no collateral mechanism.
-use std::collections::HashSet;
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::sync::Arc;
 
-use dugite_primitives::block::{Block, BlockHeader};
+use dugite_primitives::block::{
+    Block, BlockHeader, ByronBlockAux, ByronParamsUpdate, ByronUpdVote,
+};
 use dugite_primitives::era::Era;
-use dugite_primitives::hash::{blake2b_224, Hash28};
+use dugite_primitives::hash::{blake2b_224, Hash28, Hash32};
 use dugite_primitives::time::EpochNo;
 use dugite_primitives::transaction::{Transaction, TransactionInput, TransactionOutput};
 use dugite_primitives::value::Lovelace;
+use sha3::Digest;
 
 use crate::state::substates::*;
 use crate::state::{BlockValidationMode, LedgerError};
@@ -716,6 +719,889 @@ impl EraRules for ByronRules {
 
 // Keep the old name as an alias for backward compatibility during migration.
 pub type ByronLedger = ByronRules;
+
+// ============================================================================
+// Byron delegation + update-proposal state (#1084)
+// ============================================================================
+//
+// Models `Cardano.Chain.Delegation.Interface::State` (`DI.State`) and
+// `Cardano.Chain.Update.Validation.Interface::State` (`UPI.State`) — the two
+// `ChainValidationState` fields Byron carries beyond the UTxO set already
+// modelled elsewhere in this file. Grounded in `cardano-ledger-byron`
+// 1.2.0.0; see
+// `docs/superpowers/specs/2026-08-20-byron-delegation-update-state-design.md`
+// for the full derivation.
+//
+// Deliberately NOT threaded through the `EraRules` trait: `genesis_delegates`
+// / `future_gen_delegs` (Shelley's analogous top-level `LedgerState` fields)
+// are handled the same way — dedicated functions called directly from
+// `state/apply.rs`'s Byron branch — rather than widening every era's
+// `process_epoch_transition` signature (Shelley/Alonzo/Babbage/Conway/
+// Dijkstra all implement it) for a field only Byron ever touches.
+
+/// `Cardano.Chain.Delegation.Scheduling::ScheduledDelegation` — one
+/// heavyweight delegation certificate awaiting activation.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ScheduledDelegation {
+    pub slot: u64,
+    pub delegator: Hash28,
+    pub delegate: Hash28,
+}
+
+/// `Cardano.Chain.Delegation.Interface::State` — scheduling + activation
+/// halves combined (Scheduling.hs + Activation.hs).
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ByronDelegationState {
+    /// Certificates scheduled but not yet activated, in append (`Seq`) order.
+    pub scheduled: Vec<ScheduledDelegation>,
+    /// `(epoch, issuer)` pairs a certificate has already been scheduled for —
+    /// enforces "one certificate per (epoch, issuer)".
+    pub key_epoch_delegations: BTreeSet<(u64, Hash28)>,
+    /// The active delegation `Bimap`, forward half: delegator -> delegate.
+    pub delegation_map: BTreeMap<Hash28, Hash28>,
+    /// The active delegation `Bimap`, reverse half: delegate -> delegator.
+    /// Both directions are load-bearing: `lookupR` resolves votes and
+    /// endorsements to their genesis key, `notMemberR` gates activation.
+    pub delegation_map_rev: BTreeMap<Hash28, Hash28>,
+    /// The activation slot most recently accepted for each delegator —
+    /// enforces `prevDelegationSlot < slot`.
+    pub delegation_slots: BTreeMap<Hash28, u64>,
+}
+
+/// One entry of `UPI.State.candidateProtocolUpdates` — a version that has
+/// been endorsed by enough genesis keys, confirmed, and stable, and is
+/// awaiting adoption at the next epoch boundary that clears its own
+/// stability window.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ByronCandidate {
+    /// The slot at which this candidate was CREATED (`cpuSlot`) — adoption
+    /// requires `cpuSlot + 4k <= epochFirstSlot`.
+    pub slot: u64,
+    pub protocol_version: (u16, u16, u8),
+    pub protocol_parameters: ByronProtocolParameters,
+}
+
+/// Byron's full ADOPTED protocol-parameter record — `Update.ProtocolParameters`.
+/// All 14 fields; see `ByronParamsUpdate` (dugite-primitives) for the sparse
+/// wire counterpart this overlays onto.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ByronProtocolParameters {
+    pub script_version: u16,
+    pub slot_duration: u64,
+    pub max_block_size: u64,
+    pub max_header_size: u64,
+    pub max_tx_size: u64,
+    pub max_proposal_size: u64,
+    pub mpc_thd: u64,
+    pub heavy_del_thd: u64,
+    pub update_vote_thd: u64,
+    pub update_proposal_thd: u64,
+    pub update_implicit: u64,
+    /// `SoftforkRule { srInitThd, srMinThd, srThdDecrement }` — each a
+    /// `LovelacePortion` numerator over the implicit 1e15 denominator.
+    pub soft_fork_rule: (u64, u64, u64),
+    /// `(summand_lovelace, (mult_num, mult_den))` — the same exact-rational
+    /// shape `ByronTxFeePolicy::to_exact` produces from genesis JSON.
+    pub tx_fee_policy: (u64, (u64, u64)),
+    pub unlock_stake_epoch: u64,
+}
+
+/// `Cardano.Chain.Update.Validation.Interface::State` (`UPI.State`,
+/// Interface.hs:108) — eleven fields.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ByronUpdateState {
+    /// Vestigial upstream: `initialState` is the ONLY writer in the whole
+    /// package (`registerEpoch`'s record update does not name this field).
+    /// Modelled as what it is — a state field with no writer after seeding —
+    /// rather than a hardcoded dump constant, so a future upstream writer
+    /// has somewhere to land. See the design doc §2.3.
+    pub current_epoch: u64,
+    pub adopted_protocol_version: (u16, u16, u8),
+    pub adopted_protocol_parameters: ByronProtocolParameters,
+    /// Newest-first (FADS order) — `tryBumpVersion` scans from the front.
+    pub candidate_protocol_updates: Vec<ByronCandidate>,
+    /// `name -> (version, slot)`. Modelled because the state MACHINE routes
+    /// through it (the null-update check), not because anything downstream
+    /// reads it — see the design doc §4.
+    pub app_versions: BTreeMap<String, (u32, u64)>,
+    /// `UpId -> (protocol_version, FULL overlaid parameters)`. The overlay
+    /// (`PPU.apply`) happens at REGISTRATION time, not adoption time.
+    pub registered_protocol_update_proposals:
+        BTreeMap<Hash32, ((u16, u16, u8), ByronProtocolParameters)>,
+    pub registered_software_update_proposals: BTreeMap<Hash32, (String, u32)>,
+    /// `UpId -> confirming slot`.
+    pub confirmed_proposals: BTreeMap<Hash32, u64>,
+    /// `UpId -> {genesis keys that voted}`.
+    pub proposal_votes: BTreeMap<Hash32, BTreeSet<Hash28>>,
+    /// `(endorsed_version, genesis_key)` pairs.
+    pub registered_endorsements: BTreeSet<((u16, u16, u8), Hash28)>,
+    /// `UpId -> registration slot` — the TTL clock for `prune_stale_proposals`.
+    pub proposal_registration_slot: BTreeMap<Hash32, u64>,
+}
+
+/// The two Byron `ChainValidationState` fields beyond the UTxO set, plus the
+/// genesis-derived constant the rules need at apply time.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ByronSubState {
+    pub delegation: ByronDelegationState,
+    pub update: ByronUpdateState,
+    /// `bootStakeholders`' key set — the genesis-key authority both the
+    /// delegation and update-proposal state machines gate on.
+    pub allowed_delegators: BTreeSet<Hash28>,
+}
+
+impl Default for ByronSubState {
+    /// A `ByronSubState` for a network with NO Byron era (Shelley-from-genesis
+    /// devnets/testnets) — never mutated, never dumped (the dump only emits
+    /// Byron fields while `ledger.era == Era::Byron`).
+    fn default() -> Self {
+        ByronSubState {
+            delegation: ByronDelegationState::default(),
+            update: ByronUpdateState {
+                current_epoch: 0,
+                adopted_protocol_version: (0, 0, 0),
+                adopted_protocol_parameters: ByronProtocolParameters {
+                    script_version: 0,
+                    slot_duration: 20_000,
+                    max_block_size: 2_000_000,
+                    max_header_size: 2_000_000,
+                    max_tx_size: 4_096,
+                    max_proposal_size: 700,
+                    mpc_thd: 0,
+                    heavy_del_thd: 0,
+                    update_vote_thd: 0,
+                    update_proposal_thd: 0,
+                    update_implicit: 10_000,
+                    soft_fork_rule: (0, 0, 0),
+                    tx_fee_policy: (0, (0, 1)),
+                    unlock_stake_epoch: u64::MAX,
+                },
+                candidate_protocol_updates: Vec::new(),
+                app_versions: BTreeMap::new(),
+                registered_protocol_update_proposals: BTreeMap::new(),
+                registered_software_update_proposals: BTreeMap::new(),
+                confirmed_proposals: BTreeMap::new(),
+                proposal_votes: BTreeMap::new(),
+                registered_endorsements: BTreeSet::new(),
+                proposal_registration_slot: BTreeMap::new(),
+            },
+            allowed_delegators: BTreeSet::new(),
+        }
+    }
+}
+
+/// Errors from the Byron delegation-certificate scheduling rules
+/// (`Delegation.Validation.Scheduling`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum ByronDelegationError {
+    #[error("delegation cert issuer is not a genesis (bootStakeholders) key")]
+    NotGenesisKey,
+    #[error("delegation cert epoch is not the current or next epoch")]
+    WrongEpoch,
+    #[error("issuer already has a delegation certificate for this epoch")]
+    AlreadyDelegated,
+    #[error("issuer already has a scheduled delegation activating at this slot")]
+    DuplicateActivationSlot,
+}
+
+/// Errors from the Byron update-proposal-system rules (registration + voting).
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum ByronUpdateError {
+    #[error("proposer/voter key does not resolve to a registered genesis delegate")]
+    NotGenesisDelegate,
+    #[error("proposal is a null update (no protocol-version, parameter, or software change)")]
+    NullUpdate,
+    #[error("a proposal for this protocol version is already registered")]
+    DuplicateVersion,
+    #[error("proposed protocol version does not follow the adopted version (pvCanFollow)")]
+    VersionCannotFollow,
+    #[error("proposal fails canUpdate (size/maxBlockSize/maxTxSize/scriptVersion bounds)")]
+    CannotUpdate,
+    #[error(
+        "proposal sets txFeePolicy, which this implementation captures raw and cannot apply \
+         (unreachable on every real network — mainnet/preprod/preview never change it on-chain)"
+    )]
+    UnsupportedTxFeePolicyOverride,
+    #[error("proposal id is not registered")]
+    ProposalNotRegistered,
+    #[error("this genesis key has already voted on this proposal")]
+    VoteAlreadyCast,
+}
+
+/// `hashKey = blake2b_224 . sha3_256 . cbor(vk)` (`Common/KeyHash.hs:53`) —
+/// the bare-pubkey variant, distinct from `dugite-primitives`'
+/// `addr_root_hash` (which hashes an ADDRESS SPEC, not a raw key). CBOR
+/// encodes `vk` as a definite-length bytestring.
+///
+/// `pub`: the node layer needs it too, to turn a genesis `heavyDelegation`
+/// entry's base64 `delegatePk` into the `Hash28` [`seed_byron_genesis`]
+/// expects (the genesis JSON's own map KEY is already the issuer's KeyHash,
+/// but the delegate is given as a raw pubkey).
+pub fn byron_key_hash(vk: &[u8]) -> Hash28 {
+    let mut cbor = Vec::with_capacity(vk.len() + 3);
+    if vk.len() <= 23 {
+        cbor.push(0x40 | vk.len() as u8);
+    } else if vk.len() <= 0xff {
+        cbor.push(0x58);
+        cbor.push(vk.len() as u8);
+    } else {
+        cbor.push(0x59);
+        cbor.extend_from_slice(&(vk.len() as u16).to_be_bytes());
+    }
+    cbor.extend_from_slice(vk);
+    let sha3_digest: [u8; 32] = sha3::Sha3_256::digest(&cbor).into();
+    blake2b_224(&sha3_digest)
+}
+
+/// `floor(srMinThd/1e15 * numGenKeys)` (`ProtocolParameters.hs:217`,
+/// `upAdptThd`) — the confirmation/endorsement threshold. Integer floor of
+/// an exact rational; no floats. On mainnet/preprod/preview,
+/// `srMinThd = 0.6e15` and `numGenKeys = 7`, giving `floor(4.2) = 4`.
+fn up_adpt_thd(num_gen_keys: u64, pp: &ByronProtocolParameters) -> u64 {
+    let min_thd = pp.soft_fork_rule.1 as u128;
+    (min_thd * num_gen_keys as u128 / 1_000_000_000_000_000u128) as u64
+}
+
+/// `PPU.apply` — overlay a sparse `ByronParamsUpdate` onto a full adopted
+/// record. The caller must have already rejected a `Some` `tx_fee_policy`
+/// (see [`ByronUpdateError::UnsupportedTxFeePolicyOverride`]); this function
+/// therefore always carries `base.tx_fee_policy` through unchanged.
+fn apply_params_update(
+    base: &ByronProtocolParameters,
+    update: &ByronParamsUpdate,
+) -> ByronProtocolParameters {
+    ByronProtocolParameters {
+        script_version: update.script_version.unwrap_or(base.script_version),
+        slot_duration: update.slot_duration.unwrap_or(base.slot_duration),
+        max_block_size: update.max_block_size.unwrap_or(base.max_block_size),
+        max_header_size: update.max_header_size.unwrap_or(base.max_header_size),
+        max_tx_size: update.max_tx_size.unwrap_or(base.max_tx_size),
+        max_proposal_size: update.max_proposal_size.unwrap_or(base.max_proposal_size),
+        mpc_thd: update.mpc_thd.unwrap_or(base.mpc_thd),
+        heavy_del_thd: update.heavy_del_thd.unwrap_or(base.heavy_del_thd),
+        update_vote_thd: update.update_vote_thd.unwrap_or(base.update_vote_thd),
+        update_proposal_thd: update
+            .update_proposal_thd
+            .unwrap_or(base.update_proposal_thd),
+        update_implicit: update.update_implicit.unwrap_or(base.update_implicit),
+        soft_fork_rule: update.soft_fork_rule.unwrap_or(base.soft_fork_rule),
+        tx_fee_policy: base.tx_fee_policy,
+        unlock_stake_epoch: update.unlock_stake_epoch.unwrap_or(base.unlock_stake_epoch),
+    }
+}
+
+/// `pvCanFollow`: same major ⇒ minor+1; major+1 ⇒ minor 0.
+fn pv_can_follow(new: (u16, u16, u8), old: (u16, u16, u8)) -> bool {
+    (new.0 == old.0 && new.1 == old.1 + 1) || (new.0 == old.0 + 1 && new.1 == 0)
+}
+
+/// `canUpdate` (`Registration.hs`): proposal size bound, block/tx size
+/// growth bounds, script-version step bound.
+fn can_update(
+    base: &ByronProtocolParameters,
+    applied: &ByronProtocolParameters,
+    proposal_size: u64,
+) -> bool {
+    proposal_size <= base.max_proposal_size
+        && applied.max_block_size <= base.max_block_size.saturating_mul(2)
+        && applied.max_tx_size < applied.max_block_size
+        && applied.script_version.abs_diff(base.script_version) <= 1
+}
+
+/// `Delegation.Scheduling::scheduleCertificate` (Scheduling.hs:176+).
+///
+/// `k` is the activation delay divisor (`activation_slot = current_slot +
+/// 2*k`); genesis seeding passes `k = 0` for immediate activation, on-chain
+/// certificates pass the real security parameter.
+#[allow(clippy::too_many_arguments)]
+fn schedule_delegation_cert(
+    state: &mut ByronDelegationState,
+    allowed_delegators: &BTreeSet<Hash28>,
+    current_slot: u64,
+    current_epoch: u64,
+    k: u64,
+    cert_epoch: u64,
+    issuer: Hash28,
+    delegate: Hash28,
+) -> Result<(), ByronDelegationError> {
+    if !allowed_delegators.contains(&issuer) {
+        return Err(ByronDelegationError::NotGenesisKey);
+    }
+    if cert_epoch != current_epoch && cert_epoch != current_epoch.saturating_add(1) {
+        return Err(ByronDelegationError::WrongEpoch);
+    }
+    if state.key_epoch_delegations.contains(&(cert_epoch, issuer)) {
+        return Err(ByronDelegationError::AlreadyDelegated);
+    }
+    let activation_slot = current_slot.saturating_add(2 * k);
+    if state
+        .scheduled
+        .iter()
+        .any(|s| s.delegator == issuer && s.slot == activation_slot)
+    {
+        return Err(ByronDelegationError::DuplicateActivationSlot);
+    }
+    state.scheduled.push(ScheduledDelegation {
+        slot: activation_slot,
+        delegator: issuer,
+        delegate,
+    });
+    state.key_epoch_delegations.insert((cert_epoch, issuer));
+    Ok(())
+}
+
+/// `Delegation.Activation::activateDelegation`, folded over every scheduled
+/// entry with `sdSlot <= currentSlot` (Haskell folds the whole `Seq` on
+/// every tick; entries not yet due are simply left in place — the caller's
+/// prune step removes them once they age out, not this function).
+fn activate_delegations(state: &mut ByronDelegationState, current_slot: u64) {
+    let due: Vec<ScheduledDelegation> = state
+        .scheduled
+        .iter()
+        .filter(|s| s.slot <= current_slot)
+        .cloned()
+        .collect();
+    for sd in due {
+        // notMemberR: the DELEGATE must not currently be anyone's delegate.
+        let delegate_free = !state.delegation_map_rev.contains_key(&sd.delegate);
+        let prev_slot = state.delegation_slots.get(&sd.delegator).copied();
+        let slot_ok = match prev_slot {
+            None => true,
+            Some(prev) => prev < sd.slot || sd.slot == 0,
+        };
+        if !(delegate_free && slot_ok) {
+            continue;
+        }
+        // Bimap insert: replaces the delegator's previous pair.
+        if let Some(old_delegate) = state.delegation_map.get(&sd.delegator).copied() {
+            if old_delegate != sd.delegate {
+                state.delegation_map_rev.remove(&old_delegate);
+            }
+        }
+        state.delegation_map.insert(sd.delegator, sd.delegate);
+        state.delegation_map_rev.insert(sd.delegate, sd.delegator);
+        state.delegation_slots.insert(sd.delegator, sd.slot);
+    }
+}
+
+/// `tickDelegation = prune . activateDelegations currentSlot`
+/// (Interface.hs:181-217). Runs at EVERY consensus tick (every Byron block,
+/// EBBs included) and as the tail of `updateDelegation` after scheduling a
+/// block's certificates — idempotent, so calling it twice on the same block
+/// is harmless.
+pub fn tick_delegation(state: &mut ByronDelegationState, current_slot: u64, current_epoch: u64) {
+    activate_delegations(state, current_slot);
+    state.scheduled.retain(|sd| sd.slot > current_slot);
+    state
+        .key_epoch_delegations
+        .retain(|(epoch, _)| *epoch >= current_epoch);
+}
+
+/// `DI.initialState` + `UPI.initialState` (Interface.hs:94-137, :108+):
+/// start the delegation map from the IDENTITY (every genesis key delegates
+/// to itself), then apply the genesis `heavyDelegation` certificates through
+/// the REAL schedule/activate path with `k = 0` (immediate activation) — a
+/// shortcut that just inserted pairs would skip the `notMemberR` rule and
+/// drift on any genesis where a delegate collides.
+pub fn seed_byron_genesis(
+    allowed_delegators: BTreeSet<Hash28>,
+    heavy_delegation: &[(Hash28, Hash28)],
+    adopted_protocol_parameters: ByronProtocolParameters,
+) -> ByronSubState {
+    let mut delegation = ByronDelegationState::default();
+    for key in &allowed_delegators {
+        delegation.delegation_map.insert(*key, *key);
+        delegation.delegation_map_rev.insert(*key, *key);
+        delegation.delegation_slots.insert(*key, 0);
+    }
+    for (issuer, delegate) in heavy_delegation {
+        // Genesis certificates are trusted (they define the genesis itself);
+        // a scheduling failure here is a genesis-file defect, logged rather
+        // than fatal to node startup — the identity mapping is still a valid
+        // (if less accurate) starting point.
+        if let Err(e) = schedule_delegation_cert(
+            &mut delegation,
+            &allowed_delegators,
+            0,
+            0,
+            0,
+            0,
+            *issuer,
+            *delegate,
+        ) {
+            tracing::warn!(
+                issuer = %issuer.to_hex(),
+                delegate = %delegate.to_hex(),
+                error = %e,
+                "Byron genesis heavyDelegation certificate rejected by the scheduling rules"
+            );
+        }
+    }
+    tick_delegation(&mut delegation, 0, 0);
+
+    let update = ByronUpdateState {
+        current_epoch: 0,
+        adopted_protocol_version: (0, 0, 0),
+        adopted_protocol_parameters,
+        candidate_protocol_updates: Vec::new(),
+        app_versions: BTreeMap::new(),
+        registered_protocol_update_proposals: BTreeMap::new(),
+        registered_software_update_proposals: BTreeMap::new(),
+        confirmed_proposals: BTreeMap::new(),
+        proposal_votes: BTreeMap::new(),
+        registered_endorsements: BTreeSet::new(),
+        proposal_registration_slot: BTreeMap::new(),
+    };
+
+    ByronSubState {
+        delegation,
+        update,
+        allowed_delegators,
+    }
+}
+
+/// Whether `key_hash` currently carries genesis-key standing to act in the
+/// update-proposal system — either directly (it IS a `bootStakeholders`
+/// key) or indirectly (it is CURRENTLY the delegate of one, per `lookupR`).
+///
+/// **A measured finding from real mainnet data, not (yet) independently
+/// verified against Haskell source.** A pure `lookupR`-only resolution —
+/// the mechanically faithful reading of "Bimap.insert replaces both
+/// directions" the design doc's §2.5 describes — could not resolve ANY
+/// endorsement on mainnet's real Byron chain: every block issuer's key
+/// hashes to a `bootStakeholders` entry DIRECTLY, even for genesis keys
+/// whose own heavyweight delegation certificate has already activated. That
+/// is what this function's OR-clause exists to catch. It can only WIDEN
+/// acceptance relative to `lookupR` alone, so relative to that baseline it
+/// cannot introduce a new accept-where-Haskell-rejects gap — only narrow a
+/// possible reject-where-Haskell-accepts one. Flagged for independent
+/// verification against `Endorsement.hs`/`Voting.hs`/`Registration.hs`
+/// before this mechanism is wired into anything consensus-critical (it is
+/// not currently — see the design doc §3.6).
+fn resolve_genesis_authority(
+    key_hash: &Hash28,
+    allowed_delegators: &BTreeSet<Hash28>,
+    delegation_map_rev: &BTreeMap<Hash28, Hash28>,
+) -> Option<Hash28> {
+    if allowed_delegators.contains(key_hash) {
+        return Some(*key_hash);
+    }
+    delegation_map_rev.get(key_hash).copied()
+}
+
+/// `Update.Validation.Registration::registerProposal` (Registration.hs:330+).
+fn register_proposal(
+    update: &mut ByronUpdateState,
+    allowed_delegators: &BTreeSet<Hash28>,
+    delegation_map_rev: &BTreeMap<Hash28, Hash28>,
+    current_slot: u64,
+    proposal: &dugite_primitives::block::ByronUpdProposal,
+) -> Result<(), ByronUpdateError> {
+    let proposer_key_hash = byron_key_hash(&proposal.proposer_vk);
+    if resolve_genesis_authority(&proposer_key_hash, allowed_delegators, delegation_map_rev)
+        .is_none()
+    {
+        return Err(ByronUpdateError::NotGenesisDelegate);
+    }
+    if proposal.params_update.tx_fee_policy.is_some() {
+        return Err(ByronUpdateError::UnsupportedTxFeePolicyOverride);
+    }
+
+    let applied_params =
+        apply_params_update(&update.adopted_protocol_parameters, &proposal.params_update);
+    let protocol_version_changed = proposal.protocol_version != update.adopted_protocol_version
+        || applied_params != update.adopted_protocol_parameters;
+    // "New" relative to whatever `app_versions` currently records for this
+    // app name — `None` (nothing recorded yet) counts as new. Note
+    // `register_vote`'s confirmation branch does NOT promote into
+    // `app_versions` (design doc §4: nothing downstream of it is modelled,
+    // since none of #1084's five dump fields read it), so in the CURRENT
+    // implementation this is always `true` in practice and the null-update
+    // rejection below is reachable only via its PROTOCOL half. That is a
+    // deliberate scope limit, not a bug: a software-only null proposal that
+    // wrongly registers here touches no field this implementation reports.
+    let software_version_is_new = update
+        .app_versions
+        .get(&proposal.software_version.0)
+        .map(|(v, _)| *v != proposal.software_version.1)
+        .unwrap_or(true);
+
+    if !protocol_version_changed && !software_version_is_new {
+        return Err(ByronUpdateError::NullUpdate);
+    }
+
+    if protocol_version_changed {
+        let duplicate_version = update
+            .registered_protocol_update_proposals
+            .values()
+            .any(|(pv, _)| *pv == proposal.protocol_version);
+        if duplicate_version {
+            return Err(ByronUpdateError::DuplicateVersion);
+        }
+        if !pv_can_follow(proposal.protocol_version, update.adopted_protocol_version) {
+            return Err(ByronUpdateError::VersionCannotFollow);
+        }
+        if !can_update(
+            &update.adopted_protocol_parameters,
+            &applied_params,
+            proposal.encoded_len,
+        ) {
+            return Err(ByronUpdateError::CannotUpdate);
+        }
+        tracing::debug!(
+            slot = current_slot,
+            up_id = %proposal.up_id.to_hex(),
+            protocol_version = ?proposal.protocol_version,
+            max_tx_size = ?proposal.params_update.max_tx_size,
+            max_block_size = ?proposal.params_update.max_block_size,
+            "byron update proposal REGISTERED"
+        );
+        update
+            .registered_protocol_update_proposals
+            .insert(proposal.up_id, (proposal.protocol_version, applied_params));
+    }
+    if software_version_is_new {
+        update
+            .registered_software_update_proposals
+            .insert(proposal.up_id, proposal.software_version.clone());
+    }
+    update
+        .proposal_registration_slot
+        .insert(proposal.up_id, current_slot);
+    Ok(())
+}
+
+/// `Voting::registerVote` + `pastThreshold` + confirmation
+/// (Voting.hs:126-208).
+fn register_vote(
+    update: &mut ByronUpdateState,
+    allowed_delegators: &BTreeSet<Hash28>,
+    delegation_map_rev: &BTreeMap<Hash28, Hash28>,
+    num_gen_keys: usize,
+    current_slot: u64,
+    vote: &ByronUpdVote,
+) -> Result<(), ByronUpdateError> {
+    if !update
+        .registered_protocol_update_proposals
+        .contains_key(&vote.proposal_id)
+    {
+        return Err(ByronUpdateError::ProposalNotRegistered);
+    }
+    let voter_key_hash = byron_key_hash(&vote.voter_vk);
+    let genesis_key =
+        resolve_genesis_authority(&voter_key_hash, allowed_delegators, delegation_map_rev)
+            .ok_or(ByronUpdateError::NotGenesisDelegate)?;
+
+    let votes = update.proposal_votes.entry(vote.proposal_id).or_default();
+    if !votes.insert(genesis_key) {
+        return Err(ByronUpdateError::VoteAlreadyCast);
+    }
+
+    if !update.confirmed_proposals.contains_key(&vote.proposal_id) {
+        let threshold = up_adpt_thd(num_gen_keys as u64, &update.adopted_protocol_parameters);
+        if update.proposal_votes[&vote.proposal_id].len() as u64 >= threshold {
+            tracing::debug!(
+                slot = current_slot,
+                up_id = %vote.proposal_id.to_hex(),
+                votes = update.proposal_votes[&vote.proposal_id].len(),
+                threshold,
+                "byron update proposal CONFIRMED"
+            );
+            update
+                .confirmed_proposals
+                .insert(vote.proposal_id, current_slot);
+            // Promotes the software half into `app_versions` upstream
+            // (`registerVotes`, Interface.hs:315-355). Not modelled: nothing
+            // downstream of `app_versions` exists in this implementation
+            // (design doc §4), and the five #1084 dump fields never read it.
+        }
+    }
+    Ok(())
+}
+
+/// `Endorsement::registerEndorsement` + `Interface.hs::registerEndorsement`
+/// (Endorsement.hs:148-236, Interface.hs:408-479).
+#[allow(clippy::too_many_arguments)]
+fn register_endorsement(
+    update: &mut ByronUpdateState,
+    allowed_delegators: &BTreeSet<Hash28>,
+    delegation_map_rev: &BTreeMap<Hash28, Hash28>,
+    current_slot: u64,
+    security_param_k: u64,
+    num_gen_keys: usize,
+    endorsed_version: (u16, u16, u8),
+    issuer_key_hash: Hash28,
+) {
+    // Unresolvable issuer key: SILENTLY IGNORED (the UPEND comment).
+    let Some(genesis_key) =
+        resolve_genesis_authority(&issuer_key_hash, allowed_delegators, delegation_map_rev)
+    else {
+        return;
+    };
+    update
+        .registered_endorsements
+        .insert((endorsed_version, genesis_key));
+
+    prune_stale_proposals(update, current_slot);
+
+    let confirmed_slot = update
+        .registered_protocol_update_proposals
+        .iter()
+        .find(|(_, (pv, _))| *pv == endorsed_version)
+        .and_then(|(upid, _)| update.confirmed_proposals.get(upid).copied());
+    let Some(confirmed_slot) = confirmed_slot else {
+        return;
+    };
+    if confirmed_slot.saturating_add(2 * security_param_k) > current_slot {
+        return; // not yet stable
+    }
+    let endorsement_count = update
+        .registered_endorsements
+        .iter()
+        .filter(|(v, _)| *v == endorsed_version)
+        .count() as u64;
+    if endorsement_count < up_adpt_thd(num_gen_keys as u64, &update.adopted_protocol_parameters) {
+        return;
+    }
+    let Some((pv, params)) = update
+        .registered_protocol_update_proposals
+        .values()
+        .find(|(pv, _)| *pv == endorsed_version)
+        .cloned()
+    else {
+        return;
+    };
+    // FADS: prepend only if this version strictly exceeds the current head's.
+    let should_prepend = update
+        .candidate_protocol_updates
+        .first()
+        .map(|c| pv > c.protocol_version)
+        .unwrap_or(true);
+    if should_prepend {
+        tracing::debug!(
+            slot = current_slot,
+            protocol_version = ?pv,
+            endorsement_count,
+            "byron CANDIDATE created"
+        );
+        update.candidate_protocol_updates.insert(
+            0,
+            ByronCandidate {
+                slot: current_slot,
+                protocol_version: pv,
+                protocol_parameters: params,
+            },
+        );
+    }
+}
+
+/// Per-endorsement-registration pruning (`Interface.hs`): proposals older
+/// than `ppUpdateProposalTTL` (genesis `updateImplicit`) and not confirmed
+/// are dropped from every proposal-tracking map; endorsements for versions
+/// no longer registered are dropped too.
+fn prune_stale_proposals(update: &mut ByronUpdateState, current_slot: u64) {
+    let ttl = update.adopted_protocol_parameters.update_implicit;
+    let stale: Vec<Hash32> = update
+        .proposal_registration_slot
+        .iter()
+        .filter(|(upid, &reg_slot)| {
+            !update.confirmed_proposals.contains_key(*upid)
+                && reg_slot.saturating_add(ttl) < current_slot
+        })
+        .map(|(upid, _)| *upid)
+        .collect();
+    for upid in &stale {
+        update.registered_protocol_update_proposals.remove(upid);
+        update.registered_software_update_proposals.remove(upid);
+        update.proposal_votes.remove(upid);
+        update.proposal_registration_slot.remove(upid);
+    }
+    let live_versions: BTreeSet<(u16, u16, u8)> = update
+        .registered_protocol_update_proposals
+        .values()
+        .map(|(pv, _)| *pv)
+        .collect();
+    update
+        .registered_endorsements
+        .retain(|(v, _)| live_versions.contains(v));
+}
+
+/// `UPI.registerEpoch` -> `PVBump.tryBumpVersion`
+/// (Interface/ProtocolVersionBump.hs:41-63).
+///
+/// Called ONCE per applied block that crosses an epoch boundary (see
+/// `state/apply.rs`'s call site), evaluated against the FINAL epoch reached
+/// by the tick — matching upstream's `applyChainTick`, which calls
+/// `epochTransition` once with `nextEpoch = slotNumberEpoch slot`, never
+/// once per intermediate epoch (design doc's open question §6a; unobservable
+/// on any real Byron chain, none of which has an empty epoch).
+pub fn upiec_epoch_transition(
+    update: &mut ByronUpdateState,
+    new_epoch: u64,
+    byron_epoch_length: u64,
+    security_param_k: u64,
+) {
+    let epoch_first_slot = new_epoch.saturating_mul(byron_epoch_length);
+    let stability = 4 * security_param_k;
+    let winner = update
+        .candidate_protocol_updates
+        .iter()
+        .find(|c| c.slot.saturating_add(stability) <= epoch_first_slot)
+        .cloned();
+    if let Some(candidate) = winner {
+        tracing::debug!(
+            new_epoch,
+            protocol_version = ?candidate.protocol_version,
+            max_tx_size = candidate.protocol_parameters.max_tx_size,
+            max_block_size = candidate.protocol_parameters.max_block_size,
+            "byron ADOPTED"
+        );
+        update.adopted_protocol_version = candidate.protocol_version;
+        update.adopted_protocol_parameters = candidate.protocol_parameters;
+        update.candidate_protocol_updates.clear();
+        update.registered_protocol_update_proposals.clear();
+        update.registered_software_update_proposals.clear();
+        update.confirmed_proposals.clear();
+        update.proposal_votes.clear();
+        update.registered_endorsements.clear();
+        update.proposal_registration_slot.clear();
+    }
+    // `current_epoch` is NOT touched — see the field's doc comment (§2.3).
+}
+
+/// Fold a block's `dlgPayload` into the delegation state
+/// (`Block/Validation.hs:362-448` step 2: `DI.updateDelegation`).
+///
+/// # Failure posture
+///
+/// A per-certificate rule violation is logged and that ONE certificate is
+/// SKIPPED — the rest of the block (UTxO, everything else) still applies.
+/// This is narrower than #914's "hard error" precedent, and deliberately so:
+/// unlike #914's governance case, a Byron delegation-state modelling gap
+/// cannot corrupt anything CONSENSUS-CRITICAL, because nothing in dugite's
+/// validation or block-production path reads `ByronSubState` yet (the design
+/// doc §3.6 names wiring it into validation as explicitly future work).
+/// Treating a violation as block-fatal was tried first and measured wrong on
+/// real mainnet data: it aborts `apply_block` entirely, which discards the
+/// block's UTxO changes too and desyncs every block after it — a far worse
+/// outcome than one mis-modelled delegation-state entry. The five #1084 dump
+/// fields degrade gracefully (a skipped certificate simply does not move
+/// `byronDelegation.count`), which is preferable to corrupting the whole
+/// replay over a Byron sub-rule this implementation may not have modelled
+/// byte-for-byte in some historical corner case.
+pub fn apply_delegation_payload(
+    delegation: &mut ByronDelegationState,
+    allowed_delegators: &BTreeSet<Hash28>,
+    aux: &ByronBlockAux,
+    current_slot: u64,
+    current_epoch: u64,
+    security_param_k: u64,
+) {
+    for cert in &aux.dlg_certs {
+        let issuer = byron_key_hash(&cert.issuer_vk);
+        let delegate = byron_key_hash(&cert.delegate_vk);
+        if let Err(e) = schedule_delegation_cert(
+            delegation,
+            allowed_delegators,
+            current_slot,
+            current_epoch,
+            security_param_k,
+            cert.epoch,
+            issuer,
+            delegate,
+        ) {
+            tracing::warn!(
+                slot = current_slot,
+                issuer = %issuer.to_hex(),
+                error = %e,
+                "byron delegation certificate rejected by the scheduling rules — skipped"
+            );
+        }
+    }
+    // Tail of `updateDelegation`: tick immediately after scheduling.
+    tick_delegation(delegation, current_slot, current_epoch);
+}
+
+/// Fold a block's `updPayload` into the update state (`Block/Validation.hs`
+/// step 4: `UPI.registerUpdate`), plus the per-block endorsement every main
+/// block registers of its own header's version.
+///
+/// `delegation_map_rev` MUST be the delegation map AS OF the tick (i.e.
+/// captured BEFORE [`apply_delegation_payload`] ran on this same block) —
+/// `updateEnv`'s resolver reads the `BodyState`'s ORIGINAL `delegationState`
+/// binding, not the post-certificate one (design doc §2.4's ordering
+/// subtlety, #1074's lesson in miniature).
+///
+/// Same failure posture as [`apply_delegation_payload`]: a rule violation on
+/// a single proposal or vote is logged and skipped rather than failing the
+/// whole block. Measured necessary, not merely convenient — a real mainnet
+/// block (slot 73486) carries an update vote whose `proposalId` this
+/// implementation's registered-proposal map does not contain (most likely
+/// this implementation's TTL pruning, or its registration-authority
+/// resolution, diverging from upstream's exact timing in some historical
+/// corner this design's synthetic tests do not reach); treating that as
+/// block-fatal desynced every subsequent block. Filed for follow-up rather
+/// than guessed at, per this repo's divergence-fix process — the fields this
+/// implementation reports are honest about what state it actually holds
+/// either way.
+#[allow(clippy::too_many_arguments)]
+pub fn apply_update_payload(
+    update: &mut ByronUpdateState,
+    allowed_delegators: &BTreeSet<Hash28>,
+    delegation_map_rev: &BTreeMap<Hash28, Hash28>,
+    aux: &ByronBlockAux,
+    current_slot: u64,
+    security_param_k: u64,
+) {
+    let num_gen_keys = allowed_delegators.len();
+
+    if let Some(proposal) = &aux.upd_proposal {
+        if let Err(e) = register_proposal(
+            update,
+            allowed_delegators,
+            delegation_map_rev,
+            current_slot,
+            proposal,
+        ) {
+            tracing::warn!(
+                slot = current_slot,
+                up_id = %proposal.up_id.to_hex(),
+                error = %e,
+                "byron update proposal rejected by the registration rules — skipped"
+            );
+        }
+    }
+    for vote in &aux.upd_votes {
+        if let Err(e) = register_vote(
+            update,
+            allowed_delegators,
+            delegation_map_rev,
+            num_gen_keys,
+            current_slot,
+            vote,
+        ) {
+            tracing::warn!(
+                slot = current_slot,
+                proposal_id = %vote.proposal_id.to_hex(),
+                error = %e,
+                "byron update vote rejected by the voting rules — skipped"
+            );
+        }
+    }
+    // Every main block registers an endorsement of the protocol version its
+    // OWN header advertises, keyed by the issuer.
+    let issuer_key_hash = byron_key_hash(&aux.issuer_pubkey);
+    register_endorsement(
+        update,
+        allowed_delegators,
+        delegation_map_rev,
+        current_slot,
+        security_param_k,
+        num_gen_keys,
+        aux.protocol_version,
+        issuer_key_hash,
+    );
+}
 
 // ---------------------------------------------------------------------------
 // Tests
@@ -1503,6 +2389,7 @@ mod tests {
             header: make_block_header(Hash32::ZERO, vec![]),
             transactions: vec![],
             raw_cbor: None,
+            byron: None,
         };
 
         let result = rules.validate_block_body(&block, &ctx, &utxo);
@@ -1799,5 +2686,529 @@ mod tests {
         assert!(diff.inserts.is_empty());
         assert!(diff.deletes.is_empty());
         assert_eq!(utxo.epoch_fees, Lovelace(fee));
+    }
+}
+
+// ============================================================================
+// Byron delegation + update-proposal state machine tests (#1084)
+// ============================================================================
+//
+// Constructed synthetic scenarios matching the design doc's worked
+// constants: mainnet k=2160 (2k=4320, 4k=8640), 7 genesis keys, confirmation/
+// endorsement threshold floor(0.6*7)=4, epoch_length=21600. The end-to-end
+// test reproduces the SHAPE of the real mainnet epoch-16 event (a
+// maxTxSize-only bump, 4096 -> 65536) that the mainnet archived-dump
+// comparison (see the design doc §5) validates against real chain data —
+// this test is the mechanism-level proof that does not need that data.
+#[cfg(test)]
+mod byron_update_state_tests {
+    use super::*;
+    use dugite_primitives::block::ByronUpdProposal;
+    use std::collections::BTreeSet;
+
+    const MAINNET_K: u64 = 2160;
+    const MAINNET_EPOCH_LENGTH: u64 = 21_600;
+
+    fn pk(seed: u8) -> Vec<u8> {
+        vec![seed; 64]
+    }
+
+    /// The exact mainnet Byron genesis `blockVersionData`, as read from a
+    /// real mainnet `byron-genesis.json` (`cn-mainnet-config/`).
+    fn mainnet_genesis_params() -> ByronProtocolParameters {
+        ByronProtocolParameters {
+            script_version: 0,
+            slot_duration: 20_000,
+            max_block_size: 2_000_000,
+            max_header_size: 2_000_000,
+            max_tx_size: 4_096,
+            max_proposal_size: 700,
+            mpc_thd: 20_000_000_000_000,
+            heavy_del_thd: 300_000_000_000,
+            update_vote_thd: 1_000_000_000_000,
+            update_proposal_thd: 100_000_000_000_000,
+            update_implicit: 10_000,
+            soft_fork_rule: (900_000_000_000_000, 600_000_000_000_000, 50_000_000_000_000),
+            tx_fee_policy: (155_381, (21_973, 500)),
+            unlock_stake_epoch: u64::MAX,
+        }
+    }
+
+    #[test]
+    fn up_adpt_thd_matches_mainnet_4_of_7() {
+        let pp = mainnet_genesis_params();
+        assert_eq!(up_adpt_thd(7, &pp), 4);
+    }
+
+    #[test]
+    fn genesis_seeding_builds_identity_then_overlays_heavy_delegation() {
+        let g: Vec<Hash28> = (0..3u8).map(|i| byron_key_hash(&pk(i))).collect();
+        let d: Vec<Hash28> = (10..12u8).map(|i| byron_key_hash(&pk(i))).collect();
+        let allowed: BTreeSet<Hash28> = g.iter().copied().collect();
+        // g[0] delegates to d[0]; g[1] delegates to d[1]; g[2] never delegates.
+        let heavy = vec![(g[0], d[0]), (g[1], d[1])];
+        let sub = seed_byron_genesis(allowed, &heavy, mainnet_genesis_params());
+
+        assert_eq!(sub.delegation.delegation_map.get(&g[0]), Some(&d[0]));
+        assert_eq!(sub.delegation.delegation_map.get(&g[1]), Some(&d[1]));
+        // g[2] keeps the identity mapping — never overridden.
+        assert_eq!(sub.delegation.delegation_map.get(&g[2]), Some(&g[2]));
+        assert_eq!(sub.delegation.delegation_map_rev.get(&d[0]), Some(&g[0]));
+        assert_eq!(sub.delegation.delegation_map_rev.get(&d[1]), Some(&g[1]));
+        assert_eq!(sub.delegation.delegation_map_rev.get(&g[2]), Some(&g[2]));
+        // The identity pairs for g[0]/g[1] must be GONE from the reverse map
+        // — otherwise g[0]/g[1] would (wrongly) still resolve as their own
+        // delegate too.
+        assert!(!sub.delegation.delegation_map_rev.contains_key(&g[0]));
+        assert!(!sub.delegation.delegation_map_rev.contains_key(&g[1]));
+        assert_eq!(sub.update.current_epoch, 0, "§2.3: always 0 after seeding");
+        assert_eq!(sub.update.adopted_protocol_version, (0, 0, 0));
+    }
+
+    #[test]
+    fn schedule_delegation_cert_rejects_non_genesis_issuer() {
+        let allowed: BTreeSet<Hash28> = [byron_key_hash(&pk(0))].into_iter().collect();
+        let mut state = ByronDelegationState::default();
+        let not_genesis = byron_key_hash(&pk(99));
+        let err = schedule_delegation_cert(
+            &mut state,
+            &allowed,
+            1000,
+            0,
+            MAINNET_K,
+            0,
+            not_genesis,
+            byron_key_hash(&pk(1)),
+        )
+        .unwrap_err();
+        assert_eq!(err, ByronDelegationError::NotGenesisKey);
+    }
+
+    #[test]
+    fn schedule_delegation_cert_rejects_duplicate_epoch_issuer() {
+        let issuer = byron_key_hash(&pk(0));
+        let allowed: BTreeSet<Hash28> = [issuer].into_iter().collect();
+        let mut state = ByronDelegationState::default();
+        schedule_delegation_cert(
+            &mut state,
+            &allowed,
+            1000,
+            0,
+            MAINNET_K,
+            0,
+            issuer,
+            byron_key_hash(&pk(1)),
+        )
+        .expect("first cert accepted");
+        let err = schedule_delegation_cert(
+            &mut state,
+            &allowed,
+            2000,
+            0,
+            MAINNET_K,
+            0,
+            issuer,
+            byron_key_hash(&pk(2)),
+        )
+        .unwrap_err();
+        assert_eq!(err, ByronDelegationError::AlreadyDelegated);
+    }
+
+    /// A certificate scheduled at slot S activates only once the tick
+    /// reaches `S + 2k` — not one slot earlier (design doc §2.5).
+    #[test]
+    fn delegation_cert_activates_exactly_at_2k_not_before() {
+        let issuer = byron_key_hash(&pk(0));
+        let delegate = byron_key_hash(&pk(1));
+        let allowed: BTreeSet<Hash28> = [issuer].into_iter().collect();
+        let mut state = ByronDelegationState::default();
+        state.delegation_map.insert(issuer, issuer);
+        state.delegation_map_rev.insert(issuer, issuer);
+        state.delegation_slots.insert(issuer, 0);
+
+        schedule_delegation_cert(
+            &mut state, &allowed, 1000, 0, MAINNET_K, 0, issuer, delegate,
+        )
+        .expect("scheduled");
+        let activation_slot = 1000 + 2 * MAINNET_K;
+
+        tick_delegation(&mut state, activation_slot - 1, 0);
+        assert_eq!(
+            state.delegation_map.get(&issuer),
+            Some(&issuer),
+            "must NOT activate one slot early"
+        );
+
+        tick_delegation(&mut state, activation_slot, 0);
+        assert_eq!(
+            state.delegation_map.get(&issuer),
+            Some(&delegate),
+            "must activate exactly at slot+2k"
+        );
+        assert_eq!(state.delegation_map_rev.get(&delegate), Some(&issuer));
+        assert!(
+            !state.delegation_map_rev.contains_key(&issuer),
+            "the old identity pair must be replaced, not left dangling"
+        );
+    }
+
+    /// End-to-end: a proposal changing ONLY `maxTxSize` (the exact shape of
+    /// the real mainnet epoch-16 event) registers, confirms at the 4th vote
+    /// (of 7 genesis keys), creates a candidate at the 4th endorsement once
+    /// stable (2k slots after confirmation), and adopts at the first epoch
+    /// boundary whose first slot is >= candidate_slot + 4k.
+    #[test]
+    fn proposal_confirms_and_adopts_matching_mainnet_epoch_16_shape() {
+        let g: Vec<Hash28> = (0..7u8).map(|i| byron_key_hash(&pk(i))).collect();
+        let allowed: BTreeSet<Hash28> = g.iter().copied().collect();
+        let mut sub = seed_byron_genesis(allowed.clone(), &[], mainnet_genesis_params());
+        // Every genesis key starts at protocol version 0.0.0 per seeding;
+        // bump to 1.0.0 so the proposal's 1.1.0 satisfies `pvCanFollow`.
+        sub.update.adopted_protocol_version = (1, 0, 0);
+
+        let proposal = ByronUpdProposal {
+            up_id: Hash32::from_bytes([0xAA; 32]),
+            encoded_len: 200,
+            protocol_version: (1, 1, 0),
+            params_update: ByronParamsUpdate {
+                max_tx_size: Some(65_536),
+                ..Default::default()
+            },
+            software_version: ("cardano-sl".to_string(), 1),
+            proposer_vk: pk(0),
+        };
+
+        register_proposal(
+            &mut sub.update,
+            &sub.allowed_delegators,
+            &sub.delegation.delegation_map_rev,
+            100,
+            &proposal,
+        )
+        .expect("registration must succeed");
+        assert!(sub
+            .update
+            .registered_protocol_update_proposals
+            .contains_key(&proposal.up_id));
+        let (_, registered_params) =
+            &sub.update.registered_protocol_update_proposals[&proposal.up_id];
+        assert_eq!(
+            registered_params.max_tx_size, 65_536,
+            "PPU.apply must overlay max_tx_size onto the FULL adopted record"
+        );
+        assert_eq!(
+            registered_params.max_block_size, 2_000_000,
+            "every untouched field must carry over from the adopted record"
+        );
+
+        // Votes from genesis keys 0..3 — the 4th (index 3) crosses floor(0.6*7)=4.
+        for (i, slot) in (0u8..3).zip(101u64..104) {
+            let vote = ByronUpdVote {
+                voter_vk: pk(i),
+                proposal_id: proposal.up_id,
+                signature: Vec::new(),
+            };
+            register_vote(
+                &mut sub.update,
+                &sub.allowed_delegators,
+                &sub.delegation.delegation_map_rev,
+                7,
+                slot,
+                &vote,
+            )
+            .unwrap_or_else(|e| panic!("vote {i} must succeed: {e}"));
+            assert!(
+                !sub.update.confirmed_proposals.contains_key(&proposal.up_id),
+                "must not confirm before the 4th vote (only {} cast)",
+                i + 1
+            );
+        }
+        let vote4 = ByronUpdVote {
+            voter_vk: pk(3),
+            proposal_id: proposal.up_id,
+            signature: Vec::new(),
+        };
+        register_vote(
+            &mut sub.update,
+            &sub.allowed_delegators,
+            &sub.delegation.delegation_map_rev,
+            7,
+            104,
+            &vote4,
+        )
+        .expect("4th vote must succeed");
+        assert_eq!(
+            sub.update.confirmed_proposals.get(&proposal.up_id),
+            Some(&104),
+            "must confirm at exactly the 4th vote's slot"
+        );
+
+        // A 5th vote from an already-registered voter is rejected...
+        let dup = ByronUpdVote {
+            voter_vk: pk(0),
+            proposal_id: proposal.up_id,
+            signature: Vec::new(),
+        };
+        let err = register_vote(
+            &mut sub.update,
+            &sub.allowed_delegators,
+            &sub.delegation.delegation_map_rev,
+            7,
+            105,
+            &dup,
+        )
+        .unwrap_err();
+        assert_eq!(err, ByronUpdateError::VoteAlreadyCast);
+
+        // Endorsements: not stable until confirmed_slot(104) + 2k(4320) = 4424.
+        let endorse_stable_slot = 104 + 2 * MAINNET_K;
+        for i in 0..4u8 {
+            let issuer_hash = byron_key_hash(&pk(i));
+            register_endorsement(
+                &mut sub.update,
+                &sub.allowed_delegators,
+                &sub.delegation.delegation_map_rev,
+                endorse_stable_slot - 1,
+                MAINNET_K,
+                7,
+                proposal.protocol_version,
+                issuer_hash,
+            );
+        }
+        assert!(
+            sub.update.candidate_protocol_updates.is_empty(),
+            "must not create a candidate before stability (2k after confirmation)"
+        );
+
+        for i in 0..4u8 {
+            let issuer_hash = byron_key_hash(&pk(i));
+            register_endorsement(
+                &mut sub.update,
+                &sub.allowed_delegators,
+                &sub.delegation.delegation_map_rev,
+                endorse_stable_slot,
+                MAINNET_K,
+                7,
+                proposal.protocol_version,
+                issuer_hash,
+            );
+        }
+        assert_eq!(
+            sub.update.candidate_protocol_updates.len(),
+            1,
+            "the 4th endorsement (of 4, past stability) must create exactly one candidate"
+        );
+        let candidate = &sub.update.candidate_protocol_updates[0];
+        assert_eq!(candidate.protocol_version, (1, 1, 0));
+        assert_eq!(candidate.slot, endorse_stable_slot);
+        assert_eq!(candidate.protocol_parameters.max_tx_size, 65_536);
+
+        // Adoption: NOT yet at epoch 0 (candidate.slot + 4k > 0's first slot).
+        upiec_epoch_transition(&mut sub.update, 0, MAINNET_EPOCH_LENGTH, MAINNET_K);
+        assert_eq!(
+            sub.update.adopted_protocol_parameters.max_tx_size, 4_096,
+            "must not adopt before candidate.slot + 4k <= the boundary's first slot"
+        );
+
+        // Epoch 1's first slot (21600) IS >= candidate.slot(4424) + 4k(8640) = 13064.
+        upiec_epoch_transition(&mut sub.update, 1, MAINNET_EPOCH_LENGTH, MAINNET_K);
+        assert_eq!(
+            sub.update.adopted_protocol_parameters.max_tx_size, 65_536,
+            "must adopt at the first epoch boundary clearing candidate.slot + 4k"
+        );
+        assert_eq!(sub.update.adopted_protocol_version, (1, 1, 0));
+        assert_eq!(
+            sub.update.adopted_protocol_parameters.max_block_size, 2_000_000,
+            "an untouched field must survive adoption unchanged"
+        );
+        assert!(
+            sub.update.candidate_protocol_updates.is_empty(),
+            "adoption must clear the candidate list"
+        );
+        assert!(sub.update.registered_protocol_update_proposals.is_empty());
+        assert!(sub.update.confirmed_proposals.is_empty());
+        assert!(sub.update.proposal_votes.is_empty());
+        assert!(sub.update.registered_endorsements.is_empty());
+        assert_eq!(
+            sub.update.current_epoch, 0,
+            "§2.3: current_epoch is NEVER touched by registerEpoch"
+        );
+    }
+
+    #[test]
+    fn register_proposal_rejects_non_genesis_proposer() {
+        let g0 = byron_key_hash(&pk(0));
+        let mut delegation_map_rev = BTreeMap::new();
+        delegation_map_rev.insert(g0, g0);
+        let allowed_delegators: BTreeSet<Hash28> = BTreeSet::new();
+        let mut update = ByronUpdateState {
+            current_epoch: 0,
+            adopted_protocol_version: (1, 0, 0),
+            adopted_protocol_parameters: mainnet_genesis_params(),
+            candidate_protocol_updates: Vec::new(),
+            app_versions: BTreeMap::new(),
+            registered_protocol_update_proposals: BTreeMap::new(),
+            registered_software_update_proposals: BTreeMap::new(),
+            confirmed_proposals: BTreeMap::new(),
+            proposal_votes: BTreeMap::new(),
+            registered_endorsements: BTreeSet::new(),
+            proposal_registration_slot: BTreeMap::new(),
+        };
+        let proposal = ByronUpdProposal {
+            up_id: Hash32::from_bytes([0xBB; 32]),
+            encoded_len: 100,
+            protocol_version: (1, 1, 0),
+            params_update: ByronParamsUpdate {
+                max_tx_size: Some(65_536),
+                ..Default::default()
+            },
+            software_version: ("x".to_string(), 1),
+            proposer_vk: pk(99), // not a genesis delegate
+        };
+        let err = register_proposal(
+            &mut update,
+            &allowed_delegators,
+            &delegation_map_rev,
+            100,
+            &proposal,
+        )
+        .unwrap_err();
+        assert_eq!(err, ByronUpdateError::NotGenesisDelegate);
+    }
+
+    #[test]
+    fn register_proposal_rejects_tx_fee_policy_override() {
+        let g0 = byron_key_hash(&pk(0));
+        let mut delegation_map_rev = BTreeMap::new();
+        delegation_map_rev.insert(g0, g0);
+        let allowed_delegators: BTreeSet<Hash28> = BTreeSet::new();
+        let mut update = ByronUpdateState {
+            current_epoch: 0,
+            adopted_protocol_version: (1, 0, 0),
+            adopted_protocol_parameters: mainnet_genesis_params(),
+            candidate_protocol_updates: Vec::new(),
+            app_versions: BTreeMap::new(),
+            registered_protocol_update_proposals: BTreeMap::new(),
+            registered_software_update_proposals: BTreeMap::new(),
+            confirmed_proposals: BTreeMap::new(),
+            proposal_votes: BTreeMap::new(),
+            registered_endorsements: BTreeSet::new(),
+            proposal_registration_slot: BTreeMap::new(),
+        };
+        let proposal = ByronUpdProposal {
+            up_id: Hash32::from_bytes([0xCC; 32]),
+            encoded_len: 100,
+            protocol_version: (1, 1, 0),
+            params_update: ByronParamsUpdate {
+                tx_fee_policy: Some(vec![0x00]),
+                ..Default::default()
+            },
+            software_version: ("x".to_string(), 1),
+            proposer_vk: pk(0),
+        };
+        let err = register_proposal(
+            &mut update,
+            &allowed_delegators,
+            &delegation_map_rev,
+            100,
+            &proposal,
+        )
+        .unwrap_err();
+        assert_eq!(err, ByronUpdateError::UnsupportedTxFeePolicyOverride);
+    }
+
+    #[test]
+    fn register_proposal_rejects_null_update() {
+        let g0 = byron_key_hash(&pk(0));
+        let mut delegation_map_rev = BTreeMap::new();
+        delegation_map_rev.insert(g0, g0);
+        let allowed_delegators: BTreeSet<Hash28> = BTreeSet::new();
+        let params = mainnet_genesis_params();
+        let mut update = ByronUpdateState {
+            current_epoch: 0,
+            adopted_protocol_version: (1, 0, 0),
+            adopted_protocol_parameters: params,
+            candidate_protocol_updates: Vec::new(),
+            // Seeded so `software_version_is_new` correctly evaluates to
+            // `false` — real operation never populates `app_versions` (see
+            // `register_proposal`'s doc comment), so this test drives the
+            // check's LOGIC directly rather than through the (currently
+            // dormant) promotion path.
+            app_versions: [("cardano-sl".to_string(), (0u32, 50u64))]
+                .into_iter()
+                .collect(),
+            registered_protocol_update_proposals: BTreeMap::new(),
+            registered_software_update_proposals: BTreeMap::new(),
+            confirmed_proposals: BTreeMap::new(),
+            proposal_votes: BTreeMap::new(),
+            registered_endorsements: BTreeSet::new(),
+            proposal_registration_slot: BTreeMap::new(),
+        };
+        // Same version, no parameter change, no new software version.
+        let proposal = ByronUpdProposal {
+            up_id: Hash32::from_bytes([0xDD; 32]),
+            encoded_len: 100,
+            protocol_version: (1, 0, 0),
+            params_update: ByronParamsUpdate::default(),
+            software_version: ("cardano-sl".to_string(), 0),
+            proposer_vk: pk(0),
+        };
+        let err = register_proposal(
+            &mut update,
+            &allowed_delegators,
+            &delegation_map_rev,
+            100,
+            &proposal,
+        )
+        .unwrap_err();
+        assert_eq!(err, ByronUpdateError::NullUpdate);
+    }
+
+    #[test]
+    fn pv_can_follow_matches_haskell_rule() {
+        assert!(pv_can_follow((1, 1, 0), (1, 0, 0)), "same major, minor+1");
+        assert!(
+            pv_can_follow((2, 0, 0), (1, 5, 0)),
+            "major+1, minor reset to 0"
+        );
+        assert!(!pv_can_follow((1, 2, 0), (1, 0, 0)), "minor skipped a step");
+        assert!(!pv_can_follow((3, 0, 0), (1, 0, 0)), "major skipped a step");
+        assert!(
+            !pv_can_follow((2, 1, 0), (1, 5, 0)),
+            "major+1 must reset minor to 0"
+        );
+    }
+
+    #[test]
+    fn endorsement_from_unresolvable_key_is_silently_ignored() {
+        let mut update = ByronUpdateState {
+            current_epoch: 0,
+            adopted_protocol_version: (1, 0, 0),
+            adopted_protocol_parameters: mainnet_genesis_params(),
+            candidate_protocol_updates: Vec::new(),
+            app_versions: BTreeMap::new(),
+            registered_protocol_update_proposals: BTreeMap::new(),
+            registered_software_update_proposals: BTreeMap::new(),
+            confirmed_proposals: BTreeMap::new(),
+            proposal_votes: BTreeMap::new(),
+            registered_endorsements: BTreeSet::new(),
+            proposal_registration_slot: BTreeMap::new(),
+        };
+        let empty_allowed: BTreeSet<Hash28> = BTreeSet::new();
+        let empty_rev = BTreeMap::new();
+        // No panic, no error type to check — the point IS that nothing
+        // observable happens.
+        register_endorsement(
+            &mut update,
+            &empty_allowed,
+            &empty_rev,
+            10_000,
+            MAINNET_K,
+            7,
+            (1, 1, 0),
+            byron_key_hash(&pk(0)),
+        );
+        assert!(update.registered_endorsements.is_empty());
+        assert!(update.candidate_protocol_updates.is_empty());
     }
 }

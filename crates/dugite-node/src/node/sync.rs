@@ -8950,6 +8950,7 @@ mod additional_sync_tests {
             transactions: vec![],
             era,
             raw_cbor: None,
+            byron: None,
         }
     }
 

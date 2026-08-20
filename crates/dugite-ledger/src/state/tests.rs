@@ -86,6 +86,7 @@ fn make_test_block(
         transactions,
         era: Era::Conway,
         raw_cbor: None,
+        byron: None,
     }
 }
 
@@ -9516,6 +9517,7 @@ fn make_byron_block_ebb_test(slot: u64, block_no: u64, prev_hash: Hash32) -> Blo
         transactions: vec![],
         era: Era::Byron,
         raw_cbor: None,
+        byron: None,
     }
 }
 

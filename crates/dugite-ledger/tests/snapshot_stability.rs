@@ -165,7 +165,15 @@ fn snapshot_format_hash_stability() {
     // `SNothing`. 39 was bumped in anticipation of exactly this addition
     // earlier in the same session (no released snapshot ever carried 39
     // without it), so this is a hash-only update, not a further version bump.
-    const EXPECTED_HASH: &str = "48839e6b8429bfd9a7edb8ea40153fffcfcc58e6a4505d663b690a249e408d64";
+    //
+    // #1084 (SAME SNAPSHOT_VERSION 39): `LedgerStateSnapshot` gains `byron`
+    // — Byron's `UPI.State` (update-proposal system) + `DI.State`
+    // (heavyweight delegation), the two `ChainValidationState` fields Byron
+    // carries beyond the UTxO set. 39 was bumped this same session
+    // specifically anticipating this addition alongside #1071's (see
+    // `state/snapshot.rs`'s SNAPSHOT_VERSION comment and its own commit
+    // message), so this too is a hash-only update.
+    const EXPECTED_HASH: &str = "514cc7e550c9b6aad41cd93839f0842b5a2461571454008c546182fc13817acc";
 
     if EXPECTED_HASH == "COMPUTE_ON_FIRST_RUN" {
         panic!(

@@ -554,6 +554,27 @@ impl LedgerState {
     //     bytes, and that is now fixed for every reachable field, verified via
     //     `snapshot_format_hash_stability` in
     //     `crates/dugite-ledger/tests/snapshot_stability.rs`.
+    //
+    //     39 ALSO carries #1084: `LedgerStateSnapshot` gains `byron`, mirroring
+    //     the new top-level `LedgerState.byron: ByronSubState` field — Byron's
+    //     `UPI.State` (update-proposal system: registered proposals, votes,
+    //     endorsements, candidate protocol updates, the adopted protocol-
+    //     parameter record) and `DI.State` (heavyweight delegation: the active
+    //     `delegator -> delegate` bimap plus its scheduling queue), the two
+    //     `ChainValidationState` fields Byron carries beyond the UTxO set
+    //     already modelled. Neither is reconstructible after the fact: a
+    //     resumed node with no delegation map cannot verify Byron block
+    //     issuers' authority, and a resumed node with no adopted-parameters
+    //     record would silently regress `byronProtocolParams` to genesis
+    //     values on every restart mid-Byron — which is precisely the #979
+    //     failure mode `EpochSubState.non_myopic` was bumped to avoid in v38.
+    //     A positional bincode addition, so it ships under the SAME
+    //     version 39 rather than a further bump — 39 was bumped this same
+    //     session specifically anticipating both this and #1071's addition
+    //     (see that commit's message). Already `BTreeMap`/`BTreeSet`-backed
+    //     end to end on the LIVE type (no `*Wire` mirror needed, unlike the
+    //     fields #1088 above had to retrofit), so #1088's determinism
+    //     property holds for it from the start.
     pub(crate) const SNAPSHOT_VERSION: u8 = 39;
 
     /// The current on-disk snapshot layout version.
