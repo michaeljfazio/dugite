@@ -1,5 +1,6 @@
 pub mod address;
 pub mod byron;
+pub(crate) mod credential;
 pub mod genesis;
 pub mod governance;
 pub mod hash;

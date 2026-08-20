@@ -391,6 +391,195 @@ enum QuerySubcommand {
         #[arg(long)]
         output_json: bool,
     },
+    /// Query the DRep stake distribution (Conway era). #1008.
+    ///
+    /// Matches `cardano-cli conway query drep-stake-distribution`. Exactly
+    /// one DRep selector is required.
+    DrepStakeDistribution {
+        #[arg(
+            long,
+            conflicts_with_all = [
+                "ds_drep_key_hash",
+                "ds_drep_script_hash",
+                "ds_drep_verification_key",
+                "ds_drep_verification_key_file",
+            ],
+        )]
+        all_dreps: bool,
+        #[arg(long = "drep-key-hash", value_name = "HASH")]
+        ds_drep_key_hash: Option<String>,
+        #[arg(
+            long = "drep-script-hash",
+            value_name = "HASH",
+            conflicts_with = "ds_drep_key_hash"
+        )]
+        ds_drep_script_hash: Option<String>,
+        #[arg(
+            long = "drep-verification-key",
+            value_name = "STRING",
+            conflicts_with_all = ["ds_drep_key_hash", "ds_drep_script_hash"],
+        )]
+        ds_drep_verification_key: Option<String>,
+        #[arg(
+            long = "drep-verification-key-file",
+            value_name = "FILEPATH",
+            conflicts_with_all = [
+                "ds_drep_key_hash",
+                "ds_drep_script_hash",
+                "ds_drep_verification_key",
+            ],
+        )]
+        ds_drep_verification_key_file: Option<PathBuf>,
+        #[arg(long, default_value = "node.sock")]
+        socket_path: PathBuf,
+        #[arg(long)]
+        testnet_magic: Option<u64>,
+        #[arg(long, conflicts_with = "output_yaml")]
+        output_json: bool,
+        #[arg(long)]
+        output_yaml: bool,
+        #[arg(long, value_name = "FILEPATH")]
+        out_file: Option<PathBuf>,
+    },
+    /// Query the era history (Conway era). #1008.
+    ///
+    /// Matches `cardano-cli conway query era-history`. Reports each era's
+    /// boundary and parameters — the same data `query slot-number` already
+    /// consumes internally to convert a UTC time to a slot.
+    EraHistory {
+        #[arg(long, default_value = "node.sock")]
+        socket_path: PathBuf,
+        #[arg(long)]
+        testnet_magic: Option<u64>,
+        #[arg(long, value_name = "FILEPATH")]
+        out_file: Option<PathBuf>,
+    },
+    /// Query the protocol parameters that will apply next epoch (Conway
+    /// era). #1008.
+    ///
+    /// Matches `cardano-cli conway query future-pparams`. `null` when no
+    /// protocol-parameter update is pending.
+    FuturePparams {
+        #[arg(long, default_value = "node.sock")]
+        socket_path: PathBuf,
+        #[arg(long)]
+        testnet_magic: Option<u64>,
+        #[arg(long, conflicts_with = "output_yaml")]
+        output_json: bool,
+        #[arg(long)]
+        output_yaml: bool,
+        #[arg(long, value_name = "FILEPATH")]
+        out_file: Option<PathBuf>,
+    },
+    /// Query the current ledger-peer snapshot (Conway era). #1008.
+    ///
+    /// Matches `cardano-cli conway query ledger-peer-snapshot`.
+    LedgerPeerSnapshot {
+        /// Query all ledger peers instead of only the big ones (the pools
+        /// cumulatively holding 90% of stake).
+        #[arg(long)]
+        all_ledger_peers: bool,
+        #[arg(long, default_value = "node.sock")]
+        socket_path: PathBuf,
+        #[arg(long)]
+        testnet_magic: Option<u64>,
+        #[arg(long, conflicts_with = "output_yaml")]
+        output_json: bool,
+        #[arg(long)]
+        output_yaml: bool,
+        #[arg(long, value_name = "FILEPATH")]
+        out_file: Option<PathBuf>,
+    },
+    /// Dump the pool state (Conway era). #1008.
+    ///
+    /// Matches `cardano-cli conway query pool-state`. One of
+    /// `--all-stake-pools` or one-or-more `--stake-pool-id` is required.
+    PoolState {
+        #[arg(long, conflicts_with = "ps_stake_pool_id")]
+        all_stake_pools: bool,
+        #[arg(long = "stake-pool-id", value_name = "STAKE_POOL_ID")]
+        ps_stake_pool_id: Vec<String>,
+        #[arg(long, default_value = "node.sock")]
+        socket_path: PathBuf,
+        #[arg(long)]
+        testnet_magic: Option<u64>,
+        #[arg(long, conflicts_with = "output_yaml")]
+        output_json: bool,
+        #[arg(long)]
+        output_yaml: bool,
+        #[arg(long, value_name = "FILEPATH")]
+        out_file: Option<PathBuf>,
+    },
+    /// Calculate the reference-input scripts size in bytes for the given
+    /// transaction inputs. #1008.
+    ///
+    /// Matches `cardano-cli conway query ref-script-size`. Needs no
+    /// dedicated node-side query: it reads `script_ref` off `GetUTxOByTxIn`
+    /// (already implemented) and reports the summed byte length.
+    RefScriptSize {
+        #[arg(long = "tx-in", value_name = "TX_IN")]
+        tx_ins: Vec<String>,
+        #[arg(long, default_value = "node.sock")]
+        socket_path: PathBuf,
+        #[arg(long)]
+        testnet_magic: Option<u64>,
+        #[arg(long, conflicts_with_all = ["output_text", "output_yaml"])]
+        output_json: bool,
+        #[arg(long, conflicts_with = "output_yaml")]
+        output_text: bool,
+        #[arg(long)]
+        output_yaml: bool,
+        #[arg(long, value_name = "FILEPATH")]
+        out_file: Option<PathBuf>,
+    },
+    /// Query the SPO (stake pool operator) stake distribution (Conway
+    /// era). #1008.
+    ///
+    /// Matches `cardano-cli conway query spo-stake-distribution`.
+    SpoStakeDistribution {
+        #[arg(
+            long,
+            conflicts_with_all = ["spo_verification_key", "spo_verification_key_file", "spo_key_hash"],
+        )]
+        all_spos: bool,
+        #[arg(long, value_name = "STRING")]
+        spo_verification_key: Option<String>,
+        #[arg(long, value_name = "FILEPATH")]
+        spo_verification_key_file: Option<PathBuf>,
+        #[arg(long, value_name = "HASH")]
+        spo_key_hash: Option<String>,
+        #[arg(long, default_value = "node.sock")]
+        socket_path: PathBuf,
+        #[arg(long)]
+        testnet_magic: Option<u64>,
+        #[arg(long, conflicts_with = "output_yaml")]
+        output_json: bool,
+        #[arg(long)]
+        output_yaml: bool,
+        #[arg(long, value_name = "FILEPATH")]
+        out_file: Option<PathBuf>,
+    },
+    /// Query a stake pool's default governance vote (Conway era). #1008.
+    ///
+    /// Matches `cardano-cli conway query stake-pool-default-vote`.
+    StakePoolDefaultVote {
+        #[arg(long, value_name = "STRING")]
+        spo_verification_key: Option<String>,
+        #[arg(long, value_name = "FILEPATH")]
+        spo_verification_key_file: Option<PathBuf>,
+        #[arg(long, value_name = "HASH")]
+        spo_key_hash: Option<String>,
+        #[arg(long, default_value = "node.sock")]
+        socket_path: PathBuf,
+        #[arg(long)]
+        testnet_magic: Option<u64>,
+        #[arg(long, conflicts_with = "output_yaml")]
+        output_json: bool,
+        #[arg(long)]
+        output_yaml: bool,
+        #[arg(long, value_name = "FILEPATH")]
+        out_file: Option<PathBuf>,
+    },
 }
 
 /// Convert an f64 active-slot coefficient to the nearest exact rational p/q.
@@ -1043,6 +1232,131 @@ where
         }
     }
     Ok(())
+}
+
+/// Decode one `PoolParams` value (`array(9)`) at the decoder's current
+/// position into a JSON object. Shares the field-by-field layout the
+/// existing `PoolParams`/`pool-params` command already decodes (pledge,
+/// cost, margin, reward account, owners, relays, metadata) — #1008's
+/// `pool-state` renders the SAME per-pool shape `GetPoolState` (tag 19)
+/// returns for its `poolParams` map, so duplicating that parse here (rather
+/// than reusing the un-refactored inline loop in the older command) keeps
+/// this a self-contained addition.
+fn decode_pool_params_json(decoder: &mut minicbor::Decoder) -> serde_json::Value {
+    let _ = decoder.array(); // array(9)
+    let _operator = decoder.bytes().unwrap_or(&[]); // same as the map key
+    let vrf_keyhash = hex::encode(decoder.bytes().unwrap_or(&[]));
+    let pledge = decoder.u64().unwrap_or(0);
+    let cost = decoder.u64().unwrap_or(0);
+    let (margin_num, margin_den) = {
+        let _ = decoder.tag(); // tag(30)
+        let _ = decoder.array(); // [num, den]
+        let n = decoder.u64().unwrap_or(0);
+        let d = decoder.u64().unwrap_or(1);
+        (n, d)
+    };
+    let reward_account = hex::encode(decoder.bytes().unwrap_or(&[]));
+    let _ = decoder.tag(); // tag(258) owners set
+    let owner_len = decoder.array().unwrap_or(Some(0)).unwrap_or(0);
+    let mut owners = Vec::new();
+    for _ in 0..owner_len {
+        owners.push(hex::encode(decoder.bytes().unwrap_or(&[])));
+    }
+    let relay_len = decoder.array().unwrap_or(Some(0)).unwrap_or(0);
+    let mut relays: Vec<serde_json::Value> = Vec::new();
+    for _ in 0..relay_len {
+        let _ = decoder.array();
+        let relay_tag = decoder.u32().unwrap_or(99);
+        match relay_tag {
+            0 => {
+                let port = decoder.u16().ok();
+                if port.is_none() {
+                    decoder.skip().ok();
+                }
+                let ipv4 = decoder.bytes().ok().map(|b| {
+                    if b.len() == 4 {
+                        format!("{}.{}.{}.{}", b[0], b[1], b[2], b[3])
+                    } else {
+                        hex::encode(b)
+                    }
+                });
+                if ipv4.is_none() {
+                    decoder.skip().ok();
+                }
+                decoder.skip().ok(); // ipv6
+                relays.push(
+                    serde_json::json!({"type": "single-host-addr", "port": port, "ipv4": ipv4}),
+                );
+            }
+            1 => {
+                let port = decoder.u16().ok();
+                if port.is_none() {
+                    decoder.skip().ok();
+                }
+                let dns = decoder.str().unwrap_or("").to_string();
+                relays.push(
+                    serde_json::json!({"type": "single-host-name", "port": port, "dnsName": dns}),
+                );
+            }
+            2 => {
+                let dns = decoder.str().unwrap_or("").to_string();
+                relays.push(serde_json::json!({"type": "multi-host-name", "dnsName": dns}));
+            }
+            _ => {
+                decoder.skip().ok();
+            }
+        }
+    }
+    let metadata = {
+        let pos = decoder.position();
+        if let Ok(Some(2)) = decoder.array() {
+            let url = decoder.str().unwrap_or("").to_string();
+            let hash = hex::encode(decoder.bytes().unwrap_or(&[]));
+            serde_json::json!({"url": url, "hash": hash})
+        } else {
+            decoder.set_position(pos);
+            decoder.skip().ok(); // null
+            serde_json::Value::Null
+        }
+    };
+
+    serde_json::json!({
+        "vrfKeyHash": vrf_keyhash,
+        "pledge": pledge,
+        "cost": cost,
+        "margin": {"numerator": margin_num, "denominator": margin_den},
+        "rewardAccount": reward_account,
+        "owners": owners,
+        "relays": relays,
+        "metadata": metadata,
+    })
+}
+
+/// Decode a `script_ref` wire value (`tag(24) bstr(array(2)[variant, payload])`,
+/// see `dugite-node`'s `encode_script_ref`) at the decoder's current position
+/// and return its byte size per `dugite-ledger`'s `script_ref_byte_size`
+/// (`validation/scripts.rs`, CIP-0112): for a native script (`variant == 0`)
+/// the ENCODED byte span of `payload` (the CBOR value itself, since
+/// `encode_native_script` is what upstream measures); for a Plutus script
+/// (`variant` 1-4) the length of the raw program bytes inside the `payload`
+/// bstr, NOT the bstr's own CBOR header. Used by `query ref-script-size`.
+fn script_ref_wire_byte_size(decoder: &mut minicbor::Decoder) -> Result<u64> {
+    let _ = decoder.tag(); // tag(24)
+    let inner = decoder
+        .bytes()
+        .map_err(|e| anyhow::anyhow!("bad script_ref bstr: {e}"))?;
+    let mut inner_dec = minicbor::Decoder::new(inner);
+    let _ = inner_dec.array(); // array(2)[variant, payload]
+    let variant = inner_dec.u32().unwrap_or(0);
+    if variant == 0 {
+        let start = inner_dec.position();
+        inner_dec.skip().ok();
+        let end = inner_dec.position();
+        Ok((end - start) as u64)
+    } else {
+        let script_bytes = inner_dec.bytes().unwrap_or(&[]);
+        Ok(script_bytes.len() as u64)
+    }
 }
 
 fn print_utxo_result(raw: &[u8]) -> Result<()> {
@@ -3417,6 +3731,471 @@ impl QueryCmd {
                     println!("{output}");
                 }
 
+                Ok(())
+            }
+            QuerySubcommand::DrepStakeDistribution {
+                all_dreps,
+                ds_drep_key_hash,
+                ds_drep_script_hash,
+                ds_drep_verification_key,
+                ds_drep_verification_key_file,
+                socket_path,
+                testnet_magic,
+                output_json: _,
+                output_yaml,
+                out_file,
+            } => {
+                if output_yaml {
+                    anyhow::bail!("--output-yaml is not yet supported (JSON only)");
+                }
+                let filter: Vec<(u8, Option<Vec<u8>>)> = if all_dreps {
+                    Vec::new()
+                } else if let Some(h) = ds_drep_key_hash.as_ref() {
+                    let bytes = hex::decode(h.trim())
+                        .map_err(|e| anyhow::anyhow!("--drep-key-hash must be 28-byte hex: {e}"))?;
+                    if bytes.len() != 28 {
+                        anyhow::bail!("--drep-key-hash must be 28 bytes (got {})", bytes.len());
+                    }
+                    vec![(0, Some(bytes))]
+                } else if let Some(h) = ds_drep_script_hash.as_ref() {
+                    let bytes = hex::decode(h.trim()).map_err(|e| {
+                        anyhow::anyhow!("--drep-script-hash must be 28-byte hex: {e}")
+                    })?;
+                    if bytes.len() != 28 {
+                        anyhow::bail!("--drep-script-hash must be 28 bytes (got {})", bytes.len());
+                    }
+                    vec![(1, Some(bytes))]
+                } else if let Some(vk_hex) = ds_drep_verification_key.as_ref() {
+                    let vk_bytes = crate::commands::credential::decode_hex_or_bech32(vk_hex)?;
+                    let hash = crate::commands::credential::vkey_bytes_to_hash(&vk_bytes);
+                    vec![(0, Some(hash))]
+                } else if let Some(path) = ds_drep_verification_key_file.as_ref() {
+                    let hash = load_drep_key_hash_from_envelope(path)?;
+                    vec![(0, Some(hash))]
+                } else {
+                    anyhow::bail!(
+                        "missing DRep selector: pass --all-dreps, --drep-key-hash, \
+                         --drep-script-hash, --drep-verification-key, or \
+                         --drep-verification-key-file"
+                    );
+                };
+
+                let mut client = connect_and_acquire(&socket_path, testnet_magic).await?;
+                let raw = client
+                    .query_drep_stake_distr(&filter)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("Failed to query DRep stake distribution: {e}"))?;
+                release_and_done(&mut client).await;
+
+                let stake_map = parse_drep_stake_distr(&raw)?;
+                let entries: Vec<serde_json::Value> = stake_map
+                    .into_iter()
+                    .map(|((cred_type, hash), stake)| {
+                        let cred_json = if hash.is_empty() {
+                            match cred_type {
+                                2 => serde_json::json!({"alwaysAbstain": null}),
+                                _ => serde_json::json!({"alwaysNoConfidence": null}),
+                            }
+                        } else if cred_type == 1 {
+                            serde_json::json!({"scriptHash": hex::encode(&hash)})
+                        } else {
+                            serde_json::json!({"keyHash": hex::encode(&hash)})
+                        };
+                        serde_json::json!([cred_json, stake])
+                    })
+                    .collect();
+
+                let rendered = serde_json::to_string_pretty(&serde_json::Value::Array(entries))?;
+                match out_file {
+                    Some(path) => std::fs::write(&path, &rendered)?,
+                    None => println!("{rendered}"),
+                }
+                Ok(())
+            }
+            QuerySubcommand::EraHistory {
+                socket_path,
+                testnet_magic,
+                out_file,
+            } => {
+                let mut client = connect_and_handshake(&socket_path, testnet_magic).await?;
+                let raw = client
+                    .query_era_history()
+                    .await
+                    .map_err(|e| anyhow::anyhow!("Failed to query era history: {e}"))?;
+                client.done().await.ok();
+
+                // MsgResult [4, <array of EraSummary>]; EraHistory is a
+                // top-level HardFork query, not HFC-wrapped. Each
+                // EraSummary = array(3)[EraParams, EraStart, SafeZone] —
+                // the SAME wire assumption `query slot-number` above
+                // already relies on. Reused rather than re-derived so both
+                // commands agree; NOT independently re-verified against a
+                // live cardano-cli JSON capture for this specific new
+                // command (no running node/cardano-cli session was
+                // available during the #1008 implementation pass — see the
+                // session's final report).
+                let mut decoder = minicbor::Decoder::new(&raw);
+                let _ = decoder.array();
+                let tag = decoder.u32().unwrap_or(999);
+                if tag != 4 {
+                    anyhow::bail!("Expected MsgResult tag 4, got {tag}");
+                }
+
+                let mut summaries: Vec<serde_json::Value> = Vec::new();
+                let _ = decoder.array(); // outer array of summaries (definite or indefinite)
+                loop {
+                    if decoder.array().is_err() {
+                        break;
+                    }
+                    let params_len = decoder.array().unwrap_or(Some(0)).unwrap_or(0);
+                    let epoch_length = decoder.u64().unwrap_or(0);
+                    let slot_length_ms = decoder.u64().unwrap_or(1_000);
+                    for _ in 2..params_len {
+                        decoder.skip().ok();
+                    }
+                    if decoder.array().is_err() {
+                        break;
+                    }
+                    let start_slot = decoder.u64().unwrap_or(0);
+                    let start_time_ms = decoder.u64().unwrap_or(0);
+                    decoder.skip().ok(); // SafeZone
+
+                    summaries.push(serde_json::json!({
+                        "start": {"slot": start_slot, "timeMs": start_time_ms},
+                        "parameters": {"epochLength": epoch_length, "slotLengthMs": slot_length_ms},
+                    }));
+                }
+
+                let rendered = serde_json::to_string_pretty(&serde_json::Value::Array(summaries))?;
+                match out_file {
+                    Some(path) => std::fs::write(&path, &rendered)?,
+                    None => println!("{rendered}"),
+                }
+                Ok(())
+            }
+            QuerySubcommand::FuturePparams {
+                socket_path,
+                testnet_magic,
+                output_json: _,
+                output_yaml,
+                out_file,
+            } => {
+                if output_yaml {
+                    anyhow::bail!("--output-yaml is not yet supported (JSON only)");
+                }
+                let mut client = connect_and_acquire(&socket_path, testnet_magic).await?;
+                let result = client.query_future_pparams().await.map_err(|e| {
+                    anyhow::anyhow!("Failed to query future protocol parameters: {e}")
+                })?;
+                release_and_done(&mut client).await;
+
+                let rendered = result.unwrap_or_else(|| "null".to_string());
+                match out_file {
+                    Some(path) => std::fs::write(&path, &rendered)?,
+                    None => println!("{rendered}"),
+                }
+                Ok(())
+            }
+            QuerySubcommand::LedgerPeerSnapshot {
+                all_ledger_peers,
+                socket_path,
+                testnet_magic,
+                output_json: _,
+                output_yaml,
+                out_file,
+            } => {
+                if output_yaml {
+                    anyhow::bail!("--output-yaml is not yet supported (JSON only)");
+                }
+                let mut client = connect_and_acquire(&socket_path, testnet_magic).await?;
+                // V23+ shape: peerKind Some(false)=All, Some(true)=Big-only.
+                // A pre-V23 peer only ever understands the legacy no-peerKind
+                // request; negotiate on the client's own version so this
+                // command works against either.
+                let big_only = if client.version() >= 23 {
+                    Some(!all_ledger_peers)
+                } else {
+                    None
+                };
+                let raw = client
+                    .query_ledger_peer_snapshot(big_only)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("Failed to query ledger peer snapshot: {e}"))?;
+                release_and_done(&mut client).await;
+
+                // Report the raw payload as hex pending a full decoder for
+                // this response's own versioned shapes (V2 vs V23
+                // All/Big — see `dugite-node`'s
+                // `encode_ledger_peer_snapshot`/`_v23_big`/`_v23_all`).
+                let rendered = serde_json::to_string_pretty(&serde_json::json!({
+                    "cborHex": hex::encode(&raw),
+                }))?;
+                match out_file {
+                    Some(path) => std::fs::write(&path, &rendered)?,
+                    None => println!("{rendered}"),
+                }
+                Ok(())
+            }
+            QuerySubcommand::PoolState {
+                all_stake_pools,
+                ps_stake_pool_id,
+                socket_path,
+                testnet_magic,
+                output_json: _,
+                output_yaml,
+                out_file,
+            } => {
+                if output_yaml {
+                    anyhow::bail!("--output-yaml is not yet supported (JSON only)");
+                }
+                if !all_stake_pools && ps_stake_pool_id.is_empty() {
+                    anyhow::bail!("missing selector: pass --all-stake-pools or --stake-pool-id");
+                }
+                let pool_ids: Vec<Vec<u8>> = ps_stake_pool_id
+                    .iter()
+                    .map(|id| crate::commands::credential::decode_hex_or_bech32(id))
+                    .collect::<Result<_>>()?;
+
+                let mut client = connect_and_acquire(&socket_path, testnet_magic).await?;
+                let raw = client
+                    .query_pool_state(if all_stake_pools {
+                        None
+                    } else {
+                        Some(&pool_ids)
+                    })
+                    .await
+                    .map_err(|e| anyhow::anyhow!("Failed to query pool state: {e}"))?;
+                release_and_done(&mut client).await;
+
+                let mut decoder = enter_msg_result(&raw)?;
+                // array(4)[poolParams, futurePoolParams, retiring, deposits]
+                let _ = decoder.array();
+
+                let mut pool_params = serde_json::Map::new();
+                decode_map_entries(&mut decoder, |dec| {
+                    let pool_id = hex::encode(dec.bytes().unwrap_or(&[]));
+                    let value = decode_pool_params_json(dec);
+                    pool_params.insert(pool_id, value);
+                    Ok(())
+                })?;
+
+                let mut future_pool_params = serde_json::Map::new();
+                decode_map_entries(&mut decoder, |dec| {
+                    let pool_id = hex::encode(dec.bytes().unwrap_or(&[]));
+                    let value = decode_pool_params_json(dec);
+                    future_pool_params.insert(pool_id, value);
+                    Ok(())
+                })?;
+
+                let mut retiring = serde_json::Map::new();
+                decode_map_entries(&mut decoder, |dec| {
+                    let pool_id = hex::encode(dec.bytes().unwrap_or(&[]));
+                    let epoch = dec.u64().unwrap_or(0);
+                    retiring.insert(pool_id, serde_json::json!(epoch));
+                    Ok(())
+                })?;
+
+                let mut deposits = serde_json::Map::new();
+                decode_map_entries(&mut decoder, |dec| {
+                    let pool_id = hex::encode(dec.bytes().unwrap_or(&[]));
+                    let deposit = dec.u64().unwrap_or(0);
+                    deposits.insert(pool_id, serde_json::json!(deposit));
+                    Ok(())
+                })?;
+
+                let rendered = serde_json::to_string_pretty(&serde_json::json!({
+                    "poolParams": pool_params,
+                    "futurePoolParams": future_pool_params,
+                    "retiring": retiring,
+                    "deposits": deposits,
+                }))?;
+                match out_file {
+                    Some(path) => std::fs::write(&path, &rendered)?,
+                    None => println!("{rendered}"),
+                }
+                Ok(())
+            }
+            QuerySubcommand::RefScriptSize {
+                tx_ins,
+                socket_path,
+                testnet_magic,
+                output_json: _,
+                output_text,
+                output_yaml,
+                out_file,
+            } => {
+                if output_yaml {
+                    anyhow::bail!("--output-yaml is not yet supported (JSON only)");
+                }
+                if tx_ins.is_empty() {
+                    anyhow::bail!("at least one --tx-in is required");
+                }
+                let mut inputs: Vec<(Vec<u8>, u32)> = Vec::with_capacity(tx_ins.len());
+                for tx_in in &tx_ins {
+                    let (hash_str, idx_str) = tx_in.split_once('#').ok_or_else(|| {
+                        anyhow::anyhow!("--tx-in must be TX_HASH#INDEX, got '{tx_in}'")
+                    })?;
+                    let hash = hex::decode(hash_str.trim())
+                        .map_err(|e| anyhow::anyhow!("--tx-in: invalid tx hash: {e}"))?;
+                    let index: u32 = idx_str
+                        .trim()
+                        .parse()
+                        .map_err(|e| anyhow::anyhow!("--tx-in: invalid index: {e}"))?;
+                    inputs.push((hash, index));
+                }
+
+                let mut client = connect_and_acquire(&socket_path, testnet_magic).await?;
+                let raw = client
+                    .query_utxo_by_txin(&inputs)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("Failed to query UTxO: {e}"))?;
+                release_and_done(&mut client).await;
+
+                let mut decoder = enter_msg_result(&raw)?;
+                let mut total_size: u64 = 0;
+                decode_map_entries(&mut decoder, |dec| {
+                    let _ = dec.array(); // TxIn [hash, index]
+                    dec.bytes().ok();
+                    dec.u32().ok();
+
+                    decode_map_entries(dec, |inner| {
+                        let key = inner.u32().unwrap_or(999);
+                        if key == 3 {
+                            total_size += script_ref_wire_byte_size(inner)?;
+                        } else {
+                            inner.skip().ok();
+                        }
+                        Ok(())
+                    })
+                })?;
+
+                if output_text {
+                    let rendered = total_size.to_string();
+                    match out_file {
+                        Some(path) => std::fs::write(&path, &rendered)?,
+                        None => println!("{rendered}"),
+                    }
+                } else {
+                    let rendered = serde_json::to_string_pretty(&serde_json::json!({
+                        "scriptsSize": total_size,
+                    }))?;
+                    match out_file {
+                        Some(path) => std::fs::write(&path, &rendered)?,
+                        None => println!("{rendered}"),
+                    }
+                }
+                Ok(())
+            }
+            QuerySubcommand::SpoStakeDistribution {
+                all_spos,
+                spo_verification_key,
+                spo_verification_key_file,
+                spo_key_hash,
+                socket_path,
+                testnet_magic,
+                output_json: _,
+                output_yaml,
+                out_file,
+            } => {
+                if output_yaml {
+                    anyhow::bail!("--output-yaml is not yet supported (JSON only)");
+                }
+                let pool_ids: Vec<Vec<u8>> = if all_spos {
+                    Vec::new()
+                } else if let Some(vk) = spo_verification_key.as_ref() {
+                    vec![crate::commands::credential::vkey_string_to_hash(vk)?]
+                } else if let Some(path) = spo_verification_key_file.as_ref() {
+                    vec![crate::commands::credential::load_vkey_hash_from_envelope(
+                        path,
+                    )?]
+                } else if let Some(id) = spo_key_hash.as_ref() {
+                    let bytes = crate::commands::credential::decode_hex_or_bech32(id)?;
+                    if bytes.len() != 28 {
+                        anyhow::bail!("--spo-key-hash must be 28 bytes, got {}", bytes.len());
+                    }
+                    vec![bytes]
+                } else {
+                    anyhow::bail!(
+                        "missing selector: pass --all-spos, --spo-verification-key, \
+                         --spo-verification-key-file, or --spo-key-hash"
+                    );
+                };
+
+                let mut client = connect_and_acquire(&socket_path, testnet_magic).await?;
+                let raw = client
+                    .query_spo_stake_distr(&pool_ids)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("Failed to query SPO stake distribution: {e}"))?;
+                release_and_done(&mut client).await;
+
+                let mut decoder = enter_msg_result(&raw)?;
+                let mut entries = serde_json::Map::new();
+                decode_map_entries(&mut decoder, |dec| {
+                    let pool_id = hex::encode(dec.bytes().unwrap_or(&[]));
+                    let stake = dec.u64().unwrap_or(0);
+                    entries.insert(pool_id, serde_json::json!(stake));
+                    Ok(())
+                })?;
+
+                let rendered = serde_json::to_string_pretty(&serde_json::Value::Object(entries))?;
+                match out_file {
+                    Some(path) => std::fs::write(&path, &rendered)?,
+                    None => println!("{rendered}"),
+                }
+                Ok(())
+            }
+            QuerySubcommand::StakePoolDefaultVote {
+                spo_verification_key,
+                spo_verification_key_file,
+                spo_key_hash,
+                socket_path,
+                testnet_magic,
+                output_json: _,
+                output_yaml,
+                out_file,
+            } => {
+                if output_yaml {
+                    anyhow::bail!("--output-yaml is not yet supported (JSON only)");
+                }
+                let pool_id: Vec<u8> = if let Some(vk) = spo_verification_key.as_ref() {
+                    crate::commands::credential::vkey_string_to_hash(vk)?
+                } else if let Some(path) = spo_verification_key_file.as_ref() {
+                    crate::commands::credential::load_vkey_hash_from_envelope(path)?
+                } else if let Some(id) = spo_key_hash.as_ref() {
+                    let bytes = crate::commands::credential::decode_hex_or_bech32(id)?;
+                    if bytes.len() != 28 {
+                        anyhow::bail!("--spo-key-hash must be 28 bytes, got {}", bytes.len());
+                    }
+                    bytes
+                } else {
+                    anyhow::bail!(
+                        "missing selector: pass --spo-verification-key, \
+                         --spo-verification-key-file, or --spo-key-hash"
+                    );
+                };
+
+                let mut client = connect_and_acquire(&socket_path, testnet_magic).await?;
+                let raw = client
+                    .query_stake_pool_default_vote(&pool_id)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("Failed to query stake pool default vote: {e}"))?;
+                release_and_done(&mut client).await;
+
+                let mut decoder = enter_msg_result(&raw)?;
+                let vote = decoder.u8().unwrap_or(0);
+                let vote_str = match vote {
+                    1 => "DefaultAbstain",
+                    2 => "DefaultNoConfidence",
+                    _ => "DefaultNo",
+                };
+
+                let rendered = serde_json::to_string_pretty(&serde_json::json!({
+                    "defaultVote": vote_str,
+                }))?;
+                match out_file {
+                    Some(path) => std::fs::write(&path, &rendered)?,
+                    None => println!("{rendered}"),
+                }
                 Ok(())
             }
         }

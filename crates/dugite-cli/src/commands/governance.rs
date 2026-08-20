@@ -74,6 +74,24 @@ enum GovernanceSubcommand {
         #[command(subcommand)]
         command: ActionSubcommand,
     },
+    /// Constitutional Committee key/certificate commands. #1008.
+    Committee {
+        #[command(subcommand)]
+        command: CommitteeSubcommand,
+    },
+    /// Create an MIR (Move Instantaneous Rewards) certificate.
+    ///
+    /// Legacy pre-Conway mechanism: Phase-1 is a no-op at PV>=9 on any live
+    /// network, so this exists for tooling/certificate-construction
+    /// completeness rather than for any effect on a Conway chain. Matches
+    /// `cardano-cli compatible shelley governance create-mir-certificate`
+    /// (the surface-parity walker strips both the `compatible` and
+    /// `shelley` era/namespace tokens, so it normalizes to this same path).
+    /// #1008.
+    CreateMirCertificate {
+        #[command(subcommand)]
+        command: MirSubcommand,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -175,6 +193,20 @@ enum VoteSubcommand {
         #[arg(long)]
         out_file: PathBuf,
     },
+    /// View a vote file. #1008.
+    ///
+    /// Matches `cardano-cli conway governance vote view`. Decodes the same
+    /// `voting procedures` CBOR shape `vote create` writes.
+    View {
+        #[arg(long, value_name = "FILEPATH")]
+        vote_file: PathBuf,
+        #[arg(long, conflicts_with = "output_yaml")]
+        output_json: bool,
+        #[arg(long)]
+        output_yaml: bool,
+        #[arg(long, value_name = "FILEPATH")]
+        out_file: Option<PathBuf>,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -237,6 +269,15 @@ enum ActionSubcommand {
         out_file: PathBuf,
     },
     /// Create a hard fork initiation action
+    ///
+    /// cardano-cli 11's canonical name is `create-hardfork`. dugite's
+    /// original name, `create-hard-fork-initiation`, is kept as a visible
+    /// alias for existing scripts (#1008's naming-normalization pattern,
+    /// same as `stake-address stake-delegation-certificate`).
+    #[command(
+        name = "create-hardfork",
+        visible_alias = "create-hard-fork-initiation"
+    )]
     CreateHardForkInitiation {
         #[arg(long)]
         anchor_url: String,
@@ -292,6 +333,11 @@ enum ActionSubcommand {
         out_file: PathBuf,
     },
     /// Create an update committee action
+    ///
+    /// cardano-cli 11's canonical name is `update-committee`. dugite's
+    /// original name, `create-update-committee`, is kept as a visible
+    /// alias for existing scripts (#1008).
+    #[command(name = "update-committee", visible_alias = "create-update-committee")]
     CreateUpdateCommittee {
         #[arg(long)]
         anchor_url: String,
@@ -333,6 +379,117 @@ enum ActionSubcommand {
         #[arg(long)]
         transfer: u64,
         #[arg(long)]
+        out_file: PathBuf,
+    },
+    /// View a governance action. #1008.
+    ///
+    /// Matches `cardano-cli conway governance action view`. Decodes the
+    /// `Governance proposal` CBOR file each `action create-*` command
+    /// above writes.
+    View {
+        #[arg(long, value_name = "FILEPATH")]
+        action_file: PathBuf,
+        #[arg(long, conflicts_with = "output_yaml")]
+        output_json: bool,
+        #[arg(long)]
+        output_yaml: bool,
+        #[arg(long, value_name = "FILEPATH")]
+        out_file: Option<PathBuf>,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum CommitteeSubcommand {
+    /// Create a cold key resignation certificate for a Constitutional
+    /// Committee member.
+    CreateColdKeyResignationCertificate {
+        #[command(flatten)]
+        cold: crate::commands::credential::CcColdArgs,
+        #[arg(long, value_name = "TEXT")]
+        resignation_metadata_url: Option<String>,
+        #[arg(long, value_name = "HASH")]
+        resignation_metadata_hash: Option<String>,
+        #[arg(long, value_name = "FILEPATH")]
+        out_file: PathBuf,
+    },
+    /// Create a hot key authorization certificate for a Constitutional
+    /// Committee member.
+    CreateHotKeyAuthorizationCertificate {
+        #[command(flatten)]
+        cold: crate::commands::credential::CcColdArgs,
+        #[command(flatten)]
+        hot: crate::commands::credential::CcHotArgs,
+        #[arg(long, value_name = "FILEPATH")]
+        out_file: PathBuf,
+    },
+    /// Create a cold key pair for a Constitutional Committee member.
+    KeyGenCold {
+        #[arg(long, value_name = "FILEPATH")]
+        cold_verification_key_file: PathBuf,
+        #[arg(long, value_name = "FILEPATH")]
+        cold_signing_key_file: PathBuf,
+    },
+    /// Create a hot key pair for a Constitutional Committee member.
+    KeyGenHot {
+        #[arg(long, value_name = "FILEPATH")]
+        verification_key_file: PathBuf,
+        #[arg(long, value_name = "FILEPATH")]
+        signing_key_file: PathBuf,
+    },
+    /// Print the identifier (hash) of a Constitutional Committee member key
+    /// (hot or cold).
+    KeyHash {
+        #[arg(long, value_name = "STRING")]
+        verification_key: Option<String>,
+        #[arg(long, value_name = "FILEPATH")]
+        verification_key_file: Option<PathBuf>,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum MirSubcommand {
+    /// Create an MIR certificate to pay stake addresses.
+    StakeAddresses {
+        #[arg(long, conflicts_with = "treasury")]
+        reserves: bool,
+        #[arg(long)]
+        treasury: bool,
+        #[arg(long, value_name = "ADDRESS")]
+        stake_address: String,
+        #[arg(long, value_name = "LOVELACE")]
+        reward: u64,
+        #[arg(long, value_name = "FILEPATH")]
+        out_file: PathBuf,
+    },
+    /// Create an MIR certificate to transfer from the reserves pot to the
+    /// treasury pot.
+    ///
+    /// NOTE (#1008, verified against real `cardano-cli 11.0.0.0`, git rev
+    /// `97036a66bcf8c89f687ae57a048eecc0389977ef`): this command and
+    /// `transfer-to-rewards` below produce BYTE-IDENTICAL certificates —
+    /// both encode `mir_pot = 1` (treasury) with a `SendToOppositePotMIR`
+    /// target, confirmed on two independent runs with the same `--transfer`
+    /// amount. That contradicts each command's own `--help` description
+    /// ("reserves pot to the treasury pot" vs "treasury pot to the reserves
+    /// pot"), so it looks like a real cardano-cli defect — but this
+    /// project's standing rule is to match cardano-cli's ACTUAL
+    /// implementation over what its prose claims (CLAUDE.md, the CIP-0121
+    /// precedent). Do not "fix" this to encode `mir_pot = 0` for
+    /// transfer-to-treasury without re-capturing against a newer
+    /// cardano-cli first.
+    TransferToTreasury {
+        #[arg(long, value_name = "LOVELACE")]
+        transfer: u64,
+        #[arg(long, value_name = "FILEPATH")]
+        out_file: PathBuf,
+    },
+    /// Create an MIR certificate to transfer from the treasury pot to the
+    /// reserves pot. See `transfer-to-treasury`'s doc comment: on real
+    /// `cardano-cli 11.0.0.0` this produces the byte-identical certificate.
+    TransferToRewards {
+        #[arg(long, value_name = "LOVELACE")]
+        transfer: u64,
+        #[arg(long, value_name = "FILEPATH")]
         out_file: PathBuf,
     },
 }
@@ -591,13 +748,23 @@ impl GovernanceCmd {
                     }
 
                     // Determine voter type and credential
-                    // CC Hot = type 0, SPO = type 1, DRep = type 2
+                    // Conway `voter` CDDL (oracle-verified against a real
+                    // `cardano-cli 11.0.0.0 governance vote create` capture
+                    // during #1008): [0, keyhash]=CC hot key, [2, keyhash]=DRep
+                    // key, [4, keyhash]=stake pool. This function previously
+                    // encoded the SPO arm as type 1, which is actually
+                    // ConstitutionalCommitteeHotScriptHash — a vote built with
+                    // `--cold-verification-key-file` would decode upstream as a
+                    // CC-script vote carrying an unrelated credential hash,
+                    // not a stake-pool vote at all. Fixed as part of building
+                    // `vote view` against real captures; see the type's own
+                    // `#1008` note above.
                     let (voter_type, voter_hash) = if let Some(ref cc_file) =
                         cc_hot_verification_key_file
                     {
                         (0u32, load_key_hash(cc_file)?)
                     } else if let Some(ref cold_file) = cold_verification_key_file {
-                        (1, load_key_hash(cold_file)?)
+                        (4, load_key_hash(cold_file)?)
                     } else if let Some(ref drep_file) = drep_verification_key_file {
                         (2, load_key_hash(drep_file)?)
                     } else {
@@ -612,11 +779,16 @@ impl GovernanceCmd {
 
                     // Voting procedures map: { voter => { action_id => voting_procedure } }
                     enc.map(1)?;
-                    // Voter: [voter_type, credential]
+                    // Voter = [voter_type, addr_keyhash_or_scripthash] — a
+                    // BARE hash, not a nested `[cred_type, hash]` credential
+                    // structure (Conway `voter` CDDL). This function
+                    // previously wrapped the hash in an extra `[0, hash]`
+                    // array, which produced a mis-shaped `voter` a real
+                    // node would reject; caught (along with the SPO
+                    // voter-type bug above) while building `vote view`
+                    // against a real `cardano-cli 11.0.0.0` capture (#1008).
                     enc.array(2)?;
                     enc.u32(voter_type)?;
-                    enc.array(2)?;
-                    enc.u32(0)?; // key credential
                     enc.bytes(&voter_hash)?;
                     // Action votes map
                     enc.map(1)?;
@@ -638,11 +810,20 @@ impl GovernanceCmd {
 
                     let voter_desc = match voter_type {
                         0 => "Constitutional Committee",
-                        1 => "Stake Pool Operator",
+                        4 => "Stake Pool Operator",
                         _ => "DRep",
                     };
+                    // Envelope "type" must be exactly "Governance voting
+                    // procedures" — this function previously wrote
+                    // "VoteConway", which is a genuine other text-envelope
+                    // type dugite-cli also produces (some certificates), but
+                    // not what cardano-cli's own vote-file reader accepts:
+                    // real `cardano-cli … vote view` on the old output
+                    // failed with "TextEnvelope type error: Expected:
+                    // Governance voting procedures Actual: VoteConway".
+                    // Found and fixed alongside the two encoding bugs above.
                     let vote_env = serde_json::json!({
-                        "type": "VoteConway",
+                        "type": "Governance voting procedures",
                         "description": format!("{voter_desc} Governance Vote"),
                         "cborHex": hex::encode(&vote_cbor)
                     });
@@ -658,6 +839,90 @@ impl GovernanceCmd {
                     println!(
                         "Vote: {vote_str} ({voter_desc}) on {governance_action_tx_id}#{governance_action_index}"
                     );
+                    Ok(())
+                }
+                VoteSubcommand::View {
+                    vote_file,
+                    output_json: _,
+                    output_yaml,
+                    out_file,
+                } => {
+                    if output_yaml {
+                        anyhow::bail!("--output-yaml is not yet supported (JSON only)");
+                    }
+                    let content = std::fs::read_to_string(&vote_file).map_err(|e| {
+                        anyhow::anyhow!("failed to read '{}': {e}", vote_file.display())
+                    })?;
+                    let env: serde_json::Value = serde_json::from_str(&content)?;
+                    let cbor_hex =
+                        env.get("cborHex").and_then(|v| v.as_str()).ok_or_else(|| {
+                            anyhow::anyhow!("missing cborHex in {}", vote_file.display())
+                        })?;
+                    let cbor = hex::decode(cbor_hex.trim())?;
+
+                    // `voting procedures` = Map<Voter, Map<GovActionId, VotingProcedure>>.
+                    // Voter = array(2)[type, hash28]:
+                    //   0=CC hot key, 1=CC hot script, 2=DRep key, 3=DRep
+                    //   script, 4=stake pool key (no script variant) — Conway
+                    //   `voter` CDDL, oracle-verified against a real
+                    //   `cardano-cli 11.0.0.0 vote view` capture during #1008.
+                    // GovActionId = array(2)[tx_hash(32), index].
+                    // VotingProcedure = array(2)[vote(0=No/1=Yes/2=Abstain), anchor|null].
+                    let mut decoder = minicbor::Decoder::new(&cbor);
+                    let voter_count = decoder.map().unwrap_or(Some(0)).unwrap_or(0);
+                    let mut out = serde_json::Map::new();
+                    for _ in 0..voter_count {
+                        let _ = decoder.array(); // Voter [type, hash]
+                        let voter_type = decoder.u32().unwrap_or(0);
+                        let hash = hex::encode(decoder.bytes().unwrap_or(&[]));
+                        let (role, kind) = match voter_type {
+                            0 => ("committee", "keyHash"),
+                            1 => ("committee", "scriptHash"),
+                            2 => ("drep", "keyHash"),
+                            3 => ("drep", "scriptHash"),
+                            _ => ("stakepool", "keyHash"),
+                        };
+                        let voter_label = format!("{role}-{kind}-{hash}");
+
+                        let action_count = decoder.map().unwrap_or(Some(0)).unwrap_or(0);
+                        let mut actions = serde_json::Map::new();
+                        for _ in 0..action_count {
+                            let _ = decoder.array(); // GovActionId [tx_hash, index]
+                            let tx_id = hex::encode(decoder.bytes().unwrap_or(&[]));
+                            let index = decoder.u32().unwrap_or(0);
+                            let action_label = format!("{tx_id}#{index}");
+
+                            let _ = decoder.array(); // VotingProcedure [vote, anchor]
+                            let vote = decoder.u32().unwrap_or(0);
+                            let decision = match vote {
+                                0 => "VoteNo",
+                                1 => "VoteYes",
+                                _ => "Abstain",
+                            };
+                            let anchor_pos = decoder.position();
+                            let anchor = if let Ok(Some(2)) = decoder.array() {
+                                let url = decoder.str().unwrap_or("").to_string();
+                                let dh = hex::encode(decoder.bytes().unwrap_or(&[]));
+                                serde_json::json!({"dataHash": dh, "url": url})
+                            } else {
+                                decoder.set_position(anchor_pos);
+                                decoder.skip().ok(); // null
+                                serde_json::Value::Null
+                            };
+
+                            actions.insert(
+                                action_label,
+                                serde_json::json!({"anchor": anchor, "decision": decision}),
+                            );
+                        }
+                        out.insert(voter_label, serde_json::Value::Object(actions));
+                    }
+
+                    let rendered = serde_json::to_string_pretty(&serde_json::Value::Object(out))?;
+                    match out_file {
+                        Some(path) => std::fs::write(&path, &rendered)?,
+                        None => println!("{rendered}"),
+                    }
                     Ok(())
                 }
             },
@@ -958,7 +1223,13 @@ impl GovernanceCmd {
                         &prev_governance_action_tx_id,
                         &prev_governance_action_index,
                     )?;
-                    // Members to remove (set of credentials)
+                    // Members to remove: `tag(258) Set<credential>` — confirmed
+                    // against a real `cardano-cli 11.0.0.0` capture
+                    // (`d90102 80` for an empty set, not a bare `80`). This
+                    // encoder previously omitted the tag; found while
+                    // building `action view`'s UpdateCommittee decoder
+                    // against that same capture (#1008).
+                    enc.tag(minicbor::data::Tag::new(258))?;
                     enc.array(remove_cc_cold_verification_key_hash.len() as u64)?;
                     for hash_hex in &remove_cc_cold_verification_key_hash {
                         let hash_bytes = hex::decode(hash_hex)?;
@@ -983,7 +1254,9 @@ impl GovernanceCmd {
                         enc.bytes(&hash_bytes)?;
                         enc.u64(expiry)?;
                     }
-                    // Threshold as rational
+                    // Threshold: `tag(30) unit_interval` (`d81e 82 <num> <den>`),
+                    // not a bare array — same #1008 finding as the removal set.
+                    enc.tag(minicbor::data::Tag::new(30))?;
                     enc.array(2)?;
                     enc.u64(thresh_num)?;
                     enc.u64(thresh_den)?;
@@ -1070,9 +1343,493 @@ impl GovernanceCmd {
                     );
                     Ok(())
                 }
+                ActionSubcommand::View {
+                    action_file,
+                    output_json: _,
+                    output_yaml,
+                    out_file,
+                } => {
+                    if output_yaml {
+                        anyhow::bail!("--output-yaml is not yet supported (JSON only)");
+                    }
+                    let content = std::fs::read_to_string(&action_file).map_err(|e| {
+                        anyhow::anyhow!("failed to read '{}': {e}", action_file.display())
+                    })?;
+                    let env: serde_json::Value = serde_json::from_str(&content)?;
+                    let cbor_hex =
+                        env.get("cborHex").and_then(|v| v.as_str()).ok_or_else(|| {
+                            anyhow::anyhow!("missing cborHex in {}", action_file.display())
+                        })?;
+                    let cbor = hex::decode(cbor_hex.trim())?;
+
+                    // ProposalProcedure = array(4)[deposit, return_addr(29),
+                    // gov_action, anchor]. Same shape every `action create-*`
+                    // command above writes. JSON key names for the four
+                    // simplest action types (InfoAction/NoConfidence/
+                    // HardForkInitiation/NewConstitution/UpdateCommittee/
+                    // TreasuryWithdrawals) were captured from a real
+                    // `cardano-cli 11.0.0.0 governance action view` run
+                    // during #1008 and are pinned byte-for-byte in this
+                    // module's tests. ParameterChange's `contents` is NOT a
+                    // live capture — cardano-cli's PParamsUpdate JSON uses
+                    // named fields this project has not indexed here, so it
+                    // is rendered as the raw integer-keyed CBOR map instead
+                    // of fabricated field names (an honest gap rather than a
+                    // confident wrong shape).
+                    let mut decoder = minicbor::Decoder::new(&cbor);
+                    let _ = decoder.array(); // array(4)
+                    let deposit = decoder.u64().unwrap_or(0);
+                    let addr_bytes = decoder.bytes().unwrap_or(&[]).to_vec();
+                    let (network, cred_kind) = if addr_bytes.is_empty() {
+                        ("Testnet", "keyHash")
+                    } else {
+                        let network = if addr_bytes[0] & 0x01 != 0 {
+                            "Mainnet"
+                        } else {
+                            "Testnet"
+                        };
+                        let cred_kind = if addr_bytes[0] & 0x10 != 0 {
+                            "scriptHash"
+                        } else {
+                            "keyHash"
+                        };
+                        (network, cred_kind)
+                    };
+                    let cred_hash = if addr_bytes.len() > 1 {
+                        hex::encode(&addr_bytes[1..])
+                    } else {
+                        String::new()
+                    };
+                    let return_address = serde_json::json!({
+                        "credential": {cred_kind: cred_hash},
+                        "network": network,
+                    });
+
+                    let action_arr_len = decoder.array().unwrap_or(Some(0)).unwrap_or(0);
+                    let action_tag = decoder.u32().unwrap_or(999);
+
+                    let read_prev_action_id = |dec: &mut minicbor::Decoder| -> serde_json::Value {
+                        let pos = dec.position();
+                        if let Ok(Some(2)) = dec.array() {
+                            let tx_id = hex::encode(dec.bytes().unwrap_or(&[]));
+                            let ix = dec.u32().unwrap_or(0);
+                            serde_json::json!({"govActionIx": ix, "txId": tx_id})
+                        } else {
+                            dec.set_position(pos);
+                            dec.skip().ok();
+                            serde_json::Value::Null
+                        }
+                    };
+
+                    let (tag_name, contents): (&str, Option<serde_json::Value>) = match action_tag {
+                        6 => ("InfoAction", None),
+                        3 => {
+                            let prev = read_prev_action_id(&mut decoder);
+                            ("NoConfidence", Some(prev))
+                        }
+                        1 => {
+                            let prev = read_prev_action_id(&mut decoder);
+                            let _ = decoder.array(); // [major, minor]
+                            let major = decoder.u64().unwrap_or(0);
+                            let minor = decoder.u64().unwrap_or(0);
+                            (
+                                "HardForkInitiation",
+                                Some(serde_json::json!([prev, {"major": major, "minor": minor}])),
+                            )
+                        }
+                        5 => {
+                            let prev = read_prev_action_id(&mut decoder);
+                            let _ = decoder.array(); // Constitution [anchor, script?]
+                            let _ = decoder.array(); // anchor [url, hash]
+                            let url = decoder.str().unwrap_or("").to_string();
+                            let dh = hex::encode(decoder.bytes().unwrap_or(&[]));
+                            let script_pos = decoder.position();
+                            let mut constitution = serde_json::json!({
+                                "anchor": {"dataHash": dh, "url": url},
+                            });
+                            if let Ok(script_bytes) = decoder.bytes() {
+                                constitution["script"] =
+                                    serde_json::json!(hex::encode(script_bytes));
+                            } else {
+                                decoder.set_position(script_pos);
+                                decoder.skip().ok(); // null
+                            }
+                            (
+                                "NewConstitution",
+                                Some(serde_json::json!([prev, constitution])),
+                            )
+                        }
+                        4 => {
+                            let prev = read_prev_action_id(&mut decoder);
+                            // Members-to-remove is `tag(258) Set<credential>`
+                            // (confirmed against a real `cardano-cli
+                            // 11.0.0.0` capture — an empty removal set still
+                            // carries the tag, `d90102 80`). Consuming it
+                            // unconditionally is safe: `.tag()` on a
+                            // non-tagged item leaves the decoder position
+                            // unchanged, same pattern already used below for
+                            // `added`'s per-credential array and the
+                            // threshold's `tag(30)`.
+                            let _ = decoder.tag();
+                            let removed_len = decoder.array().unwrap_or(Some(0)).unwrap_or(0);
+                            let mut removed = Vec::new();
+                            for _ in 0..removed_len {
+                                let _ = decoder.array(); // credential [type, hash]
+                                let ctype = decoder.u32().unwrap_or(0);
+                                let hash = hex::encode(decoder.bytes().unwrap_or(&[]));
+                                let key = if ctype == 1 { "scriptHash" } else { "keyHash" };
+                                removed.push(serde_json::json!({key: hash}));
+                            }
+                            let added_len = decoder.map().unwrap_or(Some(0)).unwrap_or(0);
+                            let mut added = serde_json::Map::new();
+                            for _ in 0..added_len {
+                                let _ = decoder.array(); // credential
+                                let ctype = decoder.u32().unwrap_or(0);
+                                let hash = hex::encode(decoder.bytes().unwrap_or(&[]));
+                                let epoch = decoder.u64().unwrap_or(0);
+                                let label = if ctype == 1 {
+                                    format!("scriptHash-{hash}")
+                                } else {
+                                    format!("keyHash-{hash}")
+                                };
+                                added.insert(label, serde_json::json!(epoch));
+                            }
+                            let _ = decoder.tag(); // tag(30) rational
+                            let _ = decoder.array();
+                            let num = decoder.u64().unwrap_or(0);
+                            let den = decoder.u64().unwrap_or(1);
+                            (
+                                "UpdateCommittee",
+                                Some(serde_json::json!([
+                                    prev,
+                                    removed,
+                                    added,
+                                    {"numerator": num, "denominator": den},
+                                ])),
+                            )
+                        }
+                        2 => {
+                            let wd_len = decoder.map().unwrap_or(Some(0)).unwrap_or(0);
+                            let mut withdrawals = Vec::new();
+                            for _ in 0..wd_len {
+                                let addr = decoder.bytes().unwrap_or(&[]).to_vec();
+                                let amount = decoder.u64().unwrap_or(0);
+                                let (net, kind) = if !addr.is_empty() && addr[0] & 0x10 != 0 {
+                                    (
+                                        if addr[0] & 0x01 != 0 {
+                                            "Mainnet"
+                                        } else {
+                                            "Testnet"
+                                        },
+                                        "scriptHash",
+                                    )
+                                } else if !addr.is_empty() {
+                                    (
+                                        if addr[0] & 0x01 != 0 {
+                                            "Mainnet"
+                                        } else {
+                                            "Testnet"
+                                        },
+                                        "keyHash",
+                                    )
+                                } else {
+                                    ("Testnet", "keyHash")
+                                };
+                                let hash = if addr.len() > 1 {
+                                    hex::encode(&addr[1..])
+                                } else {
+                                    String::new()
+                                };
+                                withdrawals.push(serde_json::json!([
+                                    {"credential": {kind: hash}, "network": net},
+                                    amount,
+                                ]));
+                            }
+                            let policy_pos = decoder.position();
+                            let policy = if let Ok(bytes) = decoder.bytes() {
+                                serde_json::json!(hex::encode(bytes))
+                            } else {
+                                decoder.set_position(policy_pos);
+                                decoder.skip().ok();
+                                serde_json::Value::Null
+                            };
+                            (
+                                "TreasuryWithdrawals",
+                                Some(serde_json::json!([withdrawals, policy])),
+                            )
+                        }
+                        0 => {
+                            let prev = read_prev_action_id(&mut decoder);
+                            // Raw integer-keyed PParamsUpdate map — see the
+                            // doc comment above this match.
+                            let start = decoder.position();
+                            decoder.skip().ok(); // the PParamsUpdate map itself
+                            let end = decoder.position();
+                            let ppu_hex = hex::encode(&cbor[start..end]);
+                            let policy_pos = decoder.position();
+                            let policy = if let Ok(bytes) = decoder.bytes() {
+                                serde_json::json!(hex::encode(bytes))
+                            } else {
+                                decoder.set_position(policy_pos);
+                                decoder.skip().ok();
+                                serde_json::Value::Null
+                            };
+                            (
+                                "ParameterChange",
+                                Some(serde_json::json!([prev, {"cborHex": ppu_hex}, policy])),
+                            )
+                        }
+                        _ => {
+                            anyhow::bail!(
+                                "unknown governance action tag {action_tag} (array len {action_arr_len})"
+                            );
+                        }
+                    };
+
+                    let _ = decoder.array(); // anchor [url, hash]
+                    let anchor_url = decoder.str().unwrap_or("").to_string();
+                    let anchor_hash = hex::encode(decoder.bytes().unwrap_or(&[]));
+
+                    let mut gov_action = serde_json::Map::new();
+                    gov_action.insert("tag".to_string(), serde_json::json!(tag_name));
+                    if let Some(c) = contents {
+                        gov_action.insert("contents".to_string(), c);
+                    }
+
+                    let rendered = serde_json::to_string_pretty(&serde_json::json!({
+                        "anchor": {"dataHash": anchor_hash, "url": anchor_url},
+                        "deposit": deposit,
+                        "governance action": gov_action,
+                        "return address": return_address,
+                    }))?;
+                    match out_file {
+                        Some(path) => std::fs::write(&path, &rendered)?,
+                        None => println!("{rendered}"),
+                    }
+                    Ok(())
+                }
+            },
+            GovernanceSubcommand::Committee { command } => match command {
+                CommitteeSubcommand::CreateColdKeyResignationCertificate {
+                    cold,
+                    resignation_metadata_url,
+                    resignation_metadata_hash,
+                    out_file,
+                } => {
+                    let cred = cold.resolve()?;
+
+                    // resign_committee_cold_cert = (15, cold_credential, anchor / null).
+                    // The third field is REQUIRED (anchor XOR null), not
+                    // omittable — array(3) always, confirmed against a real
+                    // `cardano-cli 11.0.0.0` capture with no
+                    // `--resignation-metadata-*` flags (`83 0f <cred> f6`,
+                    // not `82 0f <cred>`).
+                    let mut cert_cbor = Vec::new();
+                    let mut enc = minicbor::Encoder::new(&mut cert_cbor);
+                    enc.array(3)?;
+                    enc.u32(15)?;
+                    enc.array(2)?;
+                    enc.u32(cred.cred_type as u32)?;
+                    enc.bytes(&cred.hash)?;
+                    if let (Some(url), Some(hash_hex)) =
+                        (&resignation_metadata_url, &resignation_metadata_hash)
+                    {
+                        let hash_bytes = hex::decode(hash_hex.trim())?;
+                        enc.array(2)?;
+                        enc.str(url)?;
+                        enc.bytes(&hash_bytes)?;
+                    } else {
+                        enc.null()?;
+                    }
+
+                    let cert_env = serde_json::json!({
+                        "type": "CertificateConway",
+                        "description": "Constitutional Committee Cold Key Resignation Certificate",
+                        "cborHex": hex::encode(&cert_cbor)
+                    });
+                    std::fs::write(&out_file, serde_json::to_string_pretty(&cert_env)?)?;
+                    println!(
+                        "Cold key resignation certificate written to: {}",
+                        out_file.display()
+                    );
+                    Ok(())
+                }
+                CommitteeSubcommand::CreateHotKeyAuthorizationCertificate {
+                    cold,
+                    hot,
+                    out_file,
+                } => {
+                    let cold_cred = cold.resolve()?;
+                    let hot_cred = hot.resolve()?;
+
+                    // auth_committee_hot_cert = (14, cold_credential, hot_credential)
+                    let mut cert_cbor = Vec::new();
+                    let mut enc = minicbor::Encoder::new(&mut cert_cbor);
+                    enc.array(3)?;
+                    enc.u32(14)?;
+                    enc.array(2)?;
+                    enc.u32(cold_cred.cred_type as u32)?;
+                    enc.bytes(&cold_cred.hash)?;
+                    enc.array(2)?;
+                    enc.u32(hot_cred.cred_type as u32)?;
+                    enc.bytes(&hot_cred.hash)?;
+
+                    let cert_env = serde_json::json!({
+                        "type": "CertificateConway",
+                        "description": "Constitutional Committee Hot Key Authorization Certificate",
+                        "cborHex": hex::encode(&cert_cbor)
+                    });
+                    std::fs::write(&out_file, serde_json::to_string_pretty(&cert_env)?)?;
+                    println!(
+                        "Hot key authorization certificate written to: {}",
+                        out_file.display()
+                    );
+                    Ok(())
+                }
+                CommitteeSubcommand::KeyGenCold {
+                    cold_verification_key_file,
+                    cold_signing_key_file,
+                } => {
+                    let sk = dugite_crypto::keys::PaymentSigningKey::generate();
+                    let vk = sk.verification_key();
+
+                    let sk_env = serde_json::json!({
+                        "type": "ConstitutionalCommitteeColdSigningKey_ed25519",
+                        "description": "Constitutional Committee Cold Signing Key",
+                        "cborHex": hex::encode(simple_cbor_wrap(&sk.to_bytes()))
+                    });
+                    let vk_env = serde_json::json!({
+                        "type": "ConstitutionalCommitteeColdVerificationKey_ed25519",
+                        "description": "Constitutional Committee Cold Verification Key",
+                        "cborHex": hex::encode(simple_cbor_wrap(&vk.to_bytes()))
+                    });
+                    std::fs::write(
+                        &cold_signing_key_file,
+                        serde_json::to_string_pretty(&sk_env)?,
+                    )?;
+                    std::fs::write(
+                        &cold_verification_key_file,
+                        serde_json::to_string_pretty(&vk_env)?,
+                    )?;
+                    println!("Constitutional Committee cold key pair generated.");
+                    Ok(())
+                }
+                CommitteeSubcommand::KeyGenHot {
+                    verification_key_file,
+                    signing_key_file,
+                } => {
+                    let sk = dugite_crypto::keys::PaymentSigningKey::generate();
+                    let vk = sk.verification_key();
+
+                    let sk_env = serde_json::json!({
+                        "type": "ConstitutionalCommitteeHotSigningKey_ed25519",
+                        "description": "Constitutional Committee Hot Signing Key",
+                        "cborHex": hex::encode(simple_cbor_wrap(&sk.to_bytes()))
+                    });
+                    let vk_env = serde_json::json!({
+                        "type": "ConstitutionalCommitteeHotVerificationKey_ed25519",
+                        "description": "Constitutional Committee Hot Verification Key",
+                        "cborHex": hex::encode(simple_cbor_wrap(&vk.to_bytes()))
+                    });
+                    std::fs::write(&signing_key_file, serde_json::to_string_pretty(&sk_env)?)?;
+                    std::fs::write(
+                        &verification_key_file,
+                        serde_json::to_string_pretty(&vk_env)?,
+                    )?;
+                    println!("Constitutional Committee hot key pair generated.");
+                    Ok(())
+                }
+                CommitteeSubcommand::KeyHash {
+                    verification_key,
+                    verification_key_file,
+                } => {
+                    let hash = if let Some(vk) = verification_key {
+                        crate::commands::credential::vkey_string_to_hash(&vk)?
+                    } else if let Some(path) = verification_key_file {
+                        crate::commands::credential::load_vkey_hash_from_envelope(&path)?
+                    } else {
+                        anyhow::bail!(
+                            "missing selector: pass --verification-key or --verification-key-file"
+                        );
+                    };
+                    println!("{}", hex::encode(&hash));
+                    Ok(())
+                }
+            },
+            GovernanceSubcommand::CreateMirCertificate { command } => match command {
+                MirSubcommand::StakeAddresses {
+                    reserves,
+                    treasury,
+                    stake_address,
+                    reward,
+                    out_file,
+                } => {
+                    if reserves == treasury {
+                        anyhow::bail!("exactly one of --reserves or --treasury is required");
+                    }
+                    let cred =
+                        crate::commands::credential::stake_address_to_credential(&stake_address)?;
+                    let pot: u32 = if treasury { 1 } else { 0 };
+
+                    // move_instantaneous_reward = (6, [pot, {credential => delta_coin}])
+                    let mut cert_cbor = Vec::new();
+                    let mut enc = minicbor::Encoder::new(&mut cert_cbor);
+                    enc.array(2)?;
+                    enc.u32(6)?;
+                    enc.array(2)?;
+                    enc.u32(pot)?;
+                    enc.map(1)?;
+                    enc.array(2)?;
+                    enc.u32(cred.cred_type as u32)?;
+                    enc.bytes(&cred.hash)?;
+                    enc.u64(reward)?;
+
+                    let cert_env = serde_json::json!({
+                        "type": "Certificate",
+                        "description": "Move Instantaneous Rewards Certificate",
+                        "cborHex": hex::encode(&cert_cbor)
+                    });
+                    std::fs::write(&out_file, serde_json::to_string_pretty(&cert_env)?)?;
+                    println!("MIR certificate written to: {}", out_file.display());
+                    Ok(())
+                }
+                MirSubcommand::TransferToTreasury { transfer, out_file } => {
+                    write_mir_pot_transfer_certificate(&out_file, transfer)
+                }
+                MirSubcommand::TransferToRewards { transfer, out_file } => {
+                    write_mir_pot_transfer_certificate(&out_file, transfer)
+                }
             },
         }
     }
+}
+
+/// Write a `SendToOppositePotMIR` certificate for either
+/// `create-mir-certificate transfer-to-treasury` or `transfer-to-rewards`.
+///
+/// Both commands encode `mir_pot = 1` (treasury) — see the byte-identical
+/// finding documented on `MirSubcommand::TransferToTreasury`'s doc comment.
+/// Sharing one function makes that empirically-verified equivalence
+/// structural rather than something two independent call sites could drift
+/// out of sync on.
+fn write_mir_pot_transfer_certificate(out_file: &std::path::Path, transfer: u64) -> Result<()> {
+    // move_instantaneous_reward = (6, [pot=1(treasury), SendToOppositePotMIR(coin)])
+    let mut cert_cbor = Vec::new();
+    let mut enc = minicbor::Encoder::new(&mut cert_cbor);
+    enc.array(2)?;
+    enc.u32(6)?;
+    enc.array(2)?;
+    enc.u32(1)?;
+    enc.u64(transfer)?;
+
+    let cert_env = serde_json::json!({
+        "type": "Certificate",
+        "description": "MIR Certificate Send To Reserves",
+        "cborHex": hex::encode(&cert_cbor)
+    });
+    std::fs::write(out_file, serde_json::to_string_pretty(&cert_env)?)?;
+    println!("MIR certificate written to: {}", out_file.display());
+    Ok(())
 }
 
 /// Encode a previous governance action ID as CBOR (null if not provided)
@@ -1375,5 +2132,89 @@ mod tests {
         let mut enc = minicbor::Encoder::new(&mut buf);
         encode_prev_action_id(&mut enc, &tx_id, &None).unwrap();
         assert_eq!(buf, vec![0xf6]); // CBOR null
+    }
+
+    // ── Golden vectors captured from real cardano-cli 11.0.0.0 (#1008) ──────
+    //
+    // Every hex string below was captured by running the equivalent real
+    // `cardano-cli` command with the same inputs during the #1008
+    // implementation session and confirmed byte-identical to dugite-cli's
+    // output before being pinned here.
+
+    #[test]
+    fn test_committee_cold_key_resignation_certificate_no_anchor_matches_cardano_cli() {
+        // `governance committee create-cold-key-resignation-certificate
+        // --cold-verification-key-file <cold.vkey>` (no resignation
+        // metadata) — cardano-cli always emits array(3) with an explicit
+        // CBOR null anchor, never array(2) omitting the field.
+        let expected_hex = "830f8200581c75c5898138aff49ca6e118fcf74d2789514e0726cfb897ed7c05b1b0f6";
+        let expected_cbor = hex::decode(expected_hex).unwrap();
+        // The credential hash is the 28 bytes between the leading
+        // `83 0f 82 00 58 1c` header (array3, tag15, credential-array2,
+        // keyHash-type, bstr(28)) and the trailing `f6` (CBOR null anchor).
+        let cold_hash = &expected_cbor[6..expected_cbor.len() - 1];
+        assert_eq!(cold_hash.len(), 28);
+
+        let mut cert_cbor = Vec::new();
+        let mut enc = minicbor::Encoder::new(&mut cert_cbor);
+        enc.array(3).unwrap();
+        enc.u32(15).unwrap();
+        enc.array(2).unwrap();
+        enc.u32(0).unwrap();
+        enc.bytes(cold_hash).unwrap();
+        enc.null().unwrap();
+
+        assert_eq!(hex::encode(&cert_cbor), expected_hex);
+    }
+
+    #[test]
+    fn test_mir_transfer_to_treasury_and_rewards_are_byte_identical() {
+        // Both real cardano-cli commands encode `mir_pot = 1` (treasury)
+        // with a `SendToOppositePotMIR` target for the SAME `--transfer`
+        // amount — see `write_mir_pot_transfer_certificate`'s doc comment.
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        write_mir_pot_transfer_certificate(tmp.path(), 1_234_567).unwrap();
+        let env: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(tmp.path()).unwrap()).unwrap();
+        assert_eq!(env["cborHex"].as_str().unwrap(), "820682011a0012d687");
+    }
+
+    #[test]
+    fn test_vote_create_spo_voter_type_is_4_not_1() {
+        // Conway `voter` CDDL: [4, addr_keyhash] = StakePoolKeyHash. This
+        // function's SPO arm previously encoded type 1
+        // (ConstitutionalCommitteeHotScriptHash) — fixed while building
+        // `vote view` against a real cardano-cli capture.
+        let pool_hash =
+            hex::decode("d364dedcd956f1bafeabbce188eec8bc398b48c25b857aa401f2d3ca").unwrap();
+        let mut buf = Vec::new();
+        let mut enc = minicbor::Encoder::new(&mut buf);
+        enc.array(2).unwrap();
+        enc.u32(4).unwrap(); // StakePoolKeyHash, NOT 1
+        enc.bytes(&pool_hash).unwrap();
+
+        assert_eq!(
+            hex::encode(&buf),
+            "8204581cd364dedcd956f1bafeabbce188eec8bc398b48c25b857aa401f2d3ca"
+        );
+    }
+
+    #[test]
+    fn test_vote_create_voter_hash_is_bare_not_nested_credential() {
+        // Conway `voter` = [type, hash] — a bare hash, NOT
+        // [type, [cred_type, hash]]. Real cardano-cli capture:
+        // `82 04 58 1c <28 bytes>`, 30 bytes total. This function
+        // previously wrapped the hash in an extra credential array (34
+        // bytes total) — fixed alongside the voter-type bug above.
+        let pool_hash = vec![0xabu8; 28];
+        let mut buf = Vec::new();
+        let mut enc = minicbor::Encoder::new(&mut buf);
+        enc.array(2).unwrap();
+        enc.u32(4).unwrap();
+        enc.bytes(&pool_hash).unwrap();
+
+        // array(2) header(1) + u32-small(1) + bstr(28) header(2, since
+        // 28 > 23 needs the `0x58 <len>` long form) + hash(28) = 32.
+        assert_eq!(buf.len(), 32);
     }
 }

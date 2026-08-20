@@ -640,6 +640,150 @@ impl N2CClient {
         self.recv_query().await
     }
 
+    /// Query pool state (`GetPoolState` -- Shelley query tag 19).
+    ///
+    /// `pool_ids` is `None` for every pool (`cardano-cli --all-stake-pools`,
+    /// wire `Maybe (Set …) = array(0)`), or `Some(ids)` for a specific set
+    /// (wire `array(1) [tag(258) Set<pool_id>]`) — each entry a 28-byte pool
+    /// key hash. Returns raw MsgResult CBOR payload (`array(4)`: poolParams,
+    /// futurePoolParams, retiring, deposits — see
+    /// `dugite-node`'s `stake::handle_pool_state`).
+    pub async fn query_pool_state(
+        &mut self,
+        pool_ids: Option<&[Vec<u8>]>,
+    ) -> Result<Vec<u8>, NetworkError> {
+        let mut inner = Vec::new();
+        let mut enc = minicbor::Encoder::new(&mut inner);
+        enc.array(2).map_err(cbor_err)?;
+        enc.u32(19).map_err(cbor_err)?; // GetPoolState
+        match pool_ids {
+            None => {
+                enc.array(0).map_err(cbor_err)?;
+            }
+            Some(ids) => {
+                enc.array(1).map_err(cbor_err)?;
+                enc.tag(minicbor::data::Tag::new(258)).map_err(cbor_err)?;
+                enc.array(ids.len() as u64).map_err(cbor_err)?;
+                for id in ids {
+                    enc.bytes(id).map_err(cbor_err)?;
+                }
+            }
+        }
+        let buf = encode_conway_block_query(&inner)?;
+        self.send_query(buf).await?;
+        self.recv_query().await
+    }
+
+    /// Query SPO (stake pool operator) stake distribution (`GetSPOStakeDistr`
+    /// -- Shelley query tag 30).
+    ///
+    /// `pool_ids` is the set to query — each entry a 28-byte pool key hash.
+    /// An empty slice returns the full distribution (`querySPOStakeDistr`
+    /// guards on `null keys`, unlike `GetPoolState`). Returns raw MsgResult
+    /// CBOR payload (`Map<pool_hash(28), Coin>`).
+    pub async fn query_spo_stake_distr(
+        &mut self,
+        pool_ids: &[Vec<u8>],
+    ) -> Result<Vec<u8>, NetworkError> {
+        let mut inner = Vec::new();
+        let mut enc = minicbor::Encoder::new(&mut inner);
+        enc.array(2).map_err(cbor_err)?;
+        enc.u32(30).map_err(cbor_err)?; // GetSPOStakeDistr
+        enc.tag(minicbor::data::Tag::new(258)).map_err(cbor_err)?;
+        enc.array(pool_ids.len() as u64).map_err(cbor_err)?;
+        for id in pool_ids {
+            enc.bytes(id).map_err(cbor_err)?;
+        }
+        let buf = encode_conway_block_query(&inner)?;
+        self.send_query(buf).await?;
+        self.recv_query().await
+    }
+
+    /// Query the future protocol parameters (`GetFuturePParams` -- Shelley
+    /// query tag 33).
+    ///
+    /// Returns `Ok(None)` when no protocol-parameter update is pending
+    /// (wire `Maybe PParams = array(0)`), or `Ok(Some(json))` when one is —
+    /// the wire payload is then the *identical* positional `array(31)`
+    /// PParams `GetCurrentPParams` (tag 3) carries, so the JSON is produced
+    /// by feeding a reconstructed MsgResult through the same
+    /// [`parse_protocol_params_cbor`] `query_protocol_params` already uses,
+    /// rather than a second hand-written field table that could drift from
+    /// it.
+    pub async fn query_future_pparams(&mut self) -> Result<Option<String>, NetworkError> {
+        let raw = self.send_shelley_query(33).await?;
+        let mut decoder = minicbor::Decoder::new(&raw);
+        strip_msg_result(&mut decoder)?;
+        strip_hfc_wrapper(&mut decoder)?;
+        let maybe_len = decoder
+            .array()
+            .map_err(|e| protocol_err(format!("bad Maybe PParams wrapper: {e}")))?
+            .unwrap_or(0);
+        if maybe_len == 0 {
+            return Ok(None);
+        }
+        // `maybe_len == 1`: the decoder is now positioned at the inner
+        // `PParams` array(31) header. Reconstruct a minimal MsgResult
+        // (`[4, [<pparams>]]`) over just those trailing bytes so the shared
+        // parser — which expects to strip its own MsgResult+HFC wrapper —
+        // can run unmodified.
+        let inner_start = decoder.position();
+        let mut synthetic = vec![0x82u8, 0x04, 0x81];
+        synthetic.extend_from_slice(&raw[inner_start..]);
+        parse_protocol_params_cbor(&synthetic).map(Some)
+    }
+
+    /// Query the ledger peer snapshot (`GetLedgerPeerSnapshot` -- Shelley
+    /// query tag 34).
+    ///
+    /// `big_only` selects cardano-cli's `--all-ledger-peers` behaviour when
+    /// `false` is passed as `Some(false)` on a V23+ connection (peerKind 0 =
+    /// All); `Some(true)` requests only the "big" pools cumulatively holding
+    /// 90% of stake (peerKind 1). `None` uses the legacy V19-V22 request
+    /// shape (`array(1)[34]`, no peerKind byte at all) — the only shape a
+    /// pre-V23 node accepts (#456).
+    pub async fn query_ledger_peer_snapshot(
+        &mut self,
+        big_only: Option<bool>,
+    ) -> Result<Vec<u8>, NetworkError> {
+        let mut inner = Vec::new();
+        let mut enc = minicbor::Encoder::new(&mut inner);
+        match big_only {
+            None => {
+                enc.array(1).map_err(cbor_err)?;
+                enc.u32(34).map_err(cbor_err)?;
+            }
+            Some(big) => {
+                enc.array(2).map_err(cbor_err)?;
+                enc.u32(34).map_err(cbor_err)?;
+                enc.u8(if big { 1 } else { 0 }).map_err(cbor_err)?;
+            }
+        }
+        let buf = encode_conway_block_query(&inner)?;
+        self.send_query(buf).await?;
+        self.recv_query().await
+    }
+
+    /// Query a stake pool's default governance vote
+    /// (`QueryStakePoolDefaultVote` -- Shelley query tag 35, V20+).
+    ///
+    /// `pool_id` is a single 28-byte pool key hash (NOT a set). Returns raw
+    /// MsgResult CBOR payload: a bare word8 DefaultVote
+    /// (0=DefaultNo, 1=DefaultAbstain, 2=DefaultNoConfidence).
+    pub async fn query_stake_pool_default_vote(
+        &mut self,
+        pool_id: &[u8],
+    ) -> Result<Vec<u8>, NetworkError> {
+        let mut inner = Vec::new();
+        let mut enc = minicbor::Encoder::new(&mut inner);
+        enc.array(2).map_err(cbor_err)?;
+        enc.u32(35).map_err(cbor_err)?; // QueryStakePoolDefaultVote
+        enc.bytes(pool_id).map_err(cbor_err)?;
+        let buf = encode_conway_block_query(&inner)?;
+        self.send_query(buf).await?;
+        self.recv_query().await
+    }
+
     /// Evaluate a transaction and return script execution costs (`EvaluateTx` -- Shelley query tag 36).
     ///
     /// This queries the node to evaluate the Plutus scripts in the given transaction

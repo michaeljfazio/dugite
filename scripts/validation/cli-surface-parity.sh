@@ -33,16 +33,24 @@
 #     unless not covered by the documented era-prefix-leniency pattern)
 #
 # MISSING entries fail the script unless present in
-# scripts/validation/cli-surface-known-gaps.txt (one `<normalized path>
-# <issue-number>` per line — mirrors the ledger-rules SKIP_LIST discipline:
-# CLAUDE.md "Phase 4 acceptance: SKIP_LIST is empty or every entry has a
-# tracking issue"). A STALE allowlist entry (no longer actually missing)
-# also fails the script, so the allowlist can't silently rot into a wider
+# scripts/validation/cli-surface-known-gaps.txt (one
+# `<normalized path><TAB><issue-number><TAB><disposition><TAB><reason>` per
+# line — mirrors the ledger-rules SKIP_LIST discipline: CLAUDE.md "Phase 4
+# acceptance: SKIP_LIST is empty or every entry has a tracking issue",
+# extended here so each entry also carries its own DEFERRED/WONTFIX
+# disposition + reason, not just a shared issue number — see that file's own
+# header for the full format contract). A line with a missing or
+# unrecognized <disposition> (or empty <reason>/<issue>) is a MALFORMED
+# entry and fails the gate, exactly like an uncovered gap — a disposition
+# column that could be silently blank would be exactly as weak as having no
+# column at all. A STALE allowlist entry (no longer actually missing) also
+# fails the script, so the allowlist can't silently rot into a wider
 # exemption than it started as.
 #
 # ─── Exit codes ──────────────────────────────────────────────────────────
-#   0 = PASS  (no un-allowlisted MISSING entries, no stale allowlist entries)
-#   1 = FAIL  (a real gap, or a stale allowlist entry)
+#   0 = PASS  (no un-allowlisted MISSING entries, no malformed or stale
+#       allowlist entries)
+#   1 = FAIL  (a real gap, a malformed allowlist entry, or a stale one)
 #   2 = INCONCLUSIVE (cardano-cli or dugite-cli could not be run at all —
 #       NEVER reported as PASS; see CLAUDE.md #923, `adv_send_expect_close`
 #       silently returning PASS when socat was absent)
@@ -332,16 +340,34 @@ MATCHED_COUNT=$((CC_NORM_COUNT - MISSING_COUNT))
 
 # ─── Allowlist ──────────────────────────────────────────────────────────
 #
-# Format: "<normalized command path><TAB><issue-number>", blank lines and
-# lines starting with # ignored. An allowlisted entry that is NOT actually
-# missing is itself a failure (stale allowlist — same discipline as a stale
-# KNOWN_DIVERGENCES entry, ref commit 6d5605afd5 in this repo's history).
+# Format: "<normalized command path><TAB><issue-number><TAB><disposition><TAB><reason>",
+# blank lines and lines starting with # ignored. An allowlisted entry that is
+# NOT actually missing is itself a failure (stale allowlist — same
+# discipline as a stale KNOWN_DIVERGENCES entry, ref commit 6d5605afd5 in
+# this repo's history).
+#
+# <disposition> must be DEFERRED (will implement eventually, tracked) or
+# WONTFIX (deliberately excluded — dead network, unreleased era, superseded
+# by this repo's own tooling, etc). This is what makes "we haven't gotten to
+# it" distinguishable from "we will never do this" instead of both silently
+# passing forever (#1008) — the same failure mode as an unbounded
+# `KNOWN_DIVERGENCES`/`SKIP_LIST` allowlist with no per-entry accounting. A
+# line with no disposition, or one that isn't exactly DEFERRED/WONTFIX, is a
+# MALFORMED entry and fails the gate below — it does not silently count as
+# allowlisted. <reason> is required too (free text, may contain spaces).
 
 declare -A ALLOWLISTED
+declare -A DISPOSITION
+MALFORMED_ENTRIES=()
 if [[ -f "$KNOWN_GAPS_FILE" ]]; then
-    while IFS=$'\t' read -r gap_path _issue; do
+    while IFS=$'\t' read -r gap_path issue disposition reason; do
         [[ -z "$gap_path" || "$gap_path" == \#* ]] && continue
         ALLOWLISTED["$gap_path"]=1
+        if [[ "$disposition" != "DEFERRED" && "$disposition" != "WONTFIX" ]] || [[ -z "$reason" ]] || [[ -z "$issue" ]]; then
+            MALFORMED_ENTRIES+=("$gap_path (issue='${issue:-<missing>}' disposition='${disposition:-<missing>}' reason='${reason:-<missing>}')")
+        else
+            DISPOSITION["$gap_path"]="$disposition"
+        fi
     done <"$KNOWN_GAPS_FILE"
 fi
 
@@ -377,14 +403,23 @@ echo
 
 if [[ "$MISSING_COUNT" -gt 0 ]]; then
     echo "--- MISSING (cardano-cli has, dugite-cli doesn't) ---"
+    DEFERRED_COUNT=0
+    WONTFIX_COUNT=0
     while IFS= read -r m; do
         [[ -z "$m" ]] && continue
-        if [[ -n "${ALLOWLISTED[$m]:-}" ]]; then
-            echo "  [allowlisted] $m"
+        disp="${DISPOSITION[$m]:-}"
+        if [[ "$disp" == "DEFERRED" ]]; then
+            echo "  [DEFERRED]    $m"
+            DEFERRED_COUNT=$((DEFERRED_COUNT + 1))
+        elif [[ "$disp" == "WONTFIX" ]]; then
+            echo "  [WONTFIX]     $m"
+            WONTFIX_COUNT=$((WONTFIX_COUNT + 1))
         else
             echo "  [UNCOVERED]   $m"
         fi
     done <"$MISSING_FILE"
+    echo
+    echo "  disposition breakdown: $DEFERRED_COUNT DEFERRED, $WONTFIX_COUNT WONTFIX"
     echo
 fi
 
@@ -398,6 +433,15 @@ FAIL=0
 
 if [[ "$UNCOVERED_MISSING_COUNT" -gt 0 ]]; then
     echo "FAIL: $UNCOVERED_MISSING_COUNT real gap(s) not covered by $KNOWN_GAPS_FILE" >&2
+    FAIL=1
+fi
+
+if [[ "${#MALFORMED_ENTRIES[@]}" -gt 0 ]]; then
+    echo "FAIL: ${#MALFORMED_ENTRIES[@]} malformed allowlist entry/entries in $KNOWN_GAPS_FILE" \
+        "(every line needs <path><TAB><issue><TAB>DEFERRED|WONTFIX<TAB><reason>):" >&2
+    for s in "${MALFORMED_ENTRIES[@]}"; do
+        echo "  - $s" >&2
+    done
     FAIL=1
 fi
 

@@ -68,8 +68,10 @@ assert_contains() {
 
 EMPTY_ALLOWLIST=$(mktemp)
 COVERING_ALLOWLIST=$(mktemp)
-printf 'alpha two\t9999\n' >"$COVERING_ALLOWLIST"
-trap 'rm -f "$EMPTY_ALLOWLIST" "$COVERING_ALLOWLIST"' EXIT
+printf 'alpha two\t9999\tDEFERRED\ttest fixture entry\n' >"$COVERING_ALLOWLIST"
+MALFORMED_ALLOWLIST=$(mktemp)
+printf 'alpha two\t9999\n' >"$MALFORMED_ALLOWLIST"
+trap 'rm -f "$EMPTY_ALLOWLIST" "$COVERING_ALLOWLIST" "$MALFORMED_ALLOWLIST"' EXIT
 
 echo "=== 1. Matching tree: full variant must PASS with 0 missing, 0 superset ==="
 FIXTURE_VARIANT=full CARDANO_CLI_BIN="$REFERENCE" DUGITE_CLI_BIN="$TARGET" \
@@ -102,8 +104,17 @@ echo
 echo "=== 3. Allowlist coverage: same missing tree, but 'alpha two' is allowlisted -> PASS ==="
 FIXTURE_VARIANT=missing CARDANO_CLI_BIN="$REFERENCE" DUGITE_CLI_BIN="$TARGET" \
     CLI_SURFACE_KNOWN_GAPS_FILE="$COVERING_ALLOWLIST" \
-    check "missing 'alpha two' but allowlisted -> PASS" 0 "$PARITY_SCRIPT"
-assert_contains "allowlisted: shows as allowlisted, not uncovered" "$LAST_OUTPUT" "[allowlisted] alpha two"
+    check "missing 'alpha two' but allowlisted (DEFERRED) -> PASS" 0 "$PARITY_SCRIPT"
+assert_contains "allowlisted: shows its disposition, not uncovered" "$LAST_OUTPUT" "[DEFERRED]"
+assert_contains "allowlisted: names the entry" "$LAST_OUTPUT" "alpha two"
+
+echo
+echo "=== 3b. Malformed disposition: same missing tree, allowlist entry has NO disposition/reason -> FAIL ==="
+FIXTURE_VARIANT=missing CARDANO_CLI_BIN="$REFERENCE" DUGITE_CLI_BIN="$TARGET" \
+    CLI_SURFACE_KNOWN_GAPS_FILE="$MALFORMED_ALLOWLIST" \
+    check "allowlist entry missing disposition -> FAIL, not silently covered" 1 "$PARITY_SCRIPT"
+assert_contains "malformed: reports malformed-entry banner" "$LAST_OUTPUT" "malformed allowlist entry"
+assert_contains "malformed: names the entry" "$LAST_OUTPUT" "alpha two"
 
 echo
 echo "=== 4. Stale allowlist: full tree (nothing missing) but allowlist still claims 'alpha two' -> FAIL ==="
