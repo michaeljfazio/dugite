@@ -6808,9 +6808,11 @@ impl Node {
             apply_count = apply.len(),
             "Chain selection: fork switch at live tip — rolling back ledger to intersection"
         );
-        self.metrics
-            .rollback_count
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        // `ledger_reorg_total` is incremented once, inside
+        // `handle_ledger_rollback` -> `handle_rollback_inner`, below — not
+        // duplicated here (#1098: a direct increment at this call site
+        // double-counted every real reorg against the equivalent single
+        // count `handle_rollback_inner` already performs).
 
         let rollback_point =
             dugite_primitives::block::Point::Specific(intersection_slot, intersection_hash);
@@ -10530,9 +10532,12 @@ impl Node {
                                 "Forge triggered fork switch — our block is new tip; \
                                  rolling back ledger and replaying fork"
                             );
-                            self.metrics
-                                .rollback_count
-                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            // `ledger_reorg_total` is incremented once, inside
+                            // `handle_ledger_rollback` -> `handle_rollback_inner`,
+                            // below — not duplicated here (#1098: a direct
+                            // increment at this call site double-counted every
+                            // real reorg against the equivalent single count
+                            // `handle_rollback_inner` already performs).
 
                             let rollback_point =
                                 Point::Specific(*intersection_slot, *intersection_hash);

@@ -19,14 +19,30 @@ groups:
           summary: "Dugite tip is stale"
           description: "Instance {{ $labels.instance }} tip age is {{ $value }}s (>120s) for >5m — node may be stalled."
 
-      - alert: DugiteHighRollbackRate
-        expr: rate(dugite_rollback_count_total[10m]) > 0.5
+      # #1098: this alert used to key off `dugite_rollback_count_total`, which
+      # conflated routine per-peer ChainSync `MsgRollBackward` protocol
+      # messages (~15-20 per peer resync, no ledger effect) with actual
+      # ledger-level chain reorgs. It now keys off `dugite_ledger_reorg_total`,
+      # which counts only real chain-switch events, and the threshold is
+      # re-tuned to that metric's scale: a 3h healthy preprod soak saw 2 real
+      # reorgs total, so >3 in a 10m window is well above normal churn.
+      - alert: DugiteHighReorgRate
+        expr: increase(dugite_ledger_reorg_total[10m]) > 3
         for: 0m
         labels:
           severity: warning
         annotations:
-          summary: "High rollback rate on Dugite node"
-          description: "Instance {{ $labels.instance }} is rolling back at {{ $value | humanize }} rollbacks/s over the last 10m."
+          summary: "High ledger reorg rate on Dugite node"
+          description: "Instance {{ $labels.instance }} had {{ $value }} ledger-level chain reorg(s) in the last 10m (healthy baseline: ~2 over a 3h soak)."
+
+      - alert: DugiteHighChainSyncRollbackMessageRate
+        expr: rate(dugite_chainsync_rollback_messages_total[10m]) > 0.5
+        for: 5m
+        labels:
+          severity: info
+        annotations:
+          summary: "Elevated ChainSync rollback message rate on Dugite node"
+          description: "Instance {{ $labels.instance }} is receiving {{ $value | humanize }} peer MsgRollBackward/s over the last 10m — routine resync chatter unless sustained; informational only, not a reorg signal."
 
       - alert: DugiteForgeFailureBurst
         expr: increase(dugite_forge_failures_total[1h]) > 0

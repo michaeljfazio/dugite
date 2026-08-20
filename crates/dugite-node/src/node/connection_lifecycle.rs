@@ -1923,6 +1923,27 @@ impl ConnectionLifecycleManager {
             // ChainSync could not drain its pipeline to zero before `MsgDone`
             // (#910) so the mux instance is not idle. Both fall back to a TCP
             // close; the governor reconnects on the next tick (Cold→Warm→Hot).
+            //
+            // Both arms are logged at INFO, not WARN. This is the DESIGNED
+            // fallback, not a defect: `stop_hot_protocols_and_recover`'s
+            // budget is `PROTOCOL_SHUTDOWN_TIMEOUT` (5s, synchronous, under
+            // the peer-manager write lock — see the deliberate-divergence
+            // note above), not Haskell's async 300s `spsDeactivateTimeout`,
+            // so a hot task genuinely busy with real-network I/O when a
+            // peer-governor churn burst demotes several peers at once can
+            // legitimately miss the 5s window. It was already measured and
+            // accepted once at ~2.4/hour (45 forced reconnects over a 19h
+            // preprod log, see the comment above); a later 3h preprod soak
+            // saw it cluster in ~10-minute bursts aligned with governor
+            // churn (~13/hour) with ZERO observed impact on block-apply
+            // correctness every time — every occurrence self-healed via the
+            // ordinary Cold→Warm→Hot reconnect. If this needs to be watched
+            // for a REAL regression, `stop_hot_protocols_and_recover`'s own
+            // per-task timeout warning (still WARN) now names WHICH protocol
+            // — chainsync/blockfetch/txsubmission — failed to stop, so a
+            // pattern (e.g. always the same protocol) is diagnosable there
+            // instead of needing this connection-level summary to alarm on
+            // every occurrence.
             if recovered {
                 info!(
                     %cid,
@@ -1930,7 +1951,7 @@ impl ConnectionLifecycleManager {
                      closing the connection instead of reusing the mux (#910)"
                 );
             } else {
-                warn!(%cid, "hot -> warm: channel recovery failed, falling back to TCP close");
+                info!(%cid, "hot -> warm: channel recovery failed, falling back to TCP close");
             }
 
             peer_manager.mark_terminating(&addr);
