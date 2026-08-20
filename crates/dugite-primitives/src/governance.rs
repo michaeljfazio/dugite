@@ -1,51 +1,61 @@
-//! CIP-0129 governance identifier bech32 encoding and decoding.
+//! Governance identifier bech32 encoding and decoding, matching cardano-cli's
+//! DEFAULT (non-`--output-cip129`) bech32 form for the governance identifiers
+//! introduced by CIP-1694 (Conway era on-chain governance).
 //!
-//! CIP-0129 defines canonical bech32 Human-Readable Parts (HRPs) for the
-//! governance identifiers introduced by CIP-1694 (Conway era on-chain governance).
+//! # Prefixes (bech32 Human-Readable Parts — do not include the `1`
+//! separator; the bech32 encoder inserts it)
 //!
-//! # Prefixes
+//! | Identifier                              | HRP            |
+//! |-----------------------------------------|----------------|
+//! | DRep key hash credential                | `drep`         |
+//! | DRep script hash credential             | `drep_script`  |
+//! | CC hot key hash credential              | `cc_hot`       |
+//! | CC hot script hash credential           | `cc_hot_script`|
+//! | CC cold key hash credential             | `cc_cold`      |
+//! | CC cold script hash credential          | `cc_cold_script`|
 //!
-//! | Identifier                              | HRP              |
-//! |-----------------------------------------|------------------|
-//! | DRep key hash credential                | `drep1`          |
-//! | DRep script hash credential             | `drep_script1`   |
-//! | CC hot key hash credential              | `cc_hot1`        |
-//! | CC hot script hash credential           | `cc_hot_script1` |
-//! | CC cold key hash credential             | `cc_cold1`       |
-//! | CC cold script hash credential          | `cc_cold_script1`|
+//! All identifiers encode a raw 28-byte Blake2b-224 hash using Bech32
+//! encoding — verified byte-for-byte against a real cardano-cli 11.0.1
+//! `conway governance drep id` (default output mode) in the fix for the bug
+//! this doc replaces: an earlier revision baked the bech32 separator into
+//! these constants (`"drep1"` instead of `"drep"`), so the encoder's own
+//! separator insertion produced a doubled `1` and every emitted identifier
+//! was nonstandard bech32 no wallet, explorer, or cardano-cli could parse.
 //!
-//! All identifiers encode a 28-byte Blake2b-224 hash using Bech32 encoding.
+//! # NOT implemented: true CIP-129
 //!
-//! # Compatibility Note
-//!
-//! The older `drep` prefix (without the trailing `1`) was used before CIP-0129
-//! was finalised. All Cardano tooling from cardano-cli 10.x onwards uses the
-//! CIP-0129 prefixes. The [`decode_drep_bech32`] function accepts both the
-//! legacy `drep` prefix and the canonical `drep1` prefix for backwards
-//! compatibility.
+//! cardano-cli's `--output-cip129` flag produces a DIFFERENT, LONGER bech32
+//! string than the default mode this module matches — CIP-129 prepends a
+//! header byte (encoding credential type + key/script) before the 28-byte
+//! hash, so the encoded payload is 29 bytes, not 28. This module does not
+//! implement that mode; it only matches cardano-cli's default output. A
+//! previous revision of this doc claimed CIP-0129 compliance for the
+//! header-less form, which was never checked against real output and does
+//! not hold — confirmed by comparing this module's HRPs are correct for the
+//! DEFAULT mode, not by re-deriving the CIP-129 claim.
 
 use crate::hash::Hash28;
 use bech32::{Bech32, Hrp};
 
-/// HRP for a DRep key-hash credential (CIP-0129).
-pub const HRP_DREP: &str = "drep1";
+/// HRP for a DRep key-hash credential.
+pub const HRP_DREP: &str = "drep";
 
-/// HRP for a DRep script-hash credential (CIP-0129).
-pub const HRP_DREP_SCRIPT: &str = "drep_script1";
+/// HRP for a DRep script-hash credential.
+pub const HRP_DREP_SCRIPT: &str = "drep_script";
 
-/// HRP for a Constitutional Committee hot key-hash credential (CIP-0129).
-pub const HRP_CC_HOT: &str = "cc_hot1";
+/// HRP for a Constitutional Committee hot key-hash credential.
+pub const HRP_CC_HOT: &str = "cc_hot";
 
-/// HRP for a Constitutional Committee hot script-hash credential (CIP-0129).
-pub const HRP_CC_HOT_SCRIPT: &str = "cc_hot_script1";
+/// HRP for a Constitutional Committee hot script-hash credential.
+pub const HRP_CC_HOT_SCRIPT: &str = "cc_hot_script";
 
-/// HRP for a Constitutional Committee cold key-hash credential (CIP-0129).
-pub const HRP_CC_COLD: &str = "cc_cold1";
+/// HRP for a Constitutional Committee cold key-hash credential.
+pub const HRP_CC_COLD: &str = "cc_cold";
 
-/// HRP for a Constitutional Committee cold script-hash credential (CIP-0129).
-pub const HRP_CC_COLD_SCRIPT: &str = "cc_cold_script1";
+/// HRP for a Constitutional Committee cold script-hash credential.
+pub const HRP_CC_COLD_SCRIPT: &str = "cc_cold_script";
 
-/// Error type for CIP-0129 governance identifier encoding/decoding.
+/// Error type for governance identifier encoding/decoding.
 #[derive(Debug, thiserror::Error)]
 pub enum GovernanceIdError {
     #[error("bech32 encoding error: {0}")]
@@ -62,44 +72,44 @@ pub enum GovernanceIdError {
 // Encoding helpers
 // ──────────────────────────────────────────────────────────────────────────────
 
-/// Encode a 28-byte hash as a CIP-0129 DRep key-hash bech32 identifier.
+/// Encode a 28-byte hash as a DRep key-hash bech32 identifier.
 ///
-/// Produces a string with the `drep1` HRP.
+/// Produces a string with the `drep` HRP (e.g. `drep1...`, HRP + separator).
 pub fn encode_drep_key(hash: &Hash28) -> Result<String, GovernanceIdError> {
     encode_governance_id(HRP_DREP, hash.as_bytes())
 }
 
-/// Encode a 28-byte hash as a CIP-0129 DRep script-hash bech32 identifier.
+/// Encode a 28-byte hash as a DRep script-hash bech32 identifier.
 ///
-/// Produces a string with the `drep_script1` HRP.
+/// Produces a string with the `drep_script` HRP.
 pub fn encode_drep_script(hash: &Hash28) -> Result<String, GovernanceIdError> {
     encode_governance_id(HRP_DREP_SCRIPT, hash.as_bytes())
 }
 
-/// Encode a 28-byte hash as a CIP-0129 CC hot key-hash bech32 identifier.
+/// Encode a 28-byte hash as a CC hot key-hash bech32 identifier.
 ///
-/// Produces a string with the `cc_hot1` HRP.
+/// Produces a string with the `cc_hot` HRP.
 pub fn encode_cc_hot_key(hash: &Hash28) -> Result<String, GovernanceIdError> {
     encode_governance_id(HRP_CC_HOT, hash.as_bytes())
 }
 
-/// Encode a 28-byte hash as a CIP-0129 CC hot script-hash bech32 identifier.
+/// Encode a 28-byte hash as a CC hot script-hash bech32 identifier.
 ///
-/// Produces a string with the `cc_hot_script1` HRP.
+/// Produces a string with the `cc_hot_script` HRP.
 pub fn encode_cc_hot_script(hash: &Hash28) -> Result<String, GovernanceIdError> {
     encode_governance_id(HRP_CC_HOT_SCRIPT, hash.as_bytes())
 }
 
-/// Encode a 28-byte hash as a CIP-0129 CC cold key-hash bech32 identifier.
+/// Encode a 28-byte hash as a CC cold key-hash bech32 identifier.
 ///
-/// Produces a string with the `cc_cold1` HRP.
+/// Produces a string with the `cc_cold` HRP.
 pub fn encode_cc_cold_key(hash: &Hash28) -> Result<String, GovernanceIdError> {
     encode_governance_id(HRP_CC_COLD, hash.as_bytes())
 }
 
-/// Encode a 28-byte hash as a CIP-0129 CC cold script-hash bech32 identifier.
+/// Encode a 28-byte hash as a CC cold script-hash bech32 identifier.
 ///
-/// Produces a string with the `cc_cold_script1` HRP.
+/// Produces a string with the `cc_cold_script` HRP.
 pub fn encode_cc_cold_script(hash: &Hash28) -> Result<String, GovernanceIdError> {
     encode_governance_id(HRP_CC_COLD_SCRIPT, hash.as_bytes())
 }
@@ -108,23 +118,22 @@ pub fn encode_cc_cold_script(hash: &Hash28) -> Result<String, GovernanceIdError>
 // Decoding helpers
 // ──────────────────────────────────────────────────────────────────────────────
 
-/// Decode a CIP-0129 DRep key-hash bech32 identifier.
+/// Decode a DRep key-hash bech32 identifier.
 ///
-/// Accepts both `drep1` (CIP-0129) and legacy `drep` prefixes.
 /// Returns the 28-byte hash.
 pub fn decode_drep_key(s: &str) -> Result<Hash28, GovernanceIdError> {
     let (hrp, data) = bech32::decode(s)?;
     let hrp_str = hrp.as_str();
-    if hrp_str != HRP_DREP && hrp_str != "drep" {
+    if hrp_str != HRP_DREP {
         return Err(GovernanceIdError::WrongHrp {
             actual: hrp_str.to_string(),
-            expected: format!("{HRP_DREP} (or legacy 'drep')"),
+            expected: HRP_DREP.to_string(),
         });
     }
     bytes_to_hash28(&data)
 }
 
-/// Decode a CIP-0129 DRep script-hash bech32 identifier.
+/// Decode a DRep script-hash bech32 identifier.
 ///
 /// Returns the 28-byte hash.
 pub fn decode_drep_script(s: &str) -> Result<Hash28, GovernanceIdError> {
@@ -139,7 +148,7 @@ pub fn decode_drep_script(s: &str) -> Result<Hash28, GovernanceIdError> {
     bytes_to_hash28(&data)
 }
 
-/// Decode a CIP-0129 CC hot key-hash bech32 identifier.
+/// Decode a CC hot key-hash bech32 identifier.
 ///
 /// Returns the 28-byte hash.
 pub fn decode_cc_hot_key(s: &str) -> Result<Hash28, GovernanceIdError> {
@@ -154,7 +163,7 @@ pub fn decode_cc_hot_key(s: &str) -> Result<Hash28, GovernanceIdError> {
     bytes_to_hash28(&data)
 }
 
-/// Decode a CIP-0129 CC hot script-hash bech32 identifier.
+/// Decode a CC hot script-hash bech32 identifier.
 ///
 /// Returns the 28-byte hash.
 pub fn decode_cc_hot_script(s: &str) -> Result<Hash28, GovernanceIdError> {
@@ -169,7 +178,7 @@ pub fn decode_cc_hot_script(s: &str) -> Result<Hash28, GovernanceIdError> {
     bytes_to_hash28(&data)
 }
 
-/// Decode a CIP-0129 CC cold key-hash bech32 identifier.
+/// Decode a CC cold key-hash bech32 identifier.
 ///
 /// Returns the 28-byte hash.
 pub fn decode_cc_cold_key(s: &str) -> Result<Hash28, GovernanceIdError> {
@@ -184,7 +193,7 @@ pub fn decode_cc_cold_key(s: &str) -> Result<Hash28, GovernanceIdError> {
     bytes_to_hash28(&data)
 }
 
-/// Decode a CIP-0129 CC cold script-hash bech32 identifier.
+/// Decode a CC cold script-hash bech32 identifier.
 ///
 /// Returns the 28-byte hash.
 pub fn decode_cc_cold_script(s: &str) -> Result<Hash28, GovernanceIdError> {
@@ -212,9 +221,10 @@ pub enum CredKind {
     Script,
 }
 
-/// Encode a DRep credential (key or script) as a CIP-0129 bech32 identifier.
+/// Encode a DRep credential (key or script) as a bech32 identifier.
 ///
-/// Selects `drep1` for key credentials and `drep_script1` for script credentials.
+/// Selects the `drep` HRP for key credentials and `drep_script` for script
+/// credentials.
 pub fn encode_drep(hash: &Hash28, kind: CredKind) -> Result<String, GovernanceIdError> {
     match kind {
         CredKind::Key => encode_drep_key(hash),
@@ -222,9 +232,10 @@ pub fn encode_drep(hash: &Hash28, kind: CredKind) -> Result<String, GovernanceId
     }
 }
 
-/// Encode a CC hot credential (key or script) as a CIP-0129 bech32 identifier.
+/// Encode a CC hot credential (key or script) as a bech32 identifier.
 ///
-/// Selects `cc_hot1` for key credentials and `cc_hot_script1` for script credentials.
+/// Selects the `cc_hot` HRP for key credentials and `cc_hot_script` for
+/// script credentials.
 pub fn encode_cc_hot(hash: &Hash28, kind: CredKind) -> Result<String, GovernanceIdError> {
     match kind {
         CredKind::Key => encode_cc_hot_key(hash),
@@ -232,9 +243,10 @@ pub fn encode_cc_hot(hash: &Hash28, kind: CredKind) -> Result<String, Governance
     }
 }
 
-/// Encode a CC cold credential (key or script) as a CIP-0129 bech32 identifier.
+/// Encode a CC cold credential (key or script) as a bech32 identifier.
 ///
-/// Selects `cc_cold1` for key credentials and `cc_cold_script1` for script credentials.
+/// Selects the `cc_cold` HRP for key credentials and `cc_cold_script` for
+/// script credentials.
 pub fn encode_cc_cold(hash: &Hash28, kind: CredKind) -> Result<String, GovernanceIdError> {
     match kind {
         CredKind::Key => encode_cc_cold_key(hash),
@@ -345,14 +357,31 @@ mod tests {
 
     // ── Encoding round-trip tests ────────────────────────────────────────────
 
+    /// `starts_with("drep1")` alone is NOT a sufficient assertion here — the
+    /// bug this module was fixed for (baking the bech32 separator into the
+    /// HRP constant, producing "drep11..." instead of "drep1...") ALSO
+    /// starts with "drep1", since "drep11..." trivially starts with its own
+    /// first five characters. Decoding the HRP back out and comparing it
+    /// EXACTLY is what would have caught it: the buggy encoding decodes to
+    /// HRP "drep1" (bech32 uses the LAST '1' in the string as the
+    /// separator, and the data alphabet never contains '1', so "drep11..."
+    /// unambiguously decodes to hrp="drep1" + data starting at the second
+    /// '1' — not hrp="drep").
+    fn assert_hrp_exact(encoded: &str, expected_hrp: &str) {
+        let (hrp, _data) = bech32::decode(encoded).expect("must be valid bech32");
+        assert_eq!(
+            hrp.as_str(),
+            expected_hrp,
+            "decoded HRP must be exactly {expected_hrp:?} — got {:?} from {encoded}",
+            hrp.as_str()
+        );
+    }
+
     #[test]
     fn test_drep_key_roundtrip() {
         let h = test_hash();
         let encoded = encode_drep_key(&h).expect("encode should succeed");
-        assert!(
-            encoded.starts_with("drep1"),
-            "expected 'drep1' prefix, got: {encoded}"
-        );
+        assert_hrp_exact(&encoded, HRP_DREP);
         let decoded = decode_drep_key(&encoded).expect("decode should succeed");
         assert_eq!(decoded, h, "round-trip should return original hash");
     }
@@ -361,10 +390,7 @@ mod tests {
     fn test_drep_script_roundtrip() {
         let h = test_hash();
         let encoded = encode_drep_script(&h).expect("encode should succeed");
-        assert!(
-            encoded.starts_with("drep_script1"),
-            "expected 'drep_script1' prefix, got: {encoded}"
-        );
+        assert_hrp_exact(&encoded, HRP_DREP_SCRIPT);
         let decoded = decode_drep_script(&encoded).expect("decode should succeed");
         assert_eq!(decoded, h);
     }
@@ -373,10 +399,7 @@ mod tests {
     fn test_cc_hot_key_roundtrip() {
         let h = test_hash();
         let encoded = encode_cc_hot_key(&h).expect("encode should succeed");
-        assert!(
-            encoded.starts_with("cc_hot1"),
-            "expected 'cc_hot1' prefix, got: {encoded}"
-        );
+        assert_hrp_exact(&encoded, HRP_CC_HOT);
         let decoded = decode_cc_hot_key(&encoded).expect("decode should succeed");
         assert_eq!(decoded, h);
     }
@@ -385,10 +408,7 @@ mod tests {
     fn test_cc_hot_script_roundtrip() {
         let h = test_hash();
         let encoded = encode_cc_hot_script(&h).expect("encode should succeed");
-        assert!(
-            encoded.starts_with("cc_hot_script1"),
-            "expected 'cc_hot_script1' prefix, got: {encoded}"
-        );
+        assert_hrp_exact(&encoded, HRP_CC_HOT_SCRIPT);
         let decoded = decode_cc_hot_script(&encoded).expect("decode should succeed");
         assert_eq!(decoded, h);
     }
@@ -397,10 +417,7 @@ mod tests {
     fn test_cc_cold_key_roundtrip() {
         let h = test_hash();
         let encoded = encode_cc_cold_key(&h).expect("encode should succeed");
-        assert!(
-            encoded.starts_with("cc_cold1"),
-            "expected 'cc_cold1' prefix, got: {encoded}"
-        );
+        assert_hrp_exact(&encoded, HRP_CC_COLD);
         let decoded = decode_cc_cold_key(&encoded).expect("decode should succeed");
         assert_eq!(decoded, h);
     }
@@ -409,12 +426,32 @@ mod tests {
     fn test_cc_cold_script_roundtrip() {
         let h = test_hash();
         let encoded = encode_cc_cold_script(&h).expect("encode should succeed");
-        assert!(
-            encoded.starts_with("cc_cold_script1"),
-            "expected 'cc_cold_script1' prefix, got: {encoded}"
-        );
+        assert_hrp_exact(&encoded, HRP_CC_COLD_SCRIPT);
         let decoded = decode_cc_cold_script(&encoded).expect("decode should succeed");
         assert_eq!(decoded, h);
+    }
+
+    /// Byte-exact against a REAL cardano-cli 11.0.1 `conway governance drep
+    /// id` (default, non-`--output-cip129` output mode) — not a
+    /// self-consistency round-trip, which is exactly what let the doubled-
+    /// separator bug ship silently: encode and decode agreeing with each
+    /// other proves nothing when they share the same wrong constant.
+    /// Captured 2026-08-20 from a freshly generated DRep verification key;
+    /// the hash is `cardano-cli ... drep id --output-hex`'s raw 28 bytes for
+    /// that same key.
+    #[test]
+    fn test_drep_key_matches_real_cardano_cli_output() {
+        let hex = "1ccd651268a5c1b07cca01101c9fab20570456d7454b0dd1b9957f10";
+        let mut bytes = [0u8; 28];
+        for i in 0..28 {
+            bytes[i] = u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16).unwrap();
+        }
+        let h = Hash28::from_bytes(bytes);
+        let encoded = encode_drep_key(&h).expect("encode should succeed");
+        assert_eq!(
+            encoded, "drep1rnxk2yng5hqmqlx2qygpe8atyptsg4khg49sm5dej4l3q2hkzth",
+            "must match real cardano-cli's default bech32 output exactly"
+        );
     }
 
     // ── CredKind dispatch tests ──────────────────────────────────────────────
@@ -505,16 +542,22 @@ mod tests {
         assert!(result.is_err(), "20-byte payload should be rejected");
     }
 
-    // ── Legacy 'drep' prefix backward-compatibility ──────────────────────────
+    // ── Bare 'drep' HRP, built independently of HRP_DREP ─────────────────────
 
+    /// Builds the HRP from a literal `"drep"` string rather than the
+    /// `HRP_DREP` constant `decode_drep_key` itself checks against — an
+    /// earlier revision of this test called this "legacy" backward
+    /// compatibility because `HRP_DREP` used to be the (buggy) `"drep1"`;
+    /// now that `HRP_DREP` IS `"drep"`, this is really just an independent
+    /// check that the decoder's accepted HRP matches the literal string,
+    /// not a fixture built from the same constant it's testing.
     #[test]
-    fn test_decode_drep_key_legacy_prefix() {
-        // Encode with old 'drep' HRP manually.
+    fn test_decode_drep_key_bare_drep_hrp() {
         let h = test_hash();
         let hrp = Hrp::parse("drep").expect("valid HRP");
-        let legacy = bech32::encode::<Bech32>(hrp, h.as_bytes()).expect("encode");
-        // decode_drep_key must accept it.
-        let decoded = decode_drep_key(&legacy).expect("legacy prefix should be accepted");
+        let independently_built = bech32::encode::<Bech32>(hrp, h.as_bytes()).expect("encode");
+        let decoded =
+            decode_drep_key(&independently_built).expect("bare 'drep' HRP should be accepted");
         assert_eq!(decoded, h);
     }
 
@@ -573,11 +616,7 @@ mod tests {
         // Hash: all 0xAB bytes (28 bytes).
         let h = Hash28::from_bytes([0xABu8; 28]);
         let encoded = encode_drep_key(&h).expect("encode");
-        // Must have the correct HRP.
-        assert!(
-            encoded.starts_with("drep1"),
-            "expected 'drep1' prefix, got: {encoded}"
-        );
+        assert_hrp_exact(&encoded, HRP_DREP);
         // Round-trip decodes to the same hash.
         let decoded = decode_drep_key(&encoded).expect("decode");
         assert_eq!(decoded, h);
