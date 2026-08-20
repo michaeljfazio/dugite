@@ -510,6 +510,13 @@ impl LedgerState {
                         self.epoch_length,
                         self.shelley_transition_epoch,
                         self.max_lovelace_supply,
+                        &self.epochs.non_myopic,
+                        self.epochs.rupd_monetary,
+                        // Non-consuming clone, unlike the production call
+                        // site's `.take()` — this debug dump runs BEFORE the
+                        // real boundary handler and must not steal the
+                        // in-flight fold the real computation still needs.
+                        self.epochs.rupd_fold.fold.clone(),
                     );
                     crate::state::epoch_state_debug::maybe_dump(
                         self,

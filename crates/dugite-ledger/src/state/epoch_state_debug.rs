@@ -1091,6 +1091,7 @@ mod tests {
             rewards,
             delta_treasury: 0,
             delta_reserves: 42,
+            ..Default::default()
         });
         let dump = capture(&state, 42, 432_000, None);
         assert_eq!(dump.rewards.total_distributed, 42);
@@ -1108,6 +1109,7 @@ mod tests {
             rewards: HashMap::new(),
             delta_treasury: 0,
             delta_reserves: 1,
+            ..Default::default()
         });
         let mut rewards = HashMap::new();
         rewards.insert(h32(0x99), Lovelace(7));
@@ -1115,6 +1117,7 @@ mod tests {
             rewards,
             delta_treasury: 0,
             delta_reserves: 7,
+            ..Default::default()
         };
         let dump = capture(&state, 42, 432_000, Some(&override_rupd));
         assert_eq!(dump.rewards.total_distributed, 7);
@@ -1147,6 +1150,7 @@ mod tests {
             rewards,
             delta_treasury: 0,
             delta_reserves: 150,
+            ..Default::default()
         };
         let dump = capture(&state, 42, 432_000, Some(&rupd));
         assert_eq!(dump.rewards.total_distributed, 150);
@@ -1195,6 +1199,7 @@ mod tests {
             rewards,
             delta_treasury: 0,
             delta_reserves: 18,
+            ..Default::default()
         };
         let pc = per_credential_summary(Some(&rupd), Some(&go));
         assert_eq!(pc.credential_count, 2);
@@ -1227,6 +1232,7 @@ mod tests {
             rewards,
             delta_treasury: 0,
             delta_reserves: 55,
+            ..Default::default()
         };
         let pc = per_credential_summary(Some(&rupd), Some(&go));
         assert_eq!(pc.credential_count, 2);
@@ -1252,6 +1258,7 @@ mod tests {
             rewards,
             delta_treasury: 0,
             delta_reserves: 9,
+            ..Default::default()
         };
         let pc = per_credential_summary(Some(&rupd), None);
         assert_eq!(pc.credential_count, 0);
