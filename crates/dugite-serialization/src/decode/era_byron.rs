@@ -409,6 +409,52 @@ fn read_byron_dlg_payload(r: &mut Reader<'_>) -> Result<Vec<ByronDlgCert>, Seria
     r.read_array(read_byron_dlg_cert)
 }
 
+/// Read `blockSig = [2, [dlg, signature]]` (`Header.hs:648-701`,
+/// `ABlockSignature`/`DecCBOR (ABlockSignature ByteSpan)`).
+///
+/// Tag 2 (heavyweight-delegation-backed signature) is the ONLY variant the
+/// pinned decoder accepts: `EncCBOR BlockSignature` unconditionally emits
+/// `[2, ...]` ("Tag 0 was previously used for BlockSignature (no
+/// delegation)... Tag 1 was previously used for BlockPSignatureLight" — both
+/// dead), and `DecCBOR` hard-rejects any other tag with
+/// `DecoderErrorUnknownTag`. No conforming implementation can have ever
+/// produced anything else, so this decoder does the same: an unknown tag is
+/// a decode error, not a lenient skip.
+///
+/// Returns the embedded certificate's DELEGATE key
+/// (`Delegation.delegateVK cert`) — this is upstream's
+/// `headerIssuer`/`blockIssuer` (`Header.hs:274-276`), NOT the raw
+/// `issuer_pubkey` read from consensus-data field 1. See
+/// [`dugite_primitives::block::ByronBlockAux::delegate_pubkey`]'s doc for why
+/// the two are different fields.
+fn read_byron_block_sig(r: &mut Reader<'_>) -> Result<Vec<u8>, SerializationError> {
+    let outer = r.read_array_header()?;
+    if !matches!(outer, Some(2)) {
+        return Err(SerializationError::CborDecode(format!(
+            "byron block_sig: expected array(2), got {outer:?}"
+        )));
+    }
+    let tag = r.read_uint()?;
+    if tag != 2 {
+        return Err(SerializationError::CborDecode(format!(
+            "byron block_sig: unknown tag {tag} (only the heavyweight-delegation \
+             tag 2 has ever been emitted by a conforming encoder)"
+        )));
+    }
+    let inner = r.read_array_header()?;
+    if !matches!(inner, Some(2)) {
+        return Err(SerializationError::CborDecode(format!(
+            "byron block_sig: expected inner array(2), got {inner:?}"
+        )));
+    }
+    let cert = read_byron_dlg_cert(r)?;
+    // signature :: Signature ToSign — the block's own signature, raw bytes.
+    // Verification is a separate, deliberately out-of-scope gap (design doc
+    // §3.6), matching the posture already taken for `dlg_certs[].signature`.
+    let _signature = r.read_bytes_owned()?;
+    Ok(cert.delegate_vk)
+}
+
 /// Read `bvermod` — the 14-field sparse protocol-parameter update record.
 /// Every field is `[? x]`. See [`ByronParamsUpdate`]'s doc for why
 /// `txFeePolicy` is captured raw rather than parsed.
@@ -649,9 +695,13 @@ pub fn decode_byron_main_block(
     }
     let block_number = r.read_uint()?;
 
-    // block_sig (skip — large structure; block-signature verification is a
-    // separate, deliberately out-of-scope gap — see the design doc §3.6)
-    r.skip()?;
+    // block_sig = [2, [dlg_cert, signature]] — decoded (not skipped) as of
+    // this fix. The embedded certificate's DELEGATE key is `headerIssuer`
+    // (`Header.hs:274-276`), which `apply_update_payload` must hash for this
+    // block's per-block update endorsement — NOT `issuer_pubkey` above.
+    // Certificate/block signature verification itself remains a separate,
+    // deliberately out-of-scope gap (design doc §3.6).
+    let delegate_pubkey = read_byron_block_sig(&mut r)?;
 
     // field 4: extra_data = [blockVersion: bver, softwareVersion, attributes, extraProof]
     let ed_arr = r.read_array_header()?;
@@ -761,6 +811,7 @@ pub fn decode_byron_main_block(
     let byron_aux = ByronBlockAux {
         protocol_version: block_version,
         issuer_pubkey,
+        delegate_pubkey,
         dlg_certs,
         upd_proposal,
         upd_votes,
@@ -1132,21 +1183,14 @@ mod tests {
         let slot_id = cbor_arr2(&cbor_uint(epoch), &cbor_uint(rel_slot));
         let issuer = cbor_bytes(&[0u8; 32]);
         let difficulty = cbor_arr1(&cbor_uint(block_no));
-        // block_sig — use a minimal placeholder: [0, [delegator, signature]]
-        // where 0 = ProxySKLight discriminator
-        // For our decoder we only read this to skip it
-        let _dlg_cert = cbor_arr5(
-            &cbor_uint(0),           // epoch range start
-            &cbor_uint(0),           // epoch range end
-            &cbor_bytes(&[0u8; 32]), // issuer
-            &cbor_bytes(&[0u8; 32]), // delegate
-            &cbor_bytes(&[0u8; 64]), // certificate signature placeholder
+        // block_sig = [2, [dlg_cert, signature]] (`ABlockSignature`,
+        // Header.hs:648-701) — tag 2 is the only variant a conforming
+        // encoder ever emits; see `read_byron_block_sig`'s doc.
+        let block_sig_cert = cbor_dlg_cert(0, &[0u8; 64], &[0u8; 64], &[0u8; 64]);
+        let block_sig = cbor_arr2(
+            &cbor_uint(2),
+            &cbor_arr2(&block_sig_cert, &cbor_bytes(&[0u8; 64])),
         );
-        // Use block_sig type 0 (GenesisSignature) — simplest: just skip
-        // Actually we need: [0, [delegator, signature]] or [1, ...] etc.
-        // Use a stub: [0, #6.24(bytes .cbor (...))] — too complex. Use bytes placeholder.
-        // The decoder calls r.skip() on block_sig so any valid CBOR works.
-        let block_sig = cbor_arr2(&cbor_uint(0), &cbor_bytes(&[0u8; 64]));
         let cons_data = cbor_arr4(&slot_id, &issuer, &difficulty, &block_sig);
 
         // extra_data = [block_version, software_version, attributes, extra_proof]
@@ -1590,7 +1634,17 @@ mod tests {
         let issuer_pubkey = [0x11u8; 64];
         let issuer = cbor_bytes(&issuer_pubkey);
         let difficulty = cbor_arr1(&cbor_uint(50_000));
-        let block_sig = cbor_arr2(&cbor_uint(0), &cbor_bytes(&[0u8; 64]));
+        // block_sig's embedded certificate's delegate key is DELIBERATELY
+        // distinct from both `issuer_pubkey` above and `dlg_certs[0]`'s
+        // delegate below, so a test reading `aux.delegate_pubkey` can only
+        // pass if the decoder actually threads this specific field through
+        // rather than any other key already in scope.
+        let sig_delegate = [0x77u8; 64];
+        let block_sig_cert = cbor_dlg_cert(0, &issuer_pubkey, &sig_delegate, &[0u8; 64]);
+        let block_sig = cbor_arr2(
+            &cbor_uint(2),
+            &cbor_arr2(&block_sig_cert, &cbor_bytes(&[0u8; 64])),
+        );
         let cons_data = cbor_arr4(&slot_id, &issuer, &difficulty, &block_sig);
 
         let extra_data = cbor_arr4(
@@ -1640,6 +1694,11 @@ mod tests {
 
         assert_eq!(aux.protocol_version, (0, 1, 0));
         assert_eq!(aux.issuer_pubkey, vec![0x11u8; 64]);
+        // `delegate_pubkey` comes from `block_sig`'s embedded certificate,
+        // NOT from `issuer_pubkey` (0x11) and NOT from `dlgPayload`'s
+        // certificate (0x33) — three different keys in this fixture, so
+        // this can only pass if the decoder reads the right one.
+        assert_eq!(aux.delegate_pubkey, vec![0x77u8; 64]);
 
         assert_eq!(aux.dlg_certs.len(), 1);
         assert_eq!(aux.dlg_certs[0].epoch, 0);
