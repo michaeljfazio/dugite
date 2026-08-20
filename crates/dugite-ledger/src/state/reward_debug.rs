@@ -481,6 +481,7 @@ mod tests {
             rewards: rupd_rewards,
             delta_treasury: 12_345_678,
             delta_reserves: 999_999_999,
+            ..Default::default()
         };
 
         let params = ProtocolParameters::mainnet_defaults();
