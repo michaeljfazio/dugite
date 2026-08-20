@@ -210,7 +210,15 @@ pub enum TxValidationError {
     DecodeFailed {
         reason: String,
     },
-    LedgerStateUnavailable,
+    // #1090: `LedgerStateUnavailable` was deleted. It mapped a `try_read()`
+    // lock-contention failure at tx-admission time to a client-visible
+    // rejection for a transaction on which no validation had run —
+    // cardano-node has no give-up-if-busy path anywhere on this surface
+    // (see docs/superpowers/specs/2026-08-21-tx-admission-lock-contention-design.md).
+    // The admission path now WAITS for the ledger (`block_in_place` +
+    // `blocking_read()`, `dugite-node/src/node/serve.rs`), so the
+    // condition this variant represented can no longer arise; deleting the
+    // variant makes that structural rather than merely undertested.
     NoInputs,
     InputNotFound {
         input: String,
