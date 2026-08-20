@@ -1416,6 +1416,57 @@ fn format_rational_decimal(num: u64, den: u64) -> String {
     format!("{int_part}.{trimmed}")
 }
 
+/// Decode one `costModels` map entry (`language => [cost, ...]`) and push its
+/// rendered JSON fragment onto `cm_entries`. Split out of
+/// `parse_protocol_params_cbor` so both the definite- and indefinite-length
+/// map arms can share it without duplicating the (already-fiddly)
+/// definite/indefinite handling for the nested cost array.
+fn decode_one_cost_model_entry(
+    decoder: &mut minicbor::Decoder<'_>,
+    payload: &[u8],
+    cm_entries: &mut Vec<String>,
+) {
+    let lang = decoder.u32().unwrap_or(0);
+    let lang_name = match lang {
+        0 => "PlutusV1",
+        1 => "PlutusV2",
+        2 => "PlutusV3",
+        _ => "Unknown",
+    };
+    let mut costs = Vec::new();
+    match decoder.array() {
+        Ok(Some(cost_len)) => {
+            // #873: a ~9-byte header must not push billions of zeros —
+            // bound against remaining input.
+            let cost_len = bounded_cbor_len(cost_len, payload.len(), decoder);
+            for _ in 0..cost_len {
+                // Stop on the first malformed cost entry instead of
+                // silently pushing 0 forever.
+                match decoder.i64() {
+                    Ok(c) => costs.push(c),
+                    Err(_) => break,
+                }
+            }
+        }
+        Ok(None) => loop {
+            match decoder.datatype() {
+                Ok(minicbor::data::Type::Break) => {
+                    let _ = decoder.skip();
+                    break;
+                }
+                Ok(_) => match decoder.i64() {
+                    Ok(c) => costs.push(c),
+                    Err(_) => break,
+                },
+                Err(_) => break,
+            }
+        },
+        Err(_) => {}
+    }
+    let costs_str: Vec<String> = costs.iter().map(|c| c.to_string()).collect();
+    cm_entries.push(format!("    \"{lang_name}\": [{}]", costs_str.join(", ")));
+}
+
 /// Parse protocol params from MsgResult CBOR into a JSON string matching
 /// `cardano-cli 10.x` output format.
 #[allow(clippy::too_many_lines)]
@@ -1486,41 +1537,46 @@ fn parse_protocol_params_cbor(payload: &[u8]) -> Result<String, NetworkError> {
                     }
                     15 => {
                         let mut cm_entries = Vec::new();
-                        if let Ok(Some(map_len)) = decoder.map() {
-                            // #873: bound the language-count against the input.
-                            let map_len = bounded_cbor_len(map_len, payload.len(), &decoder);
-                            for _ in 0..map_len {
-                                let lang = decoder.u32().unwrap_or(0);
-                                let lang_name = match lang {
-                                    0 => "PlutusV1",
-                                    1 => "PlutusV2",
-                                    2 => "PlutusV3",
-                                    _ => "Unknown",
-                                };
-                                let mut costs = Vec::new();
-                                if let Ok(Some(cost_len)) = decoder.array() {
-                                    // #873: a ~9-byte header must not push billions
-                                    // of zeros — bound against remaining input.
-                                    let cost_len =
-                                        bounded_cbor_len(cost_len, payload.len(), &decoder);
-                                    for _ in 0..cost_len {
-                                        // Stop on the first malformed cost entry
-                                        // instead of silently pushing 0 forever.
-                                        match decoder.i64() {
-                                            Ok(c) => costs.push(c),
-                                            Err(_) => break,
-                                        }
-                                    }
+                        // Real cost models are always encoded indefinite-length —
+                        // 166+ params comfortably exceeds the threshold-23 rule
+                        // (#938's class) that switches CBOR to indefinite framing
+                        // — so `decoder.map()`/`.array()` returning `None` here is
+                        // the COMMON case on real data, not an edge case. `None`
+                        // still consumes the container's header; the elements must
+                        // then be read in a loop terminated by an explicit `Break`
+                        // marker (which itself must be consumed via `.skip()`), or
+                        // the decoder cursor desyncs for every subsequent field —
+                        // this was previously unhandled and broke every real
+                        // `query protocol-parameters` call.
+                        match decoder.map() {
+                            Ok(Some(map_len)) => {
+                                // #873: bound the language-count against the input.
+                                let map_len = bounded_cbor_len(map_len, payload.len(), &decoder);
+                                for _ in 0..map_len {
+                                    decode_one_cost_model_entry(
+                                        &mut decoder,
+                                        payload,
+                                        &mut cm_entries,
+                                    );
                                 }
-                                let costs_str: Vec<String> =
-                                    costs.iter().map(|c| c.to_string()).collect();
-                                cm_entries.push(format!(
-                                    "    \"{lang_name}\": [{}]",
-                                    costs_str.join(", ")
-                                ));
                             }
-                        } else {
-                            let _ = decoder.skip();
+                            Ok(None) => loop {
+                                match decoder.datatype() {
+                                    Ok(minicbor::data::Type::Break) => {
+                                        let _ = decoder.skip();
+                                        break;
+                                    }
+                                    Ok(_) => decode_one_cost_model_entry(
+                                        &mut decoder,
+                                        payload,
+                                        &mut cm_entries,
+                                    ),
+                                    Err(_) => break,
+                                }
+                            },
+                            Err(_) => {
+                                let _ = decoder.skip();
+                            }
                         }
                         entries.push(format!(
                             "  \"costModels\": {{\n{}\n  }}",
@@ -2332,6 +2388,62 @@ mod tests {
             "rendered JSON must NOT use the legacy `minFeeA` key — Dijkstra `txFeePerByte` \
              is the canonical N2C name; cardano-cli 10.x outputs `txFeePerByte`. \
              Rendered: {json}"
+        );
+    }
+
+    /// A real cost model (166+ params) is always ABOVE the threshold-23 CBOR
+    /// framing rule (#938's class), so cardano-node always encodes
+    /// `costModels` (field 15) as an INDEFINITE-length map of INDEFINITE-
+    /// length arrays — never the definite form. This must decode correctly
+    /// AND leave the cursor positioned exactly where the next field
+    /// (`executionUnitPrices`, field 16) begins, or every field after
+    /// `costModels` reads garbage. Proven RED against the pre-fix code: the
+    /// old `if let Ok(Some(map_len)) = decoder.map()` / `if let Ok(Some(cost_len))
+    /// = decoder.array()` silently fell through to their `else` arms on this
+    /// exact indefinite-length input, leaving `costModels` empty and
+    /// desyncing `executionUnitPrices` to garbage — reproducing the bug found
+    /// live against real preprod protocol-parameters data.
+    #[test]
+    fn protocol_params_decodes_indefinite_length_cost_models_without_desync() {
+        // pparams array(17): fields 0-8 (u64, zeroed), 9-11 (tagged
+        // rationals, zeroed), 12 (protocolVersion major=11 minor=0), 13-14
+        // (u64, zeroed), 15 (costModels, INDEFINITE map of INDEFINITE
+        // arrays — the real-world shape), 16 (executionUnitPrices, with
+        // DISTINCTIVE non-zero values so the assertion can only pass if the
+        // decoder actually reached this field correctly rather than by
+        // accident).
+        let mut pparams: Vec<u8> = vec![0x91]; // array(17)
+        pparams.extend([0x00; 9]); // fields 0-8: plain u64 zero
+        for _ in 0..3 {
+            // fields 9-11: tag(30) + array(2)[0, 1]
+            pparams.extend([0xd8, 0x1e, 0x82, 0x00, 0x01]);
+        }
+        pparams.extend([0x82, 0x0b, 0x00]); // field 12: protocolVersion [11, 0]
+        pparams.extend([0x00, 0x00]); // fields 13-14: minPoolCost, utxoCostPerByte
+                                      // field 15: costModels — indefinite map, one language (PlutusV1=0),
+                                      // indefinite inner array [1, 2, 3].
+        pparams.extend([0xbf, 0x00, 0x9f, 0x01, 0x02, 0x03, 0xff, 0xff]);
+        // field 16: executionUnitPrices — priceMemory = 7/1, priceSteps = 11/1.
+        pparams.extend([
+            0x82, 0xd8, 0x1e, 0x82, 0x07, 0x01, 0xd8, 0x1e, 0x82, 0x0b, 0x01,
+        ]);
+
+        // MsgResult wrapper: [4, [<pparams>]] (matches the existing minimal
+        // fixture's shape in `protocol_params_renders_tx_fee_per_byte_phase_4_3`).
+        let mut payload = vec![0x82, 0x04, 0x81];
+        payload.extend(pparams);
+
+        let json = parse_protocol_params_cbor(&payload).expect("parse should succeed");
+        assert!(
+            json.contains("\"PlutusV1\": [1, 2, 3]"),
+            "indefinite-length costModels must decode its actual values, not an \
+             empty fallback. Rendered: {json}"
+        );
+        assert!(
+            json.contains("\"priceMemory\": 7.0") && json.contains("\"priceSteps\": 11.0"),
+            "executionUnitPrices (field 16) must decode correctly AFTER an \
+             indefinite-length costModels — a cursor desync would make these \
+             read as 0.0 (the `unwrap_or` defaults) instead. Rendered: {json}"
         );
     }
 
