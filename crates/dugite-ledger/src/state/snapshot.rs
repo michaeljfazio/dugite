@@ -523,12 +523,23 @@ impl LedgerState {
     //     re-replayed — the version number cannot reject a layout that shares
     //     its number.
     //
-    //     #1084 extends 38 again with `DRepRegistration.delegs` — Haskell's
+    //     #1085 extends 38 again with `DRepRegistration.delegs` — Haskell's
     //     `drepDelegs`, the reverse index `ConwayUnRegDRep` uses to clear its
     //     delegators. Same reasoning, same untagged window. The Mithril import
     //     path rebuilds it from the forward map, which is exact at PV10+; a
     //     chunk replay builds it from the certificates directly.
-    pub(crate) const SNAPSHOT_VERSION: u8 = 38;
+    //     (Commits landing this referred to it as "#1084" before the 2026-08-14
+    //     renumbering recorded in CLAUDE.md; #1084 itself is the unrelated
+    //     Byron delegation/update-state issue this file's v39 entry is about.)
+    //
+    // 39: v2.8.0 tagged 38 with ONLY the #1067/#1073/#1085 layout above. The
+    //     one-bump plan `xtask/tests/snapshot_one_bump_invariant.rs` protected
+    //     — "extend 38 in place while nothing tagged carries it" — is void the
+    //     moment a release does, so this is a real bump, not another
+    //     extension. That guard is deleted (see its own final commit message
+    //     for what replaces it); this comment block is now what future
+    //     extensions append to instead, exactly as 37 and 38 did before it.
+    pub(crate) const SNAPSHOT_VERSION: u8 = 39;
 
     /// Save ledger state snapshot to disk using bincode serialization.
     ///

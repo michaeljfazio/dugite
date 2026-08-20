@@ -14,7 +14,16 @@ jobs:
   build-and-test:
     runs-on: ubuntu-latest
     steps:
+      # fetch-tags: the workspace test suite includes version-seam guards
+      # that read `git tag --list` (e.g. a SNAPSHOT_VERSION collision check)
+      # to decide whether a layout has shipped. The default shallow clone
+      # carries no tags at all, so `git tag --list` returns empty and any
+      # such guard's tag-gated branch silently never fires here — the exact
+      # blindness that let xtask/tests/snapshot_one_bump_invariant.rs stay
+      # green in CI while red on a real checkout.
       - uses: actions/checkout@v7
+        with:
+          fetch-tags: true
 
       - name: Install protoc
         # dugite-rpc's build.rs invokes tonic-build → prost-build → protoc to
