@@ -1448,10 +1448,12 @@ name = "dugite-cli"
 version = "2.8.0"
 dependencies = [
  "anyhow",
+ "base64 0.22.1",
  "bech32",
  "blake2 0.10.6",
  "blake2b_simd",
  "bs58",
+ "chrono",
  "clap",
  "crc32fast",
  "curve25519-dalek 3.2.0 (git+https://github.com/iquerejeta/curve25519-dalek?branch=ietf03_vrf_compat_ell2)",
@@ -1472,6 +1474,7 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
+ "tokio-util",
 ]
 
 [[package]]

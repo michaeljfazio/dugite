@@ -1,5 +1,8 @@
 # Tech Lead Agent Memory
 
+## #1091 CLI surface second wave (2026-08-21)
+- [Full writeup](issue-1091-cli-surface-second-wave.md) — closed 11/22 of #1008's deferred shims (cip-format×4 CIP-129 wire format, byron key aliases×2 WRONG SCOPE corrected, ping incl. 2 new dugite-network handshake fns, debug×2, key verification-key/non-extended-key). Found 2 real dugite-node handshake bugs (N2N bearer-close, N2C query-mode server gap) — NOT fixed, out of scope. `transaction signed-transaction` doesn't exist in real cardano-cli 11 — moved WONTFIX. `cli-surface-parity.sh` needs no live node — run it after any gaps-file edit.
+
 ## #1084/#1093 Byron genesis-authority fix (2026-08-20, UNCOMMITTED)
 - [Full writeup](issue-1084-1093-byron-genesis-authority-fix.md) — memberR≡lookupR proof (bimap-0.5.0 source: same `right` map). Removed OR-clause fallback; fixed endorsement key to block_sig's delegate (not consensus-data issuer_pubkey, decoder was skipping block_sig); register_vote now checks proposal_registration_slot not registered_protocol_update_proposals (#1093); register_endorsement prune made unconditional. Mainnet replay 0-95, 0 rejections incl. slot 73486, oracle diff 0 real divergences. Left uncommitted per explicit instruction.
 
