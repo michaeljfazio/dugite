@@ -249,15 +249,23 @@ pub struct PeerConnection {
     cancel: CancellationToken,
 
     // ── Running protocol task handles ──
+    //
+    // Each entry carries a `&'static str` protocol name alongside the handle
+    // and token (#1097): `stop_tasks`/`stop_hot_protocols_and_recover` used
+    // to log a timeout/join-error with no indication of WHICH protocol was
+    // slow to respond to cancellation, so a burst of "channel recovery
+    // failed" warnings during peer-governor churn gave no way to tell
+    // ChainSync, BlockFetch and TxSubmission2 apart — or to notice a pattern
+    // (e.g. always the same protocol) that would point at a real regression.
     /// Warm-temperature protocol tasks (currently: KeepAlive).
-    warm_tasks: Vec<(JoinHandle<()>, CancellationToken)>,
+    warm_tasks: Vec<(&'static str, JoinHandle<()>, CancellationToken)>,
 
     /// Hot-temperature protocol tasks (ChainSync, BlockFetch, TxSubmission2).
-    hot_tasks: Vec<(JoinHandle<()>, CancellationToken)>,
+    hot_tasks: Vec<(&'static str, JoinHandle<()>, CancellationToken)>,
 
     /// Server protocol tasks (ChainSync, BlockFetch, TxSubmission2, KeepAlive, PeerSharing responders).
     /// Always populated — server protocols run on all connections so remote peers can pull blocks.
-    server_tasks: Vec<(JoinHandle<()>, CancellationToken)>,
+    server_tasks: Vec<(&'static str, JoinHandle<()>, CancellationToken)>,
 }
 
 /// Direction of a peer connection at the TCP level.
@@ -730,7 +738,7 @@ impl PeerConnection {
             (keepalive_fn)(ch, token_clone).await;
         });
 
-        self.warm_tasks.push((handle, token));
+        self.warm_tasks.push(("keepalive", handle, token));
         debug!(addr = %self.addr, "started warm protocols (KeepAlive)");
         Ok(())
     }
@@ -774,7 +782,7 @@ impl PeerConnection {
         let cs_handle = tokio::spawn(async move {
             (chainsync_fn)(cs_ch, cs_token_clone).await;
         });
-        self.hot_tasks.push((cs_handle, cs_token));
+        self.hot_tasks.push(("chainsync", cs_handle, cs_token));
 
         // Spawn BlockFetch task.
         let bf_token = self.cancel.child_token();
@@ -782,7 +790,7 @@ impl PeerConnection {
         let bf_handle = tokio::spawn(async move {
             (blockfetch_fn)(bf_ch, bf_token_clone).await;
         });
-        self.hot_tasks.push((bf_handle, bf_token));
+        self.hot_tasks.push(("blockfetch", bf_handle, bf_token));
 
         // Spawn TxSubmission2 task.
         let tx_token = self.cancel.child_token();
@@ -790,7 +798,7 @@ impl PeerConnection {
         let tx_handle = tokio::spawn(async move {
             (txsubmission_fn)(tx_ch, tx_token_clone).await;
         });
-        self.hot_tasks.push((tx_handle, tx_token));
+        self.hot_tasks.push(("txsubmission", tx_handle, tx_token));
 
         debug!(addr = %self.addr, "started hot protocols (ChainSync, BlockFetch, TxSubmission2)");
         Ok(())
@@ -825,7 +833,7 @@ impl PeerConnection {
     /// <https://github.com/IntersectMBO/ouroboros-network/blob/main/ouroboros-network/lib/Ouroboros/Network/PeerSelection/PeerStateActions.hs#L978>
     pub async fn stop_hot_protocols_and_recover(&mut self) -> bool {
         // Signal cancellation to all hot tasks.
-        for (_, token) in &self.hot_tasks {
+        for (_, _, token) in &self.hot_tasks {
             token.cancel();
         }
 
@@ -833,16 +841,24 @@ impl PeerConnection {
         // Must await each task individually so we can detect timeouts.
         let mut all_stopped = true;
         let drain = std::mem::take(&mut self.hot_tasks);
-        for (handle, _) in drain {
+        for (name, handle, _) in drain {
             let abort_handle = handle.abort_handle();
             match tokio::time::timeout(PROTOCOL_SHUTDOWN_TIMEOUT, handle).await {
                 Ok(Ok(())) => {}
                 Ok(Err(e)) => {
-                    warn!(addr = %self.addr, error = %e, "hot protocol task join error during deactivation");
+                    warn!(addr = %self.addr, protocol = name, error = %e, "hot protocol task join error during deactivation");
                 }
                 Err(_) => {
+                    // #1097: named so a burst of these during peer-governor churn
+                    // can be told apart — e.g. "always blockfetch" points at a
+                    // real regression in that task's cancellation handling,
+                    // while an even mix across chainsync/blockfetch/txsubmission
+                    // is consistent with ordinary real-network scheduling
+                    // variance under load (see `demote_to_warm`'s fallback log,
+                    // which this feeds, for the fuller picture).
                     warn!(
                         addr = %self.addr,
+                        protocol = name,
                         "hot protocol task timed out during deactivation (spsDeactivateTimeout 5s), aborting"
                     );
                     abort_handle.abort();
@@ -1007,7 +1023,7 @@ impl PeerConnection {
                 self.mux_handle.abort_handle(),
                 self.addr,
             );
-            self.server_tasks.push((handle, task_token));
+            self.server_tasks.push((label, handle, task_token));
         }
 
         debug!(addr = %self.addr, "started server protocols (ChainSync, BlockFetch, TxSubmission2, KeepAlive, PeerSharing)");
@@ -1138,8 +1154,14 @@ impl PeerConnection {
     }
 
     /// Internal helper: cancel tasks, wait with timeout, abort stragglers.
+    ///
+    /// `label` names the temperature category ("hot"/"warm"/"server"); each
+    /// task also carries its own `&'static str` protocol name (#1097) so a
+    /// timeout/join-error log identifies WHICH protocol (chainsync,
+    /// blockfetch, txsubmission, keepalive, peersharing) was slow, not just
+    /// that "a" task in the category was.
     async fn stop_tasks(
-        tasks: &mut Vec<(JoinHandle<()>, CancellationToken)>,
+        tasks: &mut Vec<(&'static str, JoinHandle<()>, CancellationToken)>,
         label: &str,
         addr: SocketAddr,
     ) {
@@ -1150,7 +1172,7 @@ impl PeerConnection {
         debug!(%addr, label, count = tasks.len(), "stopping protocol tasks");
 
         // Signal cancellation to all tasks.
-        for (_, token) in tasks.iter() {
+        for (_, _, token) in tasks.iter() {
             token.cancel();
         }
 
@@ -1158,17 +1180,17 @@ impl PeerConnection {
         // Get abort handles BEFORE moving JoinHandles into the timeout future,
         // so we can forcibly abort tasks that don't stop within the timeout.
         let drain = std::mem::take(tasks);
-        for (handle, _) in drain {
+        for (protocol, handle, _) in drain {
             let abort_handle = handle.abort_handle();
             match tokio::time::timeout(PROTOCOL_SHUTDOWN_TIMEOUT, handle).await {
                 Ok(Ok(())) => {}
                 Ok(Err(e)) => {
                     // JoinError — task panicked or was cancelled.
-                    warn!(%addr, label, error = %e, "protocol task join error");
+                    warn!(%addr, label, protocol, error = %e, "protocol task join error");
                 }
                 Err(_) => {
                     // Timeout expired — forcibly abort the task.
-                    warn!(%addr, label, "protocol task did not stop within timeout, aborting");
+                    warn!(%addr, label, protocol, "protocol task did not stop within timeout, aborting");
                     abort_handle.abort();
                 }
             }
@@ -1457,6 +1479,15 @@ impl PeerConnection {
     /// failing responder tore the whole connection down (#980).
     pub fn cancel_token_for_test(&self) -> CancellationToken {
         self.cancel.clone()
+    }
+
+    /// The protocol names currently in `hot_tasks`, in push order, so a test
+    /// can verify `start_hot_protocols` labels each spawned task correctly
+    /// (#1097) — the labels are what let an operator tell ChainSync,
+    /// BlockFetch and TxSubmission2 apart in a "channel recovery failed"
+    /// warning during peer-governor churn.
+    pub fn hot_task_names_for_test(&self) -> Vec<&'static str> {
+        self.hot_tasks.iter().map(|(name, _, _)| *name).collect()
     }
 
     /// Create a `PeerConnection` backed by caller-supplied channels and a real

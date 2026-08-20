@@ -446,7 +446,21 @@ pub struct NodeMetrics {
     pub mempool_tx_count: AtomicU64,
     pub mempool_tx_max: AtomicU64,
     pub mempool_bytes: AtomicU64,
-    pub rollback_count: AtomicU64,
+    /// Per-peer ChainSync `MsgRollBackward` protocol messages received (the
+    /// first, intersection-establishing rollback of each session excluded).
+    /// This is routine protocol chatter — a peer resyncing its candidate
+    /// fragment to a new intersection point — and fires ~15-20 times per
+    /// peer resync even when the node's own chain never changes. It is
+    /// **not** a count of ledger-level reorgs; see `ledger_reorg_total` for
+    /// that (#1098).
+    pub chainsync_rollback_messages: AtomicU64,
+    /// Actual ledger-level chain-switch (reorg) events: every call to
+    /// `Node::handle_ledger_rollback`, which is reached ONLY from a
+    /// VolatileDB `TriggeredFork` chain switch or from `abandon_failed_fork`
+    /// reverting a failed fork replay — never from a peer's ChainSync
+    /// `MsgRollBackward` (see that function's doc comment). This is the
+    /// signal an operator should watch for real reorg activity (#1098).
+    pub ledger_reorg_total: AtomicU64,
     pub blocks_forged: AtomicU64,
     pub delegation_count: AtomicU64,
     pub treasury_lovelace: AtomicU64,
@@ -839,7 +853,8 @@ impl NodeMetrics {
             mempool_tx_count: AtomicU64::new(0),
             mempool_tx_max: AtomicU64::new(0),
             mempool_bytes: AtomicU64::new(0),
-            rollback_count: AtomicU64::new(0),
+            chainsync_rollback_messages: AtomicU64::new(0),
+            ledger_reorg_total: AtomicU64::new(0),
             blocks_forged: AtomicU64::new(0),
             delegation_count: AtomicU64::new(0),
             treasury_lovelace: AtomicU64::new(0),
@@ -1666,9 +1681,16 @@ impl NodeMetrics {
                 &self.transactions_rejected,
             ),
             (
-                "dugite_rollback_count_total",
-                "Total number of chain rollbacks",
-                &self.rollback_count,
+                "dugite_chainsync_rollback_messages_total",
+                "Per-peer ChainSync MsgRollBackward protocol messages received \
+                 (routine resync chatter, NOT ledger reorgs — see \
+                 dugite_ledger_reorg_total)",
+                &self.chainsync_rollback_messages,
+            ),
+            (
+                "dugite_ledger_reorg_total",
+                "Actual ledger-level chain-switch (reorg) events",
+                &self.ledger_reorg_total,
             ),
             (
                 "dugite_block_apply_failures_total",
@@ -2858,7 +2880,8 @@ mod tests {
         // Verify correct metric types
         assert!(output.contains("# TYPE dugite_blocks_applied_total counter"));
         assert!(output.contains("# TYPE dugite_slot_number gauge"));
-        assert!(output.contains("# TYPE dugite_rollback_count_total counter"));
+        assert!(output.contains("# TYPE dugite_chainsync_rollback_messages_total counter"));
+        assert!(output.contains("# TYPE dugite_ledger_reorg_total counter"));
         assert!(output.contains("# TYPE dugite_peers_connected gauge"));
     }
 
