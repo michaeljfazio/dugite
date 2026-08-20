@@ -1,151 +1,84 @@
 # Tech Lead Agent Memory
 
-## #1050/#1051 fix: collateral + refinput wire arms (2026-08-06)
-- [Full fix writeup](issue-1050-1051-collateral-refinput-wire-fixes.md) — implements the gaps found by the shakedown below. InsufficientCollateral/CollateralHasTokens now carry balance+required / the offending Value; CollateralContainsNonADA's payload formula is NOT the netted balance (oracle got this wrong on first pass, corrected on follow-up — record both the firing condition AND payload formula, they're different subexpressions). BabbageNonDisjointRefInputs de-Set-tagged; the OLD golden test PINNED the bug (only checked the tag number). `n2c_client::decode_reject_reason` is the one crate-visible round-trip surface.
+## #1071 nesRu wire arms — SNothing/Complete real, Pulsing deferred (2026-08-20)
+- [Full writeup](issue-1071-nesru-wire-arms.md) — kept rupd_pulser_started/rupd_monetary UNTOUCHED (40+ tests), added parallel rupd_snapshot. RewardUpdate.rs is tag-258 Set at PV>=9, threshold-23 BOTH levels (oracle-verified, not analogy). Pulsing needs StakePoolSnapShot/StakeWithDelegation/Reward types dugite doesn't have anywhere — SNothing fallback, not fabricated.
 
-## tx-zoo 18/19 live shakedown, #1050/#1051 (2026-08-06)
-- [Full shakedown notes](issue-1050-1051-18-19-tx-zoo-shakedown.md) — CollateralHasTokens + InsufficientCollateral: zero encoder arms (#1050, 4th confirmation of the #1025 pattern). BabbageNonDisjointRefInputs tag 22: payload wrongly wrapped in CBOR tag-258 Set marker when Haskell field is plain NonEmpty list — cardano-cli DECODE CRASHES, not just generic-fallback (#1051, worse class). 4 script-construction bugs fixed (build auto-balance neutralizing token collateral, wrong ExtraneousScriptWitnessesUTXOW premise, EXUNITS tuple order is (steps,mem) not (mem,steps) + under-provisioned). Trap: worktree was NOT exclusively held — a concurrent process edited the same files live throughout; converged on identical conclusions but made run-all.sh's aggregate summary unreliable as a point-in-time oracle.
+## #1088 snapshot map-ordering fix (2026-08-20)
+- [Full writeup](issue-1088-snapshot-map-ordering-fix.md) — 42 field decls (54 instances) moved HashMap/imbl→BTreeMap or new `*Wire` mirrors. Replaces `snapshot_one_bump_invariant.rs` w/ version-pinned hash guard. Disarming ONE 2-entry field is only ~50% likely to fail — RED-prove by reverting the whole fix.
+
+## #1050/#1051 collateral + refinput wire arms (2026-08-06)
+- [Fix](issue-1050-1051-collateral-refinput-wire-fixes.md) · [shakedown](issue-1050-1051-18-19-tx-zoo-shakedown.md) — InsufficientCollateral/CollateralHasTokens gained payloads; BabbageNonDisjointRefInputs de-Set-tagged (cardano-cli decode crash); 4 script-construction bugs; worktree wasn't exclusive.
 
 ## PoolRetirement + OutputTooSmall wire gaps (2026-08-06)
-- [StakePoolNotRegisteredOnKeyPOOL + BabbageOutputTooSmallUTxO](issue-pool-retirement-output-too-small-wire-gaps.md) — retirement of unregistered pool used the DELEG predicate not POOL (same condition, different rule, different wire nesting); OutputTooSmall had a TxValidationError variant but ZERO encoder arm at all. Retirement-epoch bounds check (StakePoolRetirementWrongEpochPOOL) was ALREADY correct — do not re-audit. Confirms the #1025 enrich_validation_errors aggregation pattern a 3rd time.
+- [Fix](issue-pool-retirement-output-too-small-wire-gaps.md) — retirement used DELEG not POOL predicate; OutputTooSmall had zero encoder arm. #1025 pattern, 3rd confirmation.
 
-## tx-zoo 18-plutus-edges (2026-08-06)
-- [#1033 implementation](issue-1033-plutus-edges-tx-zoo-category.md) — 12 scripts + _edge-helper.sh (expect_utxo_rejection, mirrors _cert-neg-helper.sh) + one vendored non-plutus-examples.json artifact (byteStringToIntegerRoundtripPolicyV2, gh api search/code trace, ALREADY-double-wrapped cborHex — do NOT re-wrap). Real finding: dugite Rule 5 (phase1.rs) never checks collateral_return against minUTxO at all (Haskell BabbageOutputTooSmallUTxO) — 18d will likely FAIL live, that's the intended signal. ScriptsNotPaidUTxO / NotAllowedSupplementalDatums / V1+refinput Conway inversion all CONFIRMED already correct in dugite (oracle-verified) — higher confidence than the issue text assumed.
+## tx-zoo 18-plutus-edges, #1033 (2026-08-06)
+- [Impl](issue-1033-plutus-edges-tx-zoo-category.md) — 12 scripts + edge-helper; dugite Rule 5 never checks collateral_return against minUTxO (expected live fail); several predicates confirmed already correct.
 
-## Conway Cert Tags 5/6 Decode Reject (2026-08-05)
-- [#1023 fix + #1029 Dijkstra follow-up](issue-1023-conway-cert-tags-5-6-decode-reject.md) — MIR/GenesisKeyDelegation hard-reject at Conway/Dijkstra decode, clean era-type-swap not PV-gated (unlike #1014 next door); Dijkstra ALSO removes tags 0/1 (filed #1029, not fixed — unreleased era); fuzz generator + encoder-test coverage gaps found and closed. Traps: `;`+bare-echo swallows exit code same as `| tail`; idling on background jobs w/o interim report; merge-tree-diff check validates pre-merge CI run still applies post-merge.
+## Conway cert/decode/gov audits (2026-08-05)
+- [Cert tags 5/6 reject](issue-1023-conway-cert-tags-5-6-decode-reject.md) — MIR/GenesisKeyDelegation hard-reject at Conway/Dijkstra decode; #1029 filed for Dijkstra tags 0/1.
+- [Phase-1 audit](issue-1021-1022-1024-1026-1028-conway-phase1-audit.md) — #1021/#1022/#1024 fixed (26 tests); #1026/#1028 filed unreachable. Adding ValidationError variants breaks exhaustive match invisibly to `--lib` build.
+- [LSQ/mempool audit](issue-1018-1027-lsq-mempool-audit-2026-08-05.md) — #1018/#1019 fixed; #1020/#1023/#1025/#1027 filed. cli-parity.csv hash-history is a free vacuous-vs-real oracle.
+- [NEWEPOCH audit](audit-conway-epoch-newepoch-pipeline-2026-08-05.md) — #1017/#1016 fixed, #1015 filed dormant. Check THIS repo's conformance-corpus SHA, not master HEAD.
+- [#1014 aux-data key set](issue-1014-auxdata-key5-shared-decoder-pv-gate.md) — one decoder, keys 2-5 individually PV-gated, not per-era sets.
+- [#1011 Dijkstra sub-tx rules](issue-1011-dijkstra-subcerts-subpool-subgovcert.md) — clone-then-mutate-or-discard beats extracting the top-level validator.
 
-## Conway Phase-1 Transaction Validation Audit (2026-08-05)
-- [Full Phase-1 audit](issue-1021-1022-1024-1026-1028-conway-phase1-audit.md) — #1021 ProposalCantFollow (GOV tag 10, zero Phase-1 impl) + #1022 TooManyCollateralInputs wrongly gated behind has_plutus_scripts + #1024 ConwayTxRefScriptsSizeTooBig (per-tx 200KiB cap) missing entirely (all 3 FIXED, RED-GREEN verified, 26 new tests); #1026 DisallowedProposalDuringBootstrap (PV9-only, unreachable today) + #1028 InvalidGuardrailsScriptHash None-vs-SNothing ambiguity (unreachable while all 3 genesis configs seed a guardrail) both FILED not fixed. CERTS/DELEG/POOL/GOVCERT and ~17/19 GOV predicates confirmed CORRECT (clean negatives, do not re-audit). Trap: adding ValidationError variants broke an exhaustive match invisible to `cargo build --workspace --lib` — only `--all-targets`/clippy catches it.
+## Ledger review batches (2026-07-06)
+- [#804](issue-804-genesisdeleg-mir-quorum.md) SNAPSHOT v27→28, `future_gen_delegs` · [#784](issue-784-ppup-voted-value-quorum.md) LATENT quorum bug · [#796/#803](issues-796-803-batch-fix.md) signed delta_reserves i128 · [#794 batch](issues-794-795-797-808-809-789-801-batch-fix.md) IsValid filter, collateral signs · [#799 gov batch](issues-799-800-802-812-batch-fix.md) ratify tie-break v26 · [#805 robustness](issues-805-806-807-813-batch-fix.md) crash-not-diverge.
 
-## Conway N2C LSQ + Mempool-Reject Audit (2026-08-05)
-- [Full LSQ/mempool audit](issue-1018-1027-lsq-mempool-audit-2026-08-05.md) — #1018 tag-33 GetFuturePParams hardcoded + #1019 ensWithdrawals hardcoded empty (both FIXED); #1020 NextEpochChange/ensCommittee live-not-frozen, #1023 MIR/GenesisDeleg accept-where-Haskell-rejects (P1), #1025 residual generic ScriptFailed arms, #1027 `query ledger-state` LIVE-VERIFIED undecodable, zero test coverage (all FILED). Methodology: cli-parity.csv hash-history as a free vacuous-vs-real oracle; throwaway single-node devnet for cheap live round-trips.
+## Live-apply rollback investigations
+- [LedgerSeq genesis-anchor overlay wedge](ledgerseq-genesis-anchor-overlay-wedge.md) — v2.5.0 quarantine boot leaves seq at GENESIS; overlay is TPraos-ONLY.
+- [DiffSeq clear vs hardened fallback](rollback-diffseq-clear-vs-caller-fallback-hardened.md) — vestigial `diff_seq.clear()` defeats the k-bounded window.
 
-## Conway Epoch/NEWEPOCH Pipeline Audit (2026-08-05)
-- [Full NEWEPOCH audit](audit-conway-epoch-newepoch-pipeline-2026-08-05.md) — #1017 test-path committee-prune gap (fixed) + #1016 misattributed comment (fixed) + #1015 Babbage nonce formula wrongly folds extraEntropy (filed, dormant). Extensive clean negatives: reward floor chain, zero-block-pool gate, RATIFY ordering, POOLREAP, deposits/obligation. Version-pin discipline: master HEAD != cardano-node 11.0.1's actual pin — check this repo's own conformance-corpus SHA first.
-## #1014 aux-data key set (2026-08-05)
-- [AlonzoTxAuxData shared decoder + guardPlutus PV gate](issue-1014-auxdata-key5-shared-decoder-pv-gate.md) — ONE decoder across all eras, keys 2-5 individually PV-gated (5/7/9/12), not per-era key sets; ceiling model works today but is fragile to a future non-Plutus-gated key. Dijkstra key 5 deliberately capped at 4 (no `plutus_v4_scripts` field yet).
+## UPLC CEK machine (2026-07-06 unless noted)
+- [Flat wire ID vs cost table, #761](uplc-builtin-flat-id-mismatch.md) — BLS G1/G2 + 1.1.0 IDs mis-ordered; text-format conformance is blind to this.
+- [PV-gates #819/#820/#824/#828](uplc-root-cause-a-pv-gates-819-820-824-828.md) — corpus is E-only/no-PV, blind to PV<11.
+- [Flat-decode strictness #821/#822](uplc-flat-decode-strictness-821-822.md) — builtin-availability as a post-decode pass; unmasked #835.
+- [BLS unlifting/hardening #816/#827/#839/#843](uplc-bls-unlifting-and-hardening-816-827-839-843.md)
+- [Kont-depth/scope/decode #817/#823/#836/#842](uplc-kont-depth-scope-check-decode-source-842-836-817-823.md) — #836 proved ref scripts ARE CBOR-double-wrapped.
+- [Perf/hygiene/testing #838/#840/#841/#845](uplc-perf-hygiene-testing-838-840-841-845.md) — TxInfoCache kills per-redeemer O(n²).
 
-## Dijkstra Sub-Transaction Rules (2026-08-05)
-- [#1011 SUBCERTS/SUBDELEG/SUBPOOL/SUBGOVCERT/SUBENTITIES landed](issue-1011-dijkstra-subcerts-subpool-subgovcert.md) — clone-then-mutate-or-discard pattern (imbl+Arc make CertSubState/GovSubState clones cheap) beats extracting the top-level validator; SUBGOV+mint stay guarded (too large for one issue)
+## Era rules
+- [Dijkstra dispatch, #462](issue-462-dijkstra-era-rules.md) — delegates to Conway + identity translateEraDijkstra.
 
-## Ledger Review Batches (2026-07-06)
-- [#804 GenesisKeyDelegation + MIR quorum](issue-804-genesisdeleg-mir-quorum.md) — SNAPSHOT v27->28; new `future_gen_delegs` field; MIR quorum broke exhaustive ValidationError match
-- [#784 PPUP votedValue quorum](issue-784-ppup-voted-value-quorum.md) — 3 buggy distinct-proposer copies routed through unused `voted_future_pparams`; LATENT (no live-chain diff)
-- [#796/#803 batch](issues-796-803-batch-fix.md) — signed delta_reserves i128 (SNAPSHOT v27); MIR apply panic->NoMirTransfer
-- [#794/795/797/808/809/789/801 batch](issues-794-795-797-808-809-789-801-batch-fix.md) — block ExUnits IsValid filter, dup-tx-hash fatal, Byron fee burn at fork, collateral sign bugs
-- [#799/800/802/812 Conway gov batch](issues-799-800-802-812-batch-fix.md) — ratify tie-break (SNAPSHOT v26), CC zero-threshold ordering, atomic PParams enactment
-- [#805/806/807/813 robustness batch](issues-805-806-807-813-batch-fix.md) — UtxoStore crash-not-diverge on LSM errors, LedgerSeq/DiffSeq desync guard, pp_future PPUP diagnostic
+## Validation rules
+- [#810 raw_cbor=None pre-Conway](issue-810-raw-cbor-none-pre-conway-reachability.md) · DO NOT skip V1/V2 Propose/Vote redeemers (REFUTED — Haskell rejects via guardConwayFeaturesForPlutusV1V2).
+- [DRep bootstrap delegatee](conway-drep-bootstrap-phase-delegatee-check.md) skip@PV9 · [Datum native-script exemption](datum-native-script-false-positive.md) · [Redeemer exemption #758](issue-758-native-script-spend-redeemer.md)
+- [DuplicateInput PV<9, #759](issue-759-babbage-duplicate-input.md) · [VRF uniqueness PV11 gate](vrf-key-uniqueness-pv11-gate.md) · [Cert script-witness reqs](conway-cert-redeemer-witnessing.md) · [PlutusV3 cost-model seeding](conway-plutus-v3-cost-model-seeding.md)
 
-## Live-Apply Rollback Investigations
-- [LedgerSeq genesis-anchor overlay wedge (2026-08-03)](ledgerseq-genesis-anchor-overlay-wedge.md) — v2.5.0 quarantine boot leaves seq anchored at GENESIS (PV6/d=1); first fork switch installs chimera pparams via rollback_via_seq → TPraos overlay falsely rejects canonical Conway block → invalid_cache wedge. Overlay is TPraos-ONLY in Haskell (oracle-pinned).
-- [DiffSeq clear vs hardened fallback (2026-07-08)](rollback-diffseq-clear-vs-caller-fallback-hardened.md) — real root cause = vestigial `diff_seq.clear()` in epoch.rs defeats already-k-bounded `push_bounded` window; node-level snapshot-reload fallback is ALREADY hardened (refutes naive "reloads latest snapshot" theory) — fix is to stop clearing, not to further harden the fallback
+## Genesis mode
+- [GSM PreSyncing Mithril stall, #757](gsm-presyncing-mithril-stall.md) · [Cold-restart watchdog wedge, #760-A](issue-760-genesis-watchdog-rotation.md)
 
-## UPLC CEK Machine
-- [Flat wire ID vs cost table (#761)](uplc-builtin-flat-id-mismatch.md) — BLS G1/G2 + UPLC 1.1.0 builtin IDs mis-ordered; conformance (text-format) doesn't catch flat-ID bugs
-- [PV-gates #819/#820/#824/#828 (2026-07-06)](uplc-root-cause-a-pv-gates-819-820-824-828.md) — SemanticsVariant threaded into cost layer; 999-corpus is E-only/no-PV, blind to PV<11; #828.5 ConstrData tag-overflow is a scoped known limitation
-- [Flat-decode strictness #821/#822 (2026-07-06)](uplc-flat-decode-strictness-821-822.md) — builtin-availability + Constr/Case v1.1.0 gate as separate post-decode pass; unmasked latent #835 double-filler bug
-- [BLS unlifting/hardening #816/#827/#839/#843 (2026-07-06)](uplc-bls-unlifting-and-hardening-816-827-839-843.md) — ByteString-as-element laxity, MSM empty-list elem_type, subgroup-recheck, final_verify UB fix
-- [Kont-depth/scope-check/decode #817/#823/#836/#842 (2026-07-06)](uplc-kont-depth-scope-check-decode-source-842-836-817-823.md) — depth cap removed, eager checkScope; #836 proved ref scripts ARE CBOR-double-wrapped (flags latent dugite-ledger bug)
-- [Perf/hygiene/testing #838/#840/#841/#845 (2026-07-06)](uplc-perf-hygiene-testing-838-840-841-845.md) — TxInfoCache (Rc-shared, kills per-redeemer O(n²)); UplcError::MachineError split from Internal (6 sites); #845 audit found fuzz targets already exist (verdict stale)
+## Live-apply wedge, #767
+- [Lens A](issue-767-live-apply-deadlock.md) no true AB-BA cycle · [Slow-demotion cascade](issue-767-slow-demotion-cascade.md) · [Permanent wedge](issue-767-live-apply-wedge.md) save_utxo_snapshot needs block_in_place · [Lens C](issue-767-residual-stall-lens-c.md) self-recovers · [Fix review](issue-767-residual-stall-proposed-fix-review.md)
 
-## Era Rules
-- [Dijkstra era rules dispatch (#462)](issue-462-dijkstra-era-rules.md) — Conway alias removed; DijkstraRules delegates to Conway + identity translateEraDijkstra
+## Critical invariants & bug patterns
+- [#782 LedgerSeq delta allowlist audit](issue-782-ledgerseq-delta-allowlist-audit.md) — missed 11 fields; guard test forces future audit.
+- [Mempool Mined-cascade](mempool-mined-cascade-fix.md) · [GOV prev_action_id bypass](gov-apply-path-prev-action-id-bypass.md) · [#609 snapshot quarantine](issue-609-snapshot-version-quarantine.md)
+- [Forge connectivity gate, Bug C](forge-connectivity-gate-bug-c.md) · [Live-apply LedgerSeq delta, Bug B](node-live-apply-no-ledgerseq-delta.md)
+- [ChainSync at_tip rollback stall](chainsync-at-tip-rollback-stall.md) · [Origin intersection stall](chainsync-origin-intersection-fix.md) · [Fork snapshot stall cascade](fork-snapshot-stall-fix.md) 6 bugs · [Live-tip fork stall](node-fork-stall-fix.md)
+- [Cascade failure invariant](ledger-cascade-failure-invariant.md) never hard-return · [Forge body size bug](forge-body-size-bug.md) · [RUPD snapshot position](ledger-rupd-snapshot-fix.md) use `set` not `go`
+- [Rollback UTxO store](ledger-rollback-utxo-store.md) · [Output CBOR re-encode](crypto-output-cbor-reencode.md) · [Deferred pointer stake](ledger-ptr-stake-deferred.md) resolves at SNAP not insertion
 
-## Validation Rules
-- [#810 raw_cbor=None pre-Conway](issue-810-raw-cbor-none-pre-conway-reachability.md) — confirmed universal: pre-Conway output decode never KeepRaw-wraps; #810 re-encode fix neutralizes it
-- DO NOT skip V1/V2 Propose/Vote/Guarding redeemers (REFUTED 2026-06-13) — Haskell REJECTS via `guardConwayFeaturesForPlutusV1V2`; real divergence was V3 ScriptContext bug #761
-- [Conway DRep bootstrap delegatee check](conway-drep-bootstrap-phase-delegatee-check.md) — `DelegateeDRepNotRegisteredDELEG` skipped at PV9, fires only PV>=10
-- [Datum witness native-script exemption](datum-native-script-false-positive.md) — `MissingDatumWitness` false positive on native-script inputs; guard on `version > 0`
-- [Redeemer native-script exemption (#758)](issue-758-native-script-spend-redeemer.md) — Spend/Reward/Cert/Vote all gate on `script_versions.get(sh) > 0`
-- [DuplicateInput false positive Babbage PV<9 (#759)](issue-759-babbage-duplicate-input.md) — gate on `pv >= 9`; Haskell silently dedups below that
-- [VRF key uniqueness PV11 gate](vrf-key-uniqueness-pv11-gate.md) — must gate PV>=11 not PV>=9; epoch 523 mainnet divergence
-- [Conway cert script-witness reqs](conway-cert-redeemer-witnessing.md) — 3 DRep gov-certs + ConwayStakeRegistration need a Cert redeemer
-- [Conway PlutusV3 cost-model seeding](conway-plutus-v3-cost-model-seeding.md) — seed at Babbage→Conway HF AND post-snapshot guard; else budget-exhausted every V3 tx from ep507
+## N2C protocol compliance
+- [Conway PParams protocolVersion position](n2c-pparams-protover-position.md) index 12 · [#434 gov-state decode, 3 bugs](issue-434-gov-state-decode.md)
+- [Hash32 padding](n2c-hash32-padding.md) · [Credential type discrimination](n2c-credential-type-discrimination.md) · [Committee state encoding bugs, OPEN](n2c-committee-state-bugs.md)
 
-## Genesis Mode
-- [GSM PreSyncing Mithril stall (#757)](gsm-presyncing-mithril-stall.md) — `syncing_startup_threshold_secs` gate on Mithril tip age
-- [#760-A cold-restart watchdog wedge](issue-760-genesis-watchdog-rotation.md) — unproductive-claim watchdog fires on legit parked dynamo; `!is_genesis_bulk_sync` guard fixes
-
-## Live-Apply Wedge (#767)
-- [Lens A static-cycle analysis](issue-767-live-apply-deadlock.md) — no true AB-BA cycle; best candidate = synchronous LSM stall holding ledger_state.write()
-- [Slow-demotion cascade](issue-767-slow-demotion-cascade.md) — peer_failed(Slow) demotes without tearing down TCP mux → reconnect storm
-- [Live-apply permanent wedge](issue-767-live-apply-wedge.md) — save_utxo_snapshot() w/o block_in_place pins tokio worker → cascade; fix at epoch.rs:504
-- [Residual stall Lens C](issue-767-residual-stall-lens-c.md) — apply-lag-triggered cascade via fetched_blocks_rx backpressure; self-recovers
-- [Residual fix adversarial review](issue-767-residual-stall-proposed-fix-review.md) — Fix1 confirmed correct; Fix2 won't compile (private fn); Fix3 targets wrong path
-
-## Critical Invariants & Bug Patterns
-- [#782 LedgerSeq delta allowlist audit](issue-782-ledgerseq-delta-allowlist-audit.md) — delta model missed 11 LedgerState fields; guard test forces future-field audit
-- [Mempool Mined-cascade fix](mempool-mined-cascade-fix.md) — Mined parent must NOT cascade children
-- [GOV apply-path prev_action_id bypass](gov-apply-path-prev-action-id-bypass.md) — both process_proposal AND process_governance_votes_and_proposals need validation updates
-- [#609 snapshot version quarantine](issue-609-snapshot-version-quarantine.md) — fail-fast version guard + rename to quarantine file, don't retry
-- [Forge connectivity gate (Bug C)](forge-connectivity-gate-bug-c.md) — forge-before-peers-connect → self-fork; AtomicBool + hot_peer_count gate
-- [Live apply skips LedgerSeq delta (Bug B)](node-live-apply-no-ledgerseq-delta.md) — use apply_block_with_delta in apply_fetched_block + fork replay
-- [ChainSync at_tip rollback stall](chainsync-at-tip-rollback-stall.md) — at_tip not reset on MsgRollBackward → pipeline freeze
-- [ChainSync Origin intersection stall](chainsync-origin-intersection-fix.md) — Origin intersection blocks switch_chain; fix disconnect+reconnect
-- [Fork snapshot stall cascade](fork-snapshot-stall-fix.md) — 6-bug cascade fixed (1ff9cbce)
-- [Live-tip fork stall fix](node-fork-stall-fix.md) — TriggeredFork + MsgRollBackward + LSM lock; 3 commits
-- [Cascade failure invariant](ledger-cascade-failure-invariant.md) — never hard-return on confirmed blocks; log+self-correct
-- [Forge body size bug](forge-body-size-bug.md) — body_size miscalc + epoch nonce + KES expiry off-by-one
-- [RUPD snapshot position fix](ledger-rupd-snapshot-fix.md) — use `set` snapshot not `go` in calculate_rewards()
-- [Rollback UTxO store](ledger-rollback-utxo-store.md) — slow-path rollback must open fresh store from LSM snapshot
-- [Output CBOR re-encode](crypto-output-cbor-reencode.md) — indefinite-length inline datum + legacy vs post-Alonzo detection
-- [Deferred pointer stake](ledger-ptr-stake-deferred.md) — ptr_stake resolves at SNAP time not insertion; 603 epoch mismatches
-
-## N2C Protocol Compliance
-- [Conway PParams protocolVersion position](n2c-pparams-protover-position.md) — index 12, NOT 30 (prior note was the bug #434 fixed)
-- [#434 gov-state decode failure](issue-434-gov-state-decode.md) — 3 stacked bugs: PParams order, vote-map dedup, OMap insertion order
-- [Hash32 padding convention](n2c-hash32-padding.md) — 28→32 byte padding/truncation for N2C wire output
-- [Credential type discrimination](n2c-credential-type-discrimination.md) — track KeyHash vs Script via HashSets
-- [Committee state encoding bugs](n2c-committee-state-bugs.md) — open: wrong source map, hardcoded hot credential type
-
-## N2N Protocol
-- [#1003 NodePeerManager dead-code audit](issue-1003-peermanager-dead-code-audit.md) — oracle-verified: no BlockFetch-success reward upstream (deleted), inbound-maturity GC IS upstream pattern (wired), no unified PeerCategory (deleted), no IP-only conn lookup (deleted). LIB vs BIN dead-code ground-truth methodology.
-- [ChainSync server direction bug](network-chainsync-direction-bug.md) — InitiatorAndResponder confusion; TxSubmission2 deadlock
-- [Duplex connection architecture](network-duplex-connection.md) — Phase 1+2 done; pallas plexer semantics
-- [Duplex Phase 3 integration](node-duplex-phase3.md) — into_pipelined() conversion; TxSubmission2 responder JoinHandle
-- [ConnectionId tuple keying](connection-id-tuple-keying.md) — keyed by `(local, remote)`; SO_REUSEPORT unblocks co-located BP+relay
+## N2N protocol
+- [#1003 PeerManager dead-code audit](issue-1003-peermanager-dead-code-audit.md) — LIB vs BIN ground-truth methodology.
+- [ChainSync server direction bug](network-chainsync-direction-bug.md) · [Duplex architecture](network-duplex-connection.md) · [Duplex Phase 3](node-duplex-phase3.md) · [ConnectionId tuple keying](connection-id-tuple-keying.md)
 
 ## Consensus
-- [LoE enforcement](consensus-loe-enforcement.md) — flush_to_immutable_loe() gating + GSM integration
-- [Forge pipeline depth](consensus-forge-pipeline-depth.md) — forge disabled during sync (pipeline_depth > 1)
-- [Preview pool expected rates](consensus-preview-pool-rates.md) — SAND ~0.155 blocks/hour
-- [Forge loop Haskell alignment](forge-loop-haskell-alignment.md) — MAX_FORGE_LAG_SLOTS removed; TraceNoLedgerView gate added
+- [LoE enforcement](consensus-loe-enforcement.md) · [Forge pipeline depth](consensus-forge-pipeline-depth.md) · [Preview pool rates](consensus-preview-pool-rates.md) · [Forge loop alignment](forge-loop-haskell-alignment.md)
 
 ## Ledger
-- [Reward formula validation](ledger-reward-formula-validation.md) — Koios cross-validation; 1-epoch RUPD timing diff vs Haskell
-- [#438 Koios oracle decomposition](issue-438-koios-oracle-decomposition.md) — decompose pool_fees/deleg_rewards/account_reward_history
-- [#438 formula cleared](issue-438-formula-cleared.md) — Haskell leaderRew byte-exact; bug is snapshot inflation
-- [#438 Koios vs ssStake semantics](issue-438-koios-stake-vs-ssstake.md) — Koios active_stake is UTxO-only, Haskell adds reward balance
-- [#438 static-audit complete](issue-438-static-audit-complete.md) — rollback/dual-RUPD theories eliminated; path forward is live-replay
-- [#438 RESOLVED](issue-438-live-capture-findings.md) — undistributed=reward_pot−Σrewards was dropped; add to delta_treasury+reserves
-- [#438 formula confirmed correct](issue-438-formula-confirmed-correct.md) — overshoot is 100% from excess reserves vs Haskell, not formula
-- [Blueprint divergences](ledger-blueprint-divergences.md) — ref script fee ceiling/floor, totalRefScriptSize, chain-sel tiebreaker
-- [DRep count fix](ledger-drep-count-fix.md) — use active_drep_count() not dreps.len()
-- [Plutus test coverage](ledger-plutus-test-coverage.md) — is_valid=false UTxO, treasury Phase-1, per-redeemer V3 Unit tests
-- [Mempool epoch revalidation](node-mempool-epoch-revalidation.md) — revalidate with new pparams after epoch transition
+- [Reward formula validation](ledger-reward-formula-validation.md) vs Koios · [#438 series](issue-438-live-capture-findings.md) RESOLVED — undistributed pot term was dropped (see also: oracle-decomposition, formula-cleared, stake-vs-ssstake, static-audit, formula-confirmed-correct topic files)
+- [Blueprint divergences](ledger-blueprint-divergences.md) · [DRep count fix](ledger-drep-count-fix.md) use active_drep_count() · [Plutus test coverage](ledger-plutus-test-coverage.md) · [Mempool epoch revalidation](node-mempool-epoch-revalidation.md)
 
 ## CLI
-- [Build-raw alias](cli-build-raw-alias.md) — transaction build-raw as alias for transaction build
-- [UTxO --tx-in query](cli-utxo-txin-query.md) — GetUTxOByTxIn (tag 15) wire format
-- [Stake address info](cli-stake-address-info.md) — server-side filtering via tag 10
-- [P1 commands](cli-p1-commands.md) — calculate-min-fee, calculate-min-required-utxo, policyid, pool-params, slot-number, kes-period-info
-- [#998 CIP-0094 poll commands NOT implemented](issue-998-cip94-poll-commands-removed.md) — cardano-cli deleted them May 2025 (PR #1178); closed not-planned. Follow-up #1006: CLI surface-enumeration gate.
-- [#1006 CLI surface-parity gate built](issue-1006-cli-surface-parity-gate.md) — recursive `--help` walker; 2 parser bugs found by running it (empty-key bash assoc-array, ANSI/blank-line block terminator); 82 real gaps filed as #1008.
-- [#1008 first implementation pass](issue-1008-cli-surface-parity-implementation.md) — 69/151→77/149; `hash` cmd group + version + drep metadata-hash (Plutus hash needs the CBOR bstr wrapper RETAINED, not stripped); alias-only renames invisible to walker (must make cardano-cli's name primary); walker verified NOT misclassifying positional alternatives (386/386 leaves checked).
+- [Build-raw alias](cli-build-raw-alias.md) · [UTxO --tx-in](cli-utxo-txin-query.md) · [Stake address info](cli-stake-address-info.md) · [P1 commands](cli-p1-commands.md)
+- [#998 CIP-0094 removed](issue-998-cip94-poll-commands-removed.md) not-planned · [#1006 surface-parity gate](issue-1006-cli-surface-parity-gate.md) 82 gaps→#1008 · [#1008 impl pass](issue-1008-cli-surface-parity-implementation.md) 69/151→77/149
 
-## TUI
-- [Layout polish](tui-layout-polish.md) — wide mode, kv_aligned patterns, Monokai theme, RTT bar
-
-## Storage
-- [LSM perf baselines](storage-lsm-perf-baselines.md) — mainnet-scale runtimes on M-series (1M insert ~25s)
-- [Large tests feature](storage-large-tests-feature.md) — feature flag design, key/value sizing, deterministic PRNG
-- [ImmutableDB stale fork repair](storage-immutabledb-fork-repair.md) — delete stale chunks + rewrite tip.meta to fix gap-bridge loop
-- [Fork snapshot recovery](node-fork-snapshot-recovery.md) — volatile-range blind spot in is_snapshot_canonical; 3-layer fix
-
-## Serialization
-- [Serialization test coverage](crypto-serialization-tests.md) — 133 tests, public API patterns, PPU extraction
-
-## Soak Test Findings (2026-03-27)
-- [ChainSync log flood stall](soak-test-chainsync-log-flood.md) — inbound syncer floods 1.2M INFO logs/10min; downgrade to DEBUG
-- [CLI tx build change output](cli-tx-build-change-output.md) — --change-address computes but doesn't append change output
+## TUI / Storage / Serialization / Soak
+- [TUI layout polish](tui-layout-polish.md) · [LSM perf baselines](storage-lsm-perf-baselines.md) · [Large tests feature](storage-large-tests-feature.md) · [ImmutableDB fork repair](storage-immutabledb-fork-repair.md) · [Fork snapshot recovery](node-fork-snapshot-recovery.md)
+- [Serialization test coverage](crypto-serialization-tests.md) · [ChainSync log flood](soak-test-chainsync-log-flood.md) · [CLI tx build change output](cli-tx-build-change-output.md)

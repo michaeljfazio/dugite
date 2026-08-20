@@ -322,6 +322,16 @@ pub struct LedgerDelta {
     /// #985 is what a two-step argument about staleness is worth. The pair now
     /// moves atomically, so the invariant is enforced rather than reasoned to.
     pub rupd_monetary_snapshot: Option<Option<super::state::reward_pulser::MonetaryStep>>,
+
+    /// The WIRE-ONLY mirror, `epochs.rupd_snapshot` (#1071). Same
+    /// `Option<Option<..>>` shape and the same reason as
+    /// `rupd_monetary_snapshot` immediately above: consensus-bearing state's
+    /// sibling can still report a stale `Pulsing`/`Complete` across a
+    /// rollback if it has no delta of its own — the anchor can lag the tip by
+    /// up to `k` blocks, and a wire arm that disagrees with the
+    /// `rupd_pulser_started`/`rupd_monetary` pair it is supposed to mirror is
+    /// exactly the #979 "confidently wrong" class this field exists to avoid.
+    pub rupd_snapshot_delta: Option<Option<super::state::reward_pulser::PulsingRewUpdate>>,
 }
 
 impl LedgerDelta {
@@ -362,6 +372,7 @@ impl LedgerDelta {
             rupd_addrs_rew_snapshot: None,
             rupd_pulser_started_snapshot: None,
             rupd_monetary_snapshot: None,
+            rupd_snapshot_delta: None,
         }
     }
 }
@@ -1302,6 +1313,9 @@ pub fn apply_delta_to_state(state: &mut LedgerState, delta: &LedgerDelta) {
     if let Some(mon) = &delta.rupd_monetary_snapshot {
         state.epochs.rupd_monetary = *mon;
     }
+    if let Some(snap) = &delta.rupd_snapshot_delta {
+        state.epochs.rupd_snapshot = snap.clone();
+    }
 
     // Update tip to reflect this block.
     state.tip = dugite_primitives::block::Tip {
@@ -1804,6 +1818,7 @@ fn _assert_ledger_state_fields_audited(state: LedgerState) {
                 rupd_addrs_rew: _,
                 rupd_pulser_started: _,
                 rupd_monetary: _,
+                rupd_snapshot: _,
                 rupd_fold: _,
                 pending_avvm_return: _,
             },

@@ -1,5 +1,5 @@
 use super::non_myopic::{leader_probability, Likelihood, NonMyopic};
-use super::reward_pulser::{MemberFoldCtx, PoolRewardInfo, RewardFold};
+use super::reward_pulser::{MemberFoldCtx, PoolRewardInfo, RewardEntry, RewardFold};
 use super::{LedgerState, PendingRewardUpdate, StakeSnapshot};
 use dugite_primitives::hash::{Hash28, Hash32};
 use dugite_primitives::protocol_params::ProtocolParameters;
@@ -191,11 +191,21 @@ fn build_new_likelihoods(
 /// block N and a pulse taken at block N+1 see identical inputs, which is what
 /// makes the differential property meaningful in production and not just in
 /// the proptest.
+///
+/// Also promotes `epochs.rupd_snapshot` from `Pulsing` to `Complete` the
+/// instant the fold finishes, and — on the FIRST pulse of the epoch — fills
+/// in the frozen snapshot's `likelihoods`/`leaders` (`rewLikelihoods`/
+/// `rewLeaders`), which cannot be known until the per-pool table exists. Both
+/// are wire-only (#1071): `rupd_snapshot` is a read-only mirror of
+/// `rupd_monetary`'s gate (see `EpochSubState::rupd_snapshot`'s doc for why
+/// it is a separate field), and neither feeds `compute_reward_update`, which
+/// still derives its own answer from the GO snapshot at the boundary.
 pub(crate) fn pulse_rupd_member_fold(
     epochs: &mut super::substates::EpochSubState,
     prev_d: &dugite_primitives::transaction::Rational,
     prev_protocol_version_major: u64,
     security_param_k: u64,
+    epoch_length: u64,
 ) {
     let Some(monetary) = epochs.rupd_monetary else {
         return; // before the mark — nothing frozen, nothing to pulse
@@ -230,8 +240,8 @@ pub(crate) fn pulse_rupd_member_fold(
     let addrs = epochs.rupd_addrs_rew.clone();
     let registered = move |c: &Hash32| -> bool { addrs.as_ref().is_none_or(|set| set.contains(c)) };
 
-    let fold_state = &mut epochs.rupd_fold;
-    if fold_state.fold.is_none() {
+    let just_built_table = epochs.rupd_fold.fold.is_none();
+    if just_built_table {
         // Build the frozen per-pool table ONCE, from the frozen terms.
         let (d_num, d_den) = (prev_d.numerator as i128, prev_d.denominator.max(1) as i128);
         let total_active_stake: u64 = go
@@ -239,7 +249,7 @@ pub(crate) fn pulse_rupd_member_fold(
             .values()
             .fold(0u64, |acc, s| acc.saturating_add(s.0));
         let total_blocks_in_epoch: u64 = bprev.values().sum::<u64>().max(1);
-        fold_state.table = build_pool_reward_table(
+        let table = build_pool_reward_table(
             &go,
             &bprev,
             &pp,
@@ -254,9 +264,49 @@ pub(crate) fn pulse_rupd_member_fold(
             prev_protocol_version_major,
             &registered,
         );
-        fold_state.fold = Some(RewardFold::new(&go.delegations));
+
+        // #1071: `rewLikelihoods`/`rewLeaders` — the two `RewardSnapShot`
+        // fields the freeze itself could not populate (`apply.rs`'s capture
+        // runs before the per-pool table exists). Computed HERE from the SAME
+        // table built above, rather than a third copy of
+        // `build_pool_reward_table` (`compute_reward_update` at the boundary
+        // is the second).
+        let likelihoods = build_new_likelihoods(
+            Some(&go),
+            &bprev,
+            pp.active_slot_coeff_rational(),
+            prev_d,
+            monetary.total_stake,
+            epoch_length,
+        );
+        let mut leaders: HashMap<Hash32, Vec<RewardEntry>> = HashMap::new();
+        for info in table.values() {
+            if let Some((op_key, amount)) = info.leader {
+                leaders.entry(op_key).or_default().push(RewardEntry {
+                    is_member: false,
+                    pool_id: info.pool_id,
+                    amount,
+                });
+            }
+        }
+        // A credential earning leader rewards from more than one pool is rare
+        // but possible, and `table.values()` iterates a `HashMap` — sort each
+        // credential's entries so the persisted bytes do not depend on
+        // iteration order (the #1088 shape, one level up).
+        for entries in leaders.values_mut() {
+            entries.sort_unstable_by_key(|e| e.pool_id);
+        }
+
+        epochs.rupd_fold.table = table;
+        epochs.rupd_fold.fold = Some(RewardFold::new(&go.delegations));
+        if let Some(snap_state) = epochs.rupd_snapshot.as_mut() {
+            let snap = snap_state.snapshot_mut();
+            snap.likelihoods = likelihoods;
+            snap.leaders = leaders;
+        }
     }
 
+    let fold_state = &mut epochs.rupd_fold;
     let Some(fold) = fold_state.fold.as_mut() else {
         return;
     };
@@ -269,6 +319,15 @@ pub(crate) fn pulse_rupd_member_fold(
         registered: &registered,
     };
     fold.pulse(n, &ctx);
+
+    if fold.is_done() {
+        // `completeStep`'s Pulsing -> Complete transition, for the WIRE
+        // arm (#1071). Consensus is unaffected either way —
+        // `PulsingRewUpdate::applies_at_boundary` is `true` for both.
+        if let Some(snap_state) = epochs.rupd_snapshot.take() {
+            epochs.rupd_snapshot = Some(snap_state.complete());
+        }
+    }
 }
 
 /// Haskell `mkPoolRewardInfo` over every pool in the GO snapshot.
@@ -673,6 +732,7 @@ pub fn compute_reward_update(
             delta_treasury,
             rewards: HashMap::new(),
             non_myopic: prev_non_myopic.update(Lovelace(reward_pot), new_likelihoods),
+            ..Default::default()
         };
     }
 
@@ -699,6 +759,7 @@ pub fn compute_reward_update(
                 // drops any prior history — which is what `mapWithKey` over an
                 // empty `newLikelihoods` does upstream.
                 non_myopic: prev_non_myopic.update(Lovelace(reward_pot), new_likelihoods),
+                ..Default::default()
             };
         }
     };
@@ -788,6 +849,7 @@ pub fn compute_reward_update(
             // still gets a `likelihood 0 …` entry (all-zero after
             // normalisation, since sigma = 0 makes t = 0).
             non_myopic: prev_non_myopic.update(Lovelace(reward_pot), new_likelihoods),
+            ..Default::default()
         };
     }
 
@@ -914,6 +976,28 @@ pub fn compute_reward_update(
         }
     }
 
+    // #1071: `rs` — the UNAGGREGATED per-source entries, matching Haskell's
+    // wire `RewardUpdate.rs :: Map (Credential Staking) (Set Reward)`. Cloned
+    // BEFORE the aggregating loop below consumes `reward_entries`, so this is
+    // the one and only place either form is derived — the aggregation logic
+    // itself is not duplicated (the #932/#938/#985 N-copies trap).
+    let raw_rewards: HashMap<Hash32, Vec<RewardEntry>> = reward_entries
+        .iter()
+        .map(|(cred, entries)| {
+            (
+                *cred,
+                entries
+                    .iter()
+                    .map(|(is_member, pool_id, amount)| RewardEntry {
+                        is_member: *is_member,
+                        pool_id: *pool_id,
+                        amount: *amount,
+                    })
+                    .collect(),
+            )
+        })
+        .collect();
+
     // Apply Haskell `filterRewards` (eras/shelley/.../Rewards.hs): at pv>2 sum all
     // rewards per credential (Allegra+ aggregation); at pv<=2 keep only the single
     // minimum reward per credential (`Set.deleteFindMin`: LeaderReward < MemberReward,
@@ -1009,6 +1093,7 @@ pub fn compute_reward_update(
         // which is exactly `reward_pot` here. Not `total_rewards_available`,
         // and not `expansion`.
         non_myopic: prev_non_myopic.update(Lovelace(reward_pot), new_likelihoods),
+        raw_rewards,
     }
 }
 

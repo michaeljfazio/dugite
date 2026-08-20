@@ -334,6 +334,7 @@ pub(crate) fn encode_query_result_value(
             committee,
             gen_delegs,
             non_myopic,
+            possible_reward_update,
         } => {
             encode_debug_new_epoch_state(
                 enc,
@@ -354,6 +355,7 @@ pub(crate) fn encode_query_result_value(
                 committee,
                 gen_delegs,
                 non_myopic,
+                possible_reward_update,
             );
         }
         QueryResult::DebugChainDepState {
@@ -2601,6 +2603,124 @@ fn encode_cost_model(enc: &mut minicbor::Encoder<&mut Vec<u8>>, costs: &[i64]) {
     }
 }
 
+/// `encodeMap`/`encodeSet`'s shared `lengthThreshold = 23` rule: definite
+/// header at or below it, indefinite (with a matching `close_if_indefinite`)
+/// above. Reused here rather than inlined twice (`rs`'s outer Map and each
+/// credential's inner Set) — the #938 class of bug is exactly a threshold
+/// rule applied at one call site and missed at its sibling.
+const VARIABLE_LENGTH_THRESHOLD: usize = 23;
+
+fn open_variable_map(enc: &mut minicbor::Encoder<&mut Vec<u8>>, len: usize) -> bool {
+    if len <= VARIABLE_LENGTH_THRESHOLD {
+        enc.map(len as u64).ok();
+        false
+    } else {
+        enc.begin_map().ok();
+        true
+    }
+}
+
+fn open_variable_array(enc: &mut minicbor::Encoder<&mut Vec<u8>>, len: usize) -> bool {
+    if len <= VARIABLE_LENGTH_THRESHOLD {
+        enc.array(len as u64).ok();
+        false
+    } else {
+        enc.begin_array().ok();
+        true
+    }
+}
+
+fn close_if_indefinite(enc: &mut minicbor::Encoder<&mut Vec<u8>>, was_indefinite: bool) {
+    if was_indefinite {
+        enc.end().ok();
+    }
+}
+
+/// `NewEpochState[4]` — `StrictMaybe PulsingRewUpdate` (#1071).
+///
+/// ```haskell
+/// data PulsingRewUpdate = Pulsing !RewardSnapShot !Pulser | Complete !RewardUpdate
+/// encCBOR (Pulsing s p) = encode (Sum Pulsing 0 !> To s !> To p)
+/// encCBOR (Complete r)  = encode (Sum Complete 1 !> To r)
+/// ```
+///
+/// Pinned to real captures in `tests/fixtures/nesru/`:
+///
+/// ```text
+/// SNothing              80                    array(0)
+/// SJust (Complete r)    81 82 01 85 ...       array(1)[ array(2)[1, RewardUpdate(5)] ]
+/// ```
+///
+/// **`Pulsing` is not modeled** — see [`crate::node::n2c_query::types::PossibleRewardUpdateSnapshot`]
+/// for why, and note it means dugite still reports `SNothing` for the narrow
+/// `Pulsing` sub-window each epoch (the fold typically completes within a few
+/// dozen blocks of the `4k/f` mark and then stays `Complete` for the rest of
+/// the epoch, so this is a small and explicitly-scoped gap, not the whole of
+/// #1071's original ~20%-of-epoch divergence).
+fn encode_possible_reward_update(
+    enc: &mut minicbor::Encoder<&mut Vec<u8>>,
+    ru: &crate::node::n2c_query::types::PossibleRewardUpdateSnapshot,
+) {
+    use crate::node::n2c_query::types::PossibleRewardUpdateSnapshot;
+
+    match ru {
+        PossibleRewardUpdateSnapshot::SNothing => {
+            enc.array(0).ok();
+        }
+        PossibleRewardUpdateSnapshot::Complete(ru) => {
+            // SJust wraps in array(1).
+            enc.array(1).ok();
+            // The sum: array(2)[tag=1, RewardUpdate].
+            enc.array(2).ok();
+            enc.u8(1).ok(); // Complete
+                            // RewardUpdate = array(5)[deltaT, deltaR, rs, deltaF, nonMyopic].
+            enc.array(5).ok();
+            enc.u64(ru.delta_treasury).ok(); // deltaT — always >= 0
+            enc.i64(clamp_delta_coin_i64(ru.delta_reserves)).ok(); // deltaR — signed
+                                                                   // rs :: Map (Credential Staking) (Set Reward). Neither the outer
+                                                                   // Map nor the inner Set carries a bespoke encoder — `RewardUpdate`'s
+                                                                   // hand-written `EncCBOR` just calls `encCBOR rw` and dispatches to
+                                                                   // the library's generic `Map`/`Set` instances, so BOTH get the
+                                                                   // standard threshold-23 definite/indefinite framing (#938's exact
+                                                                   // rule), and the inner `Set` ALSO gets tag(258) at PV>=9 — oracle-
+                                                                   // verified against `encodeMap`/`encodeSet` directly (no analogy).
+            let rs_indef = open_variable_map(enc, ru.rs.len());
+            for (cred, entries) in &ru.rs {
+                enc.bytes(cred).ok();
+                enc.tag(minicbor::data::Tag::new(258)).ok();
+                let set_indef = open_variable_array(enc, entries.len());
+                for entry in entries {
+                    // Reward = array(3)[rewardType (0=Member,1=Leader), pool(28B), amount]
+                    enc.array(3).ok();
+                    enc.u8(if entry.is_member { 0 } else { 1 }).ok();
+                    enc.bytes(&entry.pool_id).ok();
+                    enc.u64(entry.amount).ok();
+                }
+                close_if_indefinite(enc, set_indef);
+            }
+            close_if_indefinite(enc, rs_indef);
+            enc.i64(clamp_delta_coin_i64(ru.delta_fee)).ok(); // deltaF — signed
+            encode_non_myopic(enc, &ru.non_myopic);
+        }
+    }
+}
+
+/// `DeltaCoin`/`Integer` fits comfortably in `i64` for any real lovelace
+/// quantity (max supply ~4.5e16, `i64::MAX` ~9.2e18) — this only guards
+/// against a `i128` value outside that range ever reaching the wire as a
+/// silently truncated one, matching this codebase's `encode_int` convention
+/// of a loud, explicit narrowing rather than a wrapping cast.
+fn clamp_delta_coin_i64(v: i128) -> i64 {
+    i64::try_from(v).unwrap_or_else(|_| {
+        tracing::warn!(value = v, "DeltaCoin exceeds i64 range, clamping");
+        if v > 0 {
+            i64::MAX
+        } else {
+            i64::MIN
+        }
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 fn encode_debug_new_epoch_state(
     enc: &mut minicbor::Encoder<&mut Vec<u8>>,
@@ -2621,6 +2741,7 @@ fn encode_debug_new_epoch_state(
     committee: &crate::node::n2c_query::types::CommitteeSnapshot,
     gen_delegs: &[(Vec<u8>, Vec<u8>, Vec<u8>)],
     non_myopic: &crate::node::n2c_query::types::NonMyopicSnapshot,
+    possible_reward_update: &crate::node::n2c_query::types::PossibleRewardUpdateSnapshot,
 ) {
     // Full Haskell-compatible NewEpochState (array(7)):
     //
@@ -2628,7 +2749,9 @@ fn encode_debug_new_epoch_state(
     //   [1] BlocksMade (prev epoch) — Map<pool_id_28B, u64>
     //   [2] BlocksMade (cur  epoch) — Map<pool_id_28B, u64>
     //   [3] EpochState — array(4) [AccountState, LedgerState, SnapShots, NonMyopic]
-    //   [4] StrictMaybe RewardUpdate — array(0) for Nothing
+    //   [4] StrictMaybe PulsingRewUpdate (#1071) — array(0) for SNothing;
+    //       array(1)[array(2)[1, RewardUpdate(5)]] for SJust (Complete _).
+    //       `Pulsing` is not modeled — see `encode_possible_reward_update`.
     //   [5] PoolDistr — array(2)[Map<pool_id_28B, IndividualPoolStake>, total_active_stake]
     //   [6] StashedAVVMAddresses — CBOR `null` in every post-Shelley era (`()`, `encodeNull`)
     //
@@ -2681,8 +2804,8 @@ fn encode_debug_new_epoch_state(
     // renders both halves and the devnet cli-parity gate compares them.
     encode_non_myopic(enc, non_myopic);
 
-    // [4] StrictMaybe RewardUpdate = Nothing = array(0)
-    enc.array(0).ok();
+    // [4] StrictMaybe PulsingRewUpdate (#1071).
+    encode_possible_reward_update(enc, possible_reward_update);
 
     // [5] PoolDistr — via the SHARED encoder, not a private copy.
     //
@@ -3524,6 +3647,11 @@ mod tests {
                 ],
                 reward_pot: 14_031_561_968_424,
             }),
+            // This test's focus is the OTHER arities; the `Complete` arm gets
+            // its own dedicated test (`complete_reward_update_matches_the_pinned_shape`).
+            possible_reward_update: Box::new(
+                crate::node::n2c_query::types::PossibleRewardUpdateSnapshot::default(),
+            ),
         };
 
         let encoded = encode_query_result(&result);
@@ -3741,6 +3869,194 @@ mod tests {
             "StashedAVVMAddresses must be CBOR null (0xf6), not array(0)"
         );
         dec.null().unwrap();
+    }
+
+    /// #1071: `NewEpochState[4]` — `SNothing` case, must stay `array(0)`.
+    ///
+    /// This is what dugite emitted for EVERY case before #1071; the point of
+    /// this test is that it still emits exactly this for the case that is
+    /// genuinely `SNothing` (no pulser this epoch), now that `Complete` is a
+    /// real encoder rather than a hardcoded fallback.
+    #[test]
+    fn possible_reward_update_snothing_is_array0() {
+        let mut buf = Vec::new();
+        let mut enc = minicbor::Encoder::new(&mut buf);
+        super::encode_possible_reward_update(
+            &mut enc,
+            &crate::node::n2c_query::types::PossibleRewardUpdateSnapshot::SNothing,
+        );
+        assert_eq!(buf, vec![0x80], "SNothing must be the bare array(0) byte");
+    }
+
+    /// #1071: `NewEpochState[4]` — `SJust (Complete r)`, pinned against the
+    /// OUTER structural bytes of the real cardano-node 11.0.1 capture at
+    /// `tests/fixtures/nesru/complete-nonzero.hex` (documented in
+    /// `nesru_wire_shape.rs`, which pins the same four leading bytes off the
+    /// raw fixture): `81 82 01 85` = `array(1)[array(2)[1, array(5)[...]]]`.
+    ///
+    /// This does not (and cannot, without fabricating a credential/pool/
+    /// amount triple matching the real capture) assert byte-identity with
+    /// the fixture beyond that outer frame — see
+    /// `PossibleRewardUpdateSnapshot`'s doc for what is and is not modeled.
+    #[test]
+    fn complete_reward_update_matches_the_pinned_outer_shape() {
+        use crate::node::n2c_query::types::{
+            CompletedRewardUpdateSnapshot, NonMyopicSnapshot, PossibleRewardUpdateSnapshot,
+            RewardWireEntry,
+        };
+
+        let ru = PossibleRewardUpdateSnapshot::Complete(Box::new(CompletedRewardUpdateSnapshot {
+            delta_treasury: 3_597_944_403_489,
+            delta_reserves: 17_989_722_017_445,
+            delta_fee: -555_555,
+            rs: vec![
+                (
+                    vec![0x10u8; 32],
+                    vec![RewardWireEntry {
+                        is_member: true,
+                        pool_id: vec![0x40u8; 28],
+                        amount: 12_345,
+                    }],
+                ),
+                (
+                    vec![0x20u8; 32],
+                    vec![
+                        RewardWireEntry {
+                            is_member: false,
+                            pool_id: vec![0x41u8; 28],
+                            amount: 54_321,
+                        },
+                        RewardWireEntry {
+                            is_member: true,
+                            pool_id: vec![0x42u8; 28],
+                            amount: 999,
+                        },
+                    ],
+                ),
+            ],
+            non_myopic: NonMyopicSnapshot {
+                likelihoods: vec![(vec![0x44u8; 28], vec![0.0f32; 100])],
+                reward_pot: 14_031_561_968_424,
+            },
+        }));
+
+        let mut buf = Vec::new();
+        let mut enc = minicbor::Encoder::new(&mut buf);
+        super::encode_possible_reward_update(&mut enc, &ru);
+
+        assert_eq!(buf[0], 0x81, "SJust must wrap in array(1)");
+        assert_eq!(buf[1], 0x82, "the sum must be array(2)");
+        assert_eq!(buf[2], 0x01, "sum tag 1 = Complete");
+        assert_eq!(buf[3], 0x85, "RewardUpdate must be array(5)");
+
+        // Decode it back and check the fields land where the shape says,
+        // including that the multi-entry credential's Set is tag-258
+        // wrapped and its entries are ordered leader-before-member.
+        let mut dec = minicbor::Decoder::new(&buf);
+        dec.array().unwrap(); // SJust
+        dec.array().unwrap(); // sum
+        dec.u8().unwrap(); // tag
+        dec.array().unwrap(); // RewardUpdate
+        assert_eq!(dec.u64().unwrap(), 3_597_944_403_489, "deltaT");
+        assert_eq!(dec.i64().unwrap(), 17_989_722_017_445, "deltaR");
+        assert_eq!(dec.map().unwrap(), Some(2), "rs must be map(2)");
+        assert_eq!(dec.bytes().unwrap(), &[0x10u8; 32]);
+        assert_eq!(
+            dec.tag().unwrap(),
+            minicbor::data::Tag::new(258),
+            "rs's value is a Set — tag 258 at PV>=9"
+        );
+        assert_eq!(dec.array().unwrap(), Some(1));
+        dec.array().unwrap(); // Reward
+        assert_eq!(dec.u8().unwrap(), 0, "MemberReward = 0");
+        dec.bytes().unwrap();
+        dec.u64().unwrap();
+        assert_eq!(dec.bytes().unwrap(), &[0x20u8; 32]);
+        dec.tag().unwrap();
+        assert_eq!(dec.array().unwrap(), Some(2));
+        dec.array().unwrap(); // Reward[0] — leader-first
+        assert_eq!(
+            dec.u8().unwrap(),
+            1,
+            "LeaderReward = 1, and must sort BEFORE the member entry"
+        );
+        dec.bytes().unwrap();
+        dec.u64().unwrap();
+        dec.array().unwrap(); // Reward[1]
+        assert_eq!(dec.u8().unwrap(), 0, "MemberReward = 0, sorts second");
+        dec.bytes().unwrap();
+        dec.u64().unwrap();
+        assert_eq!(dec.i64().unwrap(), -555_555, "deltaF");
+        // nonMyopic — shared encoder, already covered elsewhere; just check
+        // the shape lands.
+        assert_eq!(dec.array().unwrap(), Some(2));
+    }
+
+    /// #1071/#938: `rs`'s OUTER map gets the same threshold-23
+    /// definite/indefinite framing as `costModels` and every other
+    /// `encodeMap`-backed field — `RewardUpdate`'s hand-written `EncCBOR`
+    /// dispatches `rs` straight through the library's generic `Map`
+    /// instance with no bypass (oracle-verified against
+    /// `Cardano.Ledger.Shelley.RewardUpdate`, not inferred by analogy). A
+    /// real network's `rs` routinely holds far more than 23 credentials —
+    /// this is the realistic case, not the corner one.
+    #[test]
+    fn complete_reward_update_rs_map_goes_indefinite_above_23_credentials() {
+        use crate::node::n2c_query::types::{
+            CompletedRewardUpdateSnapshot, NonMyopicSnapshot, PossibleRewardUpdateSnapshot,
+            RewardWireEntry,
+        };
+
+        let make = |n: usize| {
+            PossibleRewardUpdateSnapshot::Complete(Box::new(CompletedRewardUpdateSnapshot {
+                delta_treasury: 0,
+                delta_reserves: 0,
+                delta_fee: 0,
+                rs: (0..n)
+                    .map(|i| {
+                        (
+                            vec![i as u8; 32],
+                            vec![RewardWireEntry {
+                                is_member: true,
+                                pool_id: vec![0u8; 28],
+                                amount: 1,
+                            }],
+                        )
+                    })
+                    .collect(),
+                non_myopic: NonMyopicSnapshot::default(),
+            }))
+        };
+
+        let encode = |n: usize| {
+            let ru = make(n);
+            let mut buf = Vec::new();
+            let mut enc = minicbor::Encoder::new(&mut buf);
+            super::encode_possible_reward_update(&mut enc, &ru);
+            buf
+        };
+
+        let at_23 = encode(23);
+        let at_24 = encode(24);
+
+        // Walk to the `rs` map header: array(1) SJust, array(2) sum, tag(1),
+        // array(5) RewardUpdate, deltaT(0x00), deltaR(0x00), then `rs`.
+        assert_eq!(&at_23[0..6], &[0x81, 0x82, 0x01, 0x85, 0x00, 0x00]);
+        assert_eq!(
+            at_23[6], 0xb7,
+            "23 credentials: definite map header (0xa0 | 23 = 0xb7)"
+        );
+        assert_eq!(&at_24[0..6], &[0x81, 0x82, 0x01, 0x85, 0x00, 0x00]);
+        assert_eq!(
+            at_24[6], 0xbf,
+            "24 credentials: indefinite map header (0xbf), not a wider definite one"
+        );
+        // The indefinite form must close with a break (0xff) right after the
+        // 24th credential's single-entry Set, before `deltaF`.
+        assert!(
+            at_24.windows(2).any(|w| w == [0xff, 0x00]),
+            "indefinite rs map must close with 0xff before deltaF"
+        );
     }
 
     /// #1027 root cause: `PoolDistr.pdTotalActiveStake` is a `NonZero Coin`
@@ -4004,6 +4320,9 @@ mod tests {
                 likelihoods: vec![(vec![0xAAu8; 28], vec![-1.5f32; 100])],
                 reward_pot: 14_031_561_968_424,
             }),
+            possible_reward_update: Box::new(
+                crate::node::n2c_query::types::PossibleRewardUpdateSnapshot::default(),
+            ),
         };
 
         let encoded = encode_query_result(&result);

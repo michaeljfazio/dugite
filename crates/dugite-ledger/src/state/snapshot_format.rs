@@ -294,6 +294,13 @@ pub struct LedgerStateSnapshot {
     /// it would re-derive the values from boundary-time state, silently
     /// reintroducing the accidental-correctness this freeze removes.
     pub rupd_monetary: Option<super::reward_pulser::MonetaryStep>,
+    /// The WIRE-ONLY `nesRu` mirror (#1071) — see `EpochSubState::rupd_snapshot`
+    /// for why it is a field separate from the pair above. PERSISTED for the
+    /// same reason: a mid-epoch restart that dropped it would report `SNothing`
+    /// on the N2C wire for the rest of the epoch even though a real pulser (per
+    /// `rupd_pulser_started`) exists — a wire regression, not a consensus one,
+    /// but still the #979 "confidently wrong" shape.
+    pub rupd_snapshot: Option<PulsingRewUpdateWire>,
     /// #736 (same class): AVVM return amount pending at the next epoch
     /// boundary (Shelley→Allegra transition). Set once at the era
     /// transition and consumed at the following boundary; a mid-epoch
@@ -466,6 +473,11 @@ impl From<&super::LedgerState> for LedgerStateSnapshot {
                 .map(|set| set.iter().copied().collect()),
             rupd_pulser_started: s.epochs.rupd_pulser_started,
             rupd_monetary: s.epochs.rupd_monetary,
+            rupd_snapshot: s
+                .epochs
+                .rupd_snapshot
+                .as_ref()
+                .map(PulsingRewUpdateWire::from),
             pending_avvm_return: s.epochs.pending_avvm_return,
         }
     }
@@ -553,6 +565,7 @@ impl From<LedgerStateSnapshot> for super::LedgerState {
                     .map(|set| Arc::new(set.into_iter().collect::<HashSet<_>>())),
                 rupd_pulser_started: s.rupd_pulser_started,
                 rupd_monetary: s.rupd_monetary,
+                rupd_snapshot: s.rupd_snapshot.map(Into::into),
                 // Transient: rebuilt at the next block, completed at the boundary.
                 rupd_fold: Default::default(),
                 pending_avvm_return: s.pending_avvm_return,
@@ -674,6 +687,122 @@ impl From<PendingRewardUpdateWire> for PendingRewardUpdate {
             delta_treasury: p.delta_treasury,
             delta_reserves: p.delta_reserves,
             non_myopic: p.non_myopic.into(),
+            // `raw_rewards` is `#[serde(skip)]` — wire-only, never persisted,
+            // so there is nothing to restore. A restored snapshot's
+            // `pending_reward_update`/`last_applied_rupd` therefore cannot
+            // answer the N2C `Complete` arm's `rs` field for a PAST boundary;
+            // only a live, in-memory reward update (query time only) can.
+            raw_rewards: std::collections::HashMap::new(),
+        }
+    }
+}
+
+/// Wire mirror of [`super::reward_pulser::FreeVars`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FreeVarsWire {
+    pub addrs_rew: Option<BTreeSet<Hash32>>,
+    pub total_stake: u64,
+    pub prot_ver: (u64, u64),
+}
+
+impl From<&super::reward_pulser::FreeVars> for FreeVarsWire {
+    fn from(f: &super::reward_pulser::FreeVars) -> Self {
+        FreeVarsWire {
+            addrs_rew: f.addrs_rew.as_ref().map(|s| s.iter().copied().collect()),
+            total_stake: f.total_stake,
+            prot_ver: f.prot_ver,
+        }
+    }
+}
+
+impl From<FreeVarsWire> for super::reward_pulser::FreeVars {
+    fn from(f: FreeVarsWire) -> Self {
+        super::reward_pulser::FreeVars {
+            addrs_rew: f.addrs_rew.map(|s| s.into_iter().collect()),
+            total_stake: f.total_stake,
+            prot_ver: f.prot_ver,
+        }
+    }
+}
+
+/// Wire mirror of [`super::reward_pulser::RewardSnapShot`] (#1071) —
+/// `likelihoods`/`leaders` and `free_vars.addrs_rew` are `HashMap`/`HashSet`
+/// on the live type, so they get the same ordered-container treatment as
+/// every other map/set reachable from [`LedgerStateSnapshot`] (#1088).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RewardSnapShotWire {
+    pub fees: Lovelace,
+    pub protocol_version: (u64, u64),
+    pub non_myopic: NonMyopicWire,
+    pub delta_r1: Lovelace,
+    pub r: Lovelace,
+    pub delta_t1: Lovelace,
+    pub likelihoods: BTreeMap<Hash28, Likelihood>,
+    pub leaders: BTreeMap<Hash32, Vec<super::reward_pulser::RewardEntry>>,
+    pub free_vars: FreeVarsWire,
+}
+
+impl From<&super::reward_pulser::RewardSnapShot> for RewardSnapShotWire {
+    fn from(s: &super::reward_pulser::RewardSnapShot) -> Self {
+        RewardSnapShotWire {
+            fees: s.fees,
+            protocol_version: s.protocol_version,
+            non_myopic: NonMyopicWire::from(&s.non_myopic),
+            delta_r1: s.delta_r1,
+            r: s.r,
+            delta_t1: s.delta_t1,
+            likelihoods: s.likelihoods.iter().map(|(k, v)| (*k, v.clone())).collect(),
+            leaders: s.leaders.iter().map(|(k, v)| (*k, v.clone())).collect(),
+            free_vars: FreeVarsWire::from(&s.free_vars),
+        }
+    }
+}
+
+impl From<RewardSnapShotWire> for super::reward_pulser::RewardSnapShot {
+    fn from(s: RewardSnapShotWire) -> Self {
+        super::reward_pulser::RewardSnapShot {
+            fees: s.fees,
+            protocol_version: s.protocol_version,
+            non_myopic: s.non_myopic.into(),
+            delta_r1: s.delta_r1,
+            r: s.r,
+            delta_t1: s.delta_t1,
+            likelihoods: s.likelihoods.into_iter().collect(),
+            leaders: s.leaders.into_iter().collect(),
+            free_vars: s.free_vars.into(),
+        }
+    }
+}
+
+/// Wire mirror of [`super::reward_pulser::PulsingRewUpdate`] (#1071).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum PulsingRewUpdateWire {
+    Pulsing(Box<RewardSnapShotWire>),
+    Complete(Box<RewardSnapShotWire>),
+}
+
+impl From<&super::reward_pulser::PulsingRewUpdate> for PulsingRewUpdateWire {
+    fn from(p: &super::reward_pulser::PulsingRewUpdate) -> Self {
+        match p {
+            super::reward_pulser::PulsingRewUpdate::Pulsing(s) => {
+                PulsingRewUpdateWire::Pulsing(Box::new(RewardSnapShotWire::from(s.as_ref())))
+            }
+            super::reward_pulser::PulsingRewUpdate::Complete(s) => {
+                PulsingRewUpdateWire::Complete(Box::new(RewardSnapShotWire::from(s.as_ref())))
+            }
+        }
+    }
+}
+
+impl From<PulsingRewUpdateWire> for super::reward_pulser::PulsingRewUpdate {
+    fn from(p: PulsingRewUpdateWire) -> Self {
+        match p {
+            PulsingRewUpdateWire::Pulsing(s) => {
+                super::reward_pulser::PulsingRewUpdate::Pulsing(Box::new((*s).into()))
+            }
+            PulsingRewUpdateWire::Complete(s) => {
+                super::reward_pulser::PulsingRewUpdate::Complete(Box::new((*s).into()))
+            }
         }
     }
 }
@@ -1288,6 +1417,7 @@ mod tests {
             rupd_addrs_rew,
             rupd_pulser_started,
             rupd_monetary,
+            rupd_snapshot,
             pending_avvm_return,
         } = &snap;
 
@@ -1372,6 +1502,33 @@ mod tests {
             "rupd_pulser_started is false — a bool at its default contributes \
              the same bytes as an absent field, so #1072's persisted state \
              would be invisible to the layout hash"
+        );
+        // #1071: the wire-only mirror. Its own map/set fields
+        // (`likelihoods`/`leaders`/`free_vars.addrs_rew`) need the SAME 2+
+        // entry treatment as `non_myopic.likelihoods` above — they are
+        // `HashMap`/`HashSet` on the live `RewardSnapShot` and would
+        // otherwise be invisible to the layout hash.
+        let rupd_snap = match rupd_snapshot {
+            Some(PulsingRewUpdateWire::Complete(s)) => s.as_ref(),
+            other => {
+                panic!("rupd_snapshot must be Some(Complete(_)) in this fixture, got {other:?}")
+            }
+        };
+        assert!(
+            rupd_snap.likelihoods.len() >= 2,
+            "rupd_snapshot.likelihoods has fewer than 2 entries"
+        );
+        assert!(
+            rupd_snap.leaders.len() >= 2,
+            "rupd_snapshot.leaders has fewer than 2 entries"
+        );
+        assert!(
+            rupd_snap
+                .free_vars
+                .addrs_rew
+                .as_ref()
+                .is_some_and(|s| s.len() >= 2),
+            "rupd_snapshot.free_vars.addrs_rew is absent or has fewer than 2 entries"
         );
         assert_ne!(
             non_myopic.reward_pot.0, 0,

@@ -248,7 +248,7 @@ pub struct EpochSubState {
 
     /// Whether a RUPD pulser exists for the epoch currently being closed —
     /// Haskell's `nesRu :: StrictMaybe PulsingRewUpdate` reduced to the one bit
-    /// the boundary needs today (#1072).
+    /// the boundary's CONSENSUS decision needs (#1072).
     ///
     /// ```haskell
     /// -- NewEpoch.hs:161, identically ConwayNewEpoch.hs:172
@@ -274,7 +274,26 @@ pub struct EpochSubState {
     /// Set by the per-block capture in `apply.rs`, consumed and cleared by the
     /// boundary, exactly like [`Self::rupd_addrs_rew`].
     ///
-    /// # KNOWN GAP a bool cannot express (deferred to Phase 2)
+    /// # Why this stays a bool rather than folding into [`Self::rupd_snapshot`]
+    ///
+    /// The obvious design is one `Option<PulsingRewUpdate>` doing both jobs —
+    /// gating consensus AND carrying the wire's `RewardSnapShot`. It was tried
+    /// and reverted: `state/epoch.rs` alone has 20+ hand-rolled unit tests that
+    /// set this flag directly (bypassing `apply.rs`'s freeze entirely) and rely
+    /// on `rupd_monetary == None` falling back to a boundary-time recompute in
+    /// `compute_reward_update`. Forcing every one of those tests to also
+    /// construct an internally-consistent `RewardSnapShot` — matching
+    /// whatever reserves/pparams THAT test happens to set up, so the frozen
+    /// `delta_r1` agrees with the recomputed one under `compute_reward_update`'s
+    /// `debug_assert_eq!` — is real surgery on ~40 call sites that validate a
+    /// CONSENSUS fix (#1072), for a query-only feature (#1071). The two fields
+    /// already "move together" in the one production call site that sets
+    /// either (`apply.rs`); a hand-built test that sets only the bool is
+    /// exercising the SNothing/non-SNothing gate in isolation, which is a
+    /// legitimate and narrower thing to test than the wire shape.
+    ///
+    /// # KNOWN GAP a bool cannot express (deferred to the pulser-alignment
+    /// design doc's Phase 2 "F5")
     ///
     /// `Tick.hs`'s `bheadTransition` builds `RupdEnv bprev es` from **nes0** —
     /// the PRE-boundary state — while passing `nesRu nes1`, post-NEWEPOCH. So a
@@ -290,13 +309,6 @@ pub struct EpochSubState {
     /// Reachable on an outage longer than one stabilisation window that spans a
     /// boundary — 320+ slots on the devnet, i.e. within chaos-round territory.
     /// NOT fixed by this field, and recorded here rather than left silent.
-    ///
-    /// PHASE 2 REPLACES THIS with the real `Option<PulsingRewUpdate>` carrying
-    /// the frozen `RewardSnapShot` and the pulser. It is a bool today because
-    /// that is the whole of what the boundary decision needs while the update
-    /// is still computed in one pass — not because the distinction between
-    /// `Pulsing` and `Complete` does not matter. It does, and it is ledger
-    /// state; see `state::reward_pulser`.
     pub rupd_pulser_started: bool,
 
     /// The monetary half of `startStep`, FROZEN at the 4k/f mark (Phase 1a).
@@ -316,6 +328,29 @@ pub struct EpochSubState {
     /// `None` when the epoch has not reached its mark — which is exactly when
     /// [`Self::rupd_pulser_started`] is false, so the two move together.
     pub rupd_monetary: Option<super::reward_pulser::MonetaryStep>,
+
+    /// The full `nesRu :: StrictMaybe PulsingRewUpdate` (#1071) — WIRE-ONLY.
+    /// `None` = `SNothing`; `Some(Pulsing(snap))` / `Some(Complete(snap))`
+    /// mirror [`Self::rupd_pulser_started`]/[`Self::rupd_monetary`] but also
+    /// carry `rewLikelihoods`/`rewLeaders`, which neither of those track, and
+    /// the `Pulsing`-vs-`Complete` distinction the boundary's consensus
+    /// decision does not need (`PulsingRewUpdate::applies_at_boundary` is
+    /// `true` for either — only `None` skips the update).
+    ///
+    /// A DELIBERATE second copy of "does a pulser exist", not the N-copies
+    /// trap this repo is scarred by (#932/#938/#985): [`Self::rupd_pulser_started`]
+    /// gates CONSENSUS and is read by every existing #1072 test; this field
+    /// feeds only the N2C encoder and is written/consumed at exactly the same
+    /// two call sites as the pair above (`apply.rs`'s freeze, and the
+    /// boundary's clear) — see the doc on `rupd_pulser_started` for why they
+    /// were not collapsed into one `Option`.
+    ///
+    /// `likelihoods`/`leaders` start empty at the freeze (the per-pool table
+    /// they need does not exist yet) and are filled in by
+    /// [`crate::state::rewards::pulse_rupd_member_fold`] on the first pulse;
+    /// `Pulsing -> Complete` is promoted by the same function once
+    /// [`Self::rupd_fold`] finishes.
+    pub rupd_snapshot: Option<super::reward_pulser::PulsingRewUpdate>,
 
     /// The RUPD member fold in flight (Phase 3). TRANSIENT — see
     /// [`super::reward_pulser::InFlightFold`]; it is deliberately absent from

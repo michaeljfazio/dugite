@@ -280,6 +280,8 @@ pub fn populated_ledger_state() -> LedgerState {
         delta_treasury: 42_000,
         delta_reserves: -17,
         non_myopic: sample_non_myopic(0x30, 7_777_777),
+        // `#[serde(skip)]` — wire-only (#1071), not part of the layout hash.
+        raw_rewards: HashMap::new(),
     });
     // `esNonMyopic` itself, distinct from the copy riding on the pending reward
     // update — different pool id and pot so a From impl that wires one field to
@@ -305,6 +307,64 @@ pub fn populated_ledger_state() -> LedgerState {
         s.insert(h32(0x1a));
         s
     }));
+    // #1071: the WIRE-ONLY `nesRu` mirror. `Complete` rather than `Pulsing`
+    // so the fixture exercises the arm the N2C encoder actually emits today;
+    // every map/set field carries 2+ entries per #1088's convention —
+    // `likelihoods`, `leaders` and `free_vars.addrs_rew` are all
+    // `HashMap`/`HashSet` on the live type and would otherwise be invisible
+    // to the layout hash.
+    state.epochs.rupd_snapshot = Some(crate::state::reward_pulser::PulsingRewUpdate::Complete(
+        Box::new(crate::state::reward_pulser::RewardSnapShot {
+            fees: Lovelace(555_555),
+            protocol_version: (10, 0),
+            non_myopic: sample_non_myopic(0x34, 9_999_999),
+            delta_r1: Lovelace(3_000_000_000_000),
+            r: Lovelace(2_400_000_000_800),
+            delta_t1: Lovelace(600_000_000_200),
+            likelihoods: {
+                let mut m = HashMap::new();
+                m.insert(
+                    h28(0x40),
+                    crate::state::non_myopic::Likelihood::new(50, 0.1, 432_000),
+                );
+                m.insert(
+                    h28(0x41),
+                    crate::state::non_myopic::Likelihood::new(30, 0.2, 432_000),
+                );
+                m
+            },
+            leaders: {
+                let mut m = HashMap::new();
+                m.insert(
+                    h32(0x42),
+                    vec![crate::state::reward_pulser::RewardEntry {
+                        is_member: false,
+                        pool_id: h28(0x40),
+                        amount: 12_345,
+                    }],
+                );
+                m.insert(
+                    h32(0x43),
+                    vec![crate::state::reward_pulser::RewardEntry {
+                        is_member: false,
+                        pool_id: h28(0x41),
+                        amount: 54_321,
+                    }],
+                );
+                m
+            },
+            free_vars: crate::state::reward_pulser::FreeVars {
+                addrs_rew: Some({
+                    let mut s = HashSet::new();
+                    s.insert(h32(0x10));
+                    s.insert(h32(0x1a));
+                    s
+                }),
+                total_stake: 31_112_484_745_368_612,
+                prot_ver: (10, 0),
+            },
+        }),
+    ));
     // Pre-Conway update proposals — BTreeMap so iteration order is fixed.
     // Two entries even so: `EpochSnapshotsWire`'s sibling maps need the
     // width and drift-proofing the whole fixture to one shape is simpler

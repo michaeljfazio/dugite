@@ -531,6 +531,8 @@ impl LedgerState {
                 // lands past its own 4k/f mark.
                 self.epochs.rupd_pulser_started = false;
                 self.epochs.rupd_monetary = None;
+                // #1071: the wire mirror moves with the pair above.
+                self.epochs.rupd_snapshot = None;
             }
         } else if self.era != Era::Byron && self.epochs.protocol_params.protocol_version_major >= 9
         {
@@ -582,7 +584,7 @@ impl LedgerState {
                 // not at the boundary.
                 let pp = &self.epochs.prev_protocol_params;
                 let blocks: u64 = self.epochs.snapshots.bprev_blocks_by_pool.values().sum();
-                self.epochs.rupd_monetary = Some(crate::state::reward_pulser::start_step_monetary(
+                let monetary = crate::state::reward_pulser::start_step_monetary(
                     (pp.rho.numerator, pp.rho.denominator),
                     (pp.tau.numerator, pp.tau.denominator),
                     (self.epochs.prev_d.numerator, self.epochs.prev_d.denominator),
@@ -596,7 +598,45 @@ impl LedgerState {
                     // maxLovelaceSupply would freeze the wrong total_stake,
                     // and total_stake is sigma's denominator.
                     self.max_lovelace_supply,
-                ));
+                );
+                self.epochs.rupd_monetary = Some(monetary);
+
+                // #1071: `nesRu` becomes `SJust (Pulsing snap pulser)` — the
+                // WIRE mirror of the pair set above (see
+                // `EpochSubState::rupd_snapshot`'s doc for why it is a
+                // separate field). Its `likelihoods`/`leaders` are filled in
+                // below, on the first pulse — they need the per-pool table,
+                // which does not exist yet at this instant.
+                self.epochs.rupd_snapshot =
+                    Some(crate::state::reward_pulser::PulsingRewUpdate::Pulsing(
+                        Box::new(crate::state::reward_pulser::RewardSnapShot {
+                            fees: self.epochs.snapshots.ss_fee,
+                            protocol_version: (
+                                self.epochs.prev_protocol_version_major,
+                                pp.protocol_version_minor,
+                            ),
+                            // `rewNonMyopic` — the OLD estimate, as it stood
+                            // before THIS epoch's `updateNonMyopic` runs at the
+                            // boundary.
+                            non_myopic: self.epochs.non_myopic.clone(),
+                            delta_r1: Lovelace(monetary.delta_r1),
+                            r: Lovelace(monetary.r),
+                            delta_t1: Lovelace(monetary.delta_t1),
+                            likelihoods: std::collections::HashMap::new(),
+                            leaders: std::collections::HashMap::new(),
+                            free_vars: crate::state::reward_pulser::FreeVars {
+                                // #11: the pv<=6 registration prefilter — `None`
+                                // above pv6, filled in by the same mechanism as
+                                // `rupd_addrs_rew` once captured.
+                                addrs_rew: None,
+                                total_stake: monetary.total_stake,
+                                prot_ver: (
+                                    self.epochs.prev_protocol_version_major,
+                                    pp.protocol_version_minor,
+                                ),
+                            },
+                        }),
+                    ));
             }
         }
 
@@ -632,6 +672,13 @@ impl LedgerState {
             if block.slot().0 > startstep_slot {
                 let frozen: std::collections::HashSet<dugite_primitives::hash::Hash32> =
                     self.certs.reward_accounts.keys().copied().collect();
+                // Mirror into the wire snapshot's `FreeVars.addrs_rew`
+                // (#1071) rather than adding a second read path — the two
+                // move together by construction, at the one site that
+                // captures either.
+                if let Some(snap_state) = self.epochs.rupd_snapshot.as_mut() {
+                    snap_state.snapshot_mut().free_vars.addrs_rew = Some(frozen.clone());
+                }
                 self.epochs.rupd_addrs_rew = Some(std::sync::Arc::new(frozen));
             }
         }
@@ -639,7 +686,7 @@ impl LedgerState {
         // Phase 3: one pulse of the member fold per block, spreading the ~2.55 s
         // mainnet-scale boundary fold (Phase 0) across the pulsing window.
         //
-        // A no-op before the mark (`rupd_monetary` is None) and idempotent once
+        // A no-op before the mark (`rupd_state` is None) and idempotent once
         // the balance is exhausted, so it is safe to call unconditionally on
         // every block rather than replicating the window classification here —
         // a second copy of that condition is the N-copies trap (#985/#1015).
@@ -651,7 +698,13 @@ impl LedgerState {
             let prev_d = self.epochs.prev_d.clone();
             let pv = self.epochs.prev_protocol_version_major;
             let k = self.security_param;
-            crate::state::rewards::pulse_rupd_member_fold(&mut self.epochs, &prev_d, pv, k);
+            crate::state::rewards::pulse_rupd_member_fold(
+                &mut self.epochs,
+                &prev_d,
+                pv,
+                k,
+                self.epoch_length,
+            );
         }
 
         // #804: adopt any `GenesisKeyDelegation` certs that matured by this
@@ -2159,6 +2212,11 @@ impl LedgerState {
         let future_gen_delegs_before = self.future_gen_delegs.clone();
         let rupd_addrs_rew_before = self.epochs.rupd_addrs_rew.clone();
         let rupd_pulser_started_before = self.epochs.rupd_pulser_started;
+        // #1071: `None` for ~80% of blocks (outside the pulsing window), so
+        // this clone is free there; inside the window it clones the frozen
+        // `RewardSnapShot`, bounded by pool/credential counts and far smaller
+        // than the per-block fold pulse itself.
+        let rupd_snapshot_before = self.epochs.rupd_snapshot.clone();
 
         // Apply the block (all state mutations happen here). In deferred mode
         // this returns the captured Phase-2 work items without draining them.
@@ -2287,6 +2345,15 @@ impl LedgerState {
         if rupd_pulser_started_before != self.epochs.rupd_pulser_started {
             delta.rupd_pulser_started_snapshot = Some(self.epochs.rupd_pulser_started);
             delta.rupd_monetary_snapshot = Some(self.epochs.rupd_monetary);
+        }
+        // #1071: the wire mirror gets its OWN delta — it changes on different
+        // blocks than the pair above (it is also touched by
+        // `pulse_rupd_member_fold`'s likelihood/leader fill-in and its
+        // `Pulsing -> Complete` promotion, neither of which flips
+        // `rupd_pulser_started`) — so it cannot piggy-back on that change
+        // detection without regressing to a stale arm across a rollback.
+        if rupd_snapshot_before != self.epochs.rupd_snapshot {
+            delta.rupd_snapshot_delta = Some(self.epochs.rupd_snapshot.clone());
         }
 
         // Extract the UTxO diff from the DiffSeq entry that apply_block just pushed.
