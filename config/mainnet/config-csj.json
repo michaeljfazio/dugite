@@ -29,7 +29,7 @@
   },
   "MinSeverity": "Info",
   "MetricsPort": 12800,
-  "ConsensusMode": "Genesis",
+  "ConsensusMode": "GenesisMode",
   "LowLevelGenesisOptions": {
     "EnableCSJ": true,
     "EnableLoEAndGDD": true,

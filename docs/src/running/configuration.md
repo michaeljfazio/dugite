@@ -46,7 +46,7 @@ The configuration file uses PascalCase keys (matching the cardano-node conventio
 | `NetworkMagic` | integer | auto | Network magic number. If omitted, derived from `Network` (764824073 for mainnet) |
 | `DiffusionMode` | string | `"InitiatorAndResponder"` | Controls inbound connection acceptance. `"InitiatorAndResponder"` (default): relay mode, accepts inbound N2N connections. `"InitiatorOnly"`: block producer mode, outbound only (no listening port opened) |
 | `PeerSharing` | boolean/null | `null` | Enable the peer sharing mini-protocol. When `null` (default), peer sharing is automatically disabled for block producers (when `--shelley-kes-key` is provided) and enabled for relays. Set explicitly to override |
-| `ConsensusMode` | string | `"Praos"` | `"Praos"` (default) or `"Genesis"` (trustless bulk sync). `"PraosMode"` / `"GenesisMode"` are accepted legacy aliases. The `--consensus-mode` CLI flag, taking `praos` or `genesis`, overrides this field |
+| `ConsensusMode` | string | `"PraosMode"` | `"PraosMode"` (default) or `"GenesisMode"` (trustless bulk sync) — the values a real cardano-node config actually uses (verified against cardano-node 11.0.1, which rejects any other spelling). `"Praos"` / `"Genesis"` are accepted as dugite-only legacy aliases. The `--consensus-mode` CLI flag, taking `praos` or `genesis`, overrides this field |
 | `ExperimentalHardForksEnabled` | boolean | `false` | Advertise readiness for the next major protocol version. `false` → the node signals `ProtVer 11 0` in forged headers and rejects headers whose on-chain protocol version exceeds 11; `true` → signals `ProtVer 12 0` (Dijkstra) and accepts up to 12. Must stay `false` on mainnet. The shipped `config/preview/config.json` sets it `true` |
 
 > **`EnableP2P` is not a Dugite config key.** Dugite is always P2P; there is no
@@ -115,7 +115,7 @@ would hurt Genesis sync.
 
 A second target set applies while the node is in Genesis-mode bulk sync. It is
 parsed and validated unconditionally, but only takes effect when
-`ConsensusMode` is `"Genesis"`.
+`ConsensusMode` is `"GenesisMode"`.
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
@@ -149,7 +149,7 @@ set (`[deadline]` or `[sync]`):
 ### Ouroboros Genesis Tuning
 
 `LowLevelGenesisOptions` mirrors cardano-node's object of the same name and is
-only consulted when `ConsensusMode` is `"Genesis"`. Omit the whole object to get
+only consulted when `ConsensusMode` is `"GenesisMode"`. Omit the whole object to get
 the upstream defaults.
 
 ```json
