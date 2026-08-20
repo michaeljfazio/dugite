@@ -1,5 +1,6 @@
 //! Cryptographic primitives: Ed25519, VRF, KES, text envelope format.
 
+pub mod byron;
 pub mod kes;
 pub mod keys;
 pub mod ocert;

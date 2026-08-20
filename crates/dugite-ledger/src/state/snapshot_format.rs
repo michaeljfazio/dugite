@@ -592,6 +592,14 @@ impl From<LedgerStateSnapshot> for super::LedgerState {
             byron: s.byron,
             update_quorum: s.update_quorum,
             node_network: s.node_network,
+            // #1092: NOT part of `LedgerStateSnapshot` — same treatment as
+            // `security_param` below. Every load-snapshot call site already
+            // calls `set_shelley_transition()` (which now also carries
+            // `network_magic`) immediately after this conversion, deriving
+            // it fresh from genesis config, so persisting it here would only
+            // ever be overwritten — and would cost a SNAPSHOT_VERSION bump
+            // the design doc's tier A scope explicitly rules out.
+            network_magic: dugite_primitives::network::NetworkId::Mainnet.magic(),
             randomness_stabilisation_window: s.randomness_stabilisation_window,
             stability_window_3kf: s.stability_window_3kf,
             security_param: 0, // Set from genesis config at startup via set_epoch_length()

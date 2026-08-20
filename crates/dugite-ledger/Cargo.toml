@@ -49,6 +49,15 @@ proptest = { workspace = true }
 criterion = { workspace = true }
 tempfile = { workspace = true }
 tracing-subscriber = { workspace = true }
+# Test-only: building genuinely-signed Byron fixtures for #1092's
+# signature-verification tests. A real Ed25519 signature verifies
+# identically under dalek and donna (see dugite-crypto::byron's doc), so
+# dalek-signed fixtures are a valid basis for exercising the donna-exact
+# `verify_xsig` production path.
+ed25519-dalek = { workspace = true }
+# Test-only: decoding the real mainnet `heavyDelegation` genesis certificates
+# (base64 keys) for #1092's primary offline correctness test.
+base64 = { workspace = true }
 
 [[bench]]
 name = "ledger_bench"

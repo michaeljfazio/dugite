@@ -1592,7 +1592,7 @@ impl Node {
                             state.set_genesis_delegates(&gen_deleg_entries);
                         }
                     }
-                    state.set_shelley_transition(ste, byron_epoch_length);
+                    state.set_shelley_transition(ste, byron_epoch_length, network_magic);
                     if let Some(hash) = shelley_genesis_hash {
                         state.genesis_hash = hash;
                     }
@@ -1750,7 +1750,11 @@ impl Node {
                                                         );
                                                     }
                                                 }
-                                                alt.set_shelley_transition(ste, byron_epoch_length);
+                                                alt.set_shelley_transition(
+                                                    ste,
+                                                    byron_epoch_length,
+                                                    network_magic,
+                                                );
                                                 if let Some(hash) = shelley_genesis_hash {
                                                     alt.genesis_hash = hash;
                                                 }
@@ -8942,7 +8946,7 @@ impl Node {
         }
 
         // Apply hard-fork boundary and genesis hash
-        state.set_shelley_transition(shelley_transition, byron_epoch_length);
+        state.set_shelley_transition(shelley_transition, byron_epoch_length, network_magic);
         if let Some(hash) = shelley_genesis_hash {
             // Unlike set_genesis_hash() on a fresh state, we do NOT overwrite the
             // Praos nonces — they came from the real Haskell PraosState.
@@ -9385,7 +9389,7 @@ impl Node {
             }
         }
         // Set Byron→Shelley transition boundary for correct HFC epoch numbering
-        ledger.set_shelley_transition(shelley_transition_epoch, byron_epoch_length);
+        ledger.set_shelley_transition(shelley_transition_epoch, byron_epoch_length, network_magic);
         if let Some(hash) = shelley_genesis_hash {
             ledger.set_genesis_hash(hash);
         }
@@ -9401,7 +9405,7 @@ impl Node {
             match bg.block_version_data.to_protocol_parameters() {
                 Some(params) => {
                     let allowed_delegators = bg.allowed_delegators();
-                    let heavy_delegation = bg.heavy_delegation_pairs();
+                    let heavy_delegation = bg.heavy_delegation_certs();
                     tracing::debug!(
                         allowed_delegators = allowed_delegators.len(),
                         heavy_delegation = heavy_delegation.len(),
@@ -9411,6 +9415,7 @@ impl Node {
                         allowed_delegators,
                         &heavy_delegation,
                         params,
+                        network_magic,
                     );
                 }
                 None => {

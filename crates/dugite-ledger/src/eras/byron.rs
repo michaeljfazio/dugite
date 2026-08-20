@@ -902,6 +902,12 @@ pub enum ByronDelegationError {
     AlreadyDelegated,
     #[error("issuer already has a scheduled delegation activating at this slot")]
     DuplicateActivationSlot,
+    /// `Certificate.hs::isValid` (issue #1092, design doc §3.2) — the FIFTH
+    /// and last check `scheduleCertificate` runs, after the four state
+    /// checks above (order is observable: a doubly-invalid cert reports
+    /// whichever of the two fires first, and this is always last).
+    #[error("delegation certificate signature does not verify")]
+    InvalidSignature,
 }
 
 /// Errors from the Byron update-proposal-system rules (registration + voting).
@@ -926,6 +932,13 @@ pub enum ByronUpdateError {
     ProposalNotRegistered,
     #[error("this genesis key has already voted on this proposal")]
     VoteAlreadyCast,
+    /// `Registration.hs::registerProposal` / `Voting.hs::registerVote`
+    /// (issue #1092, design doc §4.1/§4.2) — the signature check, which
+    /// upstream runs AFTER the state-rule checks above (registered/genesis
+    /// key resolution etc.), matching this variant's position as the last
+    /// arm checked by both `register_proposal` and `register_vote`.
+    #[error("proposal/vote signature does not verify")]
+    InvalidSignature,
 }
 
 /// `hashKey = blake2b_224 . sha3_256 . cbor(vk)` (`Common/KeyHash.hs:53`) —
@@ -951,6 +964,233 @@ pub fn byron_key_hash(vk: &[u8]) -> Hash28 {
     cbor.extend_from_slice(vk);
     let sha3_digest: [u8; 32] = sha3::Sha3_256::digest(&cbor).into();
     blake2b_224(&sha3_digest)
+}
+
+// ============================================================================
+// Signature verification (issue #1092)
+// ============================================================================
+//
+// Message construction for the three signed surfaces #1084 decodes but does
+// not verify: heavyweight delegation certificates, update proposals, and
+// update votes, plus the block signature itself (verified from `apply.rs`,
+// see `verify_block_signature` below). Grounded in
+// `docs/superpowers/specs/2026-08-21-byron-signature-verification-design.md`.
+// The crypto PRIMITIVE (`verify_xsig`, donna-exact — NOT dalek) and the four
+// sign-tag builders live in `dugite_crypto::byron`; everything here is
+// message assembly fed by the raw spans `era_byron.rs`'s decoder captures.
+
+/// CBOR bytestring header for a payload of `len` bytes — major type 2,
+/// minimal (canonical) length encoding. The same three-tier scheme as
+/// [`byron_key_hash`]'s inline CBOR-wrap, factored out here because the
+/// certificate signature message (design doc §3.2) wraps its payload as a
+/// CBOR bytestring TOKEN (`serialize'` of a `ByteString`), not as a bare
+/// concatenation.
+fn cbor_bstr_header(len: usize) -> Vec<u8> {
+    if len <= 23 {
+        vec![0x40 | len as u8]
+    } else if len <= 0xff {
+        vec![0x58, len as u8]
+    } else {
+        let mut h = vec![0x59];
+        h.extend_from_slice(&(len as u16).to_be_bytes());
+        h
+    }
+}
+
+/// Byron's `ProtocolMagicId` (a `Word32`), CBOR-encoded as a canonical
+/// unsigned integer — `Cardano.Crypto.Signing.Tag::signTagRaw`'s `network`
+/// argument, `serialize' byronProtVer (unProtocolMagicId pm)` (design doc
+/// §1.2). mainnet 764824073 -> `1A 2D 96 4A 09`; preprod 1 -> `01`; preview
+/// 2 -> `02`. `as u32` matches the AVVM redeem-address network tag already
+/// computed this way in `dugite-node/src/genesis.rs::avvm_to_address` — the
+/// same quantity, same encoding, proven correct there.
+pub fn network_magic_cbor(magic: u64) -> Vec<u8> {
+    let mut buf = Vec::new();
+    minicbor::encode(magic as u32, &mut buf).expect("encoding a u32 into a Vec cannot fail");
+    buf
+}
+
+/// The exact bytes signed for a heavyweight delegation certificate
+/// (`Certificate.hs::isValid`, design doc §3.2): `SignCertificate‖magic`
+/// followed by a CBOR-bytestring-wrapped `"00"‖delegate_vk‖epoch_bytes`.
+/// `epoch_bytes` is the epoch's raw wire annotation for an on-chain cert, or
+/// a fresh canonical CBOR encoding for a genesis cert (`DI.initialState`'s
+/// re-annotation, §3.3) — the caller decides which. Factored out of
+/// [`verify_dlg_cert_signature`] so the test module can build the identical
+/// message to SIGN, rather than maintaining an independent copy that could
+/// silently drift from what verification actually checks.
+fn build_dlg_cert_message(delegate_vk: &[u8], epoch_bytes: &[u8], magic_cbor: &[u8]) -> Vec<u8> {
+    let mut payload = Vec::with_capacity(2 + delegate_vk.len() + epoch_bytes.len());
+    payload.extend_from_slice(b"00"); // ASCII 0x30 0x30 — see design doc §1.2 Trap 2
+    payload.extend_from_slice(delegate_vk);
+    payload.extend_from_slice(epoch_bytes);
+
+    let mut msg = dugite_crypto::byron::sign_tag_certificate(magic_cbor);
+    msg.extend_from_slice(&cbor_bstr_header(payload.len()));
+    msg.extend_from_slice(&payload);
+    msg
+}
+
+/// Verify a heavyweight delegation certificate's signature, verified with
+/// the certificate's own `issuer_vk`. See [`build_dlg_cert_message`] for the
+/// message.
+fn verify_dlg_cert_signature(
+    issuer_vk: &[u8],
+    delegate_vk: &[u8],
+    epoch_bytes: &[u8],
+    signature: &[u8],
+    magic_cbor: &[u8],
+) -> bool {
+    let (Ok(issuer_xpub), Ok(sig)) = (
+        <[u8; 64]>::try_from(issuer_vk),
+        <[u8; 64]>::try_from(signature),
+    ) else {
+        return false;
+    };
+    let msg = build_dlg_cert_message(delegate_vk, epoch_bytes, magic_cbor);
+    dugite_crypto::byron::verify_xsig(&issuer_xpub, &msg, &sig)
+}
+
+/// The exact bytes signed for an update proposal (`Registration.hs:328`,
+/// `Proposal.hs::recoverProposalSignedBytes`, design doc §4.1):
+/// `SignUSProposal‖magic‖0x85‖body_span`. `0x85` is a synthetic bare
+/// array(5) header byte — an "implementation artifact" per upstream's own
+/// comment, not a real wire header. Factored out for the same reason as
+/// [`build_dlg_cert_message`].
+fn build_proposal_message(body_span: &[u8], magic_cbor: &[u8]) -> Vec<u8> {
+    let mut msg = dugite_crypto::byron::sign_tag_us_proposal(magic_cbor);
+    msg.push(0x85);
+    msg.extend_from_slice(body_span);
+    msg
+}
+
+/// Verify an update proposal's signature, verified with the proposal's own
+/// `proposer_vk`. See [`build_proposal_message`] for the message.
+fn verify_proposal_signature(
+    proposer_vk: &[u8],
+    body_span: &[u8],
+    signature: &[u8],
+    magic_cbor: &[u8],
+) -> bool {
+    let (Ok(xpub), Ok(sig)) = (
+        <[u8; 64]>::try_from(proposer_vk),
+        <[u8; 64]>::try_from(signature),
+    ) else {
+        return false;
+    };
+    let msg = build_proposal_message(body_span, magic_cbor);
+    dugite_crypto::byron::verify_xsig(&xpub, &msg, &sig)
+}
+
+/// The exact bytes signed for an update vote (`Voting.hs:161`,
+/// `Vote.hs::recoverSignedBytes`, design doc §4.2):
+/// `SignUSVote‖magic‖0x82‖proposal_id_raw‖0xF5`. The vote signs the
+/// synthetic pair `(proposalId, True)` — `0x82` is array(2), `0xF5` is
+/// canonical CBOR `true`; the wire `vote: bool` element itself is never
+/// part of the message (it is always `True` on the wire and is
+/// decoded-and-discarded, matching upstream — see `read_byron_upvote`'s
+/// doc). Factored out for the same reason as [`build_dlg_cert_message`].
+fn build_vote_message(proposal_id_raw: &[u8], magic_cbor: &[u8]) -> Vec<u8> {
+    let mut msg = dugite_crypto::byron::sign_tag_us_vote(magic_cbor);
+    msg.push(0x82);
+    msg.extend_from_slice(proposal_id_raw);
+    msg.push(0xF5);
+    msg
+}
+
+/// Verify an update vote's signature, verified with the vote's own
+/// `voter_vk`. See [`build_vote_message`] for the message.
+fn verify_vote_signature(
+    voter_vk: &[u8],
+    proposal_id_raw: &[u8],
+    signature: &[u8],
+    magic_cbor: &[u8],
+) -> bool {
+    let (Ok(xpub), Ok(sig)) = (
+        <[u8; 64]>::try_from(voter_vk),
+        <[u8; 64]>::try_from(signature),
+    ) else {
+        return false;
+    };
+    let msg = build_vote_message(proposal_id_raw, magic_cbor);
+    dugite_crypto::byron::verify_xsig(&xpub, &msg, &sig)
+}
+
+/// Verify a Byron main block's own signature and delegate-membership
+/// (`Ouroboros.Consensus.Protocol.PBFT::updateChainDepState`'s steps 1 and
+/// 3 — design doc §2.1). Steps 2 (slot monotonicity) and 4 (the signing
+/// window threshold) are tier B (design doc §8) and are NOT implemented
+/// here.
+///
+/// **`ValidateAll`-mode only.** Block signatures are first-validation-only
+/// upstream — `reupdateChainDepState` skips re-verifying them on replay
+/// (design doc §2.1's "Re-application skips the signature") — so this must
+/// never be called from an `ApplyOnly` path; that is parity with upstream,
+/// not a shortcut.
+///
+/// `delegation_map_rev` MUST be the delegation map AS OF the tick, i.e.
+/// captured BEFORE this block's own `dlgPayload` is applied — the same
+/// discipline [`apply_update_payload`]'s doc explains for the identical
+/// reason (`updateEnv`'s resolver reads the *original* `delegationState`
+/// binding).
+///
+/// **Deliberately does NOT re-verify `block_sig`'s EMBEDDED delegation
+/// certificate's own signature.** Upstream does not either (design doc
+/// §2.1 step 3's note: *"the embedded certificate's own signature is never
+/// verified on this path — its only roles are carrying `delegateVK` and
+/// feeding the sign tag"*), matching this function exactly: it reads
+/// `aux.delegate_pubkey` and `aux.issuer_pubkey` (both sourced from that
+/// embedded cert, decoded but not re-checked here) and relies on the
+/// delegate-membership lookup below — i.e. on that certificate having been
+/// signature-verified WHEN IT WAS FIRST ADMITTED, by
+/// `schedule_delegation_cert`'s check 5, wherever it entered the ledger
+/// (an on-chain `dlgPayload` entry, or a genesis `heavyDelegation` entry).
+/// Adding a second verification here would be stricter than upstream, not
+/// merely redundant — design doc §10c recommends matching upstream exactly.
+pub fn verify_block_signature(
+    aux: &ByronBlockAux,
+    network_magic: u64,
+    delegation_map_rev: &BTreeMap<Hash28, Hash28>,
+    current_slot: u64,
+) -> Result<(), LedgerError> {
+    let bad_shape = || LedgerError::ByronSignatureInvalid {
+        slot: current_slot,
+        kind: "block (malformed key or signature length)".to_string(),
+    };
+    let genesis_xpub =
+        <[u8; 64]>::try_from(aux.issuer_pubkey.as_slice()).map_err(|_| bad_shape())?;
+    let delegate_xpub =
+        <[u8; 64]>::try_from(aux.delegate_pubkey.as_slice()).map_err(|_| bad_shape())?;
+    let sig = <[u8; 64]>::try_from(aux.block_signature.as_slice()).map_err(|_| bad_shape())?;
+
+    let magic_cbor = network_magic_cbor(network_magic);
+    // Tagged with the header's CLAIMED genesis key (`issuer_pubkey`) — see
+    // the design doc §2.1 point 1: this is otherwise-unauthenticated input,
+    // by design (the delegate-membership check below is what authenticates
+    // the delegate key that ACTUALLY verifies the signature).
+    let mut msg = dugite_crypto::byron::sign_tag_block(&genesis_xpub, &magic_cbor);
+    msg.extend_from_slice(&aux.block_signed_bytes);
+
+    if !dugite_crypto::byron::verify_xsig(&delegate_xpub, &msg, &sig) {
+        return Err(LedgerError::ByronSignatureInvalid {
+            slot: current_slot,
+            kind: "block".to_string(),
+        });
+    }
+
+    // Step 3: `Bimap.lookupR (hashVerKey pbftIssuer) dms` — the delegate
+    // must be SOMEONE's delegate in the ledger's activation map. Note what
+    // this does NOT check: the resolved genesis key is never compared
+    // against `issuer_pubkey` (design doc §2.1 point 3).
+    let delegate_hash = byron_key_hash(&aux.delegate_pubkey);
+    if resolve_genesis_authority(&delegate_hash, delegation_map_rev).is_none() {
+        return Err(LedgerError::ByronSignatureInvalid {
+            slot: current_slot,
+            kind: "block (delegate is not a registered genesis delegate)".to_string(),
+        });
+    }
+
+    Ok(())
 }
 
 /// `floor(srMinThd/1e15 * numGenKeys)` (`ProtocolParameters.hs:217`,
@@ -1023,6 +1263,11 @@ fn schedule_delegation_cert(
     cert_epoch: u64,
     issuer: Hash28,
     delegate: Hash28,
+    issuer_vk: &[u8],
+    delegate_vk: &[u8],
+    epoch_bytes: &[u8],
+    signature: &[u8],
+    magic_cbor: &[u8],
 ) -> Result<(), ByronDelegationError> {
     if !allowed_delegators.contains(&issuer) {
         return Err(ByronDelegationError::NotGenesisKey);
@@ -1040,6 +1285,10 @@ fn schedule_delegation_cert(
         .any(|s| s.delegator == issuer && s.slot == activation_slot)
     {
         return Err(ByronDelegationError::DuplicateActivationSlot);
+    }
+    // Check 5, last (`Certificate.hs::isValid`, design doc §3.2/§3.4).
+    if !verify_dlg_cert_signature(issuer_vk, delegate_vk, epoch_bytes, signature, magic_cbor) {
+        return Err(ByronDelegationError::InvalidSignature);
     }
     state.scheduled.push(ScheduledDelegation {
         slot: activation_slot,
@@ -1097,16 +1346,41 @@ pub fn tick_delegation(state: &mut ByronDelegationState, current_slot: u64, curr
         .retain(|(epoch, _)| *epoch >= current_epoch);
 }
 
+/// One `heavyDelegation` entry from the Byron genesis file, with the raw
+/// key/signature material [`seed_byron_genesis`] needs to verify it
+/// (`Certificate.hs::isValid`, design doc §3.3) alongside the resolved
+/// `Hash28`s [`schedule_delegation_cert`]'s state rules need.
+#[derive(Debug, Clone)]
+pub struct GenesisHeavyDelegationCert {
+    pub issuer: Hash28,
+    pub delegate: Hash28,
+    /// The issuer's (genesis key's) 64-byte extended verification key —
+    /// the certificate's VERIFYING key.
+    pub issuer_vk: Vec<u8>,
+    pub delegate_vk: Vec<u8>,
+    pub signature: Vec<u8>,
+    /// `omega` — the certificate's target epoch. Always 0 on every real
+    /// genesis file (mainnet/preprod/preview).
+    pub omega: u64,
+}
+
 /// `DI.initialState` + `UPI.initialState` (Interface.hs:94-137, :108+):
 /// start the delegation map from the IDENTITY (every genesis key delegates
 /// to itself), then apply the genesis `heavyDelegation` certificates through
 /// the REAL schedule/activate path with `k = 0` (immediate activation) — a
 /// shortcut that just inserted pairs would skip the `notMemberR` rule and
 /// drift on any genesis where a delegate collides.
+///
+/// `network_magic` is threaded through to the signature check
+/// (`DI.initialState` routes genesis certificates through the SAME
+/// `updateDelegation` path real on-chain certificates use — design doc
+/// §3.3 — so upstream signature-verifies them at every node start, and this
+/// does too).
 pub fn seed_byron_genesis(
     allowed_delegators: BTreeSet<Hash28>,
-    heavy_delegation: &[(Hash28, Hash28)],
+    heavy_delegation: &[GenesisHeavyDelegationCert],
     adopted_protocol_parameters: ByronProtocolParameters,
+    network_magic: u64,
 ) -> ByronSubState {
     let mut delegation = ByronDelegationState::default();
     for key in &allowed_delegators {
@@ -1114,7 +1388,18 @@ pub fn seed_byron_genesis(
         delegation.delegation_map_rev.insert(*key, *key);
         delegation.delegation_slots.insert(*key, 0);
     }
-    for (issuer, delegate) in heavy_delegation {
+    let magic_cbor = network_magic_cbor(network_magic);
+    for cert in heavy_delegation {
+        // `omega`'s FRESH canonical CBOR encoding — `DI.initialState`'s
+        // `annotateCertificate` re-annotation (design doc §3.3). Genesis is
+        // a JSON file, not CBOR, so there is no wire span to capture here
+        // the way `read_byron_dlg_cert` captures `epoch_raw` for an
+        // on-chain certificate; a canonical re-encode is exactly what
+        // upstream itself does at this call site.
+        let mut epoch_bytes = Vec::new();
+        minicbor::encode(cert.omega, &mut epoch_bytes)
+            .expect("encoding a u64 into a Vec cannot fail");
+
         // Genesis certificates are trusted (they define the genesis itself);
         // a scheduling failure here is a genesis-file defect, logged rather
         // than fatal to node startup — the identity mapping is still a valid
@@ -1125,13 +1410,18 @@ pub fn seed_byron_genesis(
             0,
             0,
             0,
-            0,
-            *issuer,
-            *delegate,
+            cert.omega,
+            cert.issuer,
+            cert.delegate,
+            &cert.issuer_vk,
+            &cert.delegate_vk,
+            &epoch_bytes,
+            &cert.signature,
+            &magic_cbor,
         ) {
             tracing::warn!(
-                issuer = %issuer.to_hex(),
-                delegate = %delegate.to_hex(),
+                issuer = %cert.issuer.to_hex(),
+                delegate = %cert.delegate.to_hex(),
                 error = %e,
                 "Byron genesis heavyDelegation certificate rejected by the scheduling rules"
             );
@@ -1211,10 +1501,25 @@ fn register_proposal(
     delegation_map_rev: &BTreeMap<Hash28, Hash28>,
     current_slot: u64,
     proposal: &dugite_primitives::block::ByronUpdProposal,
+    magic_cbor: &[u8],
 ) -> Result<(), ByronUpdateError> {
     let proposer_key_hash = byron_key_hash(&proposal.proposer_vk);
     if resolve_genesis_authority(&proposer_key_hash, delegation_map_rev).is_none() {
         return Err(ByronUpdateError::NotGenesisDelegate);
+    }
+    // Check 2 (design doc §4.1) — `verifySignatureDecoded ...
+    // \`orThrowError\` InvalidSignature`, immediately after genesis-delegate
+    // resolution and before every component check below (upstream's own
+    // order; `UnsupportedTxFeePolicyOverride` right after it is a
+    // dugite-only modelling guard with no direct upstream counterpart, so
+    // its position relative to this check carries no fidelity claim).
+    if !verify_proposal_signature(
+        &proposal.proposer_vk,
+        &proposal.body_span,
+        &proposal.signature,
+        magic_cbor,
+    ) {
+        return Err(ByronUpdateError::InvalidSignature);
     }
     if proposal.params_update.tx_fee_policy.is_some() {
         return Err(ByronUpdateError::UnsupportedTxFeePolicyOverride);
@@ -1307,6 +1612,7 @@ fn register_vote(
     num_gen_keys: usize,
     current_slot: u64,
     vote: &ByronUpdVote,
+    magic_cbor: &[u8],
 ) -> Result<(), ByronUpdateError> {
     if !update
         .proposal_registration_slot
@@ -1318,10 +1624,35 @@ fn register_vote(
     let genesis_key = resolve_genesis_authority(&voter_key_hash, delegation_map_rev)
         .ok_or(ByronUpdateError::NotGenesisDelegate)?;
 
-    let votes = update.proposal_votes.entry(vote.proposal_id).or_default();
-    if !votes.insert(genesis_key) {
+    // Check 3 (design doc §4.2): "not already cast" — a READ-ONLY lookup.
+    // The actual insert is deferred to AFTER the signature check below, so
+    // an invalid-signature vote can never poison the votes set and cause a
+    // LATER genuinely-signed vote from the same genesis key to be wrongly
+    // reported as a duplicate.
+    let already_cast = update
+        .proposal_votes
+        .get(&vote.proposal_id)
+        .is_some_and(|votes| votes.contains(&genesis_key));
+    if already_cast {
         return Err(ByronUpdateError::VoteAlreadyCast);
     }
+
+    // Check 4, last (design doc §4.2): `verifySignatureDecoded ...
+    // \`orThrowError\` VotingInvalidSignature`.
+    if !verify_vote_signature(
+        &vote.voter_vk,
+        &vote.proposal_id_raw,
+        &vote.signature,
+        magic_cbor,
+    ) {
+        return Err(ByronUpdateError::InvalidSignature);
+    }
+
+    update
+        .proposal_votes
+        .entry(vote.proposal_id)
+        .or_default()
+        .insert(genesis_key);
 
     if !update.confirmed_proposals.contains_key(&vote.proposal_id) {
         let threshold = up_adpt_thd(num_gen_keys as u64, &update.adopted_protocol_parameters);
@@ -1544,6 +1875,16 @@ pub fn upiec_epoch_transition(
 /// `byronDelegation.count`), which is preferable to corrupting the whole
 /// replay over a Byron sub-rule this implementation may not have modelled
 /// byte-for-byte in some historical corner case.
+///
+/// # Signature-failure posture (issue #1092, design doc §8 item 4)
+///
+/// Unlike the STATE-rule violations above (always log-and-skip, both
+/// modes), an [`ByronDelegationError::InvalidSignature`] is escalated to a
+/// hard [`LedgerError`] in `ValidateAll` mode — matching upstream, where
+/// `Certificate.hs::isValid` is unconditional (§3.1). In `ApplyOnly` it
+/// keeps the same log-and-skip posture as every other rule here, per
+/// #1084's precedent.
+#[allow(clippy::too_many_arguments)]
 pub fn apply_delegation_payload(
     delegation: &mut ByronDelegationState,
     allowed_delegators: &BTreeSet<Hash28>,
@@ -1551,11 +1892,14 @@ pub fn apply_delegation_payload(
     current_slot: u64,
     current_epoch: u64,
     security_param_k: u64,
-) {
+    network_magic: u64,
+    mode: ByronApplyMode,
+) -> Result<(), LedgerError> {
+    let magic_cbor = network_magic_cbor(network_magic);
     for cert in &aux.dlg_certs {
         let issuer = byron_key_hash(&cert.issuer_vk);
         let delegate = byron_key_hash(&cert.delegate_vk);
-        if let Err(e) = schedule_delegation_cert(
+        match schedule_delegation_cert(
             delegation,
             allowed_delegators,
             current_slot,
@@ -1564,17 +1908,32 @@ pub fn apply_delegation_payload(
             cert.epoch,
             issuer,
             delegate,
+            &cert.issuer_vk,
+            &cert.delegate_vk,
+            &cert.epoch_raw,
+            &cert.signature,
+            &magic_cbor,
         ) {
-            tracing::warn!(
-                slot = current_slot,
-                issuer = %issuer.to_hex(),
-                error = %e,
-                "byron delegation certificate rejected by the scheduling rules — skipped"
-            );
+            Ok(()) => {}
+            Err(ByronDelegationError::InvalidSignature) if mode == ByronApplyMode::ValidateAll => {
+                return Err(LedgerError::ByronSignatureInvalid {
+                    slot: current_slot,
+                    kind: "delegation certificate".to_string(),
+                });
+            }
+            Err(e) => {
+                tracing::warn!(
+                    slot = current_slot,
+                    issuer = %issuer.to_hex(),
+                    error = %e,
+                    "byron delegation certificate rejected by the scheduling rules — skipped"
+                );
+            }
         }
     }
     // Tail of `updateDelegation`: tick immediately after scheduling.
     tick_delegation(delegation, current_slot, current_epoch);
+    Ok(())
 }
 
 /// Fold a block's `updPayload` into the update state (`Block/Validation.hs`
@@ -1602,6 +1961,14 @@ pub fn apply_delegation_payload(
 /// byte-for-byte in some historical corner is a lesser failure than
 /// desyncing the whole replay over `ByronSubState`, which nothing in
 /// validation or block production reads yet (design doc §3.6).
+///
+/// # Signature-failure posture (issue #1092, design doc §8 item 4)
+///
+/// Same split as [`apply_delegation_payload`]: state-rule violations always
+/// log-and-skip; a proposal/vote [`ByronUpdateError::InvalidSignature`] is
+/// escalated to a hard [`LedgerError`] in `ValidateAll` mode (upstream's
+/// `Registration.hs`/`Voting.hs` signature checks are unconditional, §4.1),
+/// and log-and-skip in `ApplyOnly`.
 #[allow(clippy::too_many_arguments)]
 pub fn apply_update_payload(
     update: &mut ByronUpdateState,
@@ -1610,28 +1977,61 @@ pub fn apply_update_payload(
     aux: &ByronBlockAux,
     current_slot: u64,
     security_param_k: u64,
-) {
+    network_magic: u64,
+    mode: ByronApplyMode,
+) -> Result<(), LedgerError> {
     let num_gen_keys = allowed_delegators.len();
+    let magic_cbor = network_magic_cbor(network_magic);
 
     if let Some(proposal) = &aux.upd_proposal {
-        if let Err(e) = register_proposal(update, delegation_map_rev, current_slot, proposal) {
-            tracing::warn!(
-                slot = current_slot,
-                up_id = %proposal.up_id.to_hex(),
-                error = %e,
-                "byron update proposal rejected by the registration rules — skipped"
-            );
+        match register_proposal(
+            update,
+            delegation_map_rev,
+            current_slot,
+            proposal,
+            &magic_cbor,
+        ) {
+            Ok(()) => {}
+            Err(ByronUpdateError::InvalidSignature) if mode == ByronApplyMode::ValidateAll => {
+                return Err(LedgerError::ByronSignatureInvalid {
+                    slot: current_slot,
+                    kind: "update proposal".to_string(),
+                });
+            }
+            Err(e) => {
+                tracing::warn!(
+                    slot = current_slot,
+                    up_id = %proposal.up_id.to_hex(),
+                    error = %e,
+                    "byron update proposal rejected by the registration rules — skipped"
+                );
+            }
         }
     }
     for vote in &aux.upd_votes {
-        if let Err(e) = register_vote(update, delegation_map_rev, num_gen_keys, current_slot, vote)
-        {
-            tracing::warn!(
-                slot = current_slot,
-                proposal_id = %vote.proposal_id.to_hex(),
-                error = %e,
-                "byron update vote rejected by the voting rules — skipped"
-            );
+        match register_vote(
+            update,
+            delegation_map_rev,
+            num_gen_keys,
+            current_slot,
+            vote,
+            &magic_cbor,
+        ) {
+            Ok(()) => {}
+            Err(ByronUpdateError::InvalidSignature) if mode == ByronApplyMode::ValidateAll => {
+                return Err(LedgerError::ByronSignatureInvalid {
+                    slot: current_slot,
+                    kind: "update vote".to_string(),
+                });
+            }
+            Err(e) => {
+                tracing::warn!(
+                    slot = current_slot,
+                    proposal_id = %vote.proposal_id.to_hex(),
+                    error = %e,
+                    "byron update vote rejected by the voting rules — skipped"
+                );
+            }
         }
     }
     // Every main block registers an endorsement of the protocol version its
@@ -1649,6 +2049,7 @@ pub fn apply_update_payload(
         aux.protocol_version,
         delegate_key_hash,
     );
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -2761,6 +3162,134 @@ mod byron_update_state_tests {
         vec![seed; 64]
     }
 
+    // -----------------------------------------------------------------------
+    // #1092: genuinely-signed test fixtures.
+    //
+    // `pk()` above returns a fake 64-byte fill pattern — fine as a HASH input
+    // (every state-rule test above needs only `byron_key_hash` identities,
+    // never a curve point), but not a valid Ed25519 public key, so it cannot
+    // be used to exercise the NEW signature checks. These helpers build a
+    // REAL keypair and sign the EXACT message production verifies (via the
+    // shared `build_*_message` functions, so a wire-format change can never
+    // make this file's own tests silently drift from what verification
+    // checks), matching the design doc's RED-proof requirement: reject a
+    // wrong key/corrupted signature/wrong message, accept a genuine one.
+    // -----------------------------------------------------------------------
+
+    /// A real Ed25519 keypair, distinct from `pk()`'s fake fill pattern.
+    /// `xpub` is the 64-byte extended key (32-byte real public key ‖
+    /// 32-byte arbitrary chain-code filler) — `verify_xsig` ignores the
+    /// chain code, matching `CC.verify`'s own behaviour (dugite-crypto's
+    /// `byron::tests::chain_code_bytes_do_not_affect_verification` proves
+    /// this at the primitive level; nothing here needs to re-prove it).
+    struct TestKeypair {
+        signing_key: ed25519_dalek::SigningKey,
+        xpub: [u8; 64],
+    }
+
+    impl TestKeypair {
+        fn new(seed: u8) -> Self {
+            let signing_key = ed25519_dalek::SigningKey::from_bytes(&[seed; 32]);
+            let mut xpub = [0u8; 64];
+            xpub[..32].copy_from_slice(signing_key.verifying_key().as_bytes());
+            xpub[32..].copy_from_slice(&[0xCC; 32]); // arbitrary chain code
+            TestKeypair { signing_key, xpub }
+        }
+
+        fn sign(&self, msg: &[u8]) -> Vec<u8> {
+            use ed25519_dalek::Signer as _;
+            self.signing_key.sign(msg).to_bytes().to_vec()
+        }
+    }
+
+    /// Test-network magic (an arbitrary non-mainnet value) and its CBOR
+    /// encoding, shared by every signed-fixture builder below.
+    const TEST_MAGIC: u64 = 42;
+    fn test_magic_cbor() -> Vec<u8> {
+        network_magic_cbor(TEST_MAGIC)
+    }
+
+    /// Build a genuinely-signed `ByronDlgCert`.
+    fn signed_dlg_cert(
+        issuer: &TestKeypair,
+        delegate_xpub: &[u8; 64],
+        epoch: u64,
+    ) -> dugite_primitives::block::ByronDlgCert {
+        let mut epoch_raw = Vec::new();
+        minicbor::encode(epoch, &mut epoch_raw).expect("u64 encode cannot fail");
+        let msg = build_dlg_cert_message(delegate_xpub, &epoch_raw, &test_magic_cbor());
+        dugite_primitives::block::ByronDlgCert {
+            epoch,
+            issuer_vk: issuer.xpub.to_vec(),
+            delegate_vk: delegate_xpub.to_vec(),
+            signature: issuer.sign(&msg),
+            epoch_raw,
+        }
+    }
+
+    /// Build a genuinely-signed [`GenesisHeavyDelegationCert`], reusing
+    /// [`signed_dlg_cert`]'s message construction.
+    fn signed_genesis_cert(
+        issuer: &TestKeypair,
+        issuer_hash: Hash28,
+        delegate: &TestKeypair,
+        delegate_hash: Hash28,
+        omega: u64,
+    ) -> GenesisHeavyDelegationCert {
+        let cert = signed_dlg_cert(issuer, &delegate.xpub, omega);
+        GenesisHeavyDelegationCert {
+            issuer: issuer_hash,
+            delegate: delegate_hash,
+            issuer_vk: cert.issuer_vk,
+            delegate_vk: cert.delegate_vk,
+            signature: cert.signature,
+            omega,
+        }
+    }
+
+    /// Build a genuinely-signed `ByronUpdProposal`. `body_span` must be the
+    /// EXACT bytes a real decode would capture (elements 0-4, no enclosing
+    /// array header) — callers construct it directly since these tests
+    /// don't decode real wire bytes.
+    fn signed_proposal(
+        proposer: &TestKeypair,
+        up_id: Hash32,
+        body_span: Vec<u8>,
+        protocol_version: (u16, u16, u8),
+        params_update: ByronParamsUpdate,
+        software_version: (String, u32),
+    ) -> ByronUpdProposal {
+        let msg = build_proposal_message(&body_span, &test_magic_cbor());
+        let encoded_len = body_span.len() as u64;
+        ByronUpdProposal {
+            up_id,
+            encoded_len,
+            protocol_version,
+            params_update,
+            software_version,
+            proposer_vk: proposer.xpub.to_vec(),
+            signature: proposer.sign(&msg),
+            body_span,
+        }
+    }
+
+    /// Build a genuinely-signed `ByronUpdVote`. `proposal_id_raw` must be
+    /// the exact CBOR wire bytes of the proposal id (a canonical 32-byte
+    /// bstr: `0x58 0x20 ‖ 32 bytes` — the header threshold means anything
+    /// below 24 bytes would use the short form instead, but 32 always uses
+    /// `0x58`).
+    fn signed_vote(voter: &TestKeypair, proposal_id: Hash32) -> ByronUpdVote {
+        let mut proposal_id_raw = vec![0x58, 0x20];
+        proposal_id_raw.extend_from_slice(proposal_id.as_bytes());
+        let msg = build_vote_message(&proposal_id_raw, &test_magic_cbor());
+        ByronUpdVote {
+            voter_vk: voter.xpub.to_vec(),
+            proposal_id,
+            signature: voter.sign(&msg),
+            proposal_id_raw,
+        }
+    }
+
     /// The exact mainnet Byron genesis `blockVersionData`, as read from a
     /// real mainnet `byron-genesis.json` (`cn-mainnet-config/`).
     fn mainnet_genesis_params() -> ByronProtocolParameters {
@@ -2790,25 +3319,51 @@ mod byron_update_state_tests {
 
     #[test]
     fn genesis_seeding_builds_identity_then_overlays_heavy_delegation() {
-        let g: Vec<Hash28> = (0..3u8).map(|i| byron_key_hash(&pk(i))).collect();
-        let d: Vec<Hash28> = (10..12u8).map(|i| byron_key_hash(&pk(i))).collect();
-        let allowed: BTreeSet<Hash28> = g.iter().copied().collect();
+        // #1092: `seed_byron_genesis` now signature-verifies every cert, so
+        // this needs REAL keypairs (`pk()`'s fake fill pattern is not a
+        // valid curve point) — see `TestKeypair`/`signed_genesis_cert`.
+        let g: Vec<TestKeypair> = (0..3u8).map(TestKeypair::new).collect();
+        let d: Vec<TestKeypair> = (10..12u8).map(TestKeypair::new).collect();
+        let g_hash: Vec<Hash28> = g.iter().map(|k| byron_key_hash(&k.xpub)).collect();
+        let d_hash: Vec<Hash28> = d.iter().map(|k| byron_key_hash(&k.xpub)).collect();
+        let allowed: BTreeSet<Hash28> = g_hash.iter().copied().collect();
         // g[0] delegates to d[0]; g[1] delegates to d[1]; g[2] never delegates.
-        let heavy = vec![(g[0], d[0]), (g[1], d[1])];
-        let sub = seed_byron_genesis(allowed, &heavy, mainnet_genesis_params());
+        let heavy = vec![
+            signed_genesis_cert(&g[0], g_hash[0], &d[0], d_hash[0], 0),
+            signed_genesis_cert(&g[1], g_hash[1], &d[1], d_hash[1], 0),
+        ];
+        let sub = seed_byron_genesis(allowed, &heavy, mainnet_genesis_params(), TEST_MAGIC);
 
-        assert_eq!(sub.delegation.delegation_map.get(&g[0]), Some(&d[0]));
-        assert_eq!(sub.delegation.delegation_map.get(&g[1]), Some(&d[1]));
+        assert_eq!(
+            sub.delegation.delegation_map.get(&g_hash[0]),
+            Some(&d_hash[0])
+        );
+        assert_eq!(
+            sub.delegation.delegation_map.get(&g_hash[1]),
+            Some(&d_hash[1])
+        );
         // g[2] keeps the identity mapping — never overridden.
-        assert_eq!(sub.delegation.delegation_map.get(&g[2]), Some(&g[2]));
-        assert_eq!(sub.delegation.delegation_map_rev.get(&d[0]), Some(&g[0]));
-        assert_eq!(sub.delegation.delegation_map_rev.get(&d[1]), Some(&g[1]));
-        assert_eq!(sub.delegation.delegation_map_rev.get(&g[2]), Some(&g[2]));
+        assert_eq!(
+            sub.delegation.delegation_map.get(&g_hash[2]),
+            Some(&g_hash[2])
+        );
+        assert_eq!(
+            sub.delegation.delegation_map_rev.get(&d_hash[0]),
+            Some(&g_hash[0])
+        );
+        assert_eq!(
+            sub.delegation.delegation_map_rev.get(&d_hash[1]),
+            Some(&g_hash[1])
+        );
+        assert_eq!(
+            sub.delegation.delegation_map_rev.get(&g_hash[2]),
+            Some(&g_hash[2])
+        );
         // The identity pairs for g[0]/g[1] must be GONE from the reverse map
         // — otherwise g[0]/g[1] would (wrongly) still resolve as their own
         // delegate too.
-        assert!(!sub.delegation.delegation_map_rev.contains_key(&g[0]));
-        assert!(!sub.delegation.delegation_map_rev.contains_key(&g[1]));
+        assert!(!sub.delegation.delegation_map_rev.contains_key(&g_hash[0]));
+        assert!(!sub.delegation.delegation_map_rev.contains_key(&g_hash[1]));
         assert_eq!(sub.update.current_epoch, 0, "§2.3: always 0 after seeding");
         assert_eq!(sub.update.adopted_protocol_version, (0, 0, 0));
     }
@@ -2818,6 +3373,8 @@ mod byron_update_state_tests {
         let allowed: BTreeSet<Hash28> = [byron_key_hash(&pk(0))].into_iter().collect();
         let mut state = ByronDelegationState::default();
         let not_genesis = byron_key_hash(&pk(99));
+        // NotGenesisKey fires before the signature check (check 1 of 5), so
+        // the signature material below is never read — garbage is fine.
         let err = schedule_delegation_cert(
             &mut state,
             &allowed,
@@ -2827,6 +3384,11 @@ mod byron_update_state_tests {
             0,
             not_genesis,
             byron_key_hash(&pk(1)),
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
         )
         .unwrap_err();
         assert_eq!(err, ByronDelegationError::NotGenesisKey);
@@ -2834,9 +3396,13 @@ mod byron_update_state_tests {
 
     #[test]
     fn schedule_delegation_cert_rejects_duplicate_epoch_issuer() {
-        let issuer = byron_key_hash(&pk(0));
+        let issuer_kp = TestKeypair::new(0);
+        let issuer = byron_key_hash(&issuer_kp.xpub);
         let allowed: BTreeSet<Hash28> = [issuer].into_iter().collect();
         let mut state = ByronDelegationState::default();
+        let delegate0 = TestKeypair::new(1);
+        let cert0 = signed_dlg_cert(&issuer_kp, &delegate0.xpub, 0);
+        let magic_cbor = test_magic_cbor();
         schedule_delegation_cert(
             &mut state,
             &allowed,
@@ -2845,9 +3411,16 @@ mod byron_update_state_tests {
             MAINNET_K,
             0,
             issuer,
-            byron_key_hash(&pk(1)),
+            byron_key_hash(&delegate0.xpub),
+            &cert0.issuer_vk,
+            &cert0.delegate_vk,
+            &cert0.epoch_raw,
+            &cert0.signature,
+            &magic_cbor,
         )
         .expect("first cert accepted");
+        // AlreadyDelegated fires before the signature check (check 3 of 5),
+        // so garbage signature material below is fine.
         let err = schedule_delegation_cert(
             &mut state,
             &allowed,
@@ -2857,6 +3430,11 @@ mod byron_update_state_tests {
             0,
             issuer,
             byron_key_hash(&pk(2)),
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
         )
         .unwrap_err();
         assert_eq!(err, ByronDelegationError::AlreadyDelegated);
@@ -2866,16 +3444,32 @@ mod byron_update_state_tests {
     /// reaches `S + 2k` — not one slot earlier (design doc §2.5).
     #[test]
     fn delegation_cert_activates_exactly_at_2k_not_before() {
-        let issuer = byron_key_hash(&pk(0));
-        let delegate = byron_key_hash(&pk(1));
+        let issuer_kp = TestKeypair::new(0);
+        let delegate_kp = TestKeypair::new(1);
+        let issuer = byron_key_hash(&issuer_kp.xpub);
+        let delegate = byron_key_hash(&delegate_kp.xpub);
         let allowed: BTreeSet<Hash28> = [issuer].into_iter().collect();
         let mut state = ByronDelegationState::default();
         state.delegation_map.insert(issuer, issuer);
         state.delegation_map_rev.insert(issuer, issuer);
         state.delegation_slots.insert(issuer, 0);
 
+        let cert = signed_dlg_cert(&issuer_kp, &delegate_kp.xpub, 0);
+        let magic_cbor = test_magic_cbor();
         schedule_delegation_cert(
-            &mut state, &allowed, 1000, 0, MAINNET_K, 0, issuer, delegate,
+            &mut state,
+            &allowed,
+            1000,
+            0,
+            MAINNET_K,
+            0,
+            issuer,
+            delegate,
+            &cert.issuer_vk,
+            &cert.delegate_vk,
+            &cert.epoch_raw,
+            &cert.signature,
+            &magic_cbor,
         )
         .expect("scheduled");
         let activation_slot = 1000 + 2 * MAINNET_K;
@@ -2907,30 +3501,37 @@ mod byron_update_state_tests {
     /// boundary whose first slot is >= candidate_slot + 4k.
     #[test]
     fn proposal_confirms_and_adopts_matching_mainnet_epoch_16_shape() {
-        let g: Vec<Hash28> = (0..7u8).map(|i| byron_key_hash(&pk(i))).collect();
-        let allowed: BTreeSet<Hash28> = g.iter().copied().collect();
-        let mut sub = seed_byron_genesis(allowed.clone(), &[], mainnet_genesis_params());
+        // #1092: `register_proposal`/`register_vote` now signature-verify,
+        // so the 7 genesis keys need to be REAL keypairs (`pk()`'s fake fill
+        // pattern is not a valid curve point) — see `TestKeypair`.
+        let g: Vec<TestKeypair> = (0..7u8).map(TestKeypair::new).collect();
+        let g_hash: Vec<Hash28> = g.iter().map(|k| byron_key_hash(&k.xpub)).collect();
+        let allowed: BTreeSet<Hash28> = g_hash.iter().copied().collect();
+        let mut sub =
+            seed_byron_genesis(allowed.clone(), &[], mainnet_genesis_params(), TEST_MAGIC);
         // Every genesis key starts at protocol version 0.0.0 per seeding;
         // bump to 1.0.0 so the proposal's 1.1.0 satisfies `pvCanFollow`.
         sub.update.adopted_protocol_version = (1, 0, 0);
+        let magic_cbor = test_magic_cbor();
 
-        let proposal = ByronUpdProposal {
-            up_id: Hash32::from_bytes([0xAA; 32]),
-            encoded_len: 200,
-            protocol_version: (1, 1, 0),
-            params_update: ByronParamsUpdate {
+        let proposal = signed_proposal(
+            &g[0],
+            Hash32::from_bytes([0xAA; 32]),
+            b"mainnet-epoch-16-shape body span placeholder".to_vec(),
+            (1, 1, 0),
+            ByronParamsUpdate {
                 max_tx_size: Some(65_536),
                 ..Default::default()
             },
-            software_version: ("cardano-sl".to_string(), 1),
-            proposer_vk: pk(0),
-        };
+            ("cardano-sl".to_string(), 1),
+        );
 
         register_proposal(
             &mut sub.update,
             &sub.delegation.delegation_map_rev,
             100,
             &proposal,
+            &magic_cbor,
         )
         .expect("registration must succeed");
         assert!(sub
@@ -2950,17 +3551,14 @@ mod byron_update_state_tests {
 
         // Votes from genesis keys 0..3 — the 4th (index 3) crosses floor(0.6*7)=4.
         for (i, slot) in (0u8..3).zip(101u64..104) {
-            let vote = ByronUpdVote {
-                voter_vk: pk(i),
-                proposal_id: proposal.up_id,
-                signature: Vec::new(),
-            };
+            let vote = signed_vote(&g[i as usize], proposal.up_id);
             register_vote(
                 &mut sub.update,
                 &sub.delegation.delegation_map_rev,
                 7,
                 slot,
                 &vote,
+                &magic_cbor,
             )
             .unwrap_or_else(|e| panic!("vote {i} must succeed: {e}"));
             assert!(
@@ -2969,17 +3567,14 @@ mod byron_update_state_tests {
                 i + 1
             );
         }
-        let vote4 = ByronUpdVote {
-            voter_vk: pk(3),
-            proposal_id: proposal.up_id,
-            signature: Vec::new(),
-        };
+        let vote4 = signed_vote(&g[3], proposal.up_id);
         register_vote(
             &mut sub.update,
             &sub.delegation.delegation_map_rev,
             7,
             104,
             &vote4,
+            &magic_cbor,
         )
         .expect("4th vote must succeed");
         assert_eq!(
@@ -2989,25 +3584,21 @@ mod byron_update_state_tests {
         );
 
         // A 5th vote from an already-registered voter is rejected...
-        let dup = ByronUpdVote {
-            voter_vk: pk(0),
-            proposal_id: proposal.up_id,
-            signature: Vec::new(),
-        };
+        let dup = signed_vote(&g[0], proposal.up_id);
         let err = register_vote(
             &mut sub.update,
             &sub.delegation.delegation_map_rev,
             7,
             105,
             &dup,
+            &magic_cbor,
         )
         .unwrap_err();
         assert_eq!(err, ByronUpdateError::VoteAlreadyCast);
 
         // Endorsements: not stable until confirmed_slot(104) + 2k(4320) = 4424.
         let endorse_stable_slot = 104 + 2 * MAINNET_K;
-        for i in 0..4u8 {
-            let issuer_hash = byron_key_hash(&pk(i));
+        for issuer_hash in g_hash.iter().take(4).copied() {
             register_endorsement(
                 &mut sub.update,
                 &sub.delegation.delegation_map_rev,
@@ -3023,8 +3614,7 @@ mod byron_update_state_tests {
             "must not create a candidate before stability (2k after confirmation)"
         );
 
-        for i in 0..4u8 {
-            let issuer_hash = byron_key_hash(&pk(i));
+        for issuer_hash in g_hash.iter().take(4).copied() {
             register_endorsement(
                 &mut sub.update,
                 &sub.delegation.delegation_map_rev,
@@ -3105,14 +3695,24 @@ mod byron_update_state_tests {
             },
             software_version: ("x".to_string(), 1),
             proposer_vk: pk(99), // not a genesis delegate
+            body_span: Vec::new(),
+            signature: Vec::new(),
         };
-        let err = register_proposal(&mut update, &delegation_map_rev, 100, &proposal).unwrap_err();
+        // NotGenesisDelegate fires before the signature check (check 1 of
+        // 2), so the body/signature above and `magic_cbor` below are never
+        // read — garbage/empty is fine.
+        let err =
+            register_proposal(&mut update, &delegation_map_rev, 100, &proposal, &[]).unwrap_err();
         assert_eq!(err, ByronUpdateError::NotGenesisDelegate);
     }
 
     #[test]
     fn register_proposal_rejects_tx_fee_policy_override() {
-        let g0 = byron_key_hash(&pk(0));
+        // #1092: the signature check (check 2) now runs BEFORE
+        // `UnsupportedTxFeePolicyOverride` (check 3), so the proposer needs
+        // a REAL keypair to reach the check this test targets.
+        let g0_kp = TestKeypair::new(0);
+        let g0 = byron_key_hash(&g0_kp.xpub);
         let mut delegation_map_rev = BTreeMap::new();
         delegation_map_rev.insert(g0, g0);
         let mut update = ByronUpdateState {
@@ -3128,24 +3728,34 @@ mod byron_update_state_tests {
             registered_endorsements: BTreeSet::new(),
             proposal_registration_slot: BTreeMap::new(),
         };
-        let proposal = ByronUpdProposal {
-            up_id: Hash32::from_bytes([0xCC; 32]),
-            encoded_len: 100,
-            protocol_version: (1, 1, 0),
-            params_update: ByronParamsUpdate {
+        let proposal = signed_proposal(
+            &g0_kp,
+            Hash32::from_bytes([0xCC; 32]),
+            b"tx-fee-policy-override body span placeholder".to_vec(),
+            (1, 1, 0),
+            ByronParamsUpdate {
                 tx_fee_policy: Some(vec![0x00]),
                 ..Default::default()
             },
-            software_version: ("x".to_string(), 1),
-            proposer_vk: pk(0),
-        };
-        let err = register_proposal(&mut update, &delegation_map_rev, 100, &proposal).unwrap_err();
+            ("x".to_string(), 1),
+        );
+        let err = register_proposal(
+            &mut update,
+            &delegation_map_rev,
+            100,
+            &proposal,
+            &test_magic_cbor(),
+        )
+        .unwrap_err();
         assert_eq!(err, ByronUpdateError::UnsupportedTxFeePolicyOverride);
     }
 
     #[test]
     fn register_proposal_rejects_null_update() {
-        let g0 = byron_key_hash(&pk(0));
+        // #1092: same reason as the tx-fee-policy test above — NullUpdate
+        // (check 4) is now reached only after the signature check (check 2).
+        let g0_kp = TestKeypair::new(0);
+        let g0 = byron_key_hash(&g0_kp.xpub);
         let mut delegation_map_rev = BTreeMap::new();
         delegation_map_rev.insert(g0, g0);
         let params = mainnet_genesis_params();
@@ -3170,15 +3780,22 @@ mod byron_update_state_tests {
             proposal_registration_slot: BTreeMap::new(),
         };
         // Same version, no parameter change, no new software version.
-        let proposal = ByronUpdProposal {
-            up_id: Hash32::from_bytes([0xDD; 32]),
-            encoded_len: 100,
-            protocol_version: (1, 0, 0),
-            params_update: ByronParamsUpdate::default(),
-            software_version: ("cardano-sl".to_string(), 0),
-            proposer_vk: pk(0),
-        };
-        let err = register_proposal(&mut update, &delegation_map_rev, 100, &proposal).unwrap_err();
+        let proposal = signed_proposal(
+            &g0_kp,
+            Hash32::from_bytes([0xDD; 32]),
+            b"null-update body span placeholder".to_vec(),
+            (1, 0, 0),
+            ByronParamsUpdate::default(),
+            ("cardano-sl".to_string(), 0),
+        );
+        let err = register_proposal(
+            &mut update,
+            &delegation_map_rev,
+            100,
+            &proposal,
+            &test_magic_cbor(),
+        )
+        .unwrap_err();
         assert_eq!(err, ByronUpdateError::NullUpdate);
     }
 
@@ -3243,5 +3860,436 @@ mod byron_update_state_tests {
         );
         assert!(update.registered_endorsements.is_empty());
         assert!(update.candidate_protocol_updates.is_empty());
+    }
+
+    // =========================================================================
+    // #1092: signature verification
+    // =========================================================================
+
+    /// Mainnet's real protocol magic — the sign-tag `network` bytes for
+    /// every test in this section that uses real mainnet genesis data.
+    const MAINNET_MAGIC: u64 = 764_824_073;
+
+    /// The design doc's named PRIMARY test vector (§6): "The 7 mainnet
+    /// `heavyDelegation` genesis certificates — offline, in-repo today
+    /// (`config/mainnet/byron-genesis.json`), epoch 0, canonical bytes."
+    /// This is the one test in this file grounded in real on-chain data
+    /// rather than a self-signed synthetic fixture: every one of these 7
+    /// certificates was accepted by every Byron node that has ever synced
+    /// mainnet, so a correct message construction MUST verify all 7 with no
+    /// chain sync required.
+    #[test]
+    fn mainnet_genesis_heavy_delegation_certs_verify() {
+        use base64::Engine;
+
+        let path = std::path::Path::new("../../config/mainnet/byron-genesis.json");
+        if !path.exists() {
+            return; // skip if config files not available (matches genesis.rs's convention)
+        }
+        let content = std::fs::read_to_string(path).expect("read mainnet byron-genesis.json");
+        let json: serde_json::Value =
+            serde_json::from_str(&content).expect("parse mainnet byron-genesis.json");
+        let heavy = json["heavyDelegation"]
+            .as_object()
+            .expect("heavyDelegation must be a JSON object");
+        assert_eq!(
+            heavy.len(),
+            7,
+            "mainnet has exactly 7 heavyDelegation certs"
+        );
+
+        let magic_cbor = network_magic_cbor(MAINNET_MAGIC);
+        for (issuer_hex, entry) in heavy {
+            let issuer_pk = base64::engine::general_purpose::STANDARD
+                .decode(entry["issuerPk"].as_str().expect("issuerPk is a string"))
+                .expect("issuerPk is valid base64");
+            let delegate_pk = base64::engine::general_purpose::STANDARD
+                .decode(
+                    entry["delegatePk"]
+                        .as_str()
+                        .expect("delegatePk is a string"),
+                )
+                .expect("delegatePk is valid base64");
+            let signature = hex::decode(entry["cert"].as_str().expect("cert is a string"))
+                .expect("cert is valid hex");
+            let omega = entry["omega"].as_u64().expect("omega is a u64");
+            assert_eq!(
+                omega, 0,
+                "every real genesis heavyDelegation cert has omega=0 (issuer {issuer_hex})"
+            );
+            assert_eq!(issuer_pk.len(), 64, "issuerPk must be a 64-byte XPub");
+            assert_eq!(delegate_pk.len(), 64, "delegatePk must be a 64-byte XPub");
+            assert_eq!(signature.len(), 64, "cert must be a 64-byte signature");
+
+            let mut epoch_bytes = Vec::new();
+            minicbor::encode(omega, &mut epoch_bytes).expect("u64 encode cannot fail");
+
+            assert!(
+                verify_dlg_cert_signature(
+                    &issuer_pk,
+                    &delegate_pk,
+                    &epoch_bytes,
+                    &signature,
+                    &magic_cbor,
+                ),
+                "mainnet genesis heavyDelegation cert for issuer {issuer_hex} must verify \
+                 — if this fails, the message construction in `build_dlg_cert_message` \
+                 disagrees with real on-chain data, not just a self-signed test fixture"
+            );
+        }
+    }
+
+    /// RED proof on the SAME real mainnet data as the test above: corrupting
+    /// one signature byte of a genuinely-issued certificate must reject.
+    #[test]
+    fn mainnet_genesis_heavy_delegation_cert_corrupted_signature_is_rejected() {
+        use base64::Engine;
+
+        let path = std::path::Path::new("../../config/mainnet/byron-genesis.json");
+        if !path.exists() {
+            return;
+        }
+        let content = std::fs::read_to_string(path).expect("read mainnet byron-genesis.json");
+        let json: serde_json::Value =
+            serde_json::from_str(&content).expect("parse mainnet byron-genesis.json");
+        let heavy = json["heavyDelegation"].as_object().unwrap();
+        let (_, entry) = heavy
+            .iter()
+            .next()
+            .expect("at least one heavyDelegation entry");
+
+        let issuer_pk = base64::engine::general_purpose::STANDARD
+            .decode(entry["issuerPk"].as_str().unwrap())
+            .unwrap();
+        let delegate_pk = base64::engine::general_purpose::STANDARD
+            .decode(entry["delegatePk"].as_str().unwrap())
+            .unwrap();
+        let mut signature = hex::decode(entry["cert"].as_str().unwrap()).unwrap();
+        signature[0] ^= 0x01; // corrupt one byte
+
+        let mut epoch_bytes = Vec::new();
+        minicbor::encode(0u64, &mut epoch_bytes).unwrap();
+        let magic_cbor = network_magic_cbor(MAINNET_MAGIC);
+
+        assert!(!verify_dlg_cert_signature(
+            &issuer_pk,
+            &delegate_pk,
+            &epoch_bytes,
+            &signature,
+            &magic_cbor,
+        ));
+    }
+
+    /// Design doc §3.2's exact worked example: "CBOR-bstr-header(2 + 64 +
+    /// len(epochBytes)) -- e.g. `0x58 0x43` for epoch 0" — `2 + 64 + 1 =
+    /// 67 = 0x43`, and 67 > 23 selects the one-byte-length form (`0x58`).
+    /// Pinned literally against `build_dlg_cert_message`'s actual output,
+    /// not just `cbor_bstr_header` in isolation.
+    #[test]
+    fn dlg_cert_message_bstr_header_matches_design_doc_epoch_0_example() {
+        let mut epoch_bytes = Vec::new();
+        minicbor::encode(0u64, &mut epoch_bytes).unwrap();
+        assert_eq!(epoch_bytes, vec![0x00], "canonical CBOR uint 0 is one byte");
+
+        let delegate_xpub = [0x11u8; 64];
+        let magic_cbor = vec![0x01]; // preprod, arbitrary for this check
+        let msg = build_dlg_cert_message(&delegate_xpub, &epoch_bytes, &magic_cbor);
+
+        // 0x0A (SignCertificate) ‖ magic(1) ‖ 0x58 0x43 (bstr header) ‖ payload(67)
+        assert_eq!(msg[0], 0x0A);
+        assert_eq!(&msg[1..2], &magic_cbor[..]);
+        assert_eq!(&msg[2..4], &[0x58, 0x43]);
+        assert_eq!(msg.len(), 1 + 1 + 2 + 67);
+        // payload = "00" ‖ delegate_xpub ‖ epoch_bytes
+        assert_eq!(&msg[4..6], b"00");
+        assert_eq!(&msg[6..70], &delegate_xpub[..]);
+        assert_eq!(&msg[70..], &epoch_bytes[..]);
+    }
+
+    /// Design doc §1.2's exact claimed byte sequences for the sign-tag
+    /// `network` bytes — pinned literally, not just spot-checked via a
+    /// round-trip, since a wrong-but-self-consistent encoding could pass
+    /// every other test in this file.
+    #[test]
+    fn network_magic_cbor_matches_design_doc_examples() {
+        assert_eq!(
+            network_magic_cbor(764_824_073), // mainnet
+            vec![0x1A, 0x2D, 0x96, 0x4A, 0x09]
+        );
+        assert_eq!(network_magic_cbor(1), vec![0x01]); // preprod
+        assert_eq!(network_magic_cbor(2), vec![0x02]); // preview
+    }
+
+    // -------------------------------------------------------------------------
+    // Synthetic RED/GREEN matrix: each of the four signed surfaces, each
+    // component of its message independently corrupted. The mainnet test
+    // above proves the message format matches real Byron on-chain data;
+    // these prove the WIRING (which bytes each `verify_*` function reads and
+    // in what role) is right, including surfaces mainnet's genesis file
+    // carries no example of (proposals, votes, block signatures).
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn verify_dlg_cert_signature_accepts_genuine_rejects_each_corruption() {
+        let issuer = TestKeypair::new(1);
+        let delegate = TestKeypair::new(2);
+        let other = TestKeypair::new(3);
+        let magic_cbor = test_magic_cbor();
+        let cert = signed_dlg_cert(&issuer, &delegate.xpub, 0);
+
+        assert!(verify_dlg_cert_signature(
+            &cert.issuer_vk,
+            &cert.delegate_vk,
+            &cert.epoch_raw,
+            &cert.signature,
+            &magic_cbor,
+        ));
+
+        // Wrong verifying key.
+        assert!(!verify_dlg_cert_signature(
+            &other.xpub,
+            &cert.delegate_vk,
+            &cert.epoch_raw,
+            &cert.signature,
+            &magic_cbor,
+        ));
+        // Wrong delegate (a message component).
+        assert!(!verify_dlg_cert_signature(
+            &cert.issuer_vk,
+            &other.xpub,
+            &cert.epoch_raw,
+            &cert.signature,
+            &magic_cbor,
+        ));
+        // Wrong epoch bytes (a message component).
+        let mut wrong_epoch = Vec::new();
+        minicbor::encode(1u64, &mut wrong_epoch).unwrap();
+        assert!(!verify_dlg_cert_signature(
+            &cert.issuer_vk,
+            &cert.delegate_vk,
+            &wrong_epoch,
+            &cert.signature,
+            &magic_cbor,
+        ));
+        // Corrupted signature.
+        let mut bad_sig = cert.signature.clone();
+        bad_sig[0] ^= 0xFF;
+        assert!(!verify_dlg_cert_signature(
+            &cert.issuer_vk,
+            &cert.delegate_vk,
+            &cert.epoch_raw,
+            &bad_sig,
+            &magic_cbor,
+        ));
+        // Wrong network magic (the message's tag suffix).
+        assert!(!verify_dlg_cert_signature(
+            &cert.issuer_vk,
+            &cert.delegate_vk,
+            &cert.epoch_raw,
+            &cert.signature,
+            &network_magic_cbor(MAINNET_MAGIC),
+        ));
+    }
+
+    #[test]
+    fn verify_proposal_signature_accepts_genuine_rejects_each_corruption() {
+        let proposer = TestKeypair::new(4);
+        let other = TestKeypair::new(5);
+        let body_span = b"real proposal body span bytes".to_vec();
+        let magic_cbor = test_magic_cbor();
+        let proposal = signed_proposal(
+            &proposer,
+            Hash32::from_bytes([0x22; 32]),
+            body_span.clone(),
+            (1, 1, 0),
+            ByronParamsUpdate::default(),
+            ("x".to_string(), 1),
+        );
+
+        assert!(verify_proposal_signature(
+            &proposal.proposer_vk,
+            &proposal.body_span,
+            &proposal.signature,
+            &magic_cbor,
+        ));
+        assert!(!verify_proposal_signature(
+            &other.xpub,
+            &proposal.body_span,
+            &proposal.signature,
+            &magic_cbor,
+        ));
+        assert!(!verify_proposal_signature(
+            &proposal.proposer_vk,
+            b"a different body span",
+            &proposal.signature,
+            &magic_cbor,
+        ));
+        let mut bad_sig = proposal.signature.clone();
+        bad_sig[0] ^= 0xFF;
+        assert!(!verify_proposal_signature(
+            &proposal.proposer_vk,
+            &proposal.body_span,
+            &bad_sig,
+            &magic_cbor,
+        ));
+        assert!(!verify_proposal_signature(
+            &proposal.proposer_vk,
+            &proposal.body_span,
+            &proposal.signature,
+            &network_magic_cbor(MAINNET_MAGIC),
+        ));
+    }
+
+    #[test]
+    fn verify_vote_signature_accepts_genuine_rejects_each_corruption() {
+        let voter = TestKeypair::new(6);
+        let other = TestKeypair::new(7);
+        let up_id = Hash32::from_bytes([0x33; 32]);
+        let other_up_id = Hash32::from_bytes([0x44; 32]);
+        let magic_cbor = test_magic_cbor();
+        let vote = signed_vote(&voter, up_id);
+
+        assert!(verify_vote_signature(
+            &vote.voter_vk,
+            &vote.proposal_id_raw,
+            &vote.signature,
+            &magic_cbor,
+        ));
+        assert!(!verify_vote_signature(
+            &other.xpub,
+            &vote.proposal_id_raw,
+            &vote.signature,
+            &magic_cbor,
+        ));
+        // A vote signed for a DIFFERENT proposal id must not verify against
+        // this one's raw bytes.
+        let other_vote = signed_vote(&voter, other_up_id);
+        assert!(!verify_vote_signature(
+            &vote.voter_vk,
+            &other_vote.proposal_id_raw,
+            &vote.signature,
+            &magic_cbor,
+        ));
+        let mut bad_sig = vote.signature.clone();
+        bad_sig[0] ^= 0xFF;
+        assert!(!verify_vote_signature(
+            &vote.voter_vk,
+            &vote.proposal_id_raw,
+            &bad_sig,
+            &magic_cbor,
+        ));
+        assert!(!verify_vote_signature(
+            &vote.voter_vk,
+            &vote.proposal_id_raw,
+            &vote.signature,
+            &network_magic_cbor(MAINNET_MAGIC),
+        ));
+    }
+
+    /// Build a signed `ByronBlockAux` fixture for [`verify_block_signature`]:
+    /// `genesis` is the header's CLAIMED (unauthenticated) genesis key,
+    /// `delegate` is the key that actually signs. Mirrors
+    /// `read_byron_block_sig`'s decode-time construction of
+    /// `block_signed_bytes` (design doc §2.2) with an arbitrary but fixed
+    /// payload, since these tests never decode real wire bytes.
+    fn signed_block_aux(genesis: &TestKeypair, delegate: &TestKeypair) -> ByronBlockAux {
+        let magic_cbor = test_magic_cbor();
+        let mut block_signed_bytes = vec![0x85u8];
+        block_signed_bytes.extend_from_slice(b"prev_hash+body_proof+slot_id+difficulty+extra");
+        let tag = dugite_crypto::byron::sign_tag_block(&genesis.xpub, &magic_cbor);
+        let mut msg = tag;
+        msg.extend_from_slice(&block_signed_bytes);
+        let block_signature = delegate.sign(&msg);
+        ByronBlockAux {
+            protocol_version: (1, 0, 0),
+            issuer_pubkey: genesis.xpub.to_vec(),
+            delegate_pubkey: delegate.xpub.to_vec(),
+            block_signature,
+            block_signed_bytes,
+            dlg_certs: Vec::new(),
+            upd_proposal: None,
+            upd_votes: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn verify_block_signature_accepts_genuine_registered_delegate() {
+        let genesis = TestKeypair::new(8);
+        let delegate = TestKeypair::new(9);
+        let aux = signed_block_aux(&genesis, &delegate);
+        let mut delegation_map_rev = BTreeMap::new();
+        delegation_map_rev.insert(
+            byron_key_hash(&delegate.xpub),
+            byron_key_hash(&genesis.xpub),
+        );
+
+        verify_block_signature(&aux, TEST_MAGIC, &delegation_map_rev, 1000)
+            .expect("genuine signature + registered delegate must verify");
+    }
+
+    #[test]
+    fn verify_block_signature_rejects_corrupted_signature() {
+        let genesis = TestKeypair::new(8);
+        let delegate = TestKeypair::new(9);
+        let mut aux = signed_block_aux(&genesis, &delegate);
+        aux.block_signature[0] ^= 0xFF;
+        let mut delegation_map_rev = BTreeMap::new();
+        delegation_map_rev.insert(
+            byron_key_hash(&delegate.xpub),
+            byron_key_hash(&genesis.xpub),
+        );
+
+        let err = verify_block_signature(&aux, TEST_MAGIC, &delegation_map_rev, 1000).unwrap_err();
+        assert!(matches!(err, LedgerError::ByronSignatureInvalid { .. }));
+    }
+
+    #[test]
+    fn verify_block_signature_rejects_tampered_signed_bytes() {
+        let genesis = TestKeypair::new(8);
+        let delegate = TestKeypair::new(9);
+        let mut aux = signed_block_aux(&genesis, &delegate);
+        // Tamper with the header content the signature covers, WITHOUT
+        // re-signing — simulates a body swapped under a genuine signature.
+        aux.block_signed_bytes[5] ^= 0xFF;
+        let mut delegation_map_rev = BTreeMap::new();
+        delegation_map_rev.insert(
+            byron_key_hash(&delegate.xpub),
+            byron_key_hash(&genesis.xpub),
+        );
+
+        let err = verify_block_signature(&aux, TEST_MAGIC, &delegation_map_rev, 1000).unwrap_err();
+        assert!(matches!(err, LedgerError::ByronSignatureInvalid { .. }));
+    }
+
+    #[test]
+    fn verify_block_signature_rejects_unregistered_delegate() {
+        // Signature verifies fine, but the delegate never appears in the
+        // ledger's activation map — design doc §2.1 step 3.
+        let genesis = TestKeypair::new(8);
+        let delegate = TestKeypair::new(9);
+        let aux = signed_block_aux(&genesis, &delegate);
+        let empty_delegation_map_rev = BTreeMap::new();
+
+        let err =
+            verify_block_signature(&aux, TEST_MAGIC, &empty_delegation_map_rev, 1000).unwrap_err();
+        assert!(matches!(err, LedgerError::ByronSignatureInvalid { .. }));
+    }
+
+    #[test]
+    fn verify_block_signature_rejects_wrong_network_magic() {
+        let genesis = TestKeypair::new(8);
+        let delegate = TestKeypair::new(9);
+        let aux = signed_block_aux(&genesis, &delegate);
+        let mut delegation_map_rev = BTreeMap::new();
+        delegation_map_rev.insert(
+            byron_key_hash(&delegate.xpub),
+            byron_key_hash(&genesis.xpub),
+        );
+
+        // Signed under TEST_MAGIC; verified against mainnet's magic — the
+        // tag differs, so the message differs, so it must reject.
+        let err =
+            verify_block_signature(&aux, MAINNET_MAGIC, &delegation_map_rev, 1000).unwrap_err();
+        assert!(matches!(err, LedgerError::ByronSignatureInvalid { .. }));
     }
 }
