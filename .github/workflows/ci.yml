@@ -21,9 +21,20 @@ jobs:
       # such guard's tag-gated branch silently never fires here — the exact
       # blindness that let xtask/tests/snapshot_one_bump_invariant.rs stay
       # green in CI while red on a real checkout.
+      #
+      # fetch-depth: 0 (full history): xtask/tests/qa_report_covers_shipped_code.rs
+      # walks commit ancestry (`git log -1 -- crates`, `git merge-base
+      # --is-ancestor`) between the QA report's recorded git_rev and the
+      # newest commit touching crates/. A shallow clone (the default
+      # fetch-depth: 1, unaffected by fetch-tags alone) carries only the tip
+      # commit, so any older commit — including the report's own git_rev one
+      # commit back — is invisible and the ancestry check fails with "not a
+      # commit in this repository", not the staleness verdict it exists to
+      # report.
       - uses: actions/checkout@v7
         with:
           fetch-tags: true
+          fetch-depth: 0
 
       - name: Install protoc
         # dugite-rpc's build.rs invokes tonic-build → prost-build → protoc to
@@ -150,7 +161,11 @@ jobs:
   coverage:
     runs-on: ubuntu-latest
     steps:
+      # fetch-depth: 0 — see build-and-test's checkout step for why
+      # xtask/tests/qa_report_covers_shipped_code.rs needs full history.
       - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
 
       - name: Install protoc
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
