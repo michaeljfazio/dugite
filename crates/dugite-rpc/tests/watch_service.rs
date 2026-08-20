@@ -365,6 +365,7 @@ fn conway_block(slot: u64, block_no: u64, hash_byte: u8, txs: Vec<Transaction>) 
         transactions: txs,
         era: Era::Conway,
         raw_cbor: None,
+        byron: None,
     };
     let cbor = dugite_serialization::encode::encode_block(&block, &[]);
     let decoded =
