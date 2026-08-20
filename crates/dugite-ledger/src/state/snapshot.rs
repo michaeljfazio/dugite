@@ -539,7 +539,37 @@ impl LedgerState {
     //     extension. That guard is deleted (see its own final commit message
     //     for what replaces it); this comment block is now what future
     //     extensions append to instead, exactly as 37 and 38 did before it.
+    //
+    //     39 ALSO carries #1088: every map/set field reachable from
+    //     `LedgerStateSnapshot` now writes in key order (`BTreeMap`/`BTreeSet`,
+    //     or a `*Wire` mirror struct for a type shared with live state) instead
+    //     of whatever order `HashMap`/`imbl::HashMap` happened to iterate in.
+    //     Not a positional field-count change — a `HashMap<K,V>` and a
+    //     `BTreeMap<K,V>` holding the same entries decode identically either
+    //     way, since bincode's map decode just reads length + pairs and
+    //     inserts them — but it ships under 39 rather than as a drop-in fix
+    //     because it lands in the same re-sync as #1067/#1073/#1085 and
+    //     because "the bytes decode the same" is not the property that
+    //     matters here: TWO NODES with identical state used to write DIFFERENT
+    //     bytes, and that is now fixed for every reachable field, verified via
+    //     `snapshot_format_hash_stability` in
+    //     `crates/dugite-ledger/tests/snapshot_stability.rs`.
     pub(crate) const SNAPSHOT_VERSION: u8 = 39;
+
+    /// The current on-disk snapshot layout version.
+    ///
+    /// A thin public wrapper around [`Self::SNAPSHOT_VERSION`] (itself
+    /// `pub(crate)` so callers outside this crate cannot depend on the exact
+    /// number for anything other than the check below). Exists so
+    /// `crates/dugite-ledger/tests/snapshot_stability.rs` — an external
+    /// integration-test crate — can tie its pinned layout hash to the
+    /// version it was computed against, replacing
+    /// `xtask/tests/snapshot_one_bump_invariant.rs` (deleted: its `git
+    /// tag`-based mechanism was vacuous under CI's shallow checkouts, which
+    /// carry no tags). See that test for the full design.
+    pub fn snapshot_version() -> u8 {
+        Self::SNAPSHOT_VERSION
+    }
 
     /// Save ledger state snapshot to disk using bincode serialization.
     ///

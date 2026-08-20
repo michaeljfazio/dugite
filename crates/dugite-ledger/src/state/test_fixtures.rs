@@ -50,7 +50,9 @@ use dugite_primitives::transaction::{
     Anchor, Constitution, DRep, GovActionId, Voter, VotingProcedure,
 };
 
-use super::{DRepRegistration, LedgerState, Lovelace, PendingRewardUpdate, PoolRegistration};
+use super::{
+    DRepRegistration, LedgerState, Lovelace, PEdges, PendingRewardUpdate, PoolRegistration,
+};
 
 fn h28(b: u8) -> Hash28 {
     Hash28::from_bytes([b; 28])
@@ -60,18 +62,22 @@ fn h32(b: u8) -> Hash32 {
     Hash32::from_bytes([b; 32])
 }
 
-/// A non-trivial `NonMyopic`: one pool, a full-length `Likelihood` whose
+/// A non-trivial `NonMyopic`: **two** pools, full-length `Likelihood`s whose
 /// log-weights are all DIFFERENT, and a non-zero reward pot.
 ///
 /// The weights vary across the sample positions on purpose. A constant-filled
 /// `Likelihood` would serialize identically under a bincode layout change that
 /// reordered or resized the sequence, which is the exact blindness #967 exists
-/// to remove.
+/// to remove. Two pools (not one, #1088): `likelihoods` is a `HashMap`, and a
+/// single-entry map has nothing to reorder, so it cannot exercise the
+/// snapshot-ordering determinism guard.
 fn sample_non_myopic(pool_byte: u8, reward_pot: u64) -> super::non_myopic::NonMyopic {
     use super::non_myopic::{Likelihood, NonMyopic, SAMPLE_SIZE};
     let weights: Vec<f32> = (0..SAMPLE_SIZE).map(|i| -(i as f32) * 0.25).collect();
+    let weights2: Vec<f32> = (0..SAMPLE_SIZE).map(|i| -(i as f32) * 0.5 - 1.0).collect();
     let mut likelihoods = HashMap::new();
     likelihoods.insert(h28(pool_byte), Likelihood(weights));
+    likelihoods.insert(h28(pool_byte.wrapping_add(1)), Likelihood(weights2));
     NonMyopic {
         likelihoods,
         reward_pot: Lovelace(reward_pot),
@@ -103,15 +109,27 @@ pub fn populated_ledger_state() -> LedgerState {
         .genesis_delegates
         .insert(h28(0x01), (h28(0x02), h32(0x03)));
     state
+        .genesis_delegates
+        .insert(h28(0x07), (h28(0x08), h32(0x09)));
+    state
         .future_gen_delegs
         .insert((4_492_800, h28(0x04)), (h28(0x05), h32(0x06)));
+    state
+        .future_gen_delegs
+        .insert((4_492_900, h28(0x0a)), (h28(0x0b), h32(0x0c)));
 
     // ── UTxO sub-state ──────────────────────────────────────────────────
     state.utxo.epoch_fees = Lovelace(1_234_567);
     state.utxo.pending_donations = Lovelace(7_777);
 
     // ── cert sub-state ──────────────────────────────────────────────────
+    //
+    // Every map here carries TWO entries (#1088): with 0 or 1 entries there
+    // is nothing for a hash-ordered container to reorder, so a single-entry
+    // fixture cannot exercise the snapshot determinism guard — which is
+    // exactly how this test stayed green for years while the bug shipped.
     state.certs.delegations.insert(h32(0x10), h28(0x11));
+    state.certs.delegations.insert(h32(0x1a), h28(0x1b));
     let pool = PoolRegistration {
         pool_id: h28(0x11),
         vrf_keyhash: h32(0x12),
@@ -125,15 +143,37 @@ pub fn populated_ledger_state() -> LedgerState {
         metadata_url: Some("https://example.invalid/pool.json".to_string()),
         metadata_hash: Some(h32(0x14)),
     };
+    let pool2 = PoolRegistration {
+        pool_id: h28(0x1c),
+        vrf_keyhash: h32(0x1d),
+        pledge: Lovelace(250_000_000),
+        cost: Lovelace(170_000_000),
+        margin_numerator: 1,
+        margin_denominator: 50,
+        reward_account: vec![0xe0; 29],
+        owners: vec![h28(0x1e)],
+        relays: Vec::new(),
+        metadata_url: None,
+        metadata_hash: None,
+    };
     Arc::make_mut(&mut state.certs.pool_params).insert(h28(0x11), pool.clone());
+    Arc::make_mut(&mut state.certs.pool_params).insert(h28(0x1c), pool2.clone());
     state
         .certs
         .future_pool_params
         .insert(h28(0x11), pool.clone());
     state
         .certs
+        .future_pool_params
+        .insert(h28(0x1c), pool2.clone());
+    state
+        .certs
         .pending_retirements
         .insert(h28(0x15), EpochNo(320));
+    state
+        .certs
+        .pending_retirements
+        .insert(h28(0x1c), EpochNo(321));
     // `psVRFKeyHashes` — a count above one on purpose: that is the state a
     // pre-PV11 duplicate leaves behind, and a layout that only ever saw 1
     // would not exercise the field's width.
@@ -143,9 +183,15 @@ pub fn populated_ledger_state() -> LedgerState {
         .certs
         .reward_accounts
         .insert(h32(0x10), Lovelace(9_999));
+    state
+        .certs
+        .reward_accounts
+        .insert(h32(0x1a), Lovelace(4_242));
     state.certs.stake_key_deposits.insert(h32(0x10), 2_000_000);
+    state.certs.stake_key_deposits.insert(h32(0x1a), 3_000_000);
     state.certs.pool_deposits.insert(h28(0x11), 500_000_000);
-    state.certs.total_stake_key_deposits = 2_000_000;
+    state.certs.pool_deposits.insert(h28(0x1c), 500_000_000);
+    state.certs.total_stake_key_deposits = 5_000_000;
     state.certs.pointer_map.insert(
         dugite_primitives::credentials::Pointer {
             slot: 42,
@@ -154,14 +200,30 @@ pub fn populated_ledger_state() -> LedgerState {
         },
         h32(0x16),
     );
+    state.certs.pointer_map.insert(
+        dugite_primitives::credentials::Pointer {
+            slot: 44,
+            tx_index: 3,
+            cert_index: 4,
+        },
+        h32(0x1f),
+    );
     state
         .certs
         .stake_distribution
         .stake_map
         .insert(h32(0x10), Lovelace(1_000_000_000));
+    state
+        .certs
+        .stake_distribution
+        .stake_map
+        .insert(h32(0x1a), Lovelace(250_000_000));
     state.certs.script_stake_credentials.insert(h32(0x17));
+    state.certs.script_stake_credentials.insert(h32(0x1a));
     state.certs.pending_mir_reserves.insert(h32(0x18), 123);
+    state.certs.pending_mir_reserves.insert(h32(0x1a), 321);
     state.certs.pending_mir_treasury.insert(h32(0x19), -456);
+    state.certs.pending_mir_treasury.insert(h32(0x1a), -654);
     state.certs.pending_mir_delta_reserves = 789;
     state.certs.pending_mir_delta_treasury = -321;
 
@@ -177,8 +239,10 @@ pub fn populated_ledger_state() -> LedgerState {
     state.consensus.first_block_hash_of_epoch = Some(h32(0x28));
     state.consensus.prev_epoch_first_block_hash = Some(h32(0x29));
     Arc::make_mut(&mut state.consensus.epoch_blocks_by_pool).insert(h28(0x11), 21);
-    state.consensus.epoch_block_count = 21;
+    Arc::make_mut(&mut state.consensus.epoch_blocks_by_pool).insert(h28(0x1c), 9);
+    state.consensus.epoch_block_count = 30;
     state.consensus.opcert_counters.insert(h28(0x11), 7);
+    state.consensus.opcert_counters.insert(h28(0x1c), 3);
 
     // ── epoch sub-state ─────────────────────────────────────────────────
     state.epochs.treasury = Lovelace(3_347_997_655_395);
@@ -198,10 +262,19 @@ pub fn populated_ledger_state() -> LedgerState {
         },
         4_000_000,
     );
+    state.epochs.ptr_stake.insert(
+        dugite_primitives::credentials::Pointer {
+            slot: 45,
+            tx_index: 4,
+            cert_index: 5,
+        },
+        1_500_000,
+    );
     state.epochs.pending_reward_update = Some(PendingRewardUpdate {
         rewards: {
             let mut m = HashMap::new();
             m.insert(h32(0x10), Lovelace(100_000));
+            m.insert(h32(0x1a), Lovelace(50_000));
             m
         },
         delta_treasury: 42_000,
@@ -229,18 +302,28 @@ pub fn populated_ledger_state() -> LedgerState {
     state.epochs.rupd_addrs_rew = Some(Arc::new({
         let mut s = HashSet::new();
         s.insert(h32(0x10));
+        s.insert(h32(0x1a));
         s
     }));
     // Pre-Conway update proposals — BTreeMap so iteration order is fixed.
+    // Two entries even so: `EpochSnapshotsWire`'s sibling maps need the
+    // width and drift-proofing the whole fixture to one shape is simpler
+    // than special-casing the already-ordered fields.
     let ppu = dugite_primitives::transaction::ProtocolParamUpdate {
         min_fee_a: Some(44),
         ..Default::default()
     };
     let mut pending = BTreeMap::new();
-    pending.insert(EpochNo(318), vec![(h32(0x30), ppu.clone())]);
+    pending.insert(
+        EpochNo(318),
+        vec![(h32(0x30), ppu.clone()), (h32(0x32), ppu.clone())],
+    );
     state.epochs.pending_pp_updates = pending;
     let mut future = BTreeMap::new();
-    future.insert(EpochNo(319), vec![(h32(0x31), ppu)]);
+    future.insert(
+        EpochNo(319),
+        vec![(h32(0x31), ppu.clone()), (h32(0x33), ppu)],
+    );
     state.epochs.future_pp_updates = future;
 
     // mark / set / go, so `EpochSnapshots` and `StakeSnapshot` are both covered.
@@ -249,28 +332,33 @@ pub fn populated_ledger_state() -> LedgerState {
         delegations: Arc::new({
             let mut m = HashMap::new();
             m.insert(h32(0x10), h28(0x11));
+            m.insert(h32(0x1a), h28(0x1c));
             m
         }),
         pool_stake: {
             let mut m = HashMap::new();
             m.insert(h28(0x11), Lovelace(1_000_000_000));
+            m.insert(h28(0x1c), Lovelace(250_000_000));
             m
         },
         pool_params: Arc::new({
             let mut m = HashMap::new();
             m.insert(h28(0x11), pool);
+            m.insert(h28(0x1c), pool2);
             m
         }),
         stake_distribution: Arc::new({
             let mut m = HashMap::new();
             m.insert(h32(0x10), Lovelace(1_000_000_000));
+            m.insert(h32(0x1a), Lovelace(250_000_000));
             m
         }),
         epoch_fees: Lovelace(11_111),
-        epoch_block_count: 21,
+        epoch_block_count: 30,
         epoch_blocks_by_pool: Arc::new({
             let mut m = HashMap::new();
             m.insert(h28(0x11), 21);
+            m.insert(h28(0x1c), 9);
             m
         }),
     };
@@ -278,6 +366,13 @@ pub fn populated_ledger_state() -> LedgerState {
     state.epochs.snapshots.set = Some(snap.clone());
     state.epochs.snapshots.go = Some(snap);
     state.epochs.snapshots.ss_fee = Lovelace(22_222);
+    state.epochs.snapshots.bprev_block_count = 30;
+    state.epochs.snapshots.bprev_blocks_by_pool = Arc::new({
+        let mut m = HashMap::new();
+        m.insert(h28(0x11), 21);
+        m.insert(h28(0x1c), 9);
+        m
+    });
 
     // ── governance sub-state ────────────────────────────────────────────
     let gov = Arc::make_mut(&mut state.gov.governance);
@@ -294,23 +389,84 @@ pub fn populated_ledger_state() -> LedgerState {
             registered_epoch: EpochNo(310),
             drep_expiry: EpochNo(330),
             active: true,
+            // Two delegators on purpose (#1088): `DRepRegistration.delegs`
+            // is a set nested one level below `dreps`' own keys, and a
+            // single-entry set is invisible to the width check the outer
+            // map's `at_least_two!` cannot see.
             delegs: {
                 let mut s = imbl::HashSet::new();
                 s.insert(h32(0x71));
+                s.insert(h32(0x74));
+                s
+            },
+        },
+    );
+    gov.dreps.insert(
+        h32(0x48),
+        DRepRegistration {
+            credential: dugite_primitives::credentials::Credential::VerificationKey(h28(0x48)),
+            deposit: Lovelace(500_000_000),
+            anchor: None,
+            registered_epoch: EpochNo(311),
+            drep_expiry: EpochNo(331),
+            active: true,
+            delegs: {
+                let mut s = imbl::HashSet::new();
+                s.insert(h32(0x75));
                 s
             },
         },
     );
     gov.vote_delegations
         .insert(h32(0x10), DRep::KeyHash(h32(0x41)));
+    gov.vote_delegations
+        .insert(h32(0x1a), DRep::KeyHash(h32(0x48)));
     gov.committee_hot_keys.insert(h32(0x42), h32(0x43));
+    gov.committee_hot_keys.insert(h32(0x4a), h32(0x4b));
     gov.committee_expiration.insert(h32(0x42), EpochNo(400));
+    gov.committee_expiration.insert(h32(0x4a), EpochNo(410));
     gov.committee_resigned
         .insert(h32(0x44), Some(anchor.clone()));
+    // A `None` second entry: `Option<Anchor>` is the map's VALUE type and
+    // both arms should be exercised, not just `Some`.
+    gov.committee_resigned.insert(h32(0x4c), None);
     gov.script_committee_credentials.insert(h32(0x45));
+    gov.script_committee_credentials.insert(h32(0x4d));
     gov.script_committee_hot_credentials.insert(h32(0x46));
-    gov.drep_registration_count = 1;
-    gov.proposal_count = 1;
+    gov.script_committee_hot_credentials.insert(h32(0x4e));
+    // `proposal_graph` — one purpose tree (PParam) with two nodes, so
+    // `PGraph.nodes` (an `ImblHashMap`, #1088) is exercised at least once.
+    // The other three purposes (hard_fork/committee/constitution) stay
+    // empty, matching how a real chain rarely has deep trees in every
+    // purpose simultaneously.
+    gov.proposal_graph.pparam.nodes.insert(
+        GovActionId {
+            transaction_id: h32(0x58),
+            action_index: 0,
+        },
+        PEdges {
+            parent: Some(GovActionId {
+                transaction_id: h32(0x56),
+                action_index: 0,
+            }),
+            children: imbl::OrdSet::new(),
+        },
+    );
+    gov.proposal_graph.pparam.nodes.insert(
+        GovActionId {
+            transaction_id: h32(0x59),
+            action_index: 0,
+        },
+        PEdges {
+            parent: Some(GovActionId {
+                transaction_id: h32(0x56),
+                action_index: 0,
+            }),
+            children: imbl::OrdSet::new(),
+        },
+    );
+    gov.drep_registration_count = 2;
+    gov.proposal_count = 2;
     gov.constitution = Some(Constitution {
         anchor: anchor.clone(),
         script_hash: Some(h28(0x47)),
@@ -339,7 +495,22 @@ pub fn populated_ledger_state() -> LedgerState {
             )),
             VotingProcedure {
                 vote: dugite_primitives::transaction::Vote::Yes,
-                anchor: Some(anchor),
+                anchor: Some(anchor.clone()),
+            },
+        );
+        m
+    });
+    // A second action id (#1088): `votes_by_action` is `ImblOrdMap`-keyed so
+    // it was never nondeterministic, but every collection here otherwise
+    // carries 2+ entries and there is no reason for this one to be the
+    // exception.
+    gov.votes_by_action.insert(gid(0x5b), {
+        let mut m = imbl::OrdMap::new();
+        m.insert(
+            Voter::StakePool(h32(0x59)),
+            VotingProcedure {
+                vote: dugite_primitives::transaction::Vote::No,
+                anchor: None,
             },
         );
         m
@@ -379,6 +550,28 @@ pub fn populated_ledger_state() -> LedgerState {
             submission_index: 7,
         },
     );
+    // A second proposal (#1088): `proposals` is `ImblOrdMap`-keyed (never
+    // nondeterministic) but every other collection here carries 2+ entries.
+    gov.proposals.insert(
+        gid(0x5a),
+        super::ProposalState {
+            procedure: dugite_primitives::transaction::ProposalProcedure {
+                deposit: Lovelace(50_000_000_000),
+                return_addr: vec![0xe0; 29],
+                gov_action: dugite_primitives::transaction::GovAction::InfoAction,
+                anchor: Anchor {
+                    url: "https://example.invalid/proposal-2.json".to_string(),
+                    data_hash: h32(0x5c),
+                },
+            },
+            proposed_epoch: EpochNo(316),
+            expires_epoch: EpochNo(321),
+            yes_votes: 1,
+            no_votes: 4,
+            abstain_votes: 0,
+            submission_index: 8,
+        },
+    );
 
     // Freeze the pulser LAST, so its snapshot captures the populated governance
     // state above rather than an empty one. #966 added `treasury` to it and
@@ -396,6 +589,9 @@ pub fn populated_ledger_state() -> LedgerState {
             .as_mut()
             .expect("the fixture must carry a frozen pulser");
         pulser.snapshot.drep_distr.insert(h32(0x41), 1_000_000);
+        // A second entry (#1088): `drep_distr` is an `ImblHashMap` and a
+        // single credential leaves it with nothing to reorder.
+        pulser.snapshot.drep_distr.insert(h32(0x48), 750_000);
         // Frozen `dpDRepState`. Two entries on purpose, straddling the
         // consumption epoch, so the fixture exercises both arms of
         // `drep_is_expired` rather than only the live one.
@@ -424,6 +620,7 @@ pub fn populated_ledger_state() -> LedgerState {
                 committee_expiration: {
                     let mut m = imbl::HashMap::new();
                     m.insert(h32(0x66), EpochNo(400));
+                    m.insert(h32(0x69), EpochNo(401));
                     m
                 },
                 committee_threshold: Some(dugite_primitives::transaction::Rational {

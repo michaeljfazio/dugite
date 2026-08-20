@@ -147,7 +147,17 @@ fn snapshot_format_hash_stability() {
     // `psVRFKeyHashes`, the occurrence count that makes the PV11
     // duplicate-VRF-key rejection possible. Also not derivable: POOLREAP
     // deletes a superseded key outright even when another pool still holds it.
-    const EXPECTED_HASH: &str = "31b8e00a73cff022c544943c4c7cbf53053ed3e5694891f6f9822fbfe8a7c479";
+    //
+    // #1088 (SNAPSHOT 39, same version as #1067/#1073/#1085 — see
+    // `state/snapshot.rs`'s SNAPSHOT_VERSION comment) moves this hash for a
+    // DIFFERENT reason than every entry above: not a field added or moved,
+    // but the FIXTURE widened. Every map/set field in `test_fixtures.rs` now
+    // carries 2+ entries instead of ≤1, because a hash-ordered container
+    // with 0 or 1 entries has nothing to reorder — the exact blindness that
+    // let this test stay green for years while `imbl::HashMap`/`HashMap`
+    // fields serialized in RANDOMIZED order. See `EXPECTED_SNAPSHOT_VERSION`
+    // below for the guard this pairs with.
+    const EXPECTED_HASH: &str = "e3f85424803c58e66691144fbff3d6289dc37702fb07ef263c88358cc89ffbef";
 
     if EXPECTED_HASH == "COMPUTE_ON_FIRST_RUN" {
         panic!(
@@ -157,12 +167,103 @@ fn snapshot_format_hash_stability() {
     }
 
     assert_eq!(
-        hash_hex, EXPECTED_HASH,
-        "LedgerState serialization format changed — existing snapshots will be incompatible.\n\
-         If this change was intentional, update EXPECTED_HASH to: {hash_hex}\n\
-         AND bump SNAPSHOT_VERSION in state/mod.rs — unless all you changed was\n\
-         the fixture in state/test_fixtures.rs, which moves this hash without\n\
-         touching the on-disk format."
+        hash_hex,
+        EXPECTED_HASH,
+        "LedgerStateSnapshot layout for SNAPSHOT_VERSION {} changed.\n\
+         \n\
+         If this is a genuine format change: bump SNAPSHOT_VERSION in \
+         state/snapshot.rs AND update BOTH EXPECTED_HASH and \
+         EXPECTED_SNAPSHOT_VERSION in this test to match — two different \
+         layouts must never share one SNAPSHOT_VERSION number (that is what \
+         `xtask/tests/snapshot_one_bump_invariant.rs` used to catch via `git \
+         tag`, and what this pair of constants catches instead, without \
+         needing tags or a non-shallow clone).\n\
+         \n\
+         If this is a fixture-only change (test_fixtures.rs gained or \
+         changed a value with no LedgerStateSnapshot field/type change): \
+         update EXPECTED_HASH alone.\n\
+         \n\
+         New hash: {hash_hex}",
+        dugite_ledger::LedgerState::snapshot_version(),
+    );
+}
+
+/// The `SNAPSHOT_VERSION` [`EXPECTED_HASH`] above was computed against.
+///
+/// This is the direct replacement for
+/// `xtask/tests/snapshot_one_bump_invariant.rs` (deleted — its `git
+/// tag`-based mechanism for detecting "two different `LedgerStateSnapshot`
+/// layouts both claiming the same `SNAPSHOT_VERSION`" was vacuous under CI's
+/// shallow `actions/checkout`, which fetches no tags, so the guard had been
+/// silently passing on every push since the day it was written).
+///
+/// The replacement needs no tags and works identically at any clone depth:
+/// it pins the hash AND the version number it describes side by side, in one
+/// commit, by a human. If `SNAPSHOT_VERSION` moves without this constant
+/// moving with it — in EITHER direction, a bump that forgot to update the
+/// pair or a layout change that forgot to bump — the assertion below fails
+/// with a message naming exactly what to do. `snapshot_format_hash_stability`
+/// itself is the layout guard `#1088`'s fix makes trustworthy: before that
+/// fix, a multi-entry map field made the hash vary between RUNS of identical
+/// code, so pinning a version number to it would have been pinning noise.
+#[test]
+fn snapshot_hash_is_pinned_to_the_current_snapshot_version() {
+    const EXPECTED_SNAPSHOT_VERSION: u8 = 39;
+
+    assert_eq!(
+        dugite_ledger::LedgerState::snapshot_version(),
+        EXPECTED_SNAPSHOT_VERSION,
+        "SNAPSHOT_VERSION changed ({EXPECTED_SNAPSHOT_VERSION} -> {}) without updating \
+         this test.\n\
+         \n\
+         Compute the new layout hash from `snapshot_format_hash_stability`'s failure \
+         message (or by temporarily setting its EXPECTED_HASH to a bogus value and \
+         re-running), then update BOTH `snapshot_format_hash_stability`'s EXPECTED_HASH \
+         and this test's EXPECTED_SNAPSHOT_VERSION together, in the same commit as the \
+         SNAPSHOT_VERSION bump.",
+        dugite_ledger::LedgerState::snapshot_version(),
+    );
+}
+
+/// Two INDEPENDENT serializations of logically identical state must produce
+/// byte-identical output (#1088) — this is the test that actually proves the
+/// fix, rather than re-asserting a fixed hash constant.
+///
+/// `snapshot_format_hash_stability` pins a single serialization's hash and
+/// so cannot, by itself, distinguish "this hash is deterministic" from "this
+/// hash happens to be what one process produced". The two calls below are
+/// enough to catch that gap WITHOUT a second hand-maintained fixture builder
+/// (which would have to be kept in sync with `populated_ledger_state`
+/// forever, and drift is exactly how #1088-shaped bugs hide): `std`'s
+/// `RandomState::new()` increments a thread-local counter on every call
+/// (`k0.wrapping_add(1)`, `library/std/src/collections/hash/map.rs`), so two
+/// SEPARATE `LedgerState::new()` calls in the same test process build their
+/// `HashMap`s from DIFFERENT seeds — same logical content, same insertion
+/// order, still a different underlying hash function per call. A
+/// `HashMap`/`imbl::HashMap` field that survived the ordering fix would
+/// therefore (overwhelmingly likely, across the ~40 affected fields) iterate
+/// differently between the two calls and produce different bytes.
+///
+/// Proven RED by disarming the fix before writing this test: reverting a
+/// single field's wire type from `BTreeMap` back to `HashMap` — see the
+/// commit history for #1088 — made this fail on the very first run, with no
+/// retry needed. A flaky RED here would mean the seed argument above does
+/// not hold in practice; it held.
+#[test]
+fn snapshot_bytes_are_independent_of_insertion_order() {
+    let state_a = dugite_ledger::state::test_fixtures::populated_ledger_state();
+    let state_b = dugite_ledger::state::test_fixtures::populated_ledger_state();
+
+    let bytes_a = bincode::serialize(&LedgerStateSnapshot::from(&state_a)).expect("serialize a");
+    let bytes_b = bincode::serialize(&LedgerStateSnapshot::from(&state_b)).expect("serialize b");
+
+    assert_eq!(
+        bytes_a, bytes_b,
+        "two independently-built LedgerState values with identical logical content \
+         serialized to DIFFERENT bytes — a map or set reachable from \
+         LedgerStateSnapshot is still writing in hash-iteration order instead of key \
+         order (std::collections::hash_map::RandomState reseeds every HashMap::new() \
+         call, so this catches it even within one process/thread)"
     );
 }
 
