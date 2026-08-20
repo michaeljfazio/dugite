@@ -74,6 +74,18 @@ fn hash32_padded_to_28_bytes(h: &dugite_primitives::hash::Hash32) -> Vec<u8> {
     h.as_ref()[..28].to_vec()
 }
 
+/// Order one credential's `rs` entries (#1071) the way Haskell's `Set Reward`
+/// does: leader before member, then ascending pool id.
+///
+/// Matches `dugite_ledger::state::reward_pulser::RewardEntry::ord_key`
+/// exactly — `is_member = false` (LeaderReward) sorts before `true`
+/// (MemberReward), so ascending on `is_member` directly is correct.
+/// Extracted (rather than left inline) so this can be unit-tested
+/// independently of a full `LedgerState`/`update_query_state` fixture.
+fn sort_reward_wire_entries(entries: &mut [crate::node::n2c_query::types::RewardWireEntry]) {
+    entries.sort_by(|a, b| (a.is_member, &a.pool_id).cmp(&(b.is_member, &b.pool_id)));
+}
+
 /// The `drepExpiry` value that `GetDRepState` must report for one DRep.
 ///
 /// Two distinct things are going on, and dugite previously did neither (#912).
@@ -1113,6 +1125,99 @@ impl Node {
                     reward_pot: ls.epochs.non_myopic.reward_pot.0,
                 }
             },
+            // `NewEpochState[4]` — nesRu (#1071). Query-time only: this reads
+            // the SAME frozen inputs the real boundary will use plus a CLONE
+            // of the in-flight fold, so it is pure and cannot affect what the
+            // boundary itself later computes. `compute_reward_update` is the
+            // ONE implementation of this arithmetic — reusing it here rather
+            // than re-deriving deltaT/deltaR/rs is what keeps this query from
+            // becoming a second, driftable copy (the #932/#938/#985 shape).
+            possible_reward_update: match &ls.epochs.rupd_snapshot {
+                Some(dugite_ledger::state::reward_pulser::PulsingRewUpdate::Complete(s)) => {
+                    let reward_accounts_std: std::collections::HashMap<_, _> = ls
+                        .certs
+                        .reward_accounts
+                        .iter()
+                        .map(|(k, v)| (*k, *v))
+                        .collect();
+                    let rupd = dugite_ledger::compute_reward_update(
+                        &ls.epochs.prev_protocol_params,
+                        &ls.epochs.prev_d,
+                        ls.epochs.prev_protocol_version_major,
+                        ls.epochs.snapshots.go.as_ref(),
+                        &ls.epochs.snapshots.bprev_blocks_by_pool,
+                        ls.epochs.snapshots.ss_fee,
+                        ls.epochs.reserves,
+                        ls.epochs.treasury,
+                        &reward_accounts_std,
+                        ls.epochs.rupd_addrs_rew.as_deref(),
+                        ls.epoch_length,
+                        ls.shelley_transition_epoch,
+                        ls.max_lovelace_supply,
+                        &ls.epochs.non_myopic,
+                        Some(s.monetary_step()),
+                        // The REAL boundary consumes this via `.take()`;
+                        // cloning here leaves it untouched for that consumer.
+                        ls.epochs.rupd_fold.fold.clone(),
+                    );
+
+                    let mut rs: Vec<(
+                        Vec<u8>,
+                        Vec<crate::node::n2c_query::types::RewardWireEntry>,
+                    )> = rupd
+                        .raw_rewards
+                        .iter()
+                        .map(|(cred, entries)| {
+                            let mut wire_entries: Vec<
+                                crate::node::n2c_query::types::RewardWireEntry,
+                            > = entries
+                                .iter()
+                                .map(|e| crate::node::n2c_query::types::RewardWireEntry {
+                                    is_member: e.is_member,
+                                    pool_id: e.pool_id.as_ref().to_vec(),
+                                    amount: e.amount,
+                                })
+                                .collect();
+                            sort_reward_wire_entries(&mut wire_entries);
+                            (cred.as_ref().to_vec(), wire_entries)
+                        })
+                        .collect();
+                    // The outer Map is also key-ordered upstream; a HashMap
+                    // iterated above would otherwise vary across runs.
+                    rs.sort_by(|a, b| a.0.cmp(&b.0));
+
+                    crate::node::n2c_query::types::PossibleRewardUpdateSnapshot::Complete(Box::new(
+                        crate::node::n2c_query::types::CompletedRewardUpdateSnapshot {
+                            delta_treasury: rupd.delta_treasury,
+                            delta_reserves: rupd.delta_reserves,
+                            // `deltaF = invert (toDeltaCoin feesSS)` —
+                            // `feesSS` is the FROZEN fee pot, i.e. `s.fees`,
+                            // not a live re-read of `snapshots.ss_fee` (the
+                            // two agree today, but only the frozen copy is
+                            // correct by construction).
+                            delta_fee: -(s.fees.0 as i128),
+                            rs,
+                            non_myopic: {
+                                let mut likelihoods: Vec<(Vec<u8>, Vec<f32>)> = rupd
+                                    .non_myopic
+                                    .likelihoods
+                                    .iter()
+                                    .map(|(pool_id, l)| (pool_id.as_ref().to_vec(), l.0.clone()))
+                                    .collect();
+                                likelihoods.sort_by(|a, b| a.0.cmp(&b.0));
+                                crate::node::n2c_query::types::NonMyopicSnapshot {
+                                    likelihoods,
+                                    reward_pot: rupd.non_myopic.reward_pot.0,
+                                }
+                            },
+                        },
+                    ))
+                }
+                // `None` (SNothing) and `Some(Pulsing(_))` both report
+                // `SNothing` on the wire — see `PossibleRewardUpdateSnapshot`'s
+                // doc for why `Pulsing` is not modeled.
+                _ => crate::node::n2c_query::types::PossibleRewardUpdateSnapshot::SNothing,
+            },
             constitution_url: ls
                 .gov
                 .governance
@@ -1683,6 +1788,50 @@ mod tests {
     // The N2C genesis-config response and several pparam fields require these
     // as `(num, den)` integer rationals — `float_to_rational` is the bridge.
     // Getting the bridge wrong silently changes pparams clients see.
+
+    // ─── sort_reward_wire_entries (#1071) ──────────────────────────────────
+
+    /// Leader-before-member, then ascending pool id — matching
+    /// `RewardEntry::ord_key` exactly. An earlier draft of this sort
+    /// inverted the `is_member` comparison (sorting member-before-leader);
+    /// this pins the correct direction so that mistake cannot silently
+    /// return.
+    #[test]
+    fn sort_reward_wire_entries_orders_leader_before_member_then_by_pool() {
+        use crate::node::n2c_query::types::RewardWireEntry;
+
+        let mut entries = vec![
+            RewardWireEntry {
+                is_member: true,
+                pool_id: vec![0x02],
+                amount: 1,
+            },
+            RewardWireEntry {
+                is_member: false,
+                pool_id: vec![0x99],
+                amount: 2,
+            },
+            RewardWireEntry {
+                is_member: true,
+                pool_id: vec![0x01],
+                amount: 3,
+            },
+        ];
+        super::sort_reward_wire_entries(&mut entries);
+
+        assert!(
+            !entries[0].is_member,
+            "the leader reward must sort first regardless of pool id"
+        );
+        assert_eq!(entries[0].pool_id, vec![0x99]);
+        assert!(entries[1].is_member && entries[2].is_member);
+        assert_eq!(
+            entries[1].pool_id,
+            vec![0x01],
+            "member entries break ties by ascending pool id"
+        );
+        assert_eq!(entries[2].pool_id, vec![0x02]);
+    }
 
     #[test]
     fn float_to_rational_handles_common_genesis_values() {

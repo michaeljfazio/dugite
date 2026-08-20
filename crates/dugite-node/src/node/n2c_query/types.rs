@@ -180,6 +180,8 @@ pub enum QueryResult {
         gen_delegs: Vec<(Vec<u8>, Vec<u8>, Vec<u8>)>,
         /// See [`QueryResult::DebugEpochState::non_myopic`].
         non_myopic: Box<NonMyopicSnapshot>,
+        /// `NewEpochState[4]` — `nesRu` (#1071). See [`PossibleRewardUpdateSnapshot`].
+        possible_reward_update: Box<PossibleRewardUpdateSnapshot>,
     },
     /// DebugChainDepState (tag 13): consensus chain-dependent state.
     ///
@@ -465,6 +467,76 @@ pub struct NonMyopicSnapshot {
     /// `rewardPotNM` in lovelace: `_R = rPot - deltaT1`, the pot AFTER the
     /// treasury cut.
     pub reward_pot: u64,
+}
+
+/// `NewEpochState[4]` — `nesRu :: StrictMaybe PulsingRewUpdate` (#1071).
+///
+/// ```haskell
+/// data PulsingRewUpdate = Pulsing !RewardSnapShot !Pulser | Complete !RewardUpdate
+/// encCBOR (Pulsing s p) = encode (Sum Pulsing 0 !> To s !> To p)
+/// encCBOR (Complete r)  = encode (Sum Complete 1 !> To r)
+/// ```
+///
+/// `SNothing` -> `array(0)`; `SJust (Complete r)` -> `array(1)[array(2)[1, r]]`,
+/// pinned against `tests/fixtures/nesru/complete-nonzero.hex`.
+///
+/// **`Pulsing` is deliberately NOT modeled.** Its payload (`Pulser =
+/// array(4)[pulseSize, FreeVars, balance, RewardAns]`) needs a per-pool
+/// `StakePoolSnapShot` (a DIFFERENT, 10-field record from `PoolParams`),
+/// `StakeWithDelegation`-keyed `balance`, and `Reward`-typed `RewardAns`
+/// entries — none of which dugite currently computes or stores anywhere,
+/// live or persisted. Fabricating plausible-looking bytes for it would be
+/// the #1057/#1067 mistake (a guessed shape reaching the wire) rather than
+/// the honest gap dugite reports today; reporting `SNothing` during the
+/// `Pulsing` sub-window is a smaller, explicit, and named simplification —
+/// see the doc on `encode_debug_new_epoch_state`'s `[4]` arm.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub enum PossibleRewardUpdateSnapshot {
+    /// `SNothing` — no pulser for the epoch in progress, OR the pulser is
+    /// still `Pulsing` (see the type doc for why that case is folded in here
+    /// rather than modeled).
+    #[default]
+    SNothing,
+    /// `SJust (Complete ru)` — the completed `RewardUpdate`.
+    Complete(Box<CompletedRewardUpdateSnapshot>),
+}
+
+/// Haskell `RewardUpdate` — the payload of `PossibleRewardUpdateSnapshot::Complete`.
+///
+/// ```haskell
+/// data RewardUpdate = RewardUpdate
+///   { deltaT :: !DeltaCoin, deltaR :: !DeltaCoin
+///   , rs :: !(Map (Credential 'Staking) (Set Reward))
+///   , deltaF :: !DeltaCoin, nonMyopic :: !NonMyopic }
+/// ```
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct CompletedRewardUpdateSnapshot {
+    /// `deltaT` — treasury increase (tau cut + undistributed).
+    pub delta_treasury: u64,
+    /// `deltaR` — signed reserves adjustment (Haskell `DeltaCoin`/`Integer`;
+    /// positive DEBITS reserves, matching dugite's own `PendingRewardUpdate`
+    /// sign convention, #796).
+    pub delta_reserves: i128,
+    /// `deltaF` — signed fee-pot drain. `-ssFee` at the freeze, matching what
+    /// `apply_pending_reward_update`'s sibling boundary code actually drains
+    /// from `utxosFees`.
+    pub delta_fee: i128,
+    /// `rs` — the UNAGGREGATED per-source reward entries, one `Vec` per
+    /// credential (Haskell's `Set Reward`), sorted by credential and, within
+    /// a credential, by `(is_member, pool_id)` — the same `Ord` that decides
+    /// `Set.deleteFindMin` at pv<=2 (see `RewardEntry::ord_key`).
+    pub rs: Vec<(Vec<u8>, Vec<RewardWireEntry>)>,
+    /// `nonMyopic` — the SAME shape `EpochState.esNonMyopic` uses.
+    pub non_myopic: NonMyopicSnapshot,
+}
+
+/// One element of `rs`'s `Set Reward` — Haskell `Reward`:
+/// `array(3)[rewardType (0=Member,1=Leader), rewardPool (28B), rewardAmount]`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RewardWireEntry {
+    pub is_member: bool,
+    pub pool_id: Vec<u8>,
+    pub amount: u64,
 }
 
 /// One `stakePoolsSnapShot` entry — the per-pool aggregate a snapshot carries.
@@ -1198,6 +1270,8 @@ pub struct NodeStateSnapshot {
     /// moved, so this snapshot copies what the ledger stored rather than
     /// recomputing anything.
     pub non_myopic: NonMyopicSnapshot,
+    /// `NewEpochState[4]` — `nesRu` (#1071). See [`PossibleRewardUpdateSnapshot`].
+    pub possible_reward_update: PossibleRewardUpdateSnapshot,
     /// Constitution anchor URL
     pub constitution_url: String,
     /// Constitution anchor data hash
@@ -1331,6 +1405,7 @@ impl Default for NodeStateSnapshot {
             committee: CommitteeSnapshot::default(),
             gen_delegs: Vec::new(),
             non_myopic: NonMyopicSnapshot::default(),
+            possible_reward_update: PossibleRewardUpdateSnapshot::default(),
             constitution_url: String::new(),
             constitution_hash: vec![0u8; 32],
             constitution_script: None,

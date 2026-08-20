@@ -465,6 +465,7 @@ pub(crate) fn handle_debug_new_epoch_state(state: &NodeStateSnapshot) -> QueryRe
         committee: Box::new(state.committee.clone()),
         gen_delegs: state.gen_delegs.clone(),
         non_myopic: Box::new(state.non_myopic.clone()),
+        possible_reward_update: Box::new(state.possible_reward_update.clone()),
     }
 }
 

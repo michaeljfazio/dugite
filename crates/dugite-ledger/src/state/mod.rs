@@ -293,6 +293,17 @@ pub struct PendingRewardUpdate {
     /// and `completeRupd` produces the merged record. Both halves travel
     /// together to the point of application.
     pub non_myopic: non_myopic::NonMyopic,
+    /// `rs` — Haskell `RewardUpdate.rs :: Map (Credential Staking) (Set
+    /// Reward)`, the UNAGGREGATED per-source reward entries. WIRE-ONLY
+    /// (#1071): `Self::rewards` above is what `apply_pending_reward_update`
+    /// actually credits (the aggregated per-credential total, which is the
+    /// only form consensus needs), so this is `#[serde(skip)]` — it is never
+    /// persisted and costs nothing on the path that matters. Populated by
+    /// `compute_reward_update`'s one true implementation so the N2C
+    /// `Complete` arm's `rs` field is never a second, independently
+    /// maintained copy of the aggregation logic.
+    #[serde(skip)]
+    pub raw_rewards: HashMap<Hash32, Vec<crate::state::reward_pulser::RewardEntry>>,
 }
 
 // ── Governance proposal priority forest types ─────────────────────────
@@ -1421,6 +1432,7 @@ impl LedgerState {
                 rupd_addrs_rew: None,           // #11: captured at startStep during apply
                 rupd_pulser_started: false,
                 rupd_monetary: None,
+                rupd_snapshot: None,
                 rupd_fold: Default::default(),
                 pending_avvm_return: 0,
             },
@@ -2020,6 +2032,7 @@ impl LedgerState {
                 rupd_addrs_rew: None, // #11: captured at startStep during apply
                 rupd_pulser_started: false,
                 rupd_monetary: None,
+                rupd_snapshot: None,
                 rupd_fold: Default::default(),
                 pending_avvm_return: 0,
             },

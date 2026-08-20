@@ -85,7 +85,11 @@ fn complete_is_sjust_array2_with_a_5_field_update() {
 ///                       , fvTotalStake uint 54003425994184880
 ///                       , fvProtVer    array(2)
 ///                       , fvPoolRewardInfo map(1) ]
-///   balance   = map(19)  Credential -> CompactCoin   <- THE WORK QUEUE
+///   balance   = map(19)  Credential -> StakeWithDelegation   <- THE WORK QUEUE
+///                        (array(2)[CompactForm Coin, pool KeyHash] — NOT a
+///                        bare CompactCoin; oracle-verified against
+///                        `Cardano.Ledger.State.Stake`, corrected from an
+///                        earlier draft of this comment)
 ///   RewardAns = array(2)[ map(1), map(1) ]           <- the answer so far
 /// ```
 ///
@@ -104,10 +108,25 @@ fn complete_is_sjust_array2_with_a_5_field_update() {
 ///
 /// The conclusion the misreading was cited for survives it, and is in fact
 /// stronger. BOTH `balance` (work remaining) and `RewardAns` (answer so far)
-/// are live fold state; neither exists in a node that computes the whole
-/// update at the boundary. So the `Pulsing` arm still cannot be emitted before
-/// incremental pulsing exists — the plan that put the wire arms in Phase 2 and
-/// pulsing in Phase 3 was wrong, for two reasons rather than one.
+/// are live fold state — which is why the plan that put the wire arms in
+/// Phase 2 and pulsing in Phase 3 was wrong, for two reasons rather than one.
+///
+/// **UPDATE (#1071): incremental pulsing IS production-wired now** —
+/// `reward_pulser::RewardFold`/`InFlightFold`, pulsed per block in
+/// `apply.rs`, differential-tested against a batch fold. The precondition
+/// this paragraph originally described no longer blocks the `Pulsing` arm.
+/// What still does is narrower: the Pulser's `FreeVars.fvPoolRewardInfo` is a
+/// `Map (KeyHash StakePool) PoolRewardInfo`, and `PoolRewardInfo.poolPs` is
+/// `StakePoolSnapShot` — a DIFFERENT, 10-field derived record from
+/// `PoolParams`, oracle-verified — that dugite's own `PoolRewardInfo` struct
+/// does not carry at all; `balance` needs `StakeWithDelegation`-keyed
+/// entries, not a bare stake amount; and `RewardAns` needs `Reward`-typed
+/// entries. None of that is missing because the FOLD doesn't run yet — it is
+/// missing because nothing computes or stores those specific shapes anywhere,
+/// live or persisted. `encode_possible_reward_update`
+/// (`dugite-node/src/node/n2c_query/encoding.rs`) implements `SNothing` and
+/// `Complete` fully; `Pulsing` still falls back to `SNothing` rather than
+/// fabricate that structure, and says so at the call site.
 #[test]
 fn the_pulser_carries_live_fold_state_not_a_summary() {
     let b = fixture("pulsing.hex");

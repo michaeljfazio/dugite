@@ -425,6 +425,16 @@ impl PulsingRewUpdate {
         }
     }
 
+    /// Mutable access to the frozen snapshot, for filling in `likelihoods` /
+    /// `leaders` once the per-pool table exists (they are not yet known at
+    /// the instant the freeze itself happens — see
+    /// `rewards::pulse_rupd_member_fold`).
+    pub fn snapshot_mut(&mut self) -> &mut RewardSnapShot {
+        match self {
+            PulsingRewUpdate::Pulsing(s) | PulsingRewUpdate::Complete(s) => s,
+        }
+    }
+
     /// `completeStep` — force the pulser to completion. Idempotent on
     /// `Complete`, matching `completeRupd (Complete x) = pure (x, mempty)`.
     pub fn complete(self) -> Self {
@@ -871,7 +881,7 @@ mod tests {
     fn sample_snapshot() -> RewardSnapShot {
         RewardSnapShot {
             fees: Lovelace(1_000),
-            protocol_version: 10,
+            protocol_version: (10, 0),
             non_myopic: super::super::non_myopic::NonMyopic::default(),
             delta_r1: Lovelace(3_000_000_000_000),
             r: Lovelace(2_400_000_000_800),
@@ -881,7 +891,7 @@ mod tests {
             free_vars: FreeVars {
                 addrs_rew: None,
                 total_stake: 1_000_000,
-                prot_ver: 10,
+                prot_ver: (10, 0),
             },
         }
     }
@@ -995,7 +1005,8 @@ pub struct FreeVars {
     /// `fvTotalStake` = `circulation es maxSupply` = `maxSupply - reserves`,
     /// read at the FREEZE instant, not at the boundary.
     pub total_stake: u64,
-    pub prot_ver: u64,
+    /// `fvProtVer` — `(major, minor)`, matching the wire's `array(2)`.
+    pub prot_ver: (u64, u64),
 }
 
 /// Haskell `RewardSnapShot` — everything `startStep` freezes, so the boundary
@@ -1013,7 +1024,8 @@ pub struct FreeVars {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct RewardSnapShot {
     pub fees: Lovelace,
-    pub protocol_version: u64,
+    /// `rewProtocolVersion` — `(major, minor)`, matching the wire's `array(2)`.
+    pub protocol_version: (u64, u64),
     pub non_myopic: super::non_myopic::NonMyopic,
     pub delta_r1: Lovelace,
     pub r: Lovelace,
@@ -1023,6 +1035,26 @@ pub struct RewardSnapShot {
     /// the member fold by `completeRupd`.
     pub leaders: HashMap<Hash32, Vec<RewardEntry>>,
     pub free_vars: FreeVars,
+}
+
+impl RewardSnapShot {
+    /// Reconstruct the [`MonetaryStep`] the freeze captured, for callers that
+    /// only need the four monetary scalars (`compute_reward_update`'s
+    /// `frozen_monetary` parameter).
+    ///
+    /// `expected_blocks` is NOT part of `RewardSnapShot` — it is a diagnostic
+    /// field of `MonetaryStep` alone (see that struct's doc) and
+    /// `compute_reward_update` never reads it, so `0` here is not a lossy
+    /// reconstruction of anything consensus-relevant.
+    pub fn monetary_step(&self) -> MonetaryStep {
+        MonetaryStep {
+            delta_r1: self.delta_r1.0,
+            delta_t1: self.delta_t1.0,
+            r: self.r.0,
+            expected_blocks: 0,
+            total_stake: self.free_vars.total_stake,
+        }
+    }
 }
 
 /// Haskell `PoolRewardInfo` — the per-pool terms computed ONCE, then read by

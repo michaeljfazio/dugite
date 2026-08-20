@@ -157,7 +157,15 @@ fn snapshot_format_hash_stability() {
     // let this test stay green for years while `imbl::HashMap`/`HashMap`
     // fields serialized in RANDOMIZED order. See `EXPECTED_SNAPSHOT_VERSION`
     // below for the guard this pairs with.
-    const EXPECTED_HASH: &str = "e3f85424803c58e66691144fbff3d6289dc37702fb07ef263c88358cc89ffbef";
+    //
+    // #1071 (SAME SNAPSHOT_VERSION 39): `EpochSubState` gains `rupd_snapshot`
+    // — the WIRE-ONLY `nesRu` mirror (`Option<PulsingRewUpdate>`), persisted
+    // alongside the existing `rupd_pulser_started`/`rupd_monetary` pair so a
+    // mid-epoch restart does not regress the N2C `Pulsing`/`Complete` arm to
+    // `SNothing`. 39 was bumped in anticipation of exactly this addition
+    // earlier in the same session (no released snapshot ever carried 39
+    // without it), so this is a hash-only update, not a further version bump.
+    const EXPECTED_HASH: &str = "48839e6b8429bfd9a7edb8ea40153fffcfcc58e6a4505d663b690a249e408d64";
 
     if EXPECTED_HASH == "COMPUTE_ON_FIRST_RUN" {
         panic!(
