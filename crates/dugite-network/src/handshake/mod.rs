@@ -207,6 +207,21 @@ pub async fn run_n2c_handshake_server(
     for &our_version in n2c::N2C_VERSIONS {
         if let Some(their_data) = remote_versions.get(&our_version) {
             if let Some(_accepted) = our_data.accept(their_data) {
+                // #1101: if the peer opened in query mode, reply with
+                // MsgQueryReply (our version table, tag 3) instead of
+                // MsgAcceptVersion and flag the result as `query` so the
+                // caller closes the connection — mirrors
+                // `run_n2n_handshake_server`'s #880 query-mode branch, which
+                // this function had never implemented.
+                if their_data.query {
+                    let msg = encode_query_reply_n2c(n2c::N2C_VERSIONS, our_data);
+                    channel.send(msg).await.map_err(HandshakeError::from)?;
+                    return Ok(HandshakeResult {
+                        version: our_version,
+                        simultaneous_open: false,
+                        query: true,
+                    });
+                }
                 let msg = encode_accept_version_n2c(our_version, our_data);
                 channel.send(msg).await.map_err(HandshakeError::from)?;
                 return Ok(HandshakeResult {
@@ -301,6 +316,29 @@ fn encode_query_reply_n2n(versions: &[u16], data: &N2NVersionData) -> Vec<u8> {
     enc.map(sorted_versions.len() as u64).expect("infallible");
     for v in &sorted_versions {
         enc.u16(*v).expect("infallible");
+        data.encode(&mut enc);
+    }
+    buf
+}
+
+/// Encode MsgQueryReply for N2C: `[3, {version: version_data, ...}]` (#1101).
+///
+/// Sent by the responder when the initiator opened the N2C handshake in query
+/// mode: mirrors `encode_query_reply_n2n`, carrying our full version table so
+/// the querying tool can enumerate supported versions, then the connection is
+/// closed. Versions are wire-encoded with bit-15 set, same as
+/// `encode_propose_versions_n2c`. Map keys MUST be sorted ascending
+/// (canonical CBOR).
+fn encode_query_reply_n2c(versions: &[u16], data: &N2CVersionData) -> Vec<u8> {
+    let mut buf = Vec::new();
+    let mut enc = Encoder::new(&mut buf);
+    enc.array(2).expect("infallible");
+    enc.u64(MSG_QUERY_REPLY).expect("infallible");
+    let mut sorted_versions: Vec<u16> = versions.to_vec();
+    sorted_versions.sort();
+    enc.map(sorted_versions.len() as u64).expect("infallible");
+    for v in &sorted_versions {
+        enc.u16(n2c::encode_n2c_version(*v)).expect("infallible");
         data.encode(&mut enc);
     }
     buf
@@ -861,6 +899,79 @@ mod tests {
         assert_eq!(map_len, 1);
         let wire_version = dec.u16().unwrap();
         assert_eq!(wire_version, 32784); // 16 | 0x8000
+    }
+
+    /// #1101: `run_n2c_handshake_server` never checked the client's `query`
+    /// flag and always replied with `MsgAcceptVersion`, unlike its N2N
+    /// sibling `run_n2n_handshake_server` (which has the correct branch —
+    /// see `query_mode_reply_roundtrip` above). Drives the REAL server
+    /// function through a `MuxChannel` backed by plain mpsc queues (the same
+    /// idiom used by every other protocol server test in this crate, e.g.
+    /// `peersharing::server::tests::make_test_channel`), sends a
+    /// `MsgProposeVersions` with `query = true`, and asserts the reply on the
+    /// wire is `MsgQueryReply` (tag 3) carrying the full `N2C_VERSIONS`
+    /// table — not a lone `MsgAcceptVersion` (tag 1).
+    #[tokio::test]
+    async fn n2c_query_mode_server_replies_with_query_reply() {
+        use bytes::Bytes;
+        use std::sync::atomic::AtomicUsize;
+        use std::sync::Arc;
+        use tokio::sync::mpsc;
+
+        let (egress_tx, mut egress_rx) = mpsc::channel(8);
+        let (ingress_tx, ingress_rx) = mpsc::channel(8);
+        let mut channel = MuxChannel::new(
+            0,
+            crate::mux::Direction::ResponderDir,
+            egress_tx,
+            ingress_rx,
+            65536,
+            Arc::new(AtomicUsize::new(0)),
+        );
+
+        let our_data = N2CVersionData::new(2);
+        let handle =
+            tokio::spawn(async move { run_n2c_handshake_server(&mut channel, &our_data).await });
+
+        // Client opens in query mode.
+        let their_data = N2CVersionData {
+            network_magic: 2,
+            query: true,
+        };
+        let proposal = encode_propose_versions_n2c(n2c::N2C_VERSIONS, &their_data);
+        ingress_tx.send(Bytes::from(proposal)).await.unwrap();
+
+        let result = handle.await.unwrap().unwrap();
+        assert!(
+            result.query,
+            "server must flag a query-mode handshake as such"
+        );
+
+        let reply = egress_rx.recv().await.expect("server must reply");
+        let mut dec = Decoder::new(&reply.2);
+        assert_eq!(dec.array().unwrap(), Some(2));
+        assert_eq!(
+            dec.u64().unwrap(),
+            MSG_QUERY_REPLY,
+            "N2C handshake server must answer a query-mode proposal with \
+             MsgQueryReply (tag 3), not MsgAcceptVersion (tag 1)"
+        );
+        let map_len = dec.map().unwrap().unwrap();
+        assert_eq!(
+            map_len,
+            n2c::N2C_VERSIONS.len() as u64,
+            "MsgQueryReply must carry the full supported-version table"
+        );
+        let mut seen = std::collections::BTreeSet::new();
+        for _ in 0..map_len {
+            let wire_version = dec.u16().unwrap();
+            seen.insert(n2c::decode_n2c_version(wire_version));
+            // Skip the version_data that follows each key.
+            let _ = N2CVersionData::decode(&mut dec).unwrap();
+        }
+        for &v in n2c::N2C_VERSIONS {
+            assert!(seen.contains(&v), "query reply missing version {v}");
+        }
     }
 
     #[test]
