@@ -288,6 +288,22 @@ pub struct ByronBlockAux {
     /// `heavyDelegation`), so on mainnet `issuer_pubkey` is never the correct
     /// endorsement key past slot 0.
     pub delegate_pubkey: Vec<u8>,
+    /// `block_sig`'s embedded `[2, [dlg_cert, signature]]` signature bytes —
+    /// the block's OWN Ed25519 signature (raw `XSignature`, 64 bytes),
+    /// verified with [`Self::delegate_pubkey`] as the key
+    /// (issue #1092, design doc §2.1/§2.5). Previously discarded at decode
+    /// time.
+    pub block_signature: Vec<u8>,
+    /// The exact bytes `Cardano.Chain.Block.Header::recoverSignedBytes`
+    /// signs, MINUS the leading `SignBlock` tag (issue #1092, design doc
+    /// §2.2): `0x85 ‖ raw(prev_hash) ‖ raw(body_proof) ‖ raw(slot_id) ‖
+    /// raw(difficulty) ‖ raw(extra_data)` — header fields 1 and 2,
+    /// consensus-data elements 0 and 2 (issuer_pubkey and block_sig are
+    /// EXCLUDED), and the whole extra-data array. `0x85` is a hardcoded
+    /// synthetic array(5) header, an "implementation artifact" upstream's
+    /// own comment names explicitly — not the real header's array(5) byte,
+    /// which is never part of the signed message.
+    pub block_signed_bytes: Vec<u8>,
     /// `dlgPayload` — heavyweight delegation certificates carried by this
     /// block, in wire order.
     pub dlg_certs: Vec<ByronDlgCert>,
@@ -302,9 +318,11 @@ pub struct ByronBlockAux {
 /// One `dlg` element of a Byron block's `dlgPayload`
 /// (`Cardano.Chain.Delegation.Certificate`).
 ///
-/// `certificate` is captured but never verified — Byron block/certificate
-/// signature verification is a separate, deliberately out-of-scope gap; see
-/// the design doc §3.6.
+/// `signature` is verified against `issuer_vk` and [`Self::epoch_raw`] via
+/// `dugite-ledger::eras::byron::schedule_delegation_cert`'s fifth check
+/// (`Certificate.hs::isValid`; issue #1092,
+/// `docs/superpowers/specs/2026-08-21-byron-signature-verification-design.md`
+/// §3.2).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ByronDlgCert {
     /// `omega` — the certificate's target epoch.
@@ -313,8 +331,16 @@ pub struct ByronDlgCert {
     pub issuer_vk: Vec<u8>,
     /// The delegate's 64-byte extended verification key.
     pub delegate_vk: Vec<u8>,
-    /// Raw certificate signature bytes (unverified — see above).
+    /// Raw certificate signature bytes.
     pub signature: Vec<u8>,
+    /// The raw CBOR wire bytes of the `epoch` element above (header +
+    /// payload), as actually received — NOT a re-encoding of [`Self::epoch`]
+    /// (issue #1092, design doc §3.2). `Certificate.hs::isValid` signs the
+    /// epoch's own `serialize'`d annotation, and Byron CBOR decoding accepts
+    /// non-canonical uints, so an on-chain certificate can be signed over a
+    /// non-canonical epoch encoding that a fresh re-encode of [`Self::epoch`]
+    /// would not reproduce.
+    pub epoch_raw: Vec<u8>,
 }
 
 /// A Byron protocol-parameter update PROPOSAL (`upprop`), the optional first
@@ -345,6 +371,19 @@ pub struct ByronUpdProposal {
     /// proposal whose `from` key does not resolve to a genesis key via the
     /// delegation map) — captured so that check is implementable.
     pub proposer_vk: Vec<u8>,
+    /// The raw CBOR wire bytes of wire elements 0-4 (`bver`, `bvermod`,
+    /// `softwareVersion`, `data`, `attributes`), WITHOUT any enclosing array
+    /// header — `Update.Proposal::recoverProposalSignedBytes`'s body
+    /// annotation, distinct from the whole-proposal span [`Self::up_id`]
+    /// hashes (the REAL wire array(7) header over elements 0-6). Issue
+    /// #1092, design doc §4.1: the signed message prepends a SYNTHETIC
+    /// `0x85` (a bare array(5) CBOR header byte, an "implementation
+    /// artifact" per upstream's own comment — this span never carried one on
+    /// the wire) to this span.
+    pub body_span: Vec<u8>,
+    /// Raw proposal signature bytes (issue #1092, design doc §4.1).
+    /// Previously discarded at decode time.
+    pub signature: Vec<u8>,
 }
 
 /// `bvermod` — Byron's sparse protocol-parameter update record. Every field
@@ -398,8 +437,16 @@ pub struct ByronUpdVote {
     pub voter_vk: Vec<u8>,
     /// The `UpId` of the proposal this vote confirms.
     pub proposal_id: Hash32,
-    /// Raw signature bytes (unverified — see [`ByronDlgCert::signature`]).
+    /// Raw signature bytes.
     pub signature: Vec<u8>,
+    /// The raw CBOR wire bytes of the `proposalId` element above (header +
+    /// 32-byte payload), as actually received — NOT a re-encoding of
+    /// [`Self::proposal_id`] (issue #1092, design doc §4.2).
+    /// `Vote.hs::recoverSignedBytes` signs `Binary.annotation $ aProposalId
+    /// v`, the element's own wire annotation; a non-canonical bstr header
+    /// (cborg accepts long-form headers) would not round-trip through a
+    /// fresh re-encode of the decoded `Hash32`.
+    pub proposal_id_raw: Vec<u8>,
 }
 
 impl Block {

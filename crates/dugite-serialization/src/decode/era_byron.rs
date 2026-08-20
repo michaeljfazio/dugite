@@ -385,6 +385,10 @@ fn read_bver(r: &mut Reader<'_>) -> Result<(u16, u16, u8), SerializationError> {
 
 /// Read one `dlg` element:
 /// `[epoch: u64, issuer: pubkey, delegate: pubkey, certificate: signature]`.
+///
+/// `epoch_raw` (issue #1092, design doc §3.2) captures the epoch element's
+/// raw wire bytes — `Certificate.hs::isValid` signs the epoch's own
+/// `serialize'`d annotation, not a fresh re-encode of the decoded `u64`.
 fn read_byron_dlg_cert(r: &mut Reader<'_>) -> Result<ByronDlgCert, SerializationError> {
     let n = r.read_array_header()?;
     if !matches!(n, Some(4)) {
@@ -392,7 +396,9 @@ fn read_byron_dlg_cert(r: &mut Reader<'_>) -> Result<ByronDlgCert, Serialization
             "byron dlg cert: expected array(4), got {n:?}"
         )));
     }
+    let epoch_start = r.position();
     let epoch = r.read_uint()?;
+    let epoch_raw = r.slice_from(epoch_start).to_vec();
     let issuer_vk = r.read_bytes_owned()?;
     let delegate_vk = r.read_bytes_owned()?;
     let signature = r.read_bytes_owned()?;
@@ -401,6 +407,7 @@ fn read_byron_dlg_cert(r: &mut Reader<'_>) -> Result<ByronDlgCert, Serialization
         issuer_vk,
         delegate_vk,
         signature,
+        epoch_raw,
     })
 }
 
@@ -424,10 +431,11 @@ fn read_byron_dlg_payload(r: &mut Reader<'_>) -> Result<Vec<ByronDlgCert>, Seria
 /// Returns the embedded certificate's DELEGATE key
 /// (`Delegation.delegateVK cert`) — this is upstream's
 /// `headerIssuer`/`blockIssuer` (`Header.hs:274-276`), NOT the raw
-/// `issuer_pubkey` read from consensus-data field 1. See
+/// `issuer_pubkey` read from consensus-data field 1 — see
 /// [`dugite_primitives::block::ByronBlockAux::delegate_pubkey`]'s doc for why
-/// the two are different fields.
-fn read_byron_block_sig(r: &mut Reader<'_>) -> Result<Vec<u8>, SerializationError> {
+/// the two are different fields — and the block's own signature bytes
+/// (issue #1092, design doc §2.5; previously discarded here).
+fn read_byron_block_sig(r: &mut Reader<'_>) -> Result<(Vec<u8>, Vec<u8>), SerializationError> {
     let outer = r.read_array_header()?;
     if !matches!(outer, Some(2)) {
         return Err(SerializationError::CborDecode(format!(
@@ -449,10 +457,8 @@ fn read_byron_block_sig(r: &mut Reader<'_>) -> Result<Vec<u8>, SerializationErro
     }
     let cert = read_byron_dlg_cert(r)?;
     // signature :: Signature ToSign — the block's own signature, raw bytes.
-    // Verification is a separate, deliberately out-of-scope gap (design doc
-    // §3.6), matching the posture already taken for `dlg_certs[].signature`.
-    let _signature = r.read_bytes_owned()?;
-    Ok(cert.delegate_vk)
+    let signature = r.read_bytes_owned()?;
+    Ok((cert.delegate_vk, signature))
 }
 
 /// Read `bvermod` — the 14-field sparse protocol-parameter update record.
@@ -534,6 +540,12 @@ fn read_byron_upprop(r: &mut Reader<'_>) -> Result<ByronUpdProposal, Serializati
             "byron upprop: expected array(7), got {n:?}"
         )));
     }
+    // `body_span` (issue #1092, design doc §4.1) starts HERE — right after
+    // the real array(7) header — and ends after `attributes` below, i.e.
+    // elements 0-4 only, matching `recoverProposalSignedBytes`'s body
+    // annotation (a DIFFERENT span from `up_id`'s, which starts at `start`
+    // above and covers all 7 elements plus the real header).
+    let body_start = r.position();
     let protocol_version = read_bver(r)?;
     let params_update = read_byron_bvermod(r)?;
     // softwareVersion = [text, u32]
@@ -553,11 +565,11 @@ fn read_byron_upprop(r: &mut Reader<'_>) -> Result<ByronUpdProposal, Serializati
     r.skip()?;
     // attributes — opaque, same reason.
     r.skip()?;
+    let body_span = r.slice_from(body_start).to_vec();
     // from: pubkey — the proposer's key (see doc comment above).
     let proposer_vk = r.read_bytes_owned()?;
-    // signature — unverified (Byron signature verification is out of scope;
-    // see the design doc §3.6).
-    r.skip()?;
+    // signature — captured (issue #1092, design doc §4.1; previously discarded).
+    let signature = r.read_bytes_owned()?;
 
     let raw = r.slice_from(start);
     let up_id = blake2b_256(raw);
@@ -570,6 +582,8 @@ fn read_byron_upprop(r: &mut Reader<'_>) -> Result<ByronUpdProposal, Serializati
         params_update,
         software_version: (sv_name, sv_number),
         proposer_vk,
+        body_span,
+        signature,
     })
 }
 
@@ -586,13 +600,19 @@ fn read_byron_upvote(r: &mut Reader<'_>) -> Result<ByronUpdVote, SerializationEr
         )));
     }
     let voter_vk = r.read_bytes_owned()?;
+    // proposalId — span captured (issue #1092, design doc §4.2): the vote
+    // signs the element's own raw wire bytes, header included, not a
+    // re-encode of the decoded `Hash32`.
+    let proposal_id_start = r.position();
     let proposal_id = read_hash32(r)?;
+    let proposal_id_raw = r.slice_from(proposal_id_start).to_vec();
     let _vote = r.read_bool()?;
     let signature = r.read_bytes_owned()?;
     Ok(ByronUpdVote {
         voter_vk,
         proposal_id,
         signature,
+        proposal_id_raw,
     })
 }
 
@@ -654,11 +674,17 @@ pub fn decode_byron_main_block(
     // field 0: protocol_magic (uint)
     let _protocol_magic = r.read_uint()?;
 
-    // field 1: prev_hash (32 bytes)
+    // field 1: prev_hash (32 bytes) — span captured for the block-signature
+    // message (issue #1092, design doc §2.2).
+    let prev_hash_start = r.position();
     let prev_hash = read_hash32(&mut r)?;
+    let prev_hash_raw = r.slice_from(prev_hash_start).to_vec();
 
-    // field 2: body_proof (skip)
+    // field 2: body_proof — span captured, value otherwise unused (the
+    // header-body proof binding check, §2.3, is tier B / out of scope).
+    let body_proof_start = r.position();
     r.skip()?;
+    let body_proof_raw = r.slice_from(body_proof_start).to_vec();
 
     // field 3: consensus_data = [slot_id, issuer_pubkey, difficulty, block_sig]
     //   slot_id = [epoch, rel_slot]
@@ -669,7 +695,10 @@ pub fn decode_byron_main_block(
             "byron main block consensus_data: expected array(4), got {cons_arr:?}"
         )));
     }
-    // slot_id = [epoch, rel_slot]
+    // slot_id = [epoch, rel_slot] — span captured (consensus-data element 0,
+    // part of the block-signature message; element 1, issuer_pubkey below,
+    // and element 3, block_sig, are EXCLUDED from that message).
+    let slot_id_start = r.position();
     let slot_id_arr = r.read_array_header()?;
     if !matches!(slot_id_arr, Some(2)) {
         return Err(SerializationError::CborDecode(format!(
@@ -678,15 +707,20 @@ pub fn decode_byron_main_block(
     }
     let epoch = r.read_uint()?;
     let rel_slot = r.read_uint()?;
+    let slot_id_raw = r.slice_from(slot_id_start).to_vec();
 
     // issuer_pubkey — the block issuer's 64-byte extended verification key.
     // Captured for `ByronBlockAux` (#1084), which keys the per-block update
-    // endorsement by it. NOT wired into `BlockHeader.issuer_vkey` — see the
-    // design doc §3.1's hazard note: that field feeds the Shelley `bprev`
-    // overlay-schedule read at the era seam and must stay empty for Byron.
+    // endorsement by it, and (#1092) is the GENESIS key the block-signature
+    // sign-tag is built from — see the design doc §3.1's hazard note: this
+    // is NOT wired into `BlockHeader.issuer_vkey`, which feeds the Shelley
+    // `bprev` overlay-schedule read at the era seam and must stay empty for
+    // Byron.
     let issuer_pubkey = r.read_bytes_owned()?;
 
-    // difficulty = [uint]
+    // difficulty = [uint] — span captured (consensus-data element 2, part of
+    // the block-signature message).
+    let difficulty_start = r.position();
     let diff_arr = r.read_array_header()?;
     if !matches!(diff_arr, Some(1)) {
         return Err(SerializationError::CborDecode(format!(
@@ -694,16 +728,20 @@ pub fn decode_byron_main_block(
         )));
     }
     let block_number = r.read_uint()?;
+    let difficulty_raw = r.slice_from(difficulty_start).to_vec();
 
     // block_sig = [2, [dlg_cert, signature]] — decoded (not skipped) as of
-    // this fix. The embedded certificate's DELEGATE key is `headerIssuer`
+    // #1084. The embedded certificate's DELEGATE key is `headerIssuer`
     // (`Header.hs:274-276`), which `apply_update_payload` must hash for this
-    // block's per-block update endorsement — NOT `issuer_pubkey` above.
-    // Certificate/block signature verification itself remains a separate,
-    // deliberately out-of-scope gap (design doc §3.6).
-    let delegate_pubkey = read_byron_block_sig(&mut r)?;
+    // block's per-block update endorsement — NOT `issuer_pubkey` above. The
+    // block's own signature bytes are now also captured (issue #1092,
+    // design doc §2.5) rather than discarded.
+    let (delegate_pubkey, block_signature) = read_byron_block_sig(&mut r)?;
 
     // field 4: extra_data = [blockVersion: bver, softwareVersion, attributes, extraProof]
+    // — span captured as a WHOLE (header included), matching the design
+    // doc §2.2's "the whole extra-data array(4)".
+    let extra_data_start = r.position();
     let ed_arr = r.read_array_header()?;
     if !matches!(ed_arr, Some(4)) {
         return Err(SerializationError::CborDecode(format!(
@@ -715,9 +753,28 @@ pub fn decode_byron_main_block(
     r.skip()?; // softwareVersion
     r.skip()?; // attributes
     r.skip()?; // extraProof
+    let extra_data_raw = r.slice_from(extra_data_start).to_vec();
 
     let header_raw = r.slice_from(header_start);
     let header_hash = byron_main_header_hash(header_raw);
+
+    // `Header.hs::recoverSignedBytes`'s payload, MINUS the leading
+    // `SignBlock` tag: the tag needs the network magic, which this decoder
+    // does not carry — the ledger-layer verifier prepends it (issue #1092,
+    // design doc §2.2).
+    let mut block_signed_bytes = Vec::with_capacity(
+        1 + prev_hash_raw.len()
+            + body_proof_raw.len()
+            + slot_id_raw.len()
+            + difficulty_raw.len()
+            + extra_data_raw.len(),
+    );
+    block_signed_bytes.push(0x85); // synthetic array(5) header, per upstream's own comment
+    block_signed_bytes.extend_from_slice(&prev_hash_raw);
+    block_signed_bytes.extend_from_slice(&body_proof_raw);
+    block_signed_bytes.extend_from_slice(&slot_id_raw);
+    block_signed_bytes.extend_from_slice(&difficulty_raw);
+    block_signed_bytes.extend_from_slice(&extra_data_raw);
 
     // -------------------------------------------------------------------------
     // 2. Body — decode transactions
@@ -812,6 +869,8 @@ pub fn decode_byron_main_block(
         protocol_version: block_version,
         issuer_pubkey,
         delegate_pubkey,
+        block_signature,
+        block_signed_bytes,
         dlg_certs,
         upd_proposal,
         upd_votes,

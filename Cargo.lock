@@ -1592,6 +1592,7 @@ dependencies = [
 name = "dugite-ledger"
 version = "2.8.0"
 dependencies = [
+ "base64 0.22.1",
  "bincode 1.3.3",
  "criterion",
  "dugite-crypto",
@@ -1599,6 +1600,7 @@ dependencies = [
  "dugite-primitives",
  "dugite-serialization",
  "dugite-uplc",
+ "ed25519-dalek",
  "hex",
  "imbl",
  "minicbor 0.26.5",
