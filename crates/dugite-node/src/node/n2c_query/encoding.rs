@@ -2686,7 +2686,22 @@ fn encode_possible_reward_update(
                                                                    // verified against `encodeMap`/`encodeSet` directly (no analogy).
             let rs_indef = open_variable_map(enc, ru.rs.len());
             for (cred, entries) in &ru.rs {
-                enc.bytes(cred).ok();
+                // Credential = array(2)[disc, hash(28B)] — CDDL
+                // `credential = [0, addr_keyhash // 1, scripthash]`. `cred`
+                // is a 32-byte TYPED hash (`Credential::to_typed_hash32()`'s
+                // convention: byte 28 is 0 for a key credential, 1 for a
+                // script credential — the SAME 0/1 meaning as this wire
+                // discriminator, so no inversion is needed here; only the
+                // MAP's sort order inverts it, in `sort_reward_wire_credentials`).
+                // A real cardano-node 11.0.1 capture
+                // (`tests/fixtures/nesru/complete-nonzero.hex`) shows exactly
+                // this 2-element-array shape; a bare `bstr(32)` (what this
+                // encoder emitted before) is self-undecodable — cardano-cli
+                // expects an array here, not a byte string.
+                debug_assert_eq!(cred.len(), 32, "rs credential key must be a typed Hash32");
+                enc.array(2).ok();
+                enc.u8(cred[28]).ok();
+                enc.bytes(&cred[..28]).ok();
                 enc.tag(minicbor::data::Tag::new(258)).ok();
                 let set_indef = open_variable_array(enc, entries.len());
                 for entry in entries {
@@ -3898,6 +3913,12 @@ mod tests {
     /// amount triple matching the real capture) assert byte-identity with
     /// the fixture beyond that outer frame — see
     /// `PossibleRewardUpdateSnapshot`'s doc for what is and is not modeled.
+    /// The `rs` KEY shape itself (`array(2)[disc, hash28]`, not a bare
+    /// `bstr(32)`) is what
+    /// `complete_reward_update_rs_keys_match_a_real_cardano_node_11_0_1_capture`
+    /// below RED-proves against the real capture; this test additionally
+    /// covers a SCRIPT credential (disc=1), which the fixture happens not to
+    /// contain any of.
     #[test]
     fn complete_reward_update_matches_the_pinned_outer_shape() {
         use crate::node::n2c_query::types::{
@@ -3905,13 +3926,24 @@ mod tests {
             RewardWireEntry,
         };
 
+        // Typed Hash32 credential keys (32 bytes total): bytes 0..28 are the
+        // raw hash, byte 28 is the discriminator (0 = KeyHashObj,
+        // 1 = ScriptHashObj), bytes 29..32 stay zero padding — see
+        // `Credential::to_typed_hash32`.
+        let mut key_hash = vec![0u8; 32];
+        key_hash[..28].copy_from_slice(&[0x10u8; 28]);
+        key_hash[28] = 0x00; // KeyHashObj
+        let mut key_script = vec![0u8; 32];
+        key_script[..28].copy_from_slice(&[0x20u8; 28]);
+        key_script[28] = 0x01; // ScriptHashObj
+
         let ru = PossibleRewardUpdateSnapshot::Complete(Box::new(CompletedRewardUpdateSnapshot {
             delta_treasury: 3_597_944_403_489,
             delta_reserves: 17_989_722_017_445,
             delta_fee: -555_555,
             rs: vec![
                 (
-                    vec![0x10u8; 32],
+                    key_hash.clone(),
                     vec![RewardWireEntry {
                         is_member: true,
                         pool_id: vec![0x40u8; 28],
@@ -3919,7 +3951,7 @@ mod tests {
                     }],
                 ),
                 (
-                    vec![0x20u8; 32],
+                    key_script.clone(),
                     vec![
                         RewardWireEntry {
                             is_member: false,
@@ -3960,7 +3992,13 @@ mod tests {
         assert_eq!(dec.u64().unwrap(), 3_597_944_403_489, "deltaT");
         assert_eq!(dec.i64().unwrap(), 17_989_722_017_445, "deltaR");
         assert_eq!(dec.map().unwrap(), Some(2), "rs must be map(2)");
-        assert_eq!(dec.bytes().unwrap(), &[0x10u8; 32]);
+        assert_eq!(
+            dec.array().unwrap(),
+            Some(2),
+            "a Credential key is array(2)[disc, hash28], not a bare bstr"
+        );
+        assert_eq!(dec.u8().unwrap(), 0, "KeyHashObj discriminator");
+        assert_eq!(dec.bytes().unwrap(), &[0x10u8; 28]);
         assert_eq!(
             dec.tag().unwrap(),
             minicbor::data::Tag::new(258),
@@ -3971,7 +4009,9 @@ mod tests {
         assert_eq!(dec.u8().unwrap(), 0, "MemberReward = 0");
         dec.bytes().unwrap();
         dec.u64().unwrap();
-        assert_eq!(dec.bytes().unwrap(), &[0x20u8; 32]);
+        assert_eq!(dec.array().unwrap(), Some(2), "second Credential key");
+        assert_eq!(dec.u8().unwrap(), 1, "ScriptHashObj discriminator");
+        assert_eq!(dec.bytes().unwrap(), &[0x20u8; 28]);
         dec.tag().unwrap();
         assert_eq!(dec.array().unwrap(), Some(2));
         dec.array().unwrap(); // Reward[0] — leader-first
@@ -3990,6 +4030,329 @@ mod tests {
         // nonMyopic — shared encoder, already covered elsewhere; just check
         // the shape lands.
         assert_eq!(dec.array().unwrap(), Some(2));
+    }
+
+    /// #1071 follow-up (P1) — `rs`'s outer map KEY shape, RED-proven against
+    /// a REAL cardano-node 11.0.1 capture, not merely internal
+    /// self-consistency (which is exactly the trap that let the bare-`bstr`
+    /// shape ship in the first place: the old test above encoded and decoded
+    /// its own invented shape and could never have caught the mismatch).
+    ///
+    /// The fixture's `rs` map holds 21 real credentials (all `KeyHashObj`
+    /// here — the devnet that produced this capture seeded no script
+    /// credentials), including credential #12, a LEADER reward of amount
+    /// **0** — the same real data that grounds the zero-amount-leader fix
+    /// (`build_pool_reward_table`, `rewards.rs`), reproduced here for free
+    /// since this test round-trips the WHOLE `rs` map rather than one entry.
+    #[test]
+    fn complete_reward_update_rs_keys_match_a_real_cardano_node_11_0_1_capture() {
+        use crate::node::n2c_query::types::{
+            CompletedRewardUpdateSnapshot, NonMyopicSnapshot, PossibleRewardUpdateSnapshot,
+            RewardWireEntry,
+        };
+
+        // Hand-transcribed from `tests/fixtures/nesru/complete-nonzero.hex`
+        // by decoding it with a generic CBOR item-length walker (not by eye)
+        // — (disc, hash28_hex, &[(reward_type, pool28_hex, amount)]), in the
+        // EXACT order the fixture's own map holds them (ascending hash —
+        // Haskell's `Ord Credential`, all entries here sharing disc=0 so the
+        // Script-vs-Key ordering direction is NOT exercised by this test;
+        // see `sort_reward_wire_credentials_sorts_script_before_keyhash` in
+        // `query.rs` for that, oracle-grounded since no real capture
+        // contains a script staking credential).
+        type RewardEntryFixture = (u8, &'static str, u64);
+        type CredentialFixture = (u8, &'static str, &'static [RewardEntryFixture]);
+        const RS_ENTRIES: &[CredentialFixture] = &[
+            (
+                0,
+                "1bd4abdab3e7761cf7a9dc62334c76dee4dbb6406e2d642d02bebec0",
+                &[(
+                    0,
+                    "dc6f55f44192b1b15afad370f93d5b4e11309c316c7258338e7aaadd",
+                    1107059816,
+                )],
+            ),
+            (
+                0,
+                "2329331736ed8072ac0ba808389dfdfa0b14df16d83109170a7dd31a",
+                &[(
+                    0,
+                    "dc6f55f44192b1b15afad370f93d5b4e11309c316c7258338e7aaadd",
+                    1107059816,
+                )],
+            ),
+            (
+                0,
+                "23c37d4a5a3f7f7a51a0fb8344ebfec99f0083c4023307e0c8c97050",
+                &[(
+                    0,
+                    "dc6f55f44192b1b15afad370f93d5b4e11309c316c7258338e7aaadd",
+                    1107059816,
+                )],
+            ),
+            (
+                0,
+                "28e7b84c6ee1d0ff0f640eade0a83351d08456c615172b968ddbd7a3",
+                &[(
+                    0,
+                    "dc6f55f44192b1b15afad370f93d5b4e11309c316c7258338e7aaadd",
+                    1107059816,
+                )],
+            ),
+            (
+                0,
+                "2e3819ad0db710a8950d312accd54ebdcdf67c0f426dcc944438377e",
+                &[(
+                    0,
+                    "dc6f55f44192b1b15afad370f93d5b4e11309c316c7258338e7aaadd",
+                    1107059816,
+                )],
+            ),
+            (
+                0,
+                "35be02851eeab868faa3612ff59b297daddd4d904c6f99d120ecb47e",
+                &[(
+                    0,
+                    "dc6f55f44192b1b15afad370f93d5b4e11309c316c7258338e7aaadd",
+                    1107059816,
+                )],
+            ),
+            (
+                0,
+                "3de7ca4ac6418bda87a465e6455916e901c5e987d81fa7873e28de3f",
+                &[(
+                    0,
+                    "dc6f55f44192b1b15afad370f93d5b4e11309c316c7258338e7aaadd",
+                    1107059816,
+                )],
+            ),
+            (
+                0,
+                "4399c566560d6bccc469add6f0a651a636102595bb8cbd02deefe494",
+                &[(
+                    0,
+                    "dc6f55f44192b1b15afad370f93d5b4e11309c316c7258338e7aaadd",
+                    1107059816,
+                )],
+            ),
+            (
+                0,
+                "459258e5ddd2db9074804cc417157aa28b5550109c62a3e6f641b0ac",
+                &[(
+                    0,
+                    "dc6f55f44192b1b15afad370f93d5b4e11309c316c7258338e7aaadd",
+                    1107059816,
+                )],
+            ),
+            (
+                0,
+                "501752b2f756639c4045d3427d1874d5b3283e7f108c35dbc6a4d4a7",
+                &[(
+                    0,
+                    "dc6f55f44192b1b15afad370f93d5b4e11309c316c7258338e7aaadd",
+                    1107059816,
+                )],
+            ),
+            (
+                0,
+                "55c68cc7487c924df7e4bb53fec3d694c87bffdec685ac0ee7f982a3",
+                &[(
+                    0,
+                    "dc6f55f44192b1b15afad370f93d5b4e11309c316c7258338e7aaadd",
+                    1107059816,
+                )],
+            ),
+            (
+                0,
+                "73a48e3e6ffea6f855e1ce720b14d9b2a730e28e5348a136bd2729a9",
+                &[(
+                    0,
+                    "dc6f55f44192b1b15afad370f93d5b4e11309c316c7258338e7aaadd",
+                    1107059816,
+                )],
+            ),
+            (
+                0,
+                "821ec5be362cb7d069d6aafd893b4ce1dbc5ad9e8157e5a24295e581",
+                &[(
+                    1,
+                    "dc6f55f44192b1b15afad370f93d5b4e11309c316c7258338e7aaadd",
+                    0,
+                )],
+            ),
+            (
+                0,
+                "9eda0b97e963347b9033c72d2aba101446b0cb24f48a4d9dba429559",
+                &[(
+                    0,
+                    "dc6f55f44192b1b15afad370f93d5b4e11309c316c7258338e7aaadd",
+                    1107059816,
+                )],
+            ),
+            (
+                0,
+                "b2606ae71bd8e0812776c5d8308c499ba763f24713367647afd1b756",
+                &[(
+                    0,
+                    "dc6f55f44192b1b15afad370f93d5b4e11309c316c7258338e7aaadd",
+                    1107059816,
+                )],
+            ),
+            (
+                0,
+                "b7427ccc509baefa59bfd2a57eb13d95b1c048f301f0c1c7d48992c4",
+                &[(
+                    0,
+                    "dc6f55f44192b1b15afad370f93d5b4e11309c316c7258338e7aaadd",
+                    1107059816,
+                )],
+            ),
+            (
+                0,
+                "c5d2326dec2fda340f6057aaa10bb0f878d18cfe3d903a793859b338",
+                &[(
+                    0,
+                    "dc6f55f44192b1b15afad370f93d5b4e11309c316c7258338e7aaadd",
+                    1107059816,
+                )],
+            ),
+            (
+                0,
+                "c7f8087f81c57ed6cab24e65e5c49e46a0db8bcb270a018051811bd4",
+                &[(
+                    0,
+                    "dc6f55f44192b1b15afad370f93d5b4e11309c316c7258338e7aaadd",
+                    1107059816,
+                )],
+            ),
+            (
+                0,
+                "c93831142b5a41a0963194a5f2582f4556db572ea75438dd5e6a77cc",
+                &[(
+                    0,
+                    "dc6f55f44192b1b15afad370f93d5b4e11309c316c7258338e7aaadd",
+                    1107059816,
+                )],
+            ),
+            (
+                0,
+                "e97280ed5ae19ab3506c5ad74082324e23285dbfd2c682d98aad0933",
+                &[(
+                    0,
+                    "dc6f55f44192b1b15afad370f93d5b4e11309c316c7258338e7aaadd",
+                    1107059816,
+                )],
+            ),
+            (
+                0,
+                "f7109a9da8c2c2f62b45d45a72ea153280db9ed7a75cac7b8312c76a",
+                &[(
+                    0,
+                    "dc6f55f44192b1b15afad370f93d5b4e11309c316c7258338e7aaadd",
+                    1107059816,
+                )],
+            ),
+        ];
+
+        let rs: Vec<(Vec<u8>, Vec<RewardWireEntry>)> = RS_ENTRIES
+            .iter()
+            .map(|(disc, hash_hex, entries)| {
+                let hash = hex::decode(hash_hex).unwrap();
+                let mut key = vec![0u8; 32];
+                key[..28].copy_from_slice(&hash);
+                key[28] = *disc;
+                let wire_entries = entries
+                    .iter()
+                    .map(|(rtype, pool_hex, amount)| RewardWireEntry {
+                        is_member: *rtype == 0,
+                        pool_id: hex::decode(pool_hex).unwrap(),
+                        amount: *amount,
+                    })
+                    .collect();
+                (key, wire_entries)
+            })
+            .collect();
+
+        // deltaT/deltaR straight off the capture (`tests/fixtures/nesru/complete-nonzero.hex`).
+        let ru = PossibleRewardUpdateSnapshot::Complete(Box::new(CompletedRewardUpdateSnapshot {
+            delta_treasury: 3_597_944_403_489,
+            delta_reserves: 3_620_085_599_809,
+            delta_fee: 0,
+            rs,
+            non_myopic: NonMyopicSnapshot::default(),
+        }));
+
+        let mut buf = Vec::new();
+        let mut enc = minicbor::Encoder::new(&mut buf);
+        super::encode_possible_reward_update(&mut enc, &ru);
+
+        let fixture_hex = include_str!("../../../../../tests/fixtures/nesru/complete-nonzero.hex");
+        let fixture = hex::decode(fixture_hex.trim()).expect("fixture hex");
+
+        // `rs` occupies fixture[22..1552] — the 4-byte outer header
+        // (`81 82 01 85`) plus two 9-byte 64-bit uints (deltaT, deltaR) put
+        // `rs`'s `0xb5` (map(21)) header at offset 22; walking the map's own
+        // definite-length framing to its end lands at 1552. Verified by
+        // decoding the fixture with a generic CBOR item-length walker, not
+        // asserted from this encoder's own output.
+        const RS_START: usize = 22;
+        const RS_END: usize = 1552;
+        // NOTE: `buf.len() != fixture.len()` in general — `non_myopic` here
+        // is `NonMyopicSnapshot::default()` (empty), while the capture's real
+        // `nonMyopic` carries two pools' 100-entry likelihood arrays. Only
+        // the `rs` SLICE is compared; the leading 22 bytes (the fixed-width
+        // outer header, deltaT, deltaR) are identical by construction since
+        // those values were transcribed from the same capture.
+        assert_eq!(
+            &buf[..RS_START],
+            &fixture[..RS_START],
+            "the header before rs (SJust/sum/tag/array5/deltaT/deltaR) must \
+             match — this is a precondition for RS_START/RS_END being valid \
+             offsets into `buf`, not just into `fixture`"
+        );
+        assert_eq!(
+            &buf[RS_START..RS_END],
+            &fixture[RS_START..RS_END],
+            "rs must reproduce the real capture byte-for-byte: definite \
+             map(21) framing, each key as array(2)[disc, hash28], the \
+             zero-amount leader entry at credential #12, tag-258 Sets"
+        );
+
+        // RED proof: apply the OLD (pre-fix) shape — a bare `bstr(32)`
+        // credential key instead of `array(2)[disc, hash28]` — to the
+        // IDENTICAL sorted data, and confirm it does NOT reproduce the real
+        // capture. If it did, this fixture would be incapable of
+        // discriminating the old shape from the new one and the assertion
+        // above would prove nothing.
+        let mut old_buf = Vec::new();
+        {
+            let mut enc = minicbor::Encoder::new(&mut old_buf);
+            enc.map(RS_ENTRIES.len() as u64).ok();
+            for (disc, hash_hex, entries) in RS_ENTRIES {
+                let hash = hex::decode(hash_hex).unwrap();
+                let mut key = vec![0u8; 32];
+                key[..28].copy_from_slice(&hash);
+                key[28] = *disc;
+                enc.bytes(&key).ok(); // the pre-fix shape: bare bstr(32)
+                enc.tag(minicbor::data::Tag::new(258)).ok();
+                enc.array(entries.len() as u64).ok();
+                for (rtype, pool_hex, amount) in *entries {
+                    enc.array(3).ok();
+                    enc.u8(*rtype).ok();
+                    enc.bytes(&hex::decode(pool_hex).unwrap()).ok();
+                    enc.u64(*amount).ok();
+                }
+            }
+        }
+        assert_ne!(
+            old_buf,
+            &fixture[RS_START..RS_END],
+            "the pre-fix bstr(32)-key shape must NOT reproduce a real \
+             capture — if it did, this fixture could not have caught the \
+             P1 defect, and #1071's original test ('complete_reward_update_\
+             matches_the_pinned_outer_shape') would never have gone red on \
+             the wrong shape it was pinning"
+        );
     }
 
     /// #1071/#938: `rs`'s OUTER map gets the same threshold-23

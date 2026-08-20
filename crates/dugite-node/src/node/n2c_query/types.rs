@@ -522,8 +522,28 @@ pub struct CompletedRewardUpdateSnapshot {
     /// from `utxosFees`.
     pub delta_fee: i128,
     /// `rs` — the UNAGGREGATED per-source reward entries, one `Vec` per
-    /// credential (Haskell's `Set Reward`), sorted by credential and, within
-    /// a credential, by `(is_member, pool_id)` — the same `Ord` that decides
+    /// credential (Haskell's `Set Reward`).
+    ///
+    /// The key is a 32-byte TYPED hash (`Credential::to_typed_hash32()`'s
+    /// convention): bytes `0..28` are the credential's raw hash and byte
+    /// `28` is `0` for a `KeyHashObj`/`VerificationKey` credential or `1`
+    /// for a `ScriptHashObj`/`Script` credential — the SAME 0/1 meaning as
+    /// the wire's own `credential = [0, addr_keyhash // 1, scripthash]`
+    /// discriminator, so the encoder needs no inversion to build the
+    /// `array(2)[disc, hash28]` shape a real cardano-node 11.0.1 capture
+    /// produces (`tests/fixtures/nesru/complete-nonzero.hex`) — dugite
+    /// previously emitted a bare `bstr(32)` here, which is self-undecodable
+    /// (cardano-cli expects a 2-element array).
+    ///
+    /// Sorted outer-to-inner: the outer `Vec` by credential using Haskell's
+    /// derived `Ord Credential` — `ScriptHashObj` sorts BEFORE `KeyHashObj`
+    /// (the OPPOSITE of the numeric wire discriminator, since `ScriptHashObj`
+    /// is the type's first data constructor; see
+    /// `dugite_primitives::credentials::Credential::cmp_ledger`, which
+    /// implements exactly this rule for an unrelated call site and is the
+    /// oracle-verified source of truth here too), then ascending on the raw
+    /// 28-byte hash within a discriminator. Within a credential, entries sort
+    /// by `(is_member, pool_id)` — the same `Ord` that decides
     /// `Set.deleteFindMin` at pv<=2 (see `RewardEntry::ord_key`).
     pub rs: Vec<(Vec<u8>, Vec<RewardWireEntry>)>,
     /// `nonMyopic` — the SAME shape `EpochState.esNonMyopic` uses.

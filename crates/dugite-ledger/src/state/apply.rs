@@ -698,8 +698,15 @@ impl LedgerState {
             }
         }
 
-        // Phase 3: one pulse of the member fold per block, spreading the ~2.55 s
-        // mainnet-scale boundary fold (Phase 0) across the pulsing window.
+        // Phase 3: at most one pulse of the member fold per block, spreading
+        // the ~2.55 s mainnet-scale boundary fold (Phase 0) across the
+        // pulsing window. Note the block that FREEZES the pulser above (the
+        // one that first crosses the 4k/f mark) performs ZERO pulses here —
+        // `pulse_rupd_member_fold` builds the fold's initial state on that
+        // call and returns without pulsing, matching Haskell's `startStep`,
+        // which is a pure constructor. The first real pulse happens on the
+        // NEXT block. See that function's doc for the full timing argument
+        // (also covers the mirrored one-tick lag on completion).
         //
         // A no-op before the mark (`rupd_state` is None) and idempotent once
         // the balance is exhausted, so it is safe to call unconditionally on
