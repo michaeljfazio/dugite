@@ -1,5 +1,8 @@
 # Tech Lead Agent Memory
 
+## #1102/#1105 accepted-connection KeepAlive DataFlow gating (2026-08-21, UNCOMMITTED)
+- [Full writeup](issue-1102-1105-keepalive-dataflow-gating.md) — #1102's fix gated on direction (too broad), broke genuine Duplex accepted peers (dugite-relay<->cardano-bp churn). #1105 gates on NEGOTIATED `min(local,remote)` diffusionMode instead. Live-proven both directions with 2 throwaway dugite-node instances + real `cardano-cli ping`. `HandshakeResult.negotiated_initiator_only`, `PeerConnection.negotiated_duplex` new fields.
+
 ## #1091 CLI surface second wave (2026-08-21)
 - [Full writeup](issue-1091-cli-surface-second-wave.md) — closed 11/22 of #1008's deferred shims (cip-format×4 CIP-129 wire format, byron key aliases×2 WRONG SCOPE corrected, ping incl. 2 new dugite-network handshake fns, debug×2, key verification-key/non-extended-key). Found 2 real dugite-node handshake bugs (N2N bearer-close, N2C query-mode server gap) — NOT fixed, out of scope. `transaction signed-transaction` doesn't exist in real cardano-cli 11 — moved WONTFIX. `cli-surface-parity.sh` needs no live node — run it after any gaps-file edit.
 
