@@ -613,6 +613,31 @@ fn gcd_u64(mut a: u64, mut b: u64) -> u64 {
     a
 }
 
+/// Estimate `query tip`'s `syncProgress` as `tip_slot / expected_tip_slot * 100`,
+/// capped at 100.
+///
+/// Byron slots are 20s each on every real network (Shelley+ slots are 1s) —
+/// so `expected_tip_slot` cannot be `elapsed_secs` uniformly, or it
+/// overshoots by `byron_slot_count * 19` seconds' worth of phantom slots,
+/// permanently capping the reported percentage below 100% even exactly at
+/// tip (confirmed live against preprod: tip slot/hash byte-identical to a
+/// real cardano-node oracle while the old formula reported 98.77%).
+/// `byron_slot_count` is 0 on preview (pure Shelley from genesis), so this
+/// is a no-op there.
+fn compute_sync_progress(tip_slot: u64, elapsed_secs: u64, byron_slot_count: u64) -> f64 {
+    let byron_wall_seconds = byron_slot_count.saturating_mul(20);
+    let expected_tip_slot = if elapsed_secs <= byron_wall_seconds {
+        elapsed_secs / 20
+    } else {
+        byron_slot_count + (elapsed_secs - byron_wall_seconds)
+    };
+    if expected_tip_slot > 0 {
+        (tip_slot as f64 / expected_tip_slot as f64 * 100.0).min(100.0)
+    } else {
+        100.0
+    }
+}
+
 /// Map era index to era name
 /// Parse a simple ISO-8601 UTC timestamp to Unix seconds.
 /// Supports "YYYY-MM-DDThh:mm:ssZ" format.
@@ -1509,14 +1534,9 @@ impl QueryCmd {
                         _ => 1_596_059_091u64,       // Mainnet Shelley
                     });
                 let elapsed_secs = now_secs.saturating_sub(genesis_unix);
-                let expected_tip_slot = elapsed_secs; // 1 slot ≈ 1 second (Shelley+)
-                let sync_progress = if expected_tip_slot > 0 {
-                    (tip.slot as f64 / expected_tip_slot as f64 * 100.0).min(100.0)
-                } else {
-                    100.0
-                };
 
-                // Epoch slot position.
+                // Epoch slot position, and the Byron→Shelley boundary slot
+                // `sync_progress` below also needs.
                 //
                 // Shelley+ slots elapsed since the Byron→Shelley boundary go
                 // through `(slot - byron_slots) % shelley_epoch_length`. Byron
@@ -1534,6 +1554,9 @@ impl QueryCmd {
                     Some(1) => (86_400, 432_000), // Preprod
                     _ => (4_492_800, 432_000),    // Mainnet (and other 432k networks)
                 };
+
+                let sync_progress = compute_sync_progress(tip.slot, elapsed_secs, byron_offset);
+
                 let shelley_relative = tip.slot.saturating_sub(byron_offset);
                 let slot_in_epoch = if epoch_length > 0 {
                     shelley_relative % epoch_length
@@ -4219,6 +4242,83 @@ mod tests {
         // 2022-11-24 is day 328 of year 2022
         // Expected: 1669248000
         assert_eq!(ts, 1669248000);
+    }
+
+    /// Reproduces the exact scenario found live against real preprod: a node
+    /// byte-exact at tip (confirmed against a real cardano-node 11.0.1
+    /// oracle) still reported `syncProgress: "98.77"` under the old
+    /// uniform-1s/slot formula. Byron slots are 20s each, not 1s, so
+    /// `elapsed_secs` computed from wall-clock genesis time overshoots the
+    /// expected slot count by 19x the Byron slot count's worth of seconds.
+    #[test]
+    fn compute_sync_progress_reports_100_at_true_tip_on_preprod() {
+        let preprod_byron_slots = 86_400u64; // 4 Byron epochs x 21,600
+        let tip_slot = 131_546_547u64; // real preprod tip observed live this session
+                                       // elapsed_secs consistent with `tip_slot` being the TRUE tip: Byron's
+                                       // 86,400 slots each took 20s, then 1s/slot for the rest.
+        let elapsed_secs = preprod_byron_slots * 20 + (tip_slot - preprod_byron_slots);
+
+        let progress = compute_sync_progress(tip_slot, elapsed_secs, preprod_byron_slots);
+        assert!(
+            (progress - 100.0).abs() < 0.01,
+            "a node exactly at tip must report ~100%, got {progress} \
+             (the old uniform-1s/slot formula reported 98.77% for this exact \
+             scenario, confirmed live against a real cardano-node oracle)"
+        );
+    }
+
+    #[test]
+    fn compute_sync_progress_old_formula_would_have_undercounted() {
+        // Same inputs as above, but computed with the OLD (buggy) formula —
+        // pins the exact regression this fix corrects, so a future revert
+        // is caught even if the "at true tip" test above is weakened.
+        let preprod_byron_slots = 86_400u64;
+        let tip_slot = 131_546_547u64;
+        let elapsed_secs = preprod_byron_slots * 20 + (tip_slot - preprod_byron_slots);
+
+        let old_buggy_progress = (tip_slot as f64 / elapsed_secs as f64 * 100.0).min(100.0);
+        assert!(
+            (old_buggy_progress - 98.77).abs() < 0.01,
+            "sanity check on the test's own construction: expected the old \
+             formula to reproduce ~98.77%, got {old_buggy_progress}"
+        );
+
+        let fixed_progress = compute_sync_progress(tip_slot, elapsed_secs, preprod_byron_slots);
+        assert!(
+            fixed_progress > old_buggy_progress + 1.0,
+            "the fix must materially change the reported value for this \
+             scenario, not coincidentally match it"
+        );
+    }
+
+    #[test]
+    fn compute_sync_progress_mid_byron_era_uses_20s_per_slot() {
+        // Halfway through Byron's 86,400 preprod slots: 43,200 slots should
+        // need 43,200 * 20 = 864,000 elapsed seconds, not 43,200.
+        let preprod_byron_slots = 86_400u64;
+        let tip_slot = 43_200u64;
+        let elapsed_secs = 43_200 * 20;
+
+        let progress = compute_sync_progress(tip_slot, elapsed_secs, preprod_byron_slots);
+        assert!(
+            (progress - 100.0).abs() < 0.01,
+            "mid-Byron-era tip must still report ~100% when wall-clock time \
+             matches the 20s/slot Byron rate, got {progress}"
+        );
+    }
+
+    #[test]
+    fn compute_sync_progress_preview_unaffected_zero_byron_slots() {
+        // Preview is pure Shelley from genesis (byron_slot_count = 0) — the
+        // fix must be a no-op there, matching the pre-fix behavior exactly
+        // for the one network it was already correct for.
+        let tip_slot = 1000u64;
+        let elapsed_secs = 1000u64;
+        let progress = compute_sync_progress(tip_slot, elapsed_secs, 0);
+        assert!(
+            (progress - 100.0).abs() < 0.01,
+            "preview (byron_slot_count=0) must behave as plain 1s/slot, got {progress}"
+        );
     }
 
     #[test]
