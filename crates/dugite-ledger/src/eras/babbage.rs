@@ -647,6 +647,7 @@ mod tests {
             },
             transactions: vec![],
             raw_cbor: None,
+            byron: None,
         };
 
         assert!(rules.validate_block_body(&block, &ctx, &utxo).is_ok());

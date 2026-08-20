@@ -40,7 +40,7 @@
 //! over a `HashMap` whose order could vary. The pinned hash must be stable
 //! across runs and platforms.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 
 use dugite_primitives::hash::{Hash28, Hash32};
@@ -701,6 +701,133 @@ pub fn populated_ledger_state() -> LedgerState {
                     constitution: Some(gid(0x65)),
                 },
             },
+        };
+    }
+
+    // ── Byron substate (#1084) ──────────────────────────────────────────
+    //
+    // Every map/set carries 2+ entries per #1088's convention — see
+    // `snapshot_format::tests::fixture_populates_every_snapshot_field`'s
+    // `at_least_two!` block for `byron`.
+    {
+        use crate::eras::byron::{
+            ByronCandidate, ByronDelegationState, ByronProtocolParameters, ByronSubState,
+            ByronUpdateState, ScheduledDelegation,
+        };
+
+        let allowed_delegators: BTreeSet<Hash28> = [h28(0x80), h28(0x81)].into_iter().collect();
+
+        let mut delegation = ByronDelegationState::default();
+        delegation.delegation_map.insert(h28(0x80), h28(0x82));
+        delegation.delegation_map.insert(h28(0x81), h28(0x83));
+        delegation.delegation_map_rev.insert(h28(0x82), h28(0x80));
+        delegation.delegation_map_rev.insert(h28(0x83), h28(0x81));
+        delegation.delegation_slots.insert(h28(0x80), 100);
+        delegation.delegation_slots.insert(h28(0x81), 200);
+        delegation.key_epoch_delegations.insert((5, h28(0x80)));
+        delegation.key_epoch_delegations.insert((6, h28(0x81)));
+        delegation.scheduled.push(ScheduledDelegation {
+            slot: 4_320_300,
+            delegator: h28(0x84),
+            delegate: h28(0x85),
+        });
+        delegation.scheduled.push(ScheduledDelegation {
+            slot: 4_320_400,
+            delegator: h28(0x86),
+            delegate: h28(0x87),
+        });
+
+        let genesis_params = ByronProtocolParameters {
+            script_version: 0,
+            slot_duration: 20_000,
+            max_block_size: 2_000_000,
+            max_header_size: 2_000_000,
+            max_tx_size: 4_096,
+            max_proposal_size: 700,
+            mpc_thd: 20_000_000_000_000,
+            heavy_del_thd: 300_000_000_000,
+            update_vote_thd: 1_000_000_000_000,
+            update_proposal_thd: 100_000_000_000_000,
+            update_implicit: 10_000,
+            soft_fork_rule: (900_000_000_000_000, 600_000_000_000_000, 50_000_000_000_000),
+            tx_fee_policy: (155_381, (21_973, 500)),
+            unlock_stake_epoch: u64::MAX,
+        };
+        let candidate_params_a = ByronProtocolParameters {
+            max_tx_size: 65_536,
+            ..genesis_params.clone()
+        };
+        let candidate_params_b = ByronProtocolParameters {
+            max_block_size: 32_768,
+            max_tx_size: 8_192,
+            ..genesis_params.clone()
+        };
+
+        let mut app_versions = BTreeMap::new();
+        app_versions.insert("daedalus".to_string(), (5u32, 1_000u64));
+        app_versions.insert("cardano-sl".to_string(), (3u32, 2_000u64));
+
+        let mut registered_protocol_update_proposals = BTreeMap::new();
+        registered_protocol_update_proposals
+            .insert(h32(0x90), ((1u16, 3u16, 0u8), candidate_params_a.clone()));
+        registered_protocol_update_proposals
+            .insert(h32(0x91), ((1u16, 4u16, 0u8), candidate_params_b.clone()));
+
+        let mut registered_software_update_proposals = BTreeMap::new();
+        registered_software_update_proposals.insert(h32(0x90), ("daedalus".to_string(), 6u32));
+        registered_software_update_proposals.insert(h32(0x91), ("cardano-sl".to_string(), 4u32));
+
+        let mut confirmed_proposals = BTreeMap::new();
+        confirmed_proposals.insert(h32(0x90), 500u64);
+        confirmed_proposals.insert(h32(0x91), 600u64);
+
+        let mut proposal_votes = BTreeMap::new();
+        proposal_votes.insert(h32(0x90), [h28(0x80), h28(0x81)].into_iter().collect());
+        proposal_votes.insert(h32(0x91), [h28(0x80)].into_iter().collect());
+
+        let registered_endorsements = [
+            ((1u16, 3u16, 0u8), h28(0x80)),
+            ((1u16, 4u16, 0u8), h28(0x81)),
+        ]
+        .into_iter()
+        .collect();
+
+        let mut proposal_registration_slot = BTreeMap::new();
+        proposal_registration_slot.insert(h32(0x90), 450u64);
+        proposal_registration_slot.insert(h32(0x91), 550u64);
+
+        let update = ByronUpdateState {
+            // Always 0 — see the field's own doc comment (§2.3 of the design
+            // doc): `initialState` is the only writer upstream, so this is
+            // not a value that could be "more distinctive".
+            current_epoch: 0,
+            adopted_protocol_version: (1, 2, 0),
+            adopted_protocol_parameters: genesis_params,
+            candidate_protocol_updates: vec![
+                ByronCandidate {
+                    slot: 4_320_100,
+                    protocol_version: (1, 4, 0),
+                    protocol_parameters: candidate_params_b,
+                },
+                ByronCandidate {
+                    slot: 4_320_050,
+                    protocol_version: (1, 3, 0),
+                    protocol_parameters: candidate_params_a,
+                },
+            ],
+            app_versions,
+            registered_protocol_update_proposals,
+            registered_software_update_proposals,
+            confirmed_proposals,
+            proposal_votes,
+            registered_endorsements,
+            proposal_registration_slot,
+        };
+
+        state.byron = ByronSubState {
+            delegation,
+            update,
+            allowed_delegators,
         };
     }
 

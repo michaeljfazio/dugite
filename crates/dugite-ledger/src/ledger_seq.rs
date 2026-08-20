@@ -332,6 +332,23 @@ pub struct LedgerDelta {
     /// `rupd_pulser_started`/`rupd_monetary` pair it is supposed to mirror is
     /// exactly the #979 "confidently wrong" class this field exists to avoid.
     pub rupd_snapshot_delta: Option<Option<super::state::reward_pulser::PulsingRewUpdate>>,
+
+    /// Post-block snapshot of the TOP-LEVEL `LedgerState.byron` substate
+    /// (issue #1084). Lives directly on `LedgerState`, not inside any
+    /// sub-state `rollback_via_seq` wholesale-copies from the reconstructed
+    /// tip, so it needs both this delta field AND an explicit copy-back in
+    /// `rollback_via_seq` (state/mod.rs) — exactly the
+    /// `genesis_delegates_snapshot` precedent above.
+    ///
+    /// Content-diffed: outside an active proposal/delegation window every
+    /// mutation site (the per-block endorsement, the delegation tick, the
+    /// TTL prune) no-ops on empty collections, so this is `None` on the
+    /// overwhelming majority of Byron blocks. During a real proposal window
+    /// it clones a struct of a few KB — the whole substate is delta'd as ONE
+    /// unit rather than field-by-field, since Byron's per-epoch volume never
+    /// approaches the scale that made `delegations`/`reward_accounts` need
+    /// their own dedicated snapshot fields.
+    pub byron_snapshot: Option<crate::eras::byron::ByronSubState>,
 }
 
 impl LedgerDelta {
@@ -373,6 +390,7 @@ impl LedgerDelta {
             rupd_pulser_started_snapshot: None,
             rupd_monetary_snapshot: None,
             rupd_snapshot_delta: None,
+            byron_snapshot: None,
         }
     }
 }
@@ -1262,6 +1280,10 @@ pub fn apply_delta_to_state(state: &mut LedgerState, delta: &LedgerDelta) {
     if let Some(fgd) = &delta.future_gen_delegs_snapshot {
         state.future_gen_delegs = fgd.clone();
     }
+    // #1084: same rationale — `byron` lives directly on `LedgerState`.
+    if let Some(bs) = &delta.byron_snapshot {
+        state.byron = bs.clone();
+    }
 
     // ── 5. Governance changes ─────────────────────────────────────────────────
     for change in &delta.governance_changes {
@@ -1833,6 +1855,10 @@ fn _assert_ledger_state_fields_audited(state: LedgerState) {
         genesis_hash: _,
         genesis_delegates: _,
         future_gen_delegs: _,
+        // #1084: whole substate delta'd as one unit via `byron_snapshot`,
+        // matching how `genesis_delegates`/`future_gen_delegs` are recorded
+        // above.
+        byron: _,
         update_quorum: _,
         node_network: _,
         randomness_stabilisation_window: _,

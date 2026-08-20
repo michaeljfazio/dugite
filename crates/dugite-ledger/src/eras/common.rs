@@ -2738,6 +2738,7 @@ mod tests {
             header: make_header(vec![], ZERO32, vec![]),
             transactions: vec![tx],
             raw_cbor: None,
+            byron: None,
         };
 
         let result = validate_block_ex_units(&block, &ctx);

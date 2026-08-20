@@ -23,12 +23,15 @@ pub struct ByronGenesis {
     /// Non-AVVM initial balances: base58 Byron address → lovelace
     #[serde(default)]
     pub non_avvm_balances: HashMap<String, String>,
-    /// Bootstrap stakeholders: stakeholder ID → weight (deserialized for completeness)
+    /// Bootstrap stakeholders: KeyHash hex → weight. The KEY SET is the
+    /// genesis-key authority (`gdGenesisKeyHashes`) both the delegation and
+    /// update-proposal state machines gate on (issue #1084); the weight
+    /// itself is irrelevant to that gate.
     #[serde(default, rename = "bootStakeholders")]
-    _boot_stakeholders: HashMap<String, serde_json::Value>,
-    /// Heavy delegation certificates (deserialized for completeness)
+    pub boot_stakeholders: HashMap<String, u64>,
+    /// Heavy (genesis-key) delegation certificates: issuer KeyHash hex → cert.
     #[serde(default, rename = "heavyDelegation")]
-    _heavy_delegation: HashMap<String, serde_json::Value>,
+    pub heavy_delegation: HashMap<String, ByronHeavyDelegationEntry>,
     /// System start time (POSIX timestamp)
     #[serde(rename = "startTime")]
     pub _start_time: u64,
@@ -46,26 +49,75 @@ pub struct ByronGenesis {
 pub struct ByronBlockVersionData {
     #[serde(default)]
     pub slot_duration: String,
-    // Parsed and deliberately NOT consumed, with the reason stated rather than
-    // the fields hidden behind a `_` prefix — hiding them is how the fee policy
-    // sat parsed-and-discarded while the ledger hardcoded its own copy.
-    //
-    // These are the GENESIS values, and Byron's update system changes them
-    // on-chain: measured at mainnet Byron epoch 100, cardano-node reports
-    // maxBlockSize 32768 / maxTxSize 8192 where genesis says 2000000 / 4096.
-    // Using them as if they were the adopted parameters would be wrong, so they
-    // wait here, visible, until Byron's `UPI.State` is modelled.
-    #[allow(dead_code)]
+    // These are the GENESIS values — `UPI.State.adoptedProtocolParameters`
+    // (issue #1084) is seeded from them at startup, then Byron's on-chain
+    // update system may move them: measured at mainnet Byron epoch 100,
+    // cardano-node reports maxBlockSize 32768 / maxTxSize 8192 where genesis
+    // says 2000000 / 4096. `seed_byron_genesis` is the ONLY place these are
+    // read as "the adopted values" — everywhere else must read
+    // `LedgerState.byron.update.adopted_protocol_parameters` instead.
     #[serde(default, rename = "maxBlockSize")]
     pub max_block_size: String,
-    #[allow(dead_code)]
+    #[serde(default, rename = "maxHeaderSize")]
+    pub max_header_size: String,
     #[serde(default, rename = "maxTxSize")]
     pub max_tx_size: String,
-    #[allow(dead_code)]
+    #[serde(default, rename = "maxProposalSize")]
+    pub max_proposal_size: String,
     #[serde(default, rename = "scriptVersion")]
-    pub script_version: u64,
+    pub script_version: u16,
+    #[serde(default, rename = "mpcThd")]
+    pub mpc_thd: String,
+    #[serde(default, rename = "heavyDelThd")]
+    pub heavy_del_thd: String,
+    #[serde(default, rename = "updateVoteThd")]
+    pub update_vote_thd: String,
+    #[serde(default, rename = "updateProposalThd")]
+    pub update_proposal_thd: String,
+    #[serde(default, rename = "updateImplicit")]
+    pub update_implicit: String,
+    #[serde(default, rename = "softforkRule")]
+    pub softfork_rule: ByronSoftforkRule,
     #[serde(default, rename = "txFeePolicy")]
     pub tx_fee_policy: ByronTxFeePolicy,
+    #[serde(default, rename = "unlockStakeEpoch")]
+    pub unlock_stake_epoch: String,
+}
+
+/// `heavyDelegation` map value — one heavyweight delegation certificate as
+/// carried in genesis JSON. `cert`/`issuer_pk` are captured for completeness
+/// but unused: Byron signature verification is a separate, deliberately
+/// out-of-scope gap (see the #1084 design doc §3.6). `omega` is the
+/// certificate's target epoch — always 0 in every real genesis.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ByronHeavyDelegationEntry {
+    #[allow(dead_code)]
+    #[serde(default)]
+    pub cert: String,
+    #[serde(default, rename = "delegatePk")]
+    pub delegate_pk: String,
+    #[allow(dead_code)]
+    #[serde(default, rename = "issuerPk")]
+    pub issuer_pk: String,
+    #[allow(dead_code)]
+    #[serde(default)]
+    pub omega: u64,
+}
+
+/// `softforkRule` — genesis JSON encodes it as an OBJECT (`{initThd, minThd,
+/// thdDecrement}`), unlike the on-chain `upprop` wire form, which is a plain
+/// 3-tuple. Each value is a `LovelacePortion` numerator over the implicit
+/// 1e15 denominator, same scale as the on-chain form.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ByronSoftforkRule {
+    #[serde(default, rename = "initThd")]
+    pub init_thd: String,
+    #[serde(default, rename = "minThd")]
+    pub min_thd: String,
+    #[serde(default, rename = "thdDecrement")]
+    pub thd_decrement: String,
 }
 
 /// Byron's on-chain `txFeePolicy`, as the genesis file stores it.
@@ -135,6 +187,38 @@ impl ByronTxFeePolicy {
     }
 }
 
+impl ByronBlockVersionData {
+    /// Convert to the ledger's `ByronProtocolParameters`, for genesis seeding
+    /// (issue #1084). `None` if any field fails to parse — a malformed
+    /// genesis is a startup-fatal condition the caller reports, not a value
+    /// this conversion silently defaults.
+    pub fn to_protocol_parameters(
+        &self,
+    ) -> Option<dugite_ledger::eras::byron::ByronProtocolParameters> {
+        let (tx_summand, tx_mult) = self.tx_fee_policy.to_exact()?;
+        Some(dugite_ledger::eras::byron::ByronProtocolParameters {
+            script_version: self.script_version,
+            slot_duration: self.slot_duration.parse().ok()?,
+            max_block_size: self.max_block_size.parse().ok()?,
+            max_header_size: self.max_header_size.parse().ok()?,
+            max_tx_size: self.max_tx_size.parse().ok()?,
+            max_proposal_size: self.max_proposal_size.parse().ok()?,
+            mpc_thd: self.mpc_thd.parse().ok()?,
+            heavy_del_thd: self.heavy_del_thd.parse().ok()?,
+            update_vote_thd: self.update_vote_thd.parse().ok()?,
+            update_proposal_thd: self.update_proposal_thd.parse().ok()?,
+            update_implicit: self.update_implicit.parse().ok()?,
+            soft_fork_rule: (
+                self.softfork_rule.init_thd.parse().ok()?,
+                self.softfork_rule.min_thd.parse().ok()?,
+                self.softfork_rule.thd_decrement.parse().ok()?,
+            ),
+            tx_fee_policy: (tx_summand, tx_mult),
+            unlock_stake_epoch: self.unlock_stake_epoch.parse().ok()?,
+        })
+    }
+}
+
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ByronProtocolConsts {
@@ -184,6 +268,59 @@ impl ByronGenesis {
             .slot_duration
             .parse::<u64>()
             .unwrap_or(20_000)
+    }
+
+    /// `bootStakeholders`' key set as `Hash28` — the genesis-key authority
+    /// (`gdGenesisKeyHashes`) both the delegation and update-proposal state
+    /// machines gate on (issue #1084). Weights are irrelevant to that gate.
+    pub fn allowed_delegators(
+        &self,
+    ) -> std::collections::BTreeSet<dugite_primitives::hash::Hash28> {
+        self.boot_stakeholders
+            .keys()
+            .filter_map(|hex| dugite_primitives::hash::Hash28::from_hex(hex).ok())
+            .collect()
+    }
+
+    /// `heavyDelegation` as `(issuer, delegate)` `Hash28` pairs, for genesis
+    /// seeding (issue #1084). The map KEY is already the issuer's KeyHash;
+    /// the delegate is derived from `delegatePk` (a raw 64-byte extended
+    /// verification key, standard base64) via the ledger's `byron_key_hash`.
+    /// An entry that fails to parse is skipped with a warning rather than
+    /// failing genesis load outright — matches `initial_utxos`'s posture on
+    /// a malformed individual entry.
+    pub fn heavy_delegation_pairs(
+        &self,
+    ) -> Vec<(
+        dugite_primitives::hash::Hash28,
+        dugite_primitives::hash::Hash28,
+    )> {
+        use base64::Engine;
+        self.heavy_delegation
+            .iter()
+            .filter_map(|(issuer_hex, entry)| {
+                let issuer = match dugite_primitives::hash::Hash28::from_hex(issuer_hex) {
+                    Ok(h) => h,
+                    Err(e) => {
+                        tracing::warn!(issuer_hex, "Byron heavyDelegation: bad issuer hash: {e}");
+                        return None;
+                    }
+                };
+                let delegate_pk =
+                    match base64::engine::general_purpose::STANDARD.decode(&entry.delegate_pk) {
+                        Ok(b) => b,
+                        Err(e) => {
+                            tracing::warn!(
+                                issuer_hex,
+                                "Byron heavyDelegation: bad delegatePk base64: {e}"
+                            );
+                            return None;
+                        }
+                    };
+                let delegate = dugite_ledger::eras::byron::byron_key_hash(&delegate_pk);
+                Some((issuer, delegate))
+            })
+            .collect()
     }
 
     /// Extract the initial UTxO set from both nonAvvmBalances and avvmDistr.

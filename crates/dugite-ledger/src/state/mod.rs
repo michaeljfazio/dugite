@@ -210,6 +210,13 @@ pub struct LedgerState {
     /// `adoptGenesisDelegs` runs at TICK, not just epoch boundaries).
     /// See issue #804.
     pub future_gen_delegs: HashMap<(u64, Hash28), (Hash28, Hash32)>,
+    /// Byron's `UPI.State` (update-proposal system) + `DI.State` (heavyweight
+    /// delegation) — the two `ChainValidationState` fields Byron carries
+    /// beyond the UTxO set (issue #1084). Always present; default-empty on a
+    /// Shelley-from-genesis network (no Byron era to seed it), seeded from
+    /// Byron genesis otherwise, and inert (never mutated) after the Byron
+    /// era ends. See `crate::eras::byron::ByronSubState`.
+    pub byron: crate::eras::byron::ByronSubState,
     /// Quorum for pre-Conway protocol parameter updates (from Shelley genesis)
     pub update_quorum: u64,
     /// The network this node is running on (mainnet, testnet, etc.).
@@ -1447,6 +1454,7 @@ impl LedgerState {
             genesis_hash: Hash32::ZERO,
             genesis_delegates: HashMap::new(),
             future_gen_delegs: HashMap::new(),
+            byron: crate::eras::byron::ByronSubState::default(),
             update_quorum: default_update_quorum(),
             node_network: None,
             randomness_stabilisation_window: 172800, // 4k/f on mainnet: ceil(4*2160/0.05)
@@ -2053,6 +2061,9 @@ impl LedgerState {
             // the Haskell snapshot decoder does not carry `dsFutureGenDelegs`
             // in the first place. Empty is correct here.
             future_gen_delegs: HashMap::new(),
+            // Mithril import lands at a Shelley+ tip — default-empty and
+            // never read (design doc §3.3).
+            byron: crate::eras::byron::ByronSubState::default(),
             update_quorum: 5,
             node_network: None, // Will be set by caller
             // Will be recalculated by set_epoch_length()
@@ -2104,6 +2115,7 @@ impl LedgerState {
             genesis_hash: self.genesis_hash,
             genesis_delegates: self.genesis_delegates.clone(),
             future_gen_delegs: self.future_gen_delegs.clone(),
+            byron: self.byron.clone(),
             update_quorum: self.update_quorum,
             node_network: self.node_network,
             randomness_stabilisation_window: self.randomness_stabilisation_window,
@@ -2971,6 +2983,9 @@ impl LedgerState {
         // #804: same rationale — `future_gen_delegs` lives directly on
         // `LedgerState`, tracked via its own delta snapshot.
         self.future_gen_delegs = new_state.future_gen_delegs;
+        // #1084: same rationale — `byron` lives directly on `LedgerState`,
+        // tracked via `LedgerDelta::byron_snapshot`.
+        self.byron = new_state.byron;
 
         Some(n)
     }

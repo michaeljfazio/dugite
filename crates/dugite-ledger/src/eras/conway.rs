@@ -2811,6 +2811,7 @@ mod tests {
             },
             transactions: vec![],
             raw_cbor: None,
+            byron: None,
         };
 
         assert!(rules.validate_block_body(&block, &ctx, &utxo).is_ok());
@@ -3302,6 +3303,7 @@ mod tests {
             },
             transactions: vec![tx0, tx1],
             raw_cbor: None,
+            byron: None,
         };
 
         let utxo = make_utxo_sub(vec![]);

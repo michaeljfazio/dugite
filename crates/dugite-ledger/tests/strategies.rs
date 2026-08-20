@@ -375,6 +375,7 @@ pub fn make_test_block(slot: u64, block_no: u64, transactions: Vec<Transaction>)
         transactions,
         era: Era::Conway,
         raw_cbor: None,
+        byron: None,
     }
 }
 

@@ -410,6 +410,9 @@ pub fn forge_block(
         transactions,
         era: config.era,
         raw_cbor: None,
+        // dugite never forges a Byron (OBFT) block — forging is Praos/Conway+
+        // only.
+        byron: None,
     };
     block.header.header_hash = header_hash;
     block.header.kes_signature = kes_signature.clone();
