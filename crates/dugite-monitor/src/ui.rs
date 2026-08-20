@@ -607,7 +607,12 @@ fn render_chain_panel(frame: &mut Frame, app: &App, theme: &Theme, area: Rect) {
         }
     };
     let blocks_received = app.metrics.get_u64("dugite_blocks_received_total");
-    let forks = app.metrics.get_u64("dugite_rollback_count_total");
+    // #1098: this row is labelled "Forks" and highlighted whenever > 0, so it
+    // must read the REAL ledger-level chain-switch counter, not the per-peer
+    // ChainSync MsgRollBackward protocol-chatter counter (which fires
+    // ~15-20 times per routine peer resync and would light this up in
+    // warning color on every healthy reconnect).
+    let forks = app.metrics.get_u64("dugite_ledger_reorg_total");
 
     let density_str = if density > 0.0 {
         format!("{:.4}", density)

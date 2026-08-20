@@ -1546,9 +1546,18 @@
             "type": "prometheus",
             "uid": "${DS_PROMETHEUS}"
           },
-          "expr": "rate(dugite_rollback_count_total[5m]) * 60",
-          "legendFormat": "rollbacks /min",
+          "expr": "rate(dugite_chainsync_rollback_messages_total[5m]) * 60",
+          "legendFormat": "ChainSync rollback msgs /min",
           "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "expr": "rate(dugite_ledger_reorg_total[5m]) * 60",
+          "legendFormat": "ledger reorgs /min",
+          "refId": "B"
         },
         {
           "datasource": {
@@ -1557,12 +1566,12 @@
           },
           "expr": "rate(dugite_block_apply_failures_total[5m]) * 60",
           "legendFormat": "apply failures /min",
-          "refId": "A"
+          "refId": "C"
         }
       ],
-      "title": "Rollbacks & Apply Failures",
+      "title": "ChainSync Rollbacks, Ledger Reorgs & Apply Failures",
       "type": "timeseries",
-      "description": "Healthy chains see < 1 rollback/min and zero apply failures."
+      "description": "ChainSync rollback msgs are routine per-peer resync chatter (~15-20 per peer resync) — high but expected. Ledger reorgs are actual chain switches and should be rare; healthy chains see 0 apply failures."
     },
     {
       "datasource": {

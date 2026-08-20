@@ -363,9 +363,17 @@ impl Node {
     async fn handle_rollback_inner(&self, rollback_point: &Point) -> bool {
         let rollback_slot = rollback_point.slot().map(|s| s.0).unwrap_or(0);
 
-        // Count every rollback event for observability, even no-ops.
+        // This function is reached ONLY via `handle_ledger_rollback`, which
+        // is called ONLY from a real ledger-level chain switch (TriggeredFork)
+        // or a failed-fork revert (abandon_failed_fork) — never from a peer's
+        // ChainSync `MsgRollBackward` (see `handle_ledger_rollback`'s doc
+        // comment). So every call here IS a real reorg event; count every one
+        // for observability, even no-ops (#1098: this metric was previously
+        // conflated with per-peer ChainSync protocol chatter under the name
+        // `dugite_rollback_count_total` — that name now counts ONLY the
+        // ChainSync messages, at the `MsgRollBackward` handling site).
         self.metrics
-            .rollback_count
+            .ledger_reorg_total
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
         // Guard: reject rollback targets older than our ImmutableDB tip.
@@ -1328,9 +1336,12 @@ impl Node {
                                 apply_count = apply.len(),
                                 "Chain selection: fork switch — rolling back ledger to intersection"
                             );
-                            self.metrics
-                                .rollback_count
-                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            // `ledger_reorg_total` is incremented once, inside
+                            // `handle_ledger_rollback` -> `handle_rollback_inner`,
+                            // below — not duplicated here (#1098: a direct
+                            // increment at this call site double-counted every
+                            // real reorg against the equivalent single count
+                            // `handle_rollback_inner` already performs).
 
                             let rollback_point = dugite_primitives::block::Point::Specific(
                                 intersection_slot,
@@ -6641,12 +6652,19 @@ pub async fn chainsync_client_task(
                             "ChainSync rollback",
                         );
 
-                        // Count non-initial rollbacks for observability.
+                        // Count non-initial MsgRollBackward messages for observability.
                         // The first MsgRollBackward after intersection is
                         // expected protocol behavior — not a real fork.
+                        //
+                        // This is per-peer ChainSync protocol chatter (a peer
+                        // resyncing its own candidate fragment), NOT a ledger-level
+                        // reorg — a peer routinely sends several of these per
+                        // resync even when this node's own chain never changes.
+                        // See `Metrics::ledger_reorg_total` for the actual
+                        // chain-switch count (#1098).
                         if !is_initial {
                             metrics
-                                .rollback_count
+                                .chainsync_rollback_messages
                                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         }
 

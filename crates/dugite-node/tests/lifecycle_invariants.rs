@@ -113,6 +113,52 @@ async fn stop_and_recover_restores_channels_on_fake_connection() {
     );
 }
 
+/// #1097: `start_hot_protocols` must label each spawned hot task with its
+/// real protocol name, in the same order it spawns them.
+///
+/// Found while investigating a preprod soak where `demote_to_warm`'s "channel
+/// recovery failed, falling back to TCP close" fired 40+ times in ~10-minute
+/// bursts clustered with peer-governor churn, and `stop_hot_protocols_and_recover`'s
+/// per-task timeout warning gave no indication of WHICH of ChainSync,
+/// BlockFetch or TxSubmission2 was slow to respond to cancellation — so a
+/// real regression in one specific protocol's cancellation handling would
+/// have looked identical to ordinary real-network scheduling variance.
+///
+/// `hot_task_names_for_test()` exposes the labels `stop_hot_protocols_and_recover`
+/// and `stop_tasks` log against; this pins them to the fixed spawn order
+/// (`start_hot_protocols`'s three `self.hot_tasks.push((name, handle, token))`
+/// call sites) so a future reorder or mislabel is caught here instead of
+/// silently mislabeling every subsequent timeout/join-error log line.
+#[tokio::test]
+async fn hot_task_names_match_spawn_order() {
+    let addr: SocketAddr = "10.0.1.2:3001".parse().unwrap();
+    let mut conn = dugite_node::node::peer_connection::PeerConnection::fake_with_hot_channels(addr);
+
+    fn noop_fn() -> dugite_node::node::peer_connection::ProtocolTaskFn {
+        Box::new(move |_ch, cancel| {
+            Box::pin(async move {
+                cancel.cancelled().await;
+            })
+        })
+    }
+
+    conn.start_hot_protocols(noop_fn(), noop_fn(), noop_fn())
+        .expect("start_hot_protocols must succeed");
+
+    assert_eq!(
+        conn.hot_task_names_for_test(),
+        vec!["chainsync", "blockfetch", "txsubmission"],
+        "hot_tasks must carry the real protocol name for each slot, in \
+         chainsync/blockfetch/txsubmission spawn order — a wrong or swapped \
+         label here means stop_hot_protocols_and_recover's timeout/join-error \
+         logs (#1097) point at the wrong protocol"
+    );
+
+    // Clean up: cancel so the waiting tasks exit rather than being aborted
+    // silently at test-drop time.
+    let _ = conn.stop_hot_protocols_and_recover().await;
+}
+
 /// Verify 100 Hot→Warm→Hot cycles on a real TCP loopback pair.
 ///
 /// Each cycle:
