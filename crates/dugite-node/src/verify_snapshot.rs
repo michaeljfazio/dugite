@@ -9,15 +9,27 @@
 //!
 //! ## Why semantic comparison (not byte-for-byte)
 //!
-//! `LedgerStateSnapshot` contains many `HashMap` and `HashSet` fields.
-//! Bincode serialises hash maps in their internal iteration order, which
-//! is non-deterministic across processes (and across hash-DOS-mitigation
-//! seed values). A raw byte comparison would flag spurious differences
-//! that are not actual ledger-state mismatches.
+//! Before #1088, `LedgerStateSnapshot` wrote most of its map/set fields in
+//! `HashMap`/`imbl::HashMap` iteration order, which is non-deterministic
+//! across processes (and across hash-DOS-mitigation seed values) — a raw
+//! byte comparison would have flagged spurious differences that were not
+//! actual ledger-state mismatches. Since #1088 every field reachable from
+//! `LedgerStateSnapshot` writes in key order (`BTreeMap`/`BTreeSet`, or an
+//! already-ordered `imbl::OrdMap`/`OrdSet`), so a byte comparison would now
+//! largely agree with this harness — EXCEPT `utxo_set`, which stays out of
+//! #1088's scope (production always attaches the on-disk LSM store, which
+//! clears the in-memory map, so `UtxoSet`'s own internal ordering is never
+//! observed on a real snapshot) and so is still compared semantically below.
 //!
-//! Instead the harness walks each field of `LedgerStateSnapshot`
-//! independently and compares using value semantics: maps are compared
-//! by key set + per-key value equality, sets by element equality, etc.
+//! The harness is kept as semantic comparison anyway, for two reasons: it
+//! remains the one path that still covers `utxo_set`, and a semantic diff
+//! reports WHICH keys differ and how (`missing_in_left`/`value_mismatches`)
+//! rather than just "the bytes differ somewhere" — strictly more useful for
+//! triage than a byte-exact check would be on its own.
+//!
+//! The harness walks each field of `LedgerStateSnapshot` independently and
+//! compares using value semantics: maps are compared by key set + per-key
+//! value equality, sets by element equality, etc.
 //!
 //! ## Output
 //!
@@ -25,8 +37,7 @@
 //! On any difference it prints a structured per-field diff and exits 1
 //! so the harness can be used as a CI gate.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
-use std::hash::Hash;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::Path;
 
 use anyhow::{Context, Result};
@@ -387,55 +398,55 @@ pub fn diff_snapshots(left: &LedgerStateSnapshot, right: &LedgerStateSnapshot) -
     }
 
     // ── Delegations / pools / rewards ────────────────────────────────
-    diff_map(
+    diff_btree(
         &mut diffs,
         "delegations",
         &left.delegations,
         &right.delegations,
     );
-    diff_map(
+    diff_btree(
         &mut diffs,
         "pool_params",
         &left.pool_params,
         &right.pool_params,
     );
-    diff_map(
+    diff_btree(
         &mut diffs,
         "future_pool_params",
         &left.future_pool_params,
         &right.future_pool_params,
     );
-    diff_map(
+    diff_btree(
         &mut diffs,
         "pending_retirements",
         &left.pending_retirements,
         &right.pending_retirements,
     );
-    diff_map(
+    diff_btree(
         &mut diffs,
         "reward_accounts",
         &left.reward_accounts,
         &right.reward_accounts,
     );
-    diff_map(
+    diff_btree(
         &mut diffs,
         "pointer_map",
         &left.pointer_map,
         &right.pointer_map,
     );
-    diff_map(
+    diff_btree(
         &mut diffs,
         "genesis_delegates",
         &left.genesis_delegates,
         &right.genesis_delegates,
     );
-    diff_map(
+    diff_btree(
         &mut diffs,
         "stake_key_deposits",
         &left.stake_key_deposits,
         &right.stake_key_deposits,
     );
-    diff_map(
+    diff_btree(
         &mut diffs,
         "pool_deposits",
         &left.pool_deposits,
@@ -447,7 +458,7 @@ pub fn diff_snapshots(left: &LedgerStateSnapshot, right: &LedgerStateSnapshot) -
         &left.total_stake_key_deposits,
         &right.total_stake_key_deposits,
     );
-    diff_set(
+    diff_btree_set(
         &mut diffs,
         "script_stake_credentials",
         &left.script_stake_credentials,
@@ -455,13 +466,13 @@ pub fn diff_snapshots(left: &LedgerStateSnapshot, right: &LedgerStateSnapshot) -
     );
 
     // ── MIR pending ──────────────────────────────────────────────────
-    diff_map(
+    diff_btree(
         &mut diffs,
         "pending_mir_reserves",
         &left.pending_mir_reserves,
         &right.pending_mir_reserves,
     );
-    diff_map(
+    diff_btree(
         &mut diffs,
         "pending_mir_treasury",
         &left.pending_mir_treasury,
@@ -484,7 +495,7 @@ pub fn diff_snapshots(left: &LedgerStateSnapshot, right: &LedgerStateSnapshot) -
     cmp_pretty(&mut diffs, "snapshots", &left.snapshots, &right.snapshots);
 
     // ── Per-pool block counts ────────────────────────────────────────
-    diff_map(
+    diff_btree(
         &mut diffs,
         "epoch_blocks_by_pool",
         &left.epoch_blocks_by_pool,
@@ -571,13 +582,13 @@ pub fn diff_snapshots(left: &LedgerStateSnapshot, right: &LedgerStateSnapshot) -
     );
 
     // ── Stake distribution + pointer stake ──────────────────────────
-    diff_map(
+    diff_btree(
         &mut diffs,
         "stake_distribution.stake_map",
         &left.stake_distribution.stake_map,
         &right.stake_distribution.stake_map,
     );
-    diff_map(&mut diffs, "ptr_stake", &left.ptr_stake, &right.ptr_stake);
+    diff_btree(&mut diffs, "ptr_stake", &left.ptr_stake, &right.ptr_stake);
 
     // ── Reward update + opcert counters ─────────────────────────────
     cmp_pretty(
@@ -586,7 +597,7 @@ pub fn diff_snapshots(left: &LedgerStateSnapshot, right: &LedgerStateSnapshot) -
         &left.pending_reward_update,
         &right.pending_reward_update,
     );
-    diff_map(
+    diff_btree(
         &mut diffs,
         "opcert_counters",
         &left.opcert_counters,
@@ -630,47 +641,6 @@ fn cmp_pretty<T: PartialEq + std::fmt::Debug>(diffs: &mut Vec<Diff>, field: &str
     }
 }
 
-fn diff_map<K, V>(diffs: &mut Vec<Diff>, field: &str, l: &HashMap<K, V>, r: &HashMap<K, V>)
-where
-    K: Eq + Hash + std::fmt::Debug,
-    V: PartialEq + std::fmt::Debug,
-{
-    let mut detail_parts = Vec::new();
-    if l.len() != r.len() {
-        detail_parts.push(format!("len {} vs {}", l.len(), r.len()));
-    }
-    let mut missing_right = 0usize;
-    let mut missing_left = 0usize;
-    let mut value_mismatches = 0usize;
-    for (k, v) in l {
-        match r.get(k) {
-            None => missing_right += 1,
-            Some(rv) if rv != v => value_mismatches += 1,
-            _ => {}
-        }
-    }
-    for k in r.keys() {
-        if !l.contains_key(k) {
-            missing_left += 1;
-        }
-    }
-    if missing_right > 0 {
-        detail_parts.push(format!("missing_in_right={missing_right}"));
-    }
-    if missing_left > 0 {
-        detail_parts.push(format!("missing_in_left={missing_left}"));
-    }
-    if value_mismatches > 0 {
-        detail_parts.push(format!("value_mismatches={value_mismatches}"));
-    }
-    if !detail_parts.is_empty() {
-        diffs.push(Diff {
-            field: field.into(),
-            detail: detail_parts.join(", "),
-        });
-    }
-}
-
 fn diff_btree<K, V>(diffs: &mut Vec<Diff>, field: &str, l: &BTreeMap<K, V>, r: &BTreeMap<K, V>)
 where
     K: Ord + std::fmt::Debug,
@@ -705,11 +675,17 @@ where
     }
 }
 
-fn diff_set<T: Eq + Hash + std::fmt::Debug>(
+/// Set-membership diff: reports a size mismatch, or the count of elements
+/// missing on each side. `script_stake_credentials` is the only set-typed
+/// field `LedgerStateSnapshot` carries; it moved to `BTreeSet` under #1088
+/// (every reachable map/set now writes in key order), so this compares by
+/// `Ord`, not `Hash` — the `HashSet`-typed sibling this replaced (`diff_set`)
+/// has no remaining caller and was deleted with it.
+fn diff_btree_set<T: Ord + std::fmt::Debug>(
     diffs: &mut Vec<Diff>,
     field: &str,
-    l: &HashSet<T>,
-    r: &HashSet<T>,
+    l: &BTreeSet<T>,
+    r: &BTreeSet<T>,
 ) {
     if l.len() != r.len() {
         diffs.push(Diff {

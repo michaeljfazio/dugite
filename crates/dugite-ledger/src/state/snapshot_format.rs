@@ -9,20 +9,55 @@
 //!
 //! There is no migration path between versions.  Pre-1.0 dugite makes no
 //! snapshot back-compat guarantee.
+//!
+//! # Map/set ordering (#1088)
+//!
+//! Bincode writes a map or set field in whatever order its type iterates.
+//! `std::collections::HashMap`/`HashSet` and `imbl::HashMap`/`HashSet` both
+//! default to a randomized hasher, so for any collection with 2+ entries two
+//! processes holding byte-for-byte identical logical state serialize
+//! DIFFERENT bytes — and the same process can differ across two runs.  Every
+//! collection reachable from [`LedgerStateSnapshot`] is therefore either
+//! already backed by an inherently-ordered type (`BTreeMap`/`BTreeSet`,
+//! `imbl::OrdMap`/`OrdSet`) or is converted to one AT THE SERIALIZATION
+//! BOUNDARY — i.e. inside this module's `From` impls, never by changing the
+//! live `LedgerState` field's own type.
+//!
+//! `LedgerState`'s live collections stay `HashMap`/`imbl::HashMap` on
+//! purpose: the ordering fix costs nothing per block (the conversion runs
+//! once, at snapshot-write time, on data that is already being cloned), while
+//! switching the LIVE per-block hot-path types to an ordered container would
+//! cost real throughput (`imbl::HashMap`'s HAMT is ~log32(N) deep vs.
+//! `OrdMap`'s B-tree at ~log2(N), and `reward_accounts` alone is ~784K
+//! entries on mainnet) for a property only the WIRE format needs. Two of the
+//! affected types (`GovernanceState`, `StakeSnapshot`, `NonMyopic`,
+//! `PendingRewardUpdate`, …) are shared between live state and the snapshot,
+//! so a `*Wire` mirror struct exists for each: field-for-field identical
+//! except every `HashMap`/`HashSet` becomes a `BTreeMap`/`BTreeSet`.  A field
+//! already backed by `imbl::OrdMap`/`OrdSet` (`proposals`, `votes_by_action`,
+//! `drep_expiry`, the `PRoot`/`PEdges` trees, …) is left untouched — it
+//! already iterates in key order.
 
 use imbl::HashMap as ImblHashMap;
-use std::collections::{BTreeMap, HashMap};
+use imbl::HashSet as ImblHashSet;
+use imbl::OrdMap as ImblOrdMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 
+use dugite_primitives::credentials::{Credential, Pointer};
 use dugite_primitives::hash::{Hash28, Hash32};
 use dugite_primitives::protocol_params::ProtocolParameters;
 use dugite_primitives::time::EpochNo;
-use dugite_primitives::transaction::{ProtocolParamUpdate, Rational};
+use dugite_primitives::transaction::{
+    Anchor, Constitution, DRep, GovActionId, ProtocolParamUpdate, Rational, Voter, VotingProcedure,
+};
 use dugite_primitives::value::Lovelace;
 use serde::{Deserialize, Serialize};
 
 use super::{
-    EpochSnapshots, GovernanceState, PendingRewardUpdate, PoolRegistration, StakeDistributionState,
+    DRepPulsingState, DRepRegistration, EnactedGovTerms, EpochSnapshots, GovRelation,
+    GovernanceState, Likelihood, NonMyopic, PEdges, PGraph, PendingRewardUpdate, PoolRegistration,
+    ProposalState, PulsedRatifyState, PulsingSnapshot, StakeDistributionState, StakeSnapshot,
 };
 use crate::plutus::SlotConfig;
 use crate::utxo::UtxoSet;
@@ -69,7 +104,7 @@ pub struct LedgerStateSnapshot {
     /// (Haskell's `prevPParams ^. ppProtocolVersionL.protocolVersionMajor`).
     pub prev_protocol_version_major: u64,
     /// Stake distribution
-    pub stake_distribution: StakeDistributionState,
+    pub stake_distribution: StakeDistributionStateWire,
     /// Treasury balance
     pub treasury: Lovelace,
     /// Pending treasury donations (Conway `TreasuryDonation`).
@@ -88,13 +123,18 @@ pub struct LedgerStateSnapshot {
     /// ~460 ms steady-state once the chain reached epoch 25-ish on
     /// preview — observed as the "rate collapse at block 119k" symptom
     /// across multiple runs.  See #702.
-    pub delegations: HashMap<Hash32, Hash28>,
+    ///
+    /// `BTreeMap`, not `HashMap` (#1088): bincode writes a map in
+    /// iteration order, and a `HashMap`/`imbl::HashMap` reserialised after
+    /// a round trip can order differently — two nodes with identical
+    /// state would write different bytes.
+    pub delegations: BTreeMap<Hash32, Hash28>,
     /// Pool registrations: pool_id -> pool registration
-    pub pool_params: HashMap<Hash28, PoolRegistration>,
+    pub pool_params: BTreeMap<Hash28, PoolRegistration>,
     /// Future pool parameters for re-registrations.
-    pub future_pool_params: HashMap<Hash28, PoolRegistration>,
+    pub future_pool_params: BTreeMap<Hash28, PoolRegistration>,
     /// Pool retirements pending: pool -> retirement epoch.
-    pub pending_retirements: HashMap<Hash28, EpochNo>,
+    pub pending_retirements: BTreeMap<Hash28, EpochNo>,
     /// `psVRFKeyHashes` — occurrences per pool VRF key hash (#1085).
     ///
     /// Persisted rather than recomputed on load: it is NOT a function of the
@@ -106,25 +146,25 @@ pub struct LedgerStateSnapshot {
     /// snapshot round-trip determinism guard catches exactly that.
     pub vrf_key_hashes: BTreeMap<Hash32, u64>,
     /// Stake snapshots for the Cardano "mark/set/go" snapshot model
-    pub snapshots: EpochSnapshots,
+    pub snapshots: EpochSnapshotsWire,
     /// Reward accounts: stake credential hash -> accumulated rewards.
     /// **OWNED, not Arc-shared** — see comment on `delegations`.
-    pub reward_accounts: HashMap<Hash32, Lovelace>,
+    pub reward_accounts: BTreeMap<Hash32, Lovelace>,
     /// Pointer map: certificate pointers -> credential hashes.
-    pub pointer_map: HashMap<dugite_primitives::credentials::Pointer, Hash32>,
+    pub pointer_map: BTreeMap<Pointer, Hash32>,
     /// Genesis delegates: genesis_key_hash -> (delegate_key_hash, vrf_key_hash).
-    pub genesis_delegates: HashMap<Hash28, (Hash28, Hash32)>,
+    pub genesis_delegates: BTreeMap<Hash28, (Hash28, Hash32)>,
     /// Pending (not-yet-matured) genesis-delegate changes: `(maturity_slot,
     /// genesis_key_hash)` -> `(delegate_key_hash, vrf_key_hash)`. Haskell
     /// `dsFutureGenDelegs`. New in v28 (#804) — MUST be persisted: it is
     /// historical bootstrap-era queue state that cannot be reconstructed
     /// from the restored tip.
-    pub future_gen_delegs: HashMap<(u64, Hash28), (Hash28, Hash32)>,
+    pub future_gen_delegs: BTreeMap<(u64, Hash28), (Hash28, Hash32)>,
     /// Fees collected in the current epoch
     pub epoch_fees: Lovelace,
     /// Number of blocks produced by each pool in the current epoch.
     /// **OWNED, not Arc-shared** — see comment on `delegations`.
-    pub epoch_blocks_by_pool: HashMap<Hash28, u64>,
+    pub epoch_blocks_by_pool: BTreeMap<Hash28, u64>,
     /// Total blocks in the current epoch
     pub epoch_block_count: u64,
     /// Evolving nonce (eta_v): accumulated hash of ALL VRF outputs.
@@ -162,14 +202,14 @@ pub struct LedgerStateSnapshot {
     pub update_quorum: u64,
     /// Conway governance state.
     /// **OWNED, not Arc-shared** — see comment on `delegations`.
-    pub governance: GovernanceState,
+    pub governance: GovernanceStateWire,
     /// Slot configuration for Plutus time conversion
     pub slot_config: SlotConfig,
     /// Whether stake distribution needs a full rebuild after snapshot load.
     #[serde(skip)]
     pub needs_stake_rebuild: bool,
     /// Pointer-addressed UTxO stake: pointer -> coin amount.
-    pub ptr_stake: HashMap<dugite_primitives::credentials::Pointer, u64>,
+    pub ptr_stake: BTreeMap<Pointer, u64>,
     /// Whether pointer-addressed UTxO stake has been excluded from stake_distribution.
     ///
     /// Persisted across snapshot reloads because the value is set ONCE at
@@ -183,7 +223,7 @@ pub struct LedgerStateSnapshot {
     /// gate against the ancillary import.
     pub ptr_stake_excluded: bool,
     /// Pending reward update (drained at the next epoch boundary).
-    pub pending_reward_update: Option<PendingRewardUpdate>,
+    pub pending_reward_update: Option<PendingRewardUpdateWire>,
     /// `EpochState.esNonMyopic` — per-pool `Likelihood` history plus the frozen
     /// reward pot (#1067).
     ///
@@ -193,17 +233,17 @@ pub struct LedgerStateSnapshot {
     /// moved. A node resuming without it would report values that only converge
     /// over ~20 epochs — which is precisely why adding it forces
     /// `SNAPSHOT_VERSION` 37 → 38 rather than a lazy backfill.
-    pub non_myopic: super::non_myopic::NonMyopic,
+    pub non_myopic: NonMyopicWire,
     /// Running total of all stake key deposits locked in the ledger (lovelace).
     pub total_stake_key_deposits: u64,
     /// Script-type stake credentials.
-    pub script_stake_credentials: std::collections::HashSet<Hash32>,
+    pub script_stake_credentials: BTreeSet<Hash32>,
     /// Pending MIR reserves-sourced reward deltas (Haskell
     /// `dsIRewards . irwdSrcReserves`; see issue #631).
-    pub pending_mir_reserves: HashMap<Hash32, i128>,
+    pub pending_mir_reserves: BTreeMap<Hash32, i128>,
     /// Pending MIR treasury-sourced reward deltas (Haskell
     /// `dsIRewards . irwdSrcTreasury`).
-    pub pending_mir_treasury: HashMap<Hash32, i128>,
+    pub pending_mir_treasury: BTreeMap<Hash32, i128>,
     /// Pending pot-to-pot accumulator: reserves drained at the next epoch
     /// boundary and routed to treasury (Haskell
     /// `dsIRewards . deltaReserves`).
@@ -219,12 +259,12 @@ pub struct LedgerStateSnapshot {
     #[serde(skip)]
     pub node_network: Option<dugite_primitives::network::NetworkId>,
     /// Operational certificate counters per pool.
-    pub opcert_counters: HashMap<Hash28, u64>,
+    pub opcert_counters: BTreeMap<Hash28, u64>,
     /// Per-credential deposit paid at stake key registration time (lovelace).
     /// **OWNED, not Arc-shared** — see comment on `delegations`.
-    pub stake_key_deposits: HashMap<Hash32, u64>,
+    pub stake_key_deposits: BTreeMap<Hash32, u64>,
     /// Per-pool deposit paid at pool registration time (lovelace).
-    pub pool_deposits: HashMap<Hash28, u64>,
+    pub pool_deposits: BTreeMap<Hash28, u64>,
     /// #736: the pv≤6 RUPD startStep capture — the registered
     /// reward-account credential set frozen when the epoch's slot crossed
     /// `epoch_first_slot + 4k/f` (Haskell RUPD pulser `fvAddrsRew`).
@@ -238,7 +278,7 @@ pub struct LedgerStateSnapshot {
     /// shortfall) and window-re-registered old credentials were paid from
     /// the GO snapshot (stale reward balances). Observed live as the
     /// ~2998 ADA replay-seam offset at mainnet boundary 337→338.
-    pub rupd_addrs_rew: Option<std::collections::HashSet<Hash32>>,
+    pub rupd_addrs_rew: Option<BTreeSet<Hash32>>,
 
     /// Whether a RUPD pulser exists for the epoch in progress (#1072).
     ///
@@ -288,12 +328,29 @@ impl From<&super::LedgerState> for LedgerStateSnapshot {
             // per map = ~60 MB total transient (held inside
             // `spawn_blocking` until file write completes), then dropped.
             // Negligible compared to the per-block savings.
-            // imbl::HashMap → std::HashMap for the snapshot wire format.
-            // The bincode positional field order is unchanged; no version bump needed.
+            //
+            // Every map/set here also moves from a hash-ordered container
+            // to a key-ordered one (#1088) — the same one-time clone, just
+            // collected into `BTreeMap`/`BTreeSet` instead.
             delegations: s.certs.delegations.iter().map(|(k, v)| (*k, *v)).collect(),
-            pool_params: (*s.certs.pool_params).clone(),
-            future_pool_params: s.certs.future_pool_params.clone(),
-            pending_retirements: s.certs.pending_retirements.clone(),
+            pool_params: s
+                .certs
+                .pool_params
+                .iter()
+                .map(|(k, v)| (*k, v.clone()))
+                .collect(),
+            future_pool_params: s
+                .certs
+                .future_pool_params
+                .iter()
+                .map(|(k, v)| (*k, v.clone()))
+                .collect(),
+            pending_retirements: s
+                .certs
+                .pending_retirements
+                .iter()
+                .map(|(k, v)| (*k, *v))
+                .collect(),
             vrf_key_hashes: s
                 .certs
                 .vrf_key_hashes
@@ -312,17 +369,32 @@ impl From<&super::LedgerState> for LedgerStateSnapshot {
                 .iter()
                 .map(|(k, v)| (*k, *v))
                 .collect(),
-            pool_deposits: s.certs.pool_deposits.clone(),
+            pool_deposits: s
+                .certs
+                .pool_deposits
+                .iter()
+                .map(|(k, v)| (*k, *v))
+                .collect(),
             total_stake_key_deposits: s.certs.total_stake_key_deposits,
-            pointer_map: s.certs.pointer_map.clone(),
-            stake_distribution: s.certs.stake_distribution.clone(),
-            script_stake_credentials: s.certs.script_stake_credentials.clone(),
-            pending_mir_reserves: s.certs.pending_mir_reserves.clone(),
-            pending_mir_treasury: s.certs.pending_mir_treasury.clone(),
+            pointer_map: s.certs.pointer_map.iter().map(|(k, v)| (*k, *v)).collect(),
+            stake_distribution: StakeDistributionStateWire::from(&s.certs.stake_distribution),
+            script_stake_credentials: s.certs.script_stake_credentials.iter().copied().collect(),
+            pending_mir_reserves: s
+                .certs
+                .pending_mir_reserves
+                .iter()
+                .map(|(k, v)| (*k, *v))
+                .collect(),
+            pending_mir_treasury: s
+                .certs
+                .pending_mir_treasury
+                .iter()
+                .map(|(k, v)| (*k, *v))
+                .collect(),
             pending_mir_delta_reserves: s.certs.pending_mir_delta_reserves,
             pending_mir_delta_treasury: s.certs.pending_mir_delta_treasury,
             // Gov sub-state — owned, see comment above.
-            governance: (*s.gov.governance).clone(),
+            governance: GovernanceStateWire::from(&*s.gov.governance),
             // Consensus sub-state
             evolving_nonce: s.consensus.evolving_nonce,
             candidate_nonce: s.consensus.candidate_nonce,
@@ -335,19 +407,33 @@ impl From<&super::LedgerState> for LedgerStateSnapshot {
             first_block_hash_of_epoch: s.consensus.first_block_hash_of_epoch,
             prev_epoch_first_block_hash: s.consensus.prev_epoch_first_block_hash,
             // Owned, see comment on `delegations`.
-            epoch_blocks_by_pool: (*s.consensus.epoch_blocks_by_pool).clone(),
+            epoch_blocks_by_pool: s
+                .consensus
+                .epoch_blocks_by_pool
+                .iter()
+                .map(|(k, v)| (*k, *v))
+                .collect(),
             epoch_block_count: s.consensus.epoch_block_count,
-            opcert_counters: s.consensus.opcert_counters.clone(),
+            opcert_counters: s
+                .consensus
+                .opcert_counters
+                .iter()
+                .map(|(k, v)| (*k, *v))
+                .collect(),
             // Epoch sub-state
-            snapshots: s.epochs.snapshots.clone(),
+            snapshots: EpochSnapshotsWire::from(&s.epochs.snapshots),
             treasury: s.epochs.treasury,
             reserves: s.epochs.reserves,
-            pending_reward_update: s.epochs.pending_reward_update.clone(),
-            non_myopic: s.epochs.non_myopic.clone(),
+            pending_reward_update: s
+                .epochs
+                .pending_reward_update
+                .as_ref()
+                .map(PendingRewardUpdateWire::from),
+            non_myopic: NonMyopicWire::from(&s.epochs.non_myopic),
             pending_pp_updates: s.epochs.pending_pp_updates.clone(),
             future_pp_updates: s.epochs.future_pp_updates.clone(),
             needs_stake_rebuild: s.epochs.needs_stake_rebuild,
-            ptr_stake: s.epochs.ptr_stake.clone(),
+            ptr_stake: s.epochs.ptr_stake.iter().map(|(k, v)| (*k, *v)).collect(),
             ptr_stake_excluded: s.epochs.ptr_stake_excluded,
             protocol_params: s.epochs.protocol_params.clone(),
             prev_protocol_params: s.epochs.prev_protocol_params.clone(),
@@ -363,8 +449,8 @@ impl From<&super::LedgerState> for LedgerStateSnapshot {
             byron_epoch_length: s.byron_epoch_length,
             slot_config: s.slot_config,
             genesis_hash: s.genesis_hash,
-            genesis_delegates: s.genesis_delegates.clone(),
-            future_gen_delegs: s.future_gen_delegs.clone(),
+            genesis_delegates: s.genesis_delegates.iter().map(|(k, v)| (*k, *v)).collect(),
+            future_gen_delegs: s.future_gen_delegs.iter().map(|(k, v)| (*k, *v)).collect(),
             update_quorum: s.update_quorum,
             node_network: s.node_network,
             randomness_stabilisation_window: s.randomness_stabilisation_window,
@@ -373,7 +459,11 @@ impl From<&super::LedgerState> for LedgerStateSnapshot {
             stability_window: 0,
             // #736: persist the pv≤6 RUPD startStep capture — historical
             // state that a restart cannot re-derive.
-            rupd_addrs_rew: s.epochs.rupd_addrs_rew.as_deref().cloned(),
+            rupd_addrs_rew: s
+                .epochs
+                .rupd_addrs_rew
+                .as_deref()
+                .map(|set| set.iter().copied().collect()),
             rupd_pulser_started: s.epochs.rupd_pulser_started,
             rupd_monetary: s.epochs.rupd_monetary,
             pending_avvm_return: s.epochs.pending_avvm_return,
@@ -393,30 +483,30 @@ impl From<LedgerStateSnapshot> for super::LedgerState {
                 pending_donations: s.pending_donations,
             },
             certs: CertSubState {
-                // std::HashMap → imbl::HashMap on load.
+                // BTreeMap → imbl::HashMap / std::HashMap on load.
                 // The conversion is O(N) once at startup — not in the hot path.
                 delegations: s.delegations.into_iter().collect::<ImblHashMap<_, _>>(),
-                pool_params: Arc::new(s.pool_params),
-                future_pool_params: s.future_pool_params,
-                pending_retirements: s.pending_retirements,
+                pool_params: Arc::new(s.pool_params.into_iter().collect::<HashMap<_, _>>()),
+                future_pool_params: s.future_pool_params.into_iter().collect(),
+                pending_retirements: s.pending_retirements.into_iter().collect(),
                 vrf_key_hashes: s.vrf_key_hashes.into_iter().collect::<ImblHashMap<_, _>>(),
                 reward_accounts: s.reward_accounts.into_iter().collect::<ImblHashMap<_, _>>(),
                 stake_key_deposits: s
                     .stake_key_deposits
                     .into_iter()
                     .collect::<ImblHashMap<_, _>>(),
-                pool_deposits: s.pool_deposits,
+                pool_deposits: s.pool_deposits.into_iter().collect(),
                 total_stake_key_deposits: s.total_stake_key_deposits,
-                pointer_map: s.pointer_map,
-                stake_distribution: s.stake_distribution,
-                script_stake_credentials: s.script_stake_credentials,
-                pending_mir_reserves: s.pending_mir_reserves,
-                pending_mir_treasury: s.pending_mir_treasury,
+                pointer_map: s.pointer_map.into_iter().collect(),
+                stake_distribution: s.stake_distribution.into(),
+                script_stake_credentials: s.script_stake_credentials.into_iter().collect(),
+                pending_mir_reserves: s.pending_mir_reserves.into_iter().collect(),
+                pending_mir_treasury: s.pending_mir_treasury.into_iter().collect(),
                 pending_mir_delta_reserves: s.pending_mir_delta_reserves,
                 pending_mir_delta_treasury: s.pending_mir_delta_treasury,
             },
             gov: GovSubState {
-                governance: Arc::new(s.governance),
+                governance: Arc::new(s.governance.into()),
             },
             consensus: ConsensusSubState {
                 evolving_nonce: s.evolving_nonce,
@@ -429,16 +519,16 @@ impl From<LedgerStateSnapshot> for super::LedgerState {
                 rolling_nonce: s.rolling_nonce,
                 first_block_hash_of_epoch: s.first_block_hash_of_epoch,
                 prev_epoch_first_block_hash: s.prev_epoch_first_block_hash,
-                epoch_blocks_by_pool: Arc::new(s.epoch_blocks_by_pool),
+                epoch_blocks_by_pool: Arc::new(s.epoch_blocks_by_pool.into_iter().collect()),
                 epoch_block_count: s.epoch_block_count,
-                opcert_counters: s.opcert_counters,
+                opcert_counters: s.opcert_counters.into_iter().collect(),
             },
             epochs: EpochSubState {
-                snapshots: s.snapshots,
+                snapshots: s.snapshots.into(),
                 treasury: s.treasury,
                 reserves: s.reserves,
-                pending_reward_update: s.pending_reward_update,
-                non_myopic: s.non_myopic,
+                pending_reward_update: s.pending_reward_update.map(Into::into),
+                non_myopic: s.non_myopic.into(),
                 // Not persisted to ledger snapshots — this is a
                 // post-boundary debug-dump aid only.  Recomputed on the
                 // next epoch boundary.
@@ -446,7 +536,7 @@ impl From<LedgerStateSnapshot> for super::LedgerState {
                 pending_pp_updates: s.pending_pp_updates,
                 future_pp_updates: s.future_pp_updates,
                 needs_stake_rebuild: s.needs_stake_rebuild,
-                ptr_stake: s.ptr_stake,
+                ptr_stake: s.ptr_stake.into_iter().collect(),
                 ptr_stake_excluded: s.ptr_stake_excluded,
                 protocol_params: s.protocol_params,
                 prev_protocol_params: s.prev_protocol_params,
@@ -458,7 +548,9 @@ impl From<LedgerStateSnapshot> for super::LedgerState {
                 // restart happened past the epoch's 4k/f mark, producing
                 // the ~2998 ADA replay-seam treasury shortfall + stale
                 // reward balances at the next pv≤6 boundary.
-                rupd_addrs_rew: s.rupd_addrs_rew.map(Arc::new),
+                rupd_addrs_rew: s
+                    .rupd_addrs_rew
+                    .map(|set| Arc::new(set.into_iter().collect::<HashSet<_>>())),
                 rupd_pulser_started: s.rupd_pulser_started,
                 rupd_monetary: s.rupd_monetary,
                 // Transient: rebuilt at the next block, completed at the boundary.
@@ -474,8 +566,8 @@ impl From<LedgerStateSnapshot> for super::LedgerState {
             byron_epoch_length: s.byron_epoch_length,
             slot_config: s.slot_config,
             genesis_hash: s.genesis_hash,
-            genesis_delegates: s.genesis_delegates,
-            future_gen_delegs: s.future_gen_delegs,
+            genesis_delegates: s.genesis_delegates.into_iter().collect(),
+            future_gen_delegs: s.future_gen_delegs.into_iter().collect(),
             update_quorum: s.update_quorum,
             node_network: s.node_network,
             randomness_stabilisation_window: s.randomness_stabilisation_window,
@@ -485,6 +577,617 @@ impl From<LedgerStateSnapshot> for super::LedgerState {
             max_lovelace_supply: super::MAX_LOVELACE_SUPPLY,
             phase2_apply_horizon: None,
             cached_validation_registry: None,
+        }
+    }
+}
+
+// ── Wire mirrors for types embedded wholesale (#1088) ───────────────
+//
+// Each of these types is used BOTH live (inside `LedgerState`, via
+// `imbl::HashMap`/`std::HashMap`/`HashSet` for O(1)-clone or per-block
+// mutation reasons) AND cloned wholesale into `LedgerStateSnapshot`. Rather
+// than change the live field's type — which would slow the per-block hot
+// path for a property only the wire format needs — each gets a `*Wire`
+// mirror: identical field-for-field, except every hash-ordered collection
+// becomes a `BTreeMap`/`BTreeSet`. A field already backed by
+// `imbl::OrdMap`/`OrdSet` (`proposals`, `votes_by_action`, `drep_expiry`, the
+// `PRoot`/`PEdges` proposal trees) is carried through UNCHANGED — it already
+// iterates in key order, so wrapping it again would just be noise.
+//
+// This is the same shape `vrf_key_hashes` and `drep_expiry` already used
+// (`ImblHashMap` live, `BTreeMap`/`ImblOrdMap` on the wire) — extended to
+// every other collection reachable from `LedgerStateSnapshot`.
+
+/// Wire mirror of [`StakeDistributionState`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct StakeDistributionStateWire {
+    pub stake_map: BTreeMap<Hash32, Lovelace>,
+}
+
+impl From<&StakeDistributionState> for StakeDistributionStateWire {
+    fn from(s: &StakeDistributionState) -> Self {
+        StakeDistributionStateWire {
+            stake_map: s.stake_map.iter().map(|(k, v)| (*k, *v)).collect(),
+        }
+    }
+}
+
+impl From<StakeDistributionStateWire> for StakeDistributionState {
+    fn from(s: StakeDistributionStateWire) -> Self {
+        StakeDistributionState {
+            stake_map: s.stake_map.into_iter().collect(),
+        }
+    }
+}
+
+/// Wire mirror of [`NonMyopic`]. Used both for `LedgerState.epochs.non_myopic`
+/// and for the copy riding on [`PendingRewardUpdate::non_myopic`] — one
+/// mirror type, two call sites, exactly like the live type.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct NonMyopicWire {
+    pub likelihoods: BTreeMap<Hash28, Likelihood>,
+    pub reward_pot: Lovelace,
+}
+
+impl From<&NonMyopic> for NonMyopicWire {
+    fn from(n: &NonMyopic) -> Self {
+        NonMyopicWire {
+            likelihoods: n.likelihoods.iter().map(|(k, v)| (*k, v.clone())).collect(),
+            reward_pot: n.reward_pot,
+        }
+    }
+}
+
+impl From<NonMyopicWire> for NonMyopic {
+    fn from(n: NonMyopicWire) -> Self {
+        NonMyopic {
+            likelihoods: n.likelihoods.into_iter().collect(),
+            reward_pot: n.reward_pot,
+        }
+    }
+}
+
+/// Wire mirror of [`PendingRewardUpdate`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PendingRewardUpdateWire {
+    pub rewards: BTreeMap<Hash32, Lovelace>,
+    pub delta_treasury: u64,
+    pub delta_reserves: i128,
+    pub non_myopic: NonMyopicWire,
+}
+
+impl From<&PendingRewardUpdate> for PendingRewardUpdateWire {
+    fn from(p: &PendingRewardUpdate) -> Self {
+        PendingRewardUpdateWire {
+            rewards: p.rewards.iter().map(|(k, v)| (*k, *v)).collect(),
+            delta_treasury: p.delta_treasury,
+            delta_reserves: p.delta_reserves,
+            non_myopic: NonMyopicWire::from(&p.non_myopic),
+        }
+    }
+}
+
+impl From<PendingRewardUpdateWire> for PendingRewardUpdate {
+    fn from(p: PendingRewardUpdateWire) -> Self {
+        PendingRewardUpdate {
+            rewards: p.rewards.into_iter().collect(),
+            delta_treasury: p.delta_treasury,
+            delta_reserves: p.delta_reserves,
+            non_myopic: p.non_myopic.into(),
+        }
+    }
+}
+
+/// Wire mirror of [`StakeSnapshot`]. Shared by `EpochSnapshotsWire`'s
+/// mark/set/go fields — three instances of one type, exactly like the live
+/// `StakeSnapshot`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct StakeSnapshotWire {
+    pub epoch: EpochNo,
+    pub delegations: BTreeMap<Hash32, Hash28>,
+    pub pool_stake: BTreeMap<Hash28, Lovelace>,
+    pub pool_params: BTreeMap<Hash28, PoolRegistration>,
+    pub stake_distribution: BTreeMap<Hash32, Lovelace>,
+    pub epoch_fees: Lovelace,
+    pub epoch_block_count: u64,
+    pub epoch_blocks_by_pool: BTreeMap<Hash28, u64>,
+}
+
+impl From<&StakeSnapshot> for StakeSnapshotWire {
+    fn from(s: &StakeSnapshot) -> Self {
+        StakeSnapshotWire {
+            epoch: s.epoch,
+            delegations: s.delegations.iter().map(|(k, v)| (*k, *v)).collect(),
+            pool_stake: s.pool_stake.iter().map(|(k, v)| (*k, *v)).collect(),
+            pool_params: s.pool_params.iter().map(|(k, v)| (*k, v.clone())).collect(),
+            stake_distribution: s.stake_distribution.iter().map(|(k, v)| (*k, *v)).collect(),
+            epoch_fees: s.epoch_fees,
+            epoch_block_count: s.epoch_block_count,
+            epoch_blocks_by_pool: s
+                .epoch_blocks_by_pool
+                .iter()
+                .map(|(k, v)| (*k, *v))
+                .collect(),
+        }
+    }
+}
+
+impl From<StakeSnapshotWire> for StakeSnapshot {
+    fn from(s: StakeSnapshotWire) -> Self {
+        StakeSnapshot {
+            epoch: s.epoch,
+            delegations: Arc::new(s.delegations.into_iter().collect()),
+            pool_stake: s.pool_stake.into_iter().collect(),
+            pool_params: Arc::new(s.pool_params.into_iter().collect()),
+            stake_distribution: Arc::new(s.stake_distribution.into_iter().collect()),
+            epoch_fees: s.epoch_fees,
+            epoch_block_count: s.epoch_block_count,
+            epoch_blocks_by_pool: Arc::new(s.epoch_blocks_by_pool.into_iter().collect()),
+        }
+    }
+}
+
+/// Wire mirror of [`EpochSnapshots`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct EpochSnapshotsWire {
+    pub mark: Option<StakeSnapshotWire>,
+    pub set: Option<StakeSnapshotWire>,
+    pub go: Option<StakeSnapshotWire>,
+    pub ss_fee: Lovelace,
+    pub bprev_block_count: u64,
+    pub bprev_blocks_by_pool: BTreeMap<Hash28, u64>,
+    pub rupd_ready: bool,
+}
+
+impl From<&EpochSnapshots> for EpochSnapshotsWire {
+    fn from(s: &EpochSnapshots) -> Self {
+        EpochSnapshotsWire {
+            mark: s.mark.as_ref().map(StakeSnapshotWire::from),
+            set: s.set.as_ref().map(StakeSnapshotWire::from),
+            go: s.go.as_ref().map(StakeSnapshotWire::from),
+            ss_fee: s.ss_fee,
+            bprev_block_count: s.bprev_block_count,
+            bprev_blocks_by_pool: s
+                .bprev_blocks_by_pool
+                .iter()
+                .map(|(k, v)| (*k, *v))
+                .collect(),
+            rupd_ready: s.rupd_ready,
+        }
+    }
+}
+
+impl From<EpochSnapshotsWire> for EpochSnapshots {
+    fn from(s: EpochSnapshotsWire) -> Self {
+        EpochSnapshots {
+            mark: s.mark.map(Into::into),
+            set: s.set.map(Into::into),
+            go: s.go.map(Into::into),
+            ss_fee: s.ss_fee,
+            bprev_block_count: s.bprev_block_count,
+            bprev_blocks_by_pool: Arc::new(s.bprev_blocks_by_pool.into_iter().collect()),
+            rupd_ready: s.rupd_ready,
+        }
+    }
+}
+
+/// Wire mirror of [`DRepRegistration`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DRepRegistrationWire {
+    pub credential: Credential,
+    pub deposit: Lovelace,
+    pub anchor: Option<Anchor>,
+    pub registered_epoch: EpochNo,
+    pub drep_expiry: EpochNo,
+    pub active: bool,
+    pub delegs: BTreeSet<Hash32>,
+}
+
+impl From<&DRepRegistration> for DRepRegistrationWire {
+    fn from(d: &DRepRegistration) -> Self {
+        DRepRegistrationWire {
+            credential: d.credential.clone(),
+            deposit: d.deposit,
+            anchor: d.anchor.clone(),
+            registered_epoch: d.registered_epoch,
+            drep_expiry: d.drep_expiry,
+            active: d.active,
+            delegs: d.delegs.iter().copied().collect(),
+        }
+    }
+}
+
+impl From<DRepRegistrationWire> for DRepRegistration {
+    fn from(d: DRepRegistrationWire) -> Self {
+        DRepRegistration {
+            credential: d.credential,
+            deposit: d.deposit,
+            anchor: d.anchor,
+            registered_epoch: d.registered_epoch,
+            drep_expiry: d.drep_expiry,
+            active: d.active,
+            delegs: d.delegs.into_iter().collect::<ImblHashSet<_>>(),
+        }
+    }
+}
+
+/// Wire mirror of [`PGraph`].
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct PGraphWire {
+    pub nodes: BTreeMap<GovActionId, PEdges>,
+}
+
+impl From<&PGraph> for PGraphWire {
+    fn from(g: &PGraph) -> Self {
+        PGraphWire {
+            nodes: g
+                .nodes
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect(),
+        }
+    }
+}
+
+impl From<PGraphWire> for PGraph {
+    fn from(g: PGraphWire) -> Self {
+        PGraph {
+            nodes: g.nodes.into_iter().collect::<ImblHashMap<_, _>>(),
+        }
+    }
+}
+
+/// Wire mirror of [`EnactedGovTerms`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct EnactedGovTermsWire {
+    pub committee_expiration: BTreeMap<Hash32, EpochNo>,
+    pub committee_threshold: Option<Rational>,
+    pub constitution: Option<Constitution>,
+    pub prev_gov_action_ids: GovRelation<Option<GovActionId>>,
+}
+
+impl From<&EnactedGovTerms> for EnactedGovTermsWire {
+    fn from(e: &EnactedGovTerms) -> Self {
+        EnactedGovTermsWire {
+            committee_expiration: e
+                .committee_expiration
+                .iter()
+                .map(|(k, v)| (*k, *v))
+                .collect(),
+            committee_threshold: e.committee_threshold.clone(),
+            constitution: e.constitution.clone(),
+            prev_gov_action_ids: e.prev_gov_action_ids.clone(),
+        }
+    }
+}
+
+impl From<EnactedGovTermsWire> for EnactedGovTerms {
+    fn from(e: EnactedGovTermsWire) -> Self {
+        EnactedGovTerms {
+            committee_expiration: e.committee_expiration.into_iter().collect(),
+            committee_threshold: e.committee_threshold,
+            constitution: e.constitution,
+            prev_gov_action_ids: e.prev_gov_action_ids,
+        }
+    }
+}
+
+/// Wire mirror of [`PulsingSnapshot`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PulsingSnapshotWire {
+    pub proposals: ImblOrdMap<GovActionId, ProposalState>,
+    pub votes_by_action: ImblOrdMap<GovActionId, ImblOrdMap<Voter, VotingProcedure>>,
+    pub committee_hot_keys: BTreeMap<Hash32, Hash32>,
+    pub committee_expiration: BTreeMap<Hash32, EpochNo>,
+    pub committee_resigned: BTreeMap<Hash32, Option<Anchor>>,
+    pub committee_threshold: Option<Rational>,
+    pub no_confidence: bool,
+    pub enacted_pparam_update: Option<GovActionId>,
+    pub enacted_hard_fork: Option<GovActionId>,
+    pub enacted_committee: Option<GovActionId>,
+    pub enacted_constitution: Option<GovActionId>,
+    pub snapshot_epoch: EpochNo,
+    pub treasury: u64,
+    pub vote_delegations: BTreeMap<Hash32, DRep>,
+    pub drep_distr: BTreeMap<Hash32, u64>,
+    pub drep_expiry: ImblOrdMap<Hash32, EpochNo>,
+    pub drep_no_confidence: u64,
+    pub drep_abstain: u64,
+    pub drep_no_confidence_delegated: bool,
+    pub drep_abstain_delegated: bool,
+}
+
+impl From<&PulsingSnapshot> for PulsingSnapshotWire {
+    fn from(p: &PulsingSnapshot) -> Self {
+        PulsingSnapshotWire {
+            proposals: p.proposals.clone(),
+            votes_by_action: p.votes_by_action.clone(),
+            committee_hot_keys: p.committee_hot_keys.iter().map(|(k, v)| (*k, *v)).collect(),
+            committee_expiration: p
+                .committee_expiration
+                .iter()
+                .map(|(k, v)| (*k, *v))
+                .collect(),
+            committee_resigned: p
+                .committee_resigned
+                .iter()
+                .map(|(k, v)| (*k, v.clone()))
+                .collect(),
+            committee_threshold: p.committee_threshold.clone(),
+            no_confidence: p.no_confidence,
+            enacted_pparam_update: p.enacted_pparam_update.clone(),
+            enacted_hard_fork: p.enacted_hard_fork.clone(),
+            enacted_committee: p.enacted_committee.clone(),
+            enacted_constitution: p.enacted_constitution.clone(),
+            snapshot_epoch: p.snapshot_epoch,
+            treasury: p.treasury,
+            vote_delegations: p
+                .vote_delegations
+                .iter()
+                .map(|(k, v)| (*k, v.clone()))
+                .collect(),
+            drep_distr: p.drep_distr.iter().map(|(k, v)| (*k, *v)).collect(),
+            drep_expiry: p.drep_expiry.clone(),
+            drep_no_confidence: p.drep_no_confidence,
+            drep_abstain: p.drep_abstain,
+            drep_no_confidence_delegated: p.drep_no_confidence_delegated,
+            drep_abstain_delegated: p.drep_abstain_delegated,
+        }
+    }
+}
+
+impl From<PulsingSnapshotWire> for PulsingSnapshot {
+    fn from(p: PulsingSnapshotWire) -> Self {
+        PulsingSnapshot {
+            proposals: p.proposals,
+            votes_by_action: p.votes_by_action,
+            committee_hot_keys: p
+                .committee_hot_keys
+                .into_iter()
+                .collect::<ImblHashMap<_, _>>(),
+            committee_expiration: p
+                .committee_expiration
+                .into_iter()
+                .collect::<ImblHashMap<_, _>>(),
+            committee_resigned: p
+                .committee_resigned
+                .into_iter()
+                .collect::<ImblHashMap<_, _>>(),
+            committee_threshold: p.committee_threshold,
+            no_confidence: p.no_confidence,
+            enacted_pparam_update: p.enacted_pparam_update,
+            enacted_hard_fork: p.enacted_hard_fork,
+            enacted_committee: p.enacted_committee,
+            enacted_constitution: p.enacted_constitution,
+            snapshot_epoch: p.snapshot_epoch,
+            treasury: p.treasury,
+            vote_delegations: p
+                .vote_delegations
+                .into_iter()
+                .collect::<ImblHashMap<_, _>>(),
+            drep_distr: p.drep_distr.into_iter().collect::<ImblHashMap<_, _>>(),
+            drep_expiry: p.drep_expiry,
+            drep_no_confidence: p.drep_no_confidence,
+            drep_abstain: p.drep_abstain,
+            drep_no_confidence_delegated: p.drep_no_confidence_delegated,
+            drep_abstain_delegated: p.drep_abstain_delegated,
+        }
+    }
+}
+
+/// Wire mirror of [`PulsedRatifyState`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PulsedRatifyStateWire {
+    pub computed_at_epoch: EpochNo,
+    pub enacted: Vec<GovActionId>,
+    pub expired: Vec<GovActionId>,
+    pub delayed: bool,
+    pub cur_pparams: ProtocolParameters,
+    pub has_pparams_changes: bool,
+    pub enact_state: EnactedGovTermsWire,
+}
+
+impl From<&PulsedRatifyState> for PulsedRatifyStateWire {
+    fn from(r: &PulsedRatifyState) -> Self {
+        PulsedRatifyStateWire {
+            computed_at_epoch: r.computed_at_epoch,
+            enacted: r.enacted.clone(),
+            expired: r.expired.clone(),
+            delayed: r.delayed,
+            cur_pparams: r.cur_pparams.clone(),
+            has_pparams_changes: r.has_pparams_changes,
+            enact_state: EnactedGovTermsWire::from(&r.enact_state),
+        }
+    }
+}
+
+impl From<PulsedRatifyStateWire> for PulsedRatifyState {
+    fn from(r: PulsedRatifyStateWire) -> Self {
+        PulsedRatifyState {
+            computed_at_epoch: r.computed_at_epoch,
+            enacted: r.enacted,
+            expired: r.expired,
+            delayed: r.delayed,
+            cur_pparams: r.cur_pparams,
+            has_pparams_changes: r.has_pparams_changes,
+            enact_state: r.enact_state.into(),
+        }
+    }
+}
+
+/// Wire mirror of [`DRepPulsingState`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DRepPulsingStateWire {
+    pub snapshot: PulsingSnapshotWire,
+    pub ratify_state: PulsedRatifyStateWire,
+}
+
+impl From<&DRepPulsingState> for DRepPulsingStateWire {
+    fn from(d: &DRepPulsingState) -> Self {
+        DRepPulsingStateWire {
+            snapshot: PulsingSnapshotWire::from(&d.snapshot),
+            ratify_state: PulsedRatifyStateWire::from(&d.ratify_state),
+        }
+    }
+}
+
+impl From<DRepPulsingStateWire> for DRepPulsingState {
+    fn from(d: DRepPulsingStateWire) -> Self {
+        DRepPulsingState {
+            snapshot: d.snapshot.into(),
+            ratify_state: d.ratify_state.into(),
+        }
+    }
+}
+
+/// Wire mirror of [`GovernanceState`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct GovernanceStateWire {
+    pub dreps: BTreeMap<Hash32, DRepRegistrationWire>,
+    pub vote_delegations: BTreeMap<Hash32, DRep>,
+    pub committee_hot_keys: BTreeMap<Hash32, Hash32>,
+    pub committee_expiration: BTreeMap<Hash32, EpochNo>,
+    pub committee_resigned: BTreeMap<Hash32, Option<Anchor>>,
+    pub script_committee_credentials: BTreeSet<Hash32>,
+    pub script_committee_hot_credentials: BTreeSet<Hash32>,
+    pub proposals: ImblOrdMap<GovActionId, ProposalState>,
+    pub votes_by_action: ImblOrdMap<GovActionId, ImblOrdMap<Voter, VotingProcedure>>,
+    pub proposal_roots: GovRelation<super::PRoot>,
+    pub proposal_graph: GovRelation<PGraphWire>,
+    pub drep_registration_count: u64,
+    pub proposal_count: u64,
+    pub constitution: Option<Constitution>,
+    pub no_confidence: bool,
+    pub committee_threshold: Option<Rational>,
+    pub enacted_pparam_update: Option<GovActionId>,
+    pub enacted_hard_fork: Option<GovActionId>,
+    pub enacted_committee: Option<GovActionId>,
+    pub enacted_constitution: Option<GovActionId>,
+    pub last_ratified: Vec<(GovActionId, ProposalState)>,
+    pub last_expired: Vec<GovActionId>,
+    pub last_ratify_delayed: bool,
+    pub num_dormant_epochs: u64,
+    pub drep_pulsing_state: Option<DRepPulsingStateWire>,
+    pub future_pparams: super::FuturePParams,
+}
+
+impl From<&GovernanceState> for GovernanceStateWire {
+    fn from(g: &GovernanceState) -> Self {
+        GovernanceStateWire {
+            dreps: g
+                .dreps
+                .iter()
+                .map(|(k, v)| (*k, DRepRegistrationWire::from(v)))
+                .collect(),
+            vote_delegations: g
+                .vote_delegations
+                .iter()
+                .map(|(k, v)| (*k, v.clone()))
+                .collect(),
+            committee_hot_keys: g.committee_hot_keys.iter().map(|(k, v)| (*k, *v)).collect(),
+            committee_expiration: g
+                .committee_expiration
+                .iter()
+                .map(|(k, v)| (*k, *v))
+                .collect(),
+            committee_resigned: g
+                .committee_resigned
+                .iter()
+                .map(|(k, v)| (*k, v.clone()))
+                .collect(),
+            script_committee_credentials: g.script_committee_credentials.iter().copied().collect(),
+            script_committee_hot_credentials: g
+                .script_committee_hot_credentials
+                .iter()
+                .copied()
+                .collect(),
+            proposals: g.proposals.clone(),
+            votes_by_action: g.votes_by_action.clone(),
+            proposal_roots: g.proposal_roots.clone(),
+            proposal_graph: GovRelation {
+                pparam: PGraphWire::from(&g.proposal_graph.pparam),
+                hard_fork: PGraphWire::from(&g.proposal_graph.hard_fork),
+                committee: PGraphWire::from(&g.proposal_graph.committee),
+                constitution: PGraphWire::from(&g.proposal_graph.constitution),
+            },
+            drep_registration_count: g.drep_registration_count,
+            proposal_count: g.proposal_count,
+            constitution: g.constitution.clone(),
+            no_confidence: g.no_confidence,
+            committee_threshold: g.committee_threshold.clone(),
+            enacted_pparam_update: g.enacted_pparam_update.clone(),
+            enacted_hard_fork: g.enacted_hard_fork.clone(),
+            enacted_committee: g.enacted_committee.clone(),
+            enacted_constitution: g.enacted_constitution.clone(),
+            last_ratified: g.last_ratified.clone(),
+            last_expired: g.last_expired.clone(),
+            last_ratify_delayed: g.last_ratify_delayed,
+            num_dormant_epochs: g.num_dormant_epochs,
+            drep_pulsing_state: g
+                .drep_pulsing_state
+                .as_ref()
+                .map(DRepPulsingStateWire::from),
+            future_pparams: g.future_pparams.clone(),
+        }
+    }
+}
+
+impl From<GovernanceStateWire> for GovernanceState {
+    fn from(g: GovernanceStateWire) -> Self {
+        GovernanceState {
+            dreps: g
+                .dreps
+                .into_iter()
+                .map(|(k, v)| (k, v.into()))
+                .collect::<ImblHashMap<_, _>>(),
+            vote_delegations: g
+                .vote_delegations
+                .into_iter()
+                .collect::<ImblHashMap<_, _>>(),
+            committee_hot_keys: g
+                .committee_hot_keys
+                .into_iter()
+                .collect::<ImblHashMap<_, _>>(),
+            committee_expiration: g
+                .committee_expiration
+                .into_iter()
+                .collect::<ImblHashMap<_, _>>(),
+            committee_resigned: g
+                .committee_resigned
+                .into_iter()
+                .collect::<ImblHashMap<_, _>>(),
+            script_committee_credentials: g
+                .script_committee_credentials
+                .into_iter()
+                .collect::<ImblHashSet<_>>(),
+            script_committee_hot_credentials: g
+                .script_committee_hot_credentials
+                .into_iter()
+                .collect::<ImblHashSet<_>>(),
+            proposals: g.proposals,
+            votes_by_action: g.votes_by_action,
+            proposal_roots: g.proposal_roots,
+            proposal_graph: GovRelation {
+                pparam: g.proposal_graph.pparam.into(),
+                hard_fork: g.proposal_graph.hard_fork.into(),
+                committee: g.proposal_graph.committee.into(),
+                constitution: g.proposal_graph.constitution.into(),
+            },
+            drep_registration_count: g.drep_registration_count,
+            proposal_count: g.proposal_count,
+            constitution: g.constitution,
+            no_confidence: g.no_confidence,
+            committee_threshold: g.committee_threshold,
+            enacted_pparam_update: g.enacted_pparam_update,
+            enacted_hard_fork: g.enacted_hard_fork,
+            enacted_committee: g.enacted_committee,
+            enacted_constitution: g.enacted_constitution,
+            last_ratified: g.last_ratified,
+            last_expired: g.last_expired,
+            last_ratify_delayed: g.last_ratify_delayed,
+            num_dormant_epochs: g.num_dormant_epochs,
+            drep_pulsing_state: g.drep_pulsing_state.map(Into::into),
+            future_pparams: g.future_pparams,
         }
     }
 }
@@ -507,7 +1210,11 @@ mod tests {
     ///
     /// bincode writes nothing for a `None` and nothing for an empty
     /// collection, so a field left at its default contributes ZERO bytes and
-    /// its layout is invisible to `snapshot_format_hash_stability`.
+    /// its layout is invisible to `snapshot_format_hash_stability`. Since
+    /// #1088, EVERY map/set field below must additionally carry **2+**
+    /// entries — with 0 or 1 entries there is nothing to reorder, so the
+    /// nondeterminism the hash-stability test exists to catch is itself
+    /// invisible at that width.
     #[test]
     fn fixture_populates_every_snapshot_field() {
         let state = crate::state::test_fixtures::populated_ledger_state();
@@ -603,13 +1310,14 @@ mod tests {
         // hash; there is simply no non-zero value to give it.
         assert_eq!(*stability_window, 0, "legacy field is always written as 0");
 
-        macro_rules! nonempty {
+        macro_rules! at_least_two {
             ($($v:expr, $name:literal);* $(;)?) => {
-                $(assert!(!$v.is_empty(), concat!($name, " is empty — the layout of its \
-                     elements contributes no bytes and is invisible to the hash"));)*
+                $(assert!($v.len() >= 2, concat!($name, " has fewer than 2 entries — a \
+                     single-entry (or empty) map/set has nothing to reorder, so it cannot \
+                     exercise the #1088 determinism guard")));*
             };
         }
-        nonempty!(
+        at_least_two!(
             delegations, "delegations";
             pool_params, "pool_params";
             future_pool_params, "future_pool_params";
@@ -620,8 +1328,6 @@ mod tests {
             genesis_delegates, "genesis_delegates";
             future_gen_delegs, "future_gen_delegs";
             epoch_blocks_by_pool, "epoch_blocks_by_pool";
-            pending_pp_updates, "pending_pp_updates";
-            future_pp_updates, "future_pp_updates";
             ptr_stake, "ptr_stake";
             script_stake_credentials, "script_stake_credentials";
             pending_mir_reserves, "pending_mir_reserves";
@@ -629,7 +1335,16 @@ mod tests {
             opcert_counters, "opcert_counters";
             stake_key_deposits, "stake_key_deposits";
             pool_deposits, "pool_deposits";
+            stake_distribution.stake_map, "stake_distribution.stake_map";
         );
+        // `pending_pp_updates`/`future_pp_updates` are `BTreeMap<EpochNo,
+        // Vec<(Hash32, ProtocolParamUpdate)>>` — already ordered at both
+        // levels (the outer key and the inner `Vec`'s push order), so they
+        // are outside #1088's scope and do not need 2+ OUTER keys. They
+        // still need to be non-empty, so the layout inside a
+        // `ProtocolParamUpdate` is not invisible to the hash.
+        assert!(!pending_pp_updates.is_empty(), "pending_pp_updates");
+        assert!(!future_pp_updates.is_empty(), "future_pp_updates");
         // #1067: both halves must be non-trivial. An empty `likelihoods` map
         // writes no element bytes at all, so a layout change inside
         // `Likelihood` would be invisible — the exact blindness this test
@@ -691,6 +1406,34 @@ mod tests {
             // change the guard failed to notice.
             governance.drep_pulsing_state, "governance.drep_pulsing_state";
         );
+        at_least_two!(
+            rupd_addrs_rew.as_ref().expect("checked above"), "rupd_addrs_rew";
+            pending_reward_update.as_ref().expect("checked above").rewards,
+                "pending_reward_update.rewards";
+        );
+        assert!(
+            pending_reward_update
+                .as_ref()
+                .expect("checked above")
+                .non_myopic
+                .likelihoods
+                .len()
+                >= 2,
+            "pending_reward_update.non_myopic.likelihoods has fewer than 2 entries"
+        );
+        {
+            let mark = snapshots.mark.as_ref().expect("checked above");
+            at_least_two!(
+                mark.delegations, "snapshots.mark.delegations";
+                mark.pool_stake, "snapshots.mark.pool_stake";
+                mark.pool_params, "snapshots.mark.pool_params";
+                mark.stake_distribution, "snapshots.mark.stake_distribution";
+                mark.epoch_blocks_by_pool, "snapshots.mark.epoch_blocks_by_pool";
+            );
+        }
+        at_least_two!(
+            snapshots.bprev_blocks_by_pool, "snapshots.bprev_blocks_by_pool";
+        );
 
         // `GovernanceState` is ONE field of the snapshot but many structures
         // under the hash, so it gets its own exhaustive destructure — again
@@ -701,7 +1444,7 @@ mod tests {
         // to compile, because `governance` is a single field there. A guard
         // that is exhaustive at one level only is exhaustive nowhere in
         // particular.
-        let crate::state::GovernanceState {
+        let GovernanceStateWire {
             dreps,
             vote_delegations,
             committee_hot_keys,
@@ -729,25 +1472,53 @@ mod tests {
             drep_pulsing_state,
             future_pparams,
         } = governance;
-        let _ = (
-            script_committee_credentials,
-            script_committee_hot_credentials,
-            gov_proposals,
-            proposal_roots,
-            proposal_graph,
-            last_ratified,
-            last_expired,
-        );
+        let _ = (proposal_roots, last_ratified, last_expired);
         assert!(
             future_pparams.known().is_some(),
             "governance.future_pparams carries no payload — `ProtocolParameters`' \
              layout inside the enum is invisible to the hash (#977)"
         );
+        at_least_two!(
+            dreps, "governance.dreps";
+            vote_delegations, "governance.vote_delegations";
+            committee_hot_keys, "governance.committee_hot_keys";
+            committee_expiration, "governance.committee_expiration";
+            committee_resigned, "governance.committee_resigned";
+            script_committee_credentials, "governance.script_committee_credentials";
+            script_committee_hot_credentials, "governance.script_committee_hot_credentials";
+            gov_proposals, "governance.proposals";
+        );
+        // #1088: the DRep's reverse-delegator index must also be 2+ wide —
+        // it lives one level below `dreps`' own keys and would otherwise
+        // stay invisible to the width check above.
+        assert!(
+            dreps.values().any(|d| d.delegs.len() >= 2),
+            "no DRepRegistration.delegs has 2+ entries — that nested set's \
+             ordering would go unexercised"
+        );
+        // `proposal_graph` is nested one level deeper than the rest of
+        // `GovernanceState`'s maps: `GovRelation<PGraphWire>` holds FOUR
+        // independent `PGraphWire.nodes` maps (one per governance purpose),
+        // and none of them is reachable from a flat `at_least_two!` call on
+        // `proposal_graph` itself.
+        assert!(
+            [
+                &proposal_graph.pparam,
+                &proposal_graph.hard_fork,
+                &proposal_graph.committee,
+                &proposal_graph.constitution,
+            ]
+            .iter()
+            .any(|g| g.nodes.len() >= 2),
+            "no GovRelation<PGraphWire> purpose tree has 2+ nodes — \
+             PGraph.nodes' ordering would go unexercised"
+        );
+
         // The pulser is ONE field here but two whole structures under the
         // hash, so it gets the same exhaustive treatment `GovernanceState`
         // does — the #988 gap was precisely a guard that stopped being
         // exhaustive one level down.
-        let crate::state::DRepPulsingState {
+        let DRepPulsingStateWire {
             snapshot: pulsing_snapshot,
             ratify_state,
         } = drep_pulsing_state.as_ref().expect(
@@ -792,25 +1563,16 @@ mod tests {
         assert!(enacted_hard_fork.is_some(), "enacted_hard_fork");
         assert!(enacted_committee.is_some(), "enacted_committee");
         assert!(enacted_constitution.is_some(), "enacted_constitution");
-
-        assert!(!dreps.is_empty(), "governance.dreps");
-        assert!(!vote_delegations.is_empty(), "governance.vote_delegations");
-        assert!(
-            !committee_hot_keys.is_empty(),
-            "governance.committee_hot_keys"
-        );
-        assert!(
-            !committee_expiration.is_empty(),
-            "governance.committee_expiration"
-        );
-        assert!(
-            !committee_resigned.is_empty(),
-            "governance.committee_resigned"
-        );
-        assert!(!votes_by_action.is_empty(), "governance.votes_by_action");
-        assert!(
-            !pulsing_snapshot.drep_distr.is_empty(),
-            "PulsingSnapshot.drep_distr"
+        at_least_two!(
+            pulsing_snapshot.committee_hot_keys, "pulsing_snapshot.committee_hot_keys";
+            pulsing_snapshot.committee_expiration, "pulsing_snapshot.committee_expiration";
+            pulsing_snapshot.committee_resigned, "pulsing_snapshot.committee_resigned";
+            pulsing_snapshot.vote_delegations, "pulsing_snapshot.vote_delegations";
+            pulsing_snapshot.drep_distr, "pulsing_snapshot.drep_distr";
+            pulsing_snapshot.drep_expiry, "pulsing_snapshot.drep_expiry";
+            votes_by_action, "governance.votes_by_action";
+            ratify_state.enact_state.committee_expiration,
+                "ratify_state.enact_state.committee_expiration";
         );
 
         // Scalars must be distinguishable from the value a bare
@@ -990,7 +1752,7 @@ mod tests {
     ///   3. `ss_fee` (fee pot captured by SNAP at the previous boundary)
     ///
     /// These are all carried inside `EpochSnapshots` which is a direct field
-    /// of `LedgerStateSnapshot` (via `snapshots: EpochSnapshots`) and is
+    /// of `LedgerStateSnapshot` (via `snapshots: EpochSnapshotsWire`) and is
     /// serialized by `#[derive(Serialize, Deserialize)]`.  A mid-epoch restart
     /// that saves then restores a snapshot MUST preserve all three byte-exact.
     ///
