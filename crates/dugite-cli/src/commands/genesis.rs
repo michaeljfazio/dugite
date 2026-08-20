@@ -32,6 +32,12 @@ enum GenesisSubcommand {
         out_file: PathBuf,
     },
     /// Create an initial UTxO transaction
+    ///
+    /// clap-derive renders a multi-word variant name with a hyphen before
+    /// every word boundary by default (`initial-tx-in`), but cardano-cli's
+    /// real name has no hyphen before "txin" (`genesis initial-txin`,
+    /// confirmed against `cardano-cli conway genesis --help`). #1008.
+    #[command(name = "initial-txin")]
     InitialTxIn {
         #[arg(long)]
         genesis_utxo_verify_key_file: PathBuf,

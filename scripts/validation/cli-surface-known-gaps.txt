@@ -1,111 +1,147 @@
 # Known, tracked gaps between cardano-cli's subcommand surface and
 # dugite-cli's, checked by cli-surface-parity.sh (#1006).
 #
-# Format: <normalized command path><TAB><issue-number>
+# Format: <normalized command path><TAB><issue-number><TAB><disposition><TAB><reason>
 # One entry per line. Blank lines and lines starting with # are ignored.
 #
-# The script fails on any MISSING command not listed here (a real gap the
-# gate hasn't tracked yet), and separately fails on any listed entry that is
-# no longer actually missing (a stale exemption — remove it). Mirrors the
-# `SKIP_LIST` discipline in
+# <disposition> is REQUIRED and must be one of:
+#   DEFERRED  — will implement eventually; tracked, not scheduled. A green
+#               gate must not be able to hide the difference between "we
+#               haven't gotten to it" and "we will never do this" — that
+#               distinction was the whole reason this column exists (#1008).
+#   WONTFIX   — deliberately excluded and not expected to change (dead
+#               network, ceremony tooling superseded by this repo's own
+#               devnet bootstrap, an era/feature that hasn't shipped, etc).
+# cli-surface-parity.sh FAILS the gate if a MISSING entry's line has no
+# disposition or an unrecognized one — see its `--- disposition audit ---`
+# check. <reason> is free text (may itself contain tabs/spaces) and is
+# REQUIRED too: every line must say SOMETHING, not rely on a blanket comment
+# above an undifferentiated block. Mirrors the `SKIP_LIST` discipline in
 # tests/conformance/src/upstream/ledger_rules_replay/mod.rs: "empty or every
-# entry has a tracking issue" (CLAUDE.md).
+# entry has a tracking issue" (CLAUDE.md) — extended here so entries also
+# each carry their OWN disposition + reason, not just a shared issue number.
 #
-# Originally 82 entries from the check's first real run against cardano-cli
-# 11.0.0.0 (97036a66bcf8c89f687ae57a048eecc0389977ef) — see #1008 for the
-# full triage (grouped, with per-group/per-item reasoning: genuine gaps vs.
-# naming/structure differences vs. out-of-scope legacy tooling vs. blocked).
-# Not a commitment to implement all of them — several are Byron-era ceremony
-# tooling or Peras BLS keys of uncertain present value.
+# The script separately fails on any listed entry that is no longer actually
+# missing (a stale exemption — remove it).
 #
-# 10 entries closed by #1008's first implementation pass (2026-08-05):
-#   hash anchor-data / hash script / hash genesis-file — new `hash` command
-#     group, offline, golden-tested against real cardano-cli.
-#   governance drep metadata-hash — new subcommand, shares hash.rs's raw-bytes
-#     blake2b_256 + fetch_url_bytes with `hash anchor-data`; golden-tested.
-#   version — new bare subcommand.
-#   stake-pool deregistration-certificate, stake-address
-#     stake-delegation-certificate — cardano-cli's names made PRIMARY (the
-#     prior dugite names are now visible aliases); same underlying
-#     certificate construction, golden-verified byte-identical CBOR body
-#     against real cardano-cli.
-#   query tx-mempool info / next-tx / tx-exists — resolved by a checker
-#     normalization rule (see `collapse_structural_equivalents` in
-#     cli-surface-parity.sh), not new dugite-cli code: cardano-cli's 3
-#     subcommands and dugite-cli's single `query tx-mempool [SUBCMD]` are the
-#     same capability described two different ways. `has-tx` renamed to
-#     `tx-exists` (dugite's original name kept as a back-compat alias) so the
-#     accepted vocabulary is byte-exact with cardano-cli's, not just close.
+# Originally 82 entries from cli-surface-parity.sh's first real run against
+# cardano-cli 11.0.0.0 (97036a66bcf8c89f687ae57a048eecc0389977ef) — see #1008
+# for the full triage. 10 closed by #1008's first implementation pass
+# (2026-08-05: hash anchor-data/script/genesis-file, governance drep
+# metadata-hash, version, stake-pool deregistration-certificate, stake-address
+# stake-delegation-certificate, and the query tx-mempool info/next-tx/tx-exists
+# checker-normalization rule — see git history for that pass's detail). A
+# further 25 closed by #1008's second implementation pass (2026-08-20, this
+# file's current shape): genesis initial-txin (rename only); 8 query commands
+# (drep-stake-distribution, era-history, future-pparams, ledger-peer-snapshot,
+# pool-state, ref-script-size, spo-stake-distribution, stake-pool-default-vote
+# — thin CLI shims over LSQ tags dugite-node already implemented); 4
+# stake-address combined-certificate commands (registration-and-delegation,
+# registration-and-vote-delegation, registration-stake-and-vote-delegation,
+# stake-and-vote-delegation — Conway cert types 10-13, golden-tested
+# byte-identical against real cardano-cli); 8 governance items (action
+# create-hardfork/update-committee made cardano-cli's names PRIMARY over
+# dugite's prior create-hard-fork-initiation/create-update-committee, both
+# kept as visible aliases; action view; vote view; committee
+# create-cold-key-resignation-certificate/create-hot-key-authorization-certificate/
+# key-gen-cold/key-gen-hot/key-hash); and 3 MIR certificate commands
+# (create-mir-certificate stake-addresses/transfer-to-treasury/
+# transfer-to-rewards — legacy pre-Conway, kept for tooling completeness).
+# Building `governance vote view` against real cardano-cli captures also
+# found and fixed THREE pre-existing bugs in `governance vote create`
+# (SPO voter type was 1 instead of 4 per the Conway `voter` CDDL; the
+# credential hash was wrapped in an extra `[0, hash]` array instead of being
+# bare; the text-envelope `type` field was "VoteConway" instead of
+# "Governance voting procedures", which made cardano-cli itself refuse to
+# read a dugite-cli-produced vote file) — see git history for that commit.
+#
+# Not a commitment to implement every remaining item — several are Byron-era
+# ceremony tooling, Peras BLS keys (unreleased Dijkstra-era), or this
+# project's own devnet-bootstrap-supersedes-genesis-ceremony call. Those are
+# WONTFIX below, not silently dropped.
 
-byron genesis genesis	1008
-byron genesis print-genesis-hash	1008
-byron governance create-proposal-vote	1008
-byron governance create-update-proposal	1008
-byron governance submit-proposal-vote	1008
-byron governance submit-update-proposal	1008
-byron key keygen	1008
-byron key to-verification	1008
-byron miscellaneous pretty-print-cbor	1008
-byron miscellaneous validate-cbor	1008
-byron transaction issue-genesis-utxo-expenditure	1008
-byron transaction issue-utxo-expenditure	1008
-byron transaction submit-tx	1008
-byron transaction txid	1008
-cip-format cip-129 committee-cold-key	1008
-cip-format cip-129 committee-hot-key	1008
-cip-format cip-129 drep	1008
-cip-format cip-129 governance-action-id	1008
-debug check-node-configuration	1008
-debug log-epoch-state	1008
-debug transaction view	1008
-genesis create-cardano	1008
-genesis create-testnet-data	1008
-genesis get-ver-key	1008
-genesis initial-addr	1008
-genesis initial-txin	1008
-genesis key-gen-delegate	1008
-genesis key-gen-genesis	1008
-genesis key-gen-utxo	1008
-governance action create-hardfork	1008
-governance action update-committee	1008
-governance action view	1008
-governance committee create-cold-key-resignation-certificate	1008
-governance committee create-hot-key-authorization-certificate	1008
-governance committee key-gen-cold	1008
-governance committee key-gen-hot	1008
-governance committee key-hash	1008
-governance create-genesis-key-delegation-certificate	1008
-governance create-mir-certificate stake-addresses	1008
-governance create-mir-certificate transfer-to-rewards	1008
-governance create-mir-certificate transfer-to-treasury	1008
-governance vote view	1008
-key convert-byron-genesis-vkey	1008
-key convert-byron-key	1008
-key convert-cardano-address-key	1008
-key convert-itn-bip32-key	1008
-key convert-itn-extended-key	1008
-key convert-itn-key	1008
-key derive-from-mnemonic	1008
-key generate-mnemonic	1008
-key non-extended-key	1008
-key verification-key	1008
-node issue-pop-BLS	1008
-node key-gen-BLS	1008
-node key-hash-BLS	1008
-ping	1008
-query drep-stake-distribution	1008
-query era-history	1008
-query future-pparams	1008
-query ledger-peer-snapshot	1008
-query pool-state	1008
-query ref-script-size	1008
-query spo-stake-distribution	1008
-query stake-pool-default-vote	1008
-stake-address registration-and-delegation-certificate	1008
-stake-address registration-and-vote-delegation-certificate	1008
-stake-address registration-stake-and-vote-delegation-certificate	1008
-stake-address stake-and-vote-delegation-certificate	1008
-transaction build-estimate	1008
-transaction calculate-plutus-script-cost offline	1008
-transaction calculate-plutus-script-cost online	1008
-transaction signed-transaction	1008
+# ── Byron era (14) — WONTFIX ────────────────────────────────────────────────
+# Byron ceremony/legacy tx tooling. Dead on every live network (mainnet,
+# preview, preprod) since the Shelley hard fork; `byron key convert-byron-*`
+# are the only Byron-adjacent commands dugite-cli has ever needed.
+byron genesis genesis	1008	WONTFIX	Byron genesis ceremony command, dead since Shelley HF
+byron genesis print-genesis-hash	1008	WONTFIX	Byron genesis ceremony command, dead since Shelley HF
+byron governance create-proposal-vote	1008	WONTFIX	Byron-era update-system tooling, no live network runs Byron governance
+byron governance create-update-proposal	1008	WONTFIX	Byron-era update-system tooling, no live network runs Byron governance
+byron governance submit-proposal-vote	1008	WONTFIX	Byron-era update-system tooling, no live network runs Byron governance
+byron governance submit-update-proposal	1008	WONTFIX	Byron-era update-system tooling, no live network runs Byron governance
+byron key keygen	1008	WONTFIX	Byron legacy key generation, dead since Shelley HF
+byron key to-verification	1008	WONTFIX	Byron legacy key derivation, dead since Shelley HF
+byron miscellaneous pretty-print-cbor	1008	WONTFIX	Byron-specific CBOR pretty-printer, dead since Shelley HF
+byron miscellaneous validate-cbor	1008	WONTFIX	Byron-specific CBOR validator, dead since Shelley HF
+byron transaction issue-genesis-utxo-expenditure	1008	WONTFIX	Byron legacy tx tooling, dead since Shelley HF
+byron transaction issue-utxo-expenditure	1008	WONTFIX	Byron legacy tx tooling, dead since Shelley HF
+byron transaction submit-tx	1008	WONTFIX	Byron legacy tx submission, dead since Shelley HF
+byron transaction txid	1008	WONTFIX	Byron legacy txid tooling, dead since Shelley HF
+
+# ── Genesis ceremony (7) — WONTFIX ──────────────────────────────────────────
+# Cluster/testnet bootstrap ceremony tooling. dugite has its own devnet
+# bootstrap mechanism under testnet/local-devnet/ that does not need a
+# cardano-cli-compatible genesis ceremony. `genesis initial-txin` (the one
+# genuinely useful non-ceremony command in this group) was implemented
+# separately, see the changelog note above.
+genesis create-cardano	1008	WONTFIX	Byron+Shelley genesis-bundle ceremony tool; dugite has its own devnet bootstrap
+genesis create-testnet-data	1008	WONTFIX	Testnet genesis-bundle ceremony tool; dugite has its own devnet bootstrap
+genesis get-ver-key	1008	WONTFIX	Genesis ceremony key-derivation helper, low value outside that ceremony
+genesis initial-addr	1008	WONTFIX	Genesis ceremony address helper, low value outside that ceremony
+genesis key-gen-delegate	1008	WONTFIX	Genesis ceremony delegate key generation
+genesis key-gen-genesis	1008	WONTFIX	Genesis ceremony genesis key generation
+genesis key-gen-utxo	1008	WONTFIX	Genesis ceremony initial-UTxO key generation
+
+# ── Governance: Byron-adjacent genesis delegation (1) — WONTFIX ────────────
+governance create-genesis-key-delegation-certificate	1008	WONTFIX	Byron/Shelley-genesis-delegate ceremony cert, same class as the genesis group above
+
+# ── node / BLS (3) — WONTFIX ────────────────────────────────────────────────
+# Peras-related BLS key material. Peras is Dijkstra-era and unreleased; this
+# repo's current directive is to skip Dijkstra work entirely until it ships.
+node issue-pop-BLS	1008	WONTFIX	Peras BLS proof-of-possession, Dijkstra-era and unreleased
+node key-gen-BLS	1008	WONTFIX	Peras BLS key generation, Dijkstra-era and unreleased
+node key-hash-BLS	1008	WONTFIX	Peras BLS key hashing, Dijkstra-era and unreleased
+
+# ── cip-format (4) — DEFERRED ───────────────────────────────────────────────
+# CIP-0129 governance-identifier bech32 formatting utilities. Genuinely
+# useful (dugite already emits CIP-0129 identifiers elsewhere, e.g.
+# `governance drep id`), just not urgent enough to have been picked up yet.
+cip-format cip-129 committee-cold-key	1008	DEFERRED	CIP-0129 formatter, useful but not yet scheduled
+cip-format cip-129 committee-hot-key	1008	DEFERRED	CIP-0129 formatter, useful but not yet scheduled
+cip-format cip-129 drep	1008	DEFERRED	CIP-0129 formatter, useful but not yet scheduled
+cip-format cip-129 governance-action-id	1008	DEFERRED	CIP-0129 formatter, useful but not yet scheduled
+
+# ── debug (3) — DEFERRED ────────────────────────────────────────────────────
+# Debugging/inspection tools, useful for operators but not urgent.
+debug check-node-configuration	1008	DEFERRED	Node config sanity-checker, useful but not yet scheduled
+debug log-epoch-state	1008	DEFERRED	Epoch-state cross-validation dump; dugite-node's own metrics/logging cover some of the same need at the node level, not as a dugite-cli command
+debug transaction view	1008	DEFERRED	Offline tx pretty-printer, useful but not yet scheduled (note: dugite-cli's own `transaction view` already exists as a SUPERSET entry — this is cardano-cli's `debug`-namespaced sibling with a possibly different output shape)
+
+# ── key conversion (10) — DEFERRED ──────────────────────────────────────────
+# ITN/cardano-address/mnemonic import tooling, plus two naming-normalization
+# entries (see note). Useful wallet-migration tooling, not urgent.
+key convert-byron-genesis-vkey	1008	DEFERRED	Already implemented at `byron key convert-byron-genesis-vkey` (naming-normalization gap, not a true absence per #1008's own limitations note) — a root-level alias is low priority
+key convert-byron-key	1008	DEFERRED	Already implemented at `byron key convert-byron-key` (naming-normalization gap, not a true absence) — a root-level alias is low priority
+key convert-cardano-address-key	1008	DEFERRED	cardano-address key-format import, useful but not yet scheduled
+key convert-itn-bip32-key	1008	DEFERRED	ITN (Incentivized Testnet) legacy key import, useful but not yet scheduled
+key convert-itn-extended-key	1008	DEFERRED	ITN legacy extended-key import, useful but not yet scheduled
+key convert-itn-key	1008	DEFERRED	ITN legacy key import, useful but not yet scheduled
+key derive-from-mnemonic	1008	DEFERRED	BIP-39 mnemonic key derivation, useful wallet tooling, not yet scheduled
+key generate-mnemonic	1008	DEFERRED	BIP-39 mnemonic generation, useful wallet tooling, not yet scheduled
+key non-extended-key	1008	DEFERRED	Extended-to-non-extended key conversion, useful but not yet scheduled
+key verification-key	1008	DEFERRED	Signing-to-verification key derivation utility, useful but not yet scheduled
+
+# ── Bare utility (2) ─────────────────────────────────────────────────────────
+ping	1008	DEFERRED	General Ouroboros N2N/N2C connectivity probe, low value, defer
+# NOTE: `version` was closed in #1008's FIRST pass (2026-08-05) — see the
+# changelog note above. It is intentionally absent from this file now.
+
+# ── transaction (4) — DEFERRED ──────────────────────────────────────────────
+# Fee/cost-estimation tooling. Genuinely more involved than a thin shim
+# (needs offline fee-model + Plutus cost-model plumbing), so deferred rather
+# than rushed.
+transaction build-estimate	1008	DEFERRED	Offline fee estimation without a live node, more involved than a shim, defer
+transaction calculate-plutus-script-cost offline	1008	DEFERRED	Offline Plutus execution-cost calculator, more involved than a shim, defer
+transaction calculate-plutus-script-cost online	1008	DEFERRED	Online Plutus execution-cost calculator, more involved than a shim, defer
+transaction signed-transaction	1008	DEFERRED	Signed-transaction inspection/assembly command, more involved than a shim, defer

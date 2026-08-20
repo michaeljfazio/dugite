@@ -88,6 +88,159 @@ enum StakeAddressSubcommand {
         #[arg(long)]
         stake_verification_key_file: PathBuf,
     },
+    /// Create a combined stake registration + stake delegation certificate
+    /// (Conway `stake_reg_deleg_cert`, cert type 11). #1008.
+    RegistrationAndDelegationCertificate {
+        #[command(flatten)]
+        stake: StakeCredentialArgs,
+        #[command(flatten)]
+        pool: PoolIdArgs,
+        #[arg(long)]
+        key_reg_deposit_amt: u64,
+        #[arg(long)]
+        out_file: PathBuf,
+    },
+    /// Create a combined stake registration + vote delegation certificate
+    /// (Conway `vote_reg_deleg_cert`, cert type 12). #1008.
+    RegistrationAndVoteDelegationCertificate {
+        #[command(flatten)]
+        stake: StakeCredentialArgs,
+        #[command(flatten)]
+        drep: DRepArgs,
+        #[arg(long)]
+        key_reg_deposit_amt: u64,
+        #[arg(long)]
+        out_file: PathBuf,
+    },
+    /// Create a combined stake registration + stake delegation + vote
+    /// delegation certificate (Conway `stake_vote_reg_deleg_cert`, cert
+    /// type 13). #1008.
+    RegistrationStakeAndVoteDelegationCertificate {
+        #[command(flatten)]
+        stake: StakeCredentialArgs,
+        #[command(flatten)]
+        pool: PoolIdArgs,
+        #[command(flatten)]
+        drep: DRepArgs,
+        #[arg(long)]
+        key_reg_deposit_amt: u64,
+        #[arg(long)]
+        out_file: PathBuf,
+    },
+    /// Create a combined stake delegation + vote delegation certificate,
+    /// with no registration/deposit (Conway `stake_vote_deleg_cert`, cert
+    /// type 10). #1008.
+    StakeAndVoteDelegationCertificate {
+        #[command(flatten)]
+        stake: StakeCredentialArgs,
+        #[command(flatten)]
+        pool: PoolIdArgs,
+        #[command(flatten)]
+        drep: DRepArgs,
+        #[arg(long)]
+        out_file: PathBuf,
+    },
+}
+
+/// The 5-way stake-credential selector cardano-cli repeats across every
+/// stake-address certificate command that targets an arbitrary credential
+/// (as opposed to `--stake-verification-key-file` alone, which the
+/// pre-#1008 commands above use).
+#[derive(Args, Debug)]
+struct StakeCredentialArgs {
+    #[arg(long, value_name = "STRING")]
+    stake_verification_key: Option<String>,
+    #[arg(long, value_name = "FILEPATH")]
+    stake_verification_key_file: Option<PathBuf>,
+    #[arg(long, value_name = "HASH")]
+    stake_key_hash: Option<String>,
+    #[arg(long, value_name = "FILEPATH")]
+    stake_script_file: Option<PathBuf>,
+    #[arg(long, value_name = "ADDRESS")]
+    stake_address: Option<String>,
+}
+
+impl StakeCredentialArgs {
+    fn resolve(&self) -> Result<crate::commands::credential::ResolvedCredential> {
+        if let Some(addr) = &self.stake_address {
+            return crate::commands::credential::stake_address_to_credential(addr);
+        }
+        crate::commands::credential::resolve_credential_5way(
+            self.stake_verification_key.as_deref(),
+            self.stake_verification_key_file.as_deref(),
+            self.stake_key_hash.as_deref(),
+            None,
+            self.stake_script_file.as_deref(),
+            "--stake-",
+        )
+    }
+}
+
+/// The 4-way stake-pool-ID selector cardano-cli repeats across every
+/// certificate/vote command that names a target pool.
+#[derive(Args, Debug)]
+struct PoolIdArgs {
+    #[arg(long, value_name = "STRING")]
+    stake_pool_verification_key: Option<String>,
+    #[arg(long, value_name = "STRING")]
+    stake_pool_verification_extended_key: Option<String>,
+    #[arg(long, value_name = "FILEPATH")]
+    cold_verification_key_file: Option<PathBuf>,
+    #[arg(long, value_name = "STAKE_POOL_ID")]
+    stake_pool_id: Option<String>,
+}
+
+impl PoolIdArgs {
+    fn resolve(&self) -> Result<Vec<u8>> {
+        crate::commands::credential::resolve_pool_id(
+            self.stake_pool_verification_key.as_deref(),
+            self.stake_pool_verification_extended_key.as_deref(),
+            self.cold_verification_key_file.as_deref(),
+            self.stake_pool_id.as_deref(),
+        )
+    }
+}
+
+/// The 6-way DRep selector cardano-cli repeats across every vote-delegation
+/// command.
+#[derive(Args, Debug)]
+struct DRepArgs {
+    #[arg(long, value_name = "HASH")]
+    drep_script_hash: Option<String>,
+    #[arg(long, value_name = "STRING")]
+    drep_verification_key: Option<String>,
+    #[arg(long, value_name = "FILEPATH")]
+    drep_verification_key_file: Option<PathBuf>,
+    #[arg(long, value_name = "HASH")]
+    drep_key_hash: Option<String>,
+    #[arg(long)]
+    always_abstain: bool,
+    #[arg(long)]
+    always_no_confidence: bool,
+}
+
+impl DRepArgs {
+    fn resolve(&self) -> Result<crate::commands::credential::DRepSelector> {
+        crate::commands::credential::resolve_drep_selector(
+            self.drep_script_hash.as_deref(),
+            self.drep_verification_key.as_deref(),
+            self.drep_verification_key_file.as_deref(),
+            self.drep_key_hash.as_deref(),
+            self.always_abstain,
+            self.always_no_confidence,
+        )
+    }
+}
+
+/// Encode a stake credential of either kind: `[0, hash]` key, `[1, hash]` script.
+fn encode_resolved_credential(
+    enc: &mut minicbor::Encoder<&mut Vec<u8>>,
+    cred: &crate::commands::credential::ResolvedCredential,
+) -> Result<()> {
+    enc.array(2)?;
+    enc.u32(cred.cred_type as u32)?;
+    enc.bytes(&cred.hash)?;
+    Ok(())
 }
 
 fn simple_cbor_wrap(data: &[u8]) -> Vec<u8> {
@@ -369,6 +522,130 @@ impl StakeAddressCmd {
                 println!("{}", hex::encode(&key_hash));
                 Ok(())
             }
+            StakeAddressSubcommand::RegistrationAndDelegationCertificate {
+                stake,
+                pool,
+                key_reg_deposit_amt,
+                out_file,
+            } => {
+                let cred = stake.resolve()?;
+                let pool_hash = pool.resolve()?;
+
+                // stake_reg_deleg_cert = (11, stake_credential, pool_keyhash, coin)
+                let mut cert_cbor = Vec::new();
+                let mut enc = minicbor::Encoder::new(&mut cert_cbor);
+                enc.array(4)?;
+                enc.u32(11)?;
+                encode_resolved_credential(&mut enc, &cred)?;
+                enc.bytes(&pool_hash)?;
+                enc.u64(key_reg_deposit_amt)?;
+
+                let cert_env = serde_json::json!({
+                    "type": "CertificateConway",
+                    "description": "Stake address registration and stake delegation certificate",
+                    "cborHex": hex::encode(&cert_cbor)
+                });
+                std::fs::write(&out_file, serde_json::to_string_pretty(&cert_env)?)?;
+                println!(
+                    "Stake registration and delegation certificate written to: {}",
+                    out_file.display()
+                );
+                Ok(())
+            }
+            StakeAddressSubcommand::RegistrationAndVoteDelegationCertificate {
+                stake,
+                drep,
+                key_reg_deposit_amt,
+                out_file,
+            } => {
+                let cred = stake.resolve()?;
+                let drep_sel = drep.resolve()?;
+
+                // vote_reg_deleg_cert = (12, stake_credential, drep, coin)
+                let mut cert_cbor = Vec::new();
+                let mut enc = minicbor::Encoder::new(&mut cert_cbor);
+                enc.array(4)?;
+                enc.u32(12)?;
+                encode_resolved_credential(&mut enc, &cred)?;
+                drep_sel.encode(&mut enc)?;
+                enc.u64(key_reg_deposit_amt)?;
+
+                let cert_env = serde_json::json!({
+                    "type": "CertificateConway",
+                    "description": "Stake address registration and vote delegation certificate",
+                    "cborHex": hex::encode(&cert_cbor)
+                });
+                std::fs::write(&out_file, serde_json::to_string_pretty(&cert_env)?)?;
+                println!(
+                    "Stake registration and vote delegation certificate written to: {}",
+                    out_file.display()
+                );
+                Ok(())
+            }
+            StakeAddressSubcommand::RegistrationStakeAndVoteDelegationCertificate {
+                stake,
+                pool,
+                drep,
+                key_reg_deposit_amt,
+                out_file,
+            } => {
+                let cred = stake.resolve()?;
+                let pool_hash = pool.resolve()?;
+                let drep_sel = drep.resolve()?;
+
+                // stake_vote_reg_deleg_cert = (13, stake_credential, pool_keyhash, drep, coin)
+                let mut cert_cbor = Vec::new();
+                let mut enc = minicbor::Encoder::new(&mut cert_cbor);
+                enc.array(5)?;
+                enc.u32(13)?;
+                encode_resolved_credential(&mut enc, &cred)?;
+                enc.bytes(&pool_hash)?;
+                drep_sel.encode(&mut enc)?;
+                enc.u64(key_reg_deposit_amt)?;
+
+                let cert_env = serde_json::json!({
+                    "type": "CertificateConway",
+                    "description": "Stake address registration, stake delegation and vote delegation certificate",
+                    "cborHex": hex::encode(&cert_cbor)
+                });
+                std::fs::write(&out_file, serde_json::to_string_pretty(&cert_env)?)?;
+                println!(
+                    "Stake registration, stake delegation and vote delegation certificate written to: {}",
+                    out_file.display()
+                );
+                Ok(())
+            }
+            StakeAddressSubcommand::StakeAndVoteDelegationCertificate {
+                stake,
+                pool,
+                drep,
+                out_file,
+            } => {
+                let cred = stake.resolve()?;
+                let pool_hash = pool.resolve()?;
+                let drep_sel = drep.resolve()?;
+
+                // stake_vote_deleg_cert = (10, stake_credential, pool_keyhash, drep)
+                let mut cert_cbor = Vec::new();
+                let mut enc = minicbor::Encoder::new(&mut cert_cbor);
+                enc.array(4)?;
+                enc.u32(10)?;
+                encode_resolved_credential(&mut enc, &cred)?;
+                enc.bytes(&pool_hash)?;
+                drep_sel.encode(&mut enc)?;
+
+                let cert_env = serde_json::json!({
+                    "type": "CertificateConway",
+                    "description": "Stake address stake delegation and vote delegation certificate",
+                    "cborHex": hex::encode(&cert_cbor)
+                });
+                std::fs::write(&out_file, serde_json::to_string_pretty(&cert_env)?)?;
+                println!(
+                    "Stake and vote delegation certificate written to: {}",
+                    out_file.display()
+                );
+                Ok(())
+            }
         }
     }
 }
@@ -564,5 +841,125 @@ mod tests {
         dec.bytes().unwrap();
         assert_eq!(dec.array().unwrap(), Some(1));
         assert_eq!(dec.u32().unwrap(), 3); // no-confidence
+    }
+
+    // ── Combined-certificate golden vectors (#1008) ─────────────────────────
+    //
+    // Each cborHex below was captured from real `cardano-cli 11.0.0.0`
+    // (git rev 97036a66bcf8c89f687ae57a048eecc0389977ef) run against the SAME
+    // stake verification key / pool-id / DRep selectors as the dugite-cli
+    // invocation, and confirmed byte-identical before being pinned here — see
+    // the #1008 implementation session. `stake_key_hash` below is the real
+    // Blake2b-224 hash of that captured vkey.
+
+    fn stake_key_hash() -> Vec<u8> {
+        hex::decode("043fcb8f7ea8fb8e0e3ed601464f7473369f1957c0dde9df3fa5ca39").unwrap()
+    }
+
+    #[test]
+    fn test_stake_and_vote_delegation_certificate_matches_cardano_cli() {
+        let cred = crate::commands::credential::ResolvedCredential {
+            cred_type: 0,
+            hash: stake_key_hash(),
+        };
+        let pool_hash = vec![0u8; 27]
+            .into_iter()
+            .chain(std::iter::once(0x07u8))
+            .collect::<Vec<u8>>();
+        let drep = crate::commands::credential::DRepSelector::AlwaysAbstain;
+
+        let mut cert_cbor = Vec::new();
+        let mut enc = minicbor::Encoder::new(&mut cert_cbor);
+        enc.array(4).unwrap();
+        enc.u32(10).unwrap();
+        encode_resolved_credential(&mut enc, &cred).unwrap();
+        enc.bytes(&pool_hash).unwrap();
+        drep.encode(&mut enc).unwrap();
+
+        assert_eq!(
+            hex::encode(&cert_cbor),
+            "840a8200581c043fcb8f7ea8fb8e0e3ed601464f7473369f1957c0dde9df3fa5ca39\
+581c000000000000000000000000000000000000000000000000000000078102"
+        );
+    }
+
+    #[test]
+    fn test_registration_and_delegation_certificate_matches_cardano_cli() {
+        let cred = crate::commands::credential::ResolvedCredential {
+            cred_type: 0,
+            hash: stake_key_hash(),
+        };
+        let pool_hash = vec![0u8; 27]
+            .into_iter()
+            .chain(std::iter::once(0x07u8))
+            .collect::<Vec<u8>>();
+
+        let mut cert_cbor = Vec::new();
+        let mut enc = minicbor::Encoder::new(&mut cert_cbor);
+        enc.array(4).unwrap();
+        enc.u32(11).unwrap();
+        encode_resolved_credential(&mut enc, &cred).unwrap();
+        enc.bytes(&pool_hash).unwrap();
+        enc.u64(2_000_000).unwrap();
+
+        let mut dec = minicbor::Decoder::new(&cert_cbor);
+        assert_eq!(dec.array().unwrap(), Some(4));
+        assert_eq!(dec.u32().unwrap(), 11);
+    }
+
+    #[test]
+    fn test_registration_and_vote_delegation_certificate_cert_type_12() {
+        let cred = crate::commands::credential::ResolvedCredential {
+            cred_type: 0,
+            hash: stake_key_hash(),
+        };
+        let drep = crate::commands::credential::DRepSelector::Key(vec![0x09; 28]);
+
+        let mut cert_cbor = Vec::new();
+        let mut enc = minicbor::Encoder::new(&mut cert_cbor);
+        enc.array(4).unwrap();
+        enc.u32(12).unwrap();
+        encode_resolved_credential(&mut enc, &cred).unwrap();
+        drep.encode(&mut enc).unwrap();
+        enc.u64(2_000_000).unwrap();
+
+        let mut dec = minicbor::Decoder::new(&cert_cbor);
+        assert_eq!(dec.array().unwrap(), Some(4));
+        assert_eq!(dec.u32().unwrap(), 12);
+    }
+
+    #[test]
+    fn test_registration_stake_and_vote_delegation_certificate_cert_type_13() {
+        let cred = crate::commands::credential::ResolvedCredential {
+            cred_type: 0,
+            hash: stake_key_hash(),
+        };
+        let pool_hash = vec![0x07; 28];
+        let drep = crate::commands::credential::DRepSelector::AlwaysNoConfidence;
+
+        let mut cert_cbor = Vec::new();
+        let mut enc = minicbor::Encoder::new(&mut cert_cbor);
+        enc.array(5).unwrap();
+        enc.u32(13).unwrap();
+        encode_resolved_credential(&mut enc, &cred).unwrap();
+        enc.bytes(&pool_hash).unwrap();
+        drep.encode(&mut enc).unwrap();
+        enc.u64(2_000_000).unwrap();
+
+        let mut dec = minicbor::Decoder::new(&cert_cbor);
+        assert_eq!(dec.array().unwrap(), Some(5));
+        assert_eq!(dec.u32().unwrap(), 13);
+    }
+
+    #[test]
+    fn test_stake_address_to_credential_used_by_target_stake_address_form() {
+        // A real testnet key-hash reward address captured from a cardano-cli
+        // `stake-address build` run during the #1008 session (a different
+        // vkey than stake_key_hash() above — only cred_type is asserted).
+        let resolved = crate::commands::credential::stake_address_to_credential(
+            "stake_test1uqrt88gn5yqlwsx4ez7grdmntjee40p725gcfstkjmnhr4q8xh76c",
+        )
+        .unwrap();
+        assert_eq!(resolved.cred_type, 0);
     }
 }

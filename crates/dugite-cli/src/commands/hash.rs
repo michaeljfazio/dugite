@@ -126,7 +126,7 @@ pub(crate) fn fetch_url_bytes(url: &str) -> Result<Vec<u8>> {
 ///   - anything else → a native (multisig/timelock) script JSON, the same
 ///     shape `transaction policyid` accepts. Re-encoded via
 ///     `encode_native_script` and hashed as `blake2b_224(0x00 || cbor)`.
-fn hash_script_file(path: &std::path::Path) -> Result<dugite_primitives::hash::Hash28> {
+pub(crate) fn hash_script_file(path: &std::path::Path) -> Result<dugite_primitives::hash::Hash28> {
     let content = std::fs::read_to_string(path)
         .map_err(|e| anyhow::anyhow!("failed to read '{}': {e}", path.display()))?;
     let json: serde_json::Value = serde_json::from_str(&content)
