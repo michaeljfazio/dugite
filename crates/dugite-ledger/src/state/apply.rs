@@ -860,6 +860,24 @@ impl LedgerState {
             if let Some(aux) = block.byron.as_ref() {
                 let delegation_map_rev_pre_payload =
                     self.byron.delegation.delegation_map_rev.clone();
+
+                // #1092: block signature + delegate-membership check
+                // (`PBFT::updateChainDepState` steps 1/3), `ValidateAll`
+                // only — block signatures are first-validation-only
+                // upstream (`reupdateChainDepState` skips them on replay,
+                // design doc §2.1/§8 item 4), so this must run BEFORE the
+                // block's own certificates are folded into the delegation
+                // map (same pre-payload snapshot the update payload's
+                // resolver needs, for the identical reason).
+                if byron_mode == ByronApplyMode::ValidateAll {
+                    crate::eras::byron::verify_block_signature(
+                        aux,
+                        self.network_magic,
+                        &delegation_map_rev_pre_payload,
+                        block.slot().0,
+                    )?;
+                }
+
                 crate::eras::byron::apply_delegation_payload(
                     &mut self.byron.delegation,
                     &self.byron.allowed_delegators,
@@ -867,7 +885,9 @@ impl LedgerState {
                     block.slot().0,
                     block_epoch.0,
                     self.security_param,
-                );
+                    self.network_magic,
+                    byron_mode,
+                )?;
                 crate::eras::byron::apply_update_payload(
                     &mut self.byron.update,
                     &self.byron.allowed_delegators,
@@ -875,7 +895,9 @@ impl LedgerState {
                     aux,
                     block.slot().0,
                     self.security_param,
-                );
+                    self.network_magic,
+                    byron_mode,
+                )?;
             }
 
             // Track block production (Byron uses OBFT, not VRF)

@@ -1861,6 +1861,10 @@ fn _assert_ledger_state_fields_audited(state: LedgerState) {
         byron: _,
         update_quorum: _,
         node_network: _,
+        // #1092: config-only, set once at startup, never mutated during
+        // block apply — same treatment as `node_network`/`security_param`
+        // right beside it. No `LedgerDelta`/rollback representation needed.
+        network_magic: _,
         randomness_stabilisation_window: _,
         stability_window_3kf: _,
         security_param: _,

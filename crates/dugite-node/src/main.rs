@@ -845,13 +845,30 @@ async fn run_dump_snapshot(args: DumpSnapshotArgs) -> Result<()> {
         }
     }
 
+    // Derive network magic from the Shelley genesis (most reliable source),
+    // falling back to node config.  The cstreamer-compatible config files
+    // often lack an explicit networkMagic field, which caused the fallback
+    // to return mainnet magic (764824073) and completely wrong epoch offsets.
+    //
+    // Computed HERE (moved up from just before `set_shelley_transition`
+    // below) because the Byron genesis-seeding block right below also needs
+    // it (issue #1092: `seed_byron_genesis` signature-verifies the genesis
+    // `heavyDelegation` certs against it) — one computation, not two, so the
+    // value used to seed Byron state can never drift from the value later
+    // stamped onto the ledger via `set_shelley_transition`.
+    let network_magic = shelley_genesis_opt
+        .as_ref()
+        .map(|sg| sg.network_magic)
+        .or(node_config.network_magic)
+        .unwrap_or_else(|| node_config.network.magic());
+
     // #1084: seed Byron's UPI.State + DI.State, mirroring the running-node
     // path in `Node::init_fresh_ledger`.
     if let Some(ref bg) = byron_genesis_loaded {
         match bg.block_version_data.to_protocol_parameters() {
             Some(params) => {
                 let allowed_delegators = bg.allowed_delegators();
-                let heavy_delegation = bg.heavy_delegation_pairs();
+                let heavy_delegation = bg.heavy_delegation_certs();
                 info!(
                     allowed_delegators = allowed_delegators.len(),
                     heavy_delegation = heavy_delegation.len(),
@@ -861,6 +878,7 @@ async fn run_dump_snapshot(args: DumpSnapshotArgs) -> Result<()> {
                     allowed_delegators,
                     &heavy_delegation,
                     params,
+                    network_magic,
                 );
             }
             None => {
@@ -885,18 +903,9 @@ async fn run_dump_snapshot(args: DumpSnapshotArgs) -> Result<()> {
     // directly in Alonzo. On mainnet, transition = 208 (Byron epochs 0-207).
     // The default LedgerState uses mainnet values (208/21600) which would
     // produce incorrect epoch boundaries for other networks.
-    // Derive network magic from the Shelley genesis (most reliable source),
-    // falling back to node config.  The cstreamer-compatible config files
-    // often lack an explicit networkMagic field, which caused the fallback
-    // to return mainnet magic (764824073) and completely wrong epoch offsets.
-    let network_magic = shelley_genesis_opt
-        .as_ref()
-        .map(|sg| sg.network_magic)
-        .or(node_config.network_magic)
-        .unwrap_or_else(|| node_config.network.magic());
     let shelley_transition_epoch =
         crate::node::epoch::shelley_transition_epoch_for_magic(network_magic);
-    ledger.set_shelley_transition(shelley_transition_epoch, byron_epoch_length);
+    ledger.set_shelley_transition(shelley_transition_epoch, byron_epoch_length, network_magic);
     // Apply Plutus SlotConfig anchored at the Shelley hard-fork boundary.
     // Must happen after shelley_transition_epoch is computed (needs network_magic).
     if let Some(ref sg) = shelley_genesis_opt {

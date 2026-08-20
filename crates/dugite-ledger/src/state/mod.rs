@@ -225,6 +225,19 @@ pub struct LedgerState {
     /// Phase-1 validation (Haskell's `Globals.networkId`).  Not persisted in
     /// snapshots — set from genesis/config at node startup.
     pub node_network: Option<dugite_primitives::network::NetworkId>,
+    /// The network's `ProtocolMagicId` (Byron genesis `protocolConsts.protocolMagic`,
+    /// == Shelley genesis `networkMagic` — one value for the whole chain).
+    ///
+    /// Used ONLY to build the domain-separation "sign tag" for Byron
+    /// signature verification (issue #1092, design doc §1.2/§1.3) — Byron's
+    /// `Cardano.Crypto.Signing.Tag::signTag` always uses the CONFIG's magic,
+    /// canonically re-serialized, never any header-carried bytes. This is
+    /// deliberately NOT `node_network` above: that field is the coarse
+    /// address-header `NetworkId` (Mainnet=1/Testnet=0), which cannot
+    /// distinguish preprod (magic 1) from preview (magic 2). Not persisted
+    /// in snapshots — set from genesis/config at node startup, same as
+    /// `node_network`.
+    pub network_magic: u64,
     /// Randomness stabilisation window: ceiling(4k/f) for Conway+.
     pub randomness_stabilisation_window: u64,
     /// Stability window: ceiling(3k/f) for Alonzo/Babbage (per Haskell erratum 17.3).
@@ -1457,6 +1470,7 @@ impl LedgerState {
             byron: crate::eras::byron::ByronSubState::default(),
             update_quorum: default_update_quorum(),
             node_network: None,
+            network_magic: dugite_primitives::network::NetworkId::Mainnet.magic(), // mainnet default
             randomness_stabilisation_window: 172800, // 4k/f on mainnet: ceil(4*2160/0.05)
             stability_window_3kf: 129600,            // 3k/f on mainnet: ceil(3*2160/0.05)
             security_param: 2160,
@@ -2066,6 +2080,7 @@ impl LedgerState {
             byron: crate::eras::byron::ByronSubState::default(),
             update_quorum: 5,
             node_network: None, // Will be set by caller
+            network_magic: dugite_primitives::network::NetworkId::Mainnet.magic(), // Will be set by caller
             // Will be recalculated by set_epoch_length()
             randomness_stabilisation_window: 0,
             stability_window_3kf: 0,
@@ -2118,6 +2133,7 @@ impl LedgerState {
             byron: self.byron.clone(),
             update_quorum: self.update_quorum,
             node_network: self.node_network,
+            network_magic: self.network_magic,
             randomness_stabilisation_window: self.randomness_stabilisation_window,
             stability_window_3kf: self.stability_window_3kf,
             security_param: self.security_param,
@@ -2202,16 +2218,23 @@ impl LedgerState {
     /// `shelley_transition_epoch` is the number of Byron epochs before
     /// Shelley starts (e.g. mainnet=208, guild=2, preview=0).
     /// `byron_epoch_length` is 10*k in Byron slots.
+    /// `network_magic` is the chain's `ProtocolMagicId` — see
+    /// [`LedgerState::network_magic`]'s doc. Threaded here (rather than a
+    /// separate setter) so every caller that configures the Byron/Shelley
+    /// boundary is compiler-forced to supply it too, since both are
+    /// genesis-derived and always known together at every call site.
     pub fn set_shelley_transition(
         &mut self,
         shelley_transition_epoch: u64,
         byron_epoch_length: u64,
+        network_magic: u64,
     ) {
         self.shelley_transition_epoch = shelley_transition_epoch;
         self.byron_epoch_length = byron_epoch_length;
+        self.network_magic = network_magic;
         debug!(
-            "Ledger: Shelley transition at epoch {}, byron_epoch_len={}",
-            shelley_transition_epoch, byron_epoch_length,
+            "Ledger: Shelley transition at epoch {}, byron_epoch_len={}, network_magic={}",
+            shelley_transition_epoch, byron_epoch_length, network_magic,
         );
     }
 
@@ -3291,6 +3314,16 @@ pub enum LedgerError {
         tx_hash: String,
         error: String,
     },
+    /// A Byron block/certificate/proposal/vote signature failed to verify
+    /// (`ValidateAll` mode only — issue #1092). Block-fatal: an invalid
+    /// signature means the item was never authenticated by any genesis-key
+    /// authority, matching upstream's `PBftInvalidSignature` /
+    /// `Certificate.hs::isValid` / `Registration.hs` / `Voting.hs`
+    /// rejections — all unconditional checks upstream, unlike the Byron
+    /// state-machine rules #1084 deliberately keeps as log-and-skip (see
+    /// `eras::byron::apply_delegation_payload`'s doc).
+    #[error("Byron {kind} signature verification failed at slot {slot}")]
+    ByronSignatureInvalid { slot: u64, kind: String },
 }
 
 #[cfg(test)]

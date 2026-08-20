@@ -85,22 +85,20 @@ pub struct ByronBlockVersionData {
 }
 
 /// `heavyDelegation` map value — one heavyweight delegation certificate as
-/// carried in genesis JSON. `cert`/`issuer_pk` are captured for completeness
-/// but unused: Byron signature verification is a separate, deliberately
-/// out-of-scope gap (see the #1084 design doc §3.6). `omega` is the
+/// carried in genesis JSON. `cert` is the certificate's signature
+/// (hex-encoded 64 bytes); `issuer_pk` is the issuer's raw 64-byte extended
+/// verification key (standard base64) — both verified via
+/// [`ByronGenesis::heavy_delegation_certs`] (issue #1092). `omega` is the
 /// certificate's target epoch — always 0 in every real genesis.
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ByronHeavyDelegationEntry {
-    #[allow(dead_code)]
     #[serde(default)]
     pub cert: String,
     #[serde(default, rename = "delegatePk")]
     pub delegate_pk: String,
-    #[allow(dead_code)]
     #[serde(default, rename = "issuerPk")]
     pub issuer_pk: String,
-    #[allow(dead_code)]
     #[serde(default)]
     pub omega: u64,
 }
@@ -282,19 +280,20 @@ impl ByronGenesis {
             .collect()
     }
 
-    /// `heavyDelegation` as `(issuer, delegate)` `Hash28` pairs, for genesis
-    /// seeding (issue #1084). The map KEY is already the issuer's KeyHash;
-    /// the delegate is derived from `delegatePk` (a raw 64-byte extended
+    /// `heavyDelegation` as [`dugite_ledger::eras::byron::GenesisHeavyDelegationCert`]s,
+    /// for genesis seeding (issue #1084, and #1092's signature verification —
+    /// design doc §3.3). The map KEY is already the issuer's KeyHash; the
+    /// delegate is derived from `delegatePk` (a raw 64-byte extended
     /// verification key, standard base64) via the ledger's `byron_key_hash`.
+    /// `cert` is the certificate's own signature (hex-encoded 64 bytes) and
+    /// `issuerPk` is the issuer's raw verification key (standard base64) —
+    /// both needed to verify the certificate, not just to derive its hashes.
     /// An entry that fails to parse is skipped with a warning rather than
     /// failing genesis load outright — matches `initial_utxos`'s posture on
     /// a malformed individual entry.
-    pub fn heavy_delegation_pairs(
+    pub fn heavy_delegation_certs(
         &self,
-    ) -> Vec<(
-        dugite_primitives::hash::Hash28,
-        dugite_primitives::hash::Hash28,
-    )> {
+    ) -> Vec<dugite_ledger::eras::byron::GenesisHeavyDelegationCert> {
         use base64::Engine;
         self.heavy_delegation
             .iter()
@@ -306,7 +305,7 @@ impl ByronGenesis {
                         return None;
                     }
                 };
-                let delegate_pk =
+                let delegate_vk =
                     match base64::engine::general_purpose::STANDARD.decode(&entry.delegate_pk) {
                         Ok(b) => b,
                         Err(e) => {
@@ -317,8 +316,33 @@ impl ByronGenesis {
                             return None;
                         }
                     };
-                let delegate = dugite_ledger::eras::byron::byron_key_hash(&delegate_pk);
-                Some((issuer, delegate))
+                let issuer_vk =
+                    match base64::engine::general_purpose::STANDARD.decode(&entry.issuer_pk) {
+                        Ok(b) => b,
+                        Err(e) => {
+                            tracing::warn!(
+                                issuer_hex,
+                                "Byron heavyDelegation: bad issuerPk base64: {e}"
+                            );
+                            return None;
+                        }
+                    };
+                let signature = match hex::decode(&entry.cert) {
+                    Ok(b) => b,
+                    Err(e) => {
+                        tracing::warn!(issuer_hex, "Byron heavyDelegation: bad cert hex: {e}");
+                        return None;
+                    }
+                };
+                let delegate = dugite_ledger::eras::byron::byron_key_hash(&delegate_vk);
+                Some(dugite_ledger::eras::byron::GenesisHeavyDelegationCert {
+                    issuer,
+                    delegate,
+                    issuer_vk,
+                    delegate_vk,
+                    signature,
+                    omega: entry.omega,
+                })
             })
             .collect()
     }
@@ -2203,6 +2227,44 @@ mod tests {
 
         // Hash should be non-zero
         assert_ne!(hash, dugite_primitives::hash::Hash32::ZERO);
+    }
+
+    /// Issue #1092: `heavy_delegation_certs()` must expose the raw
+    /// issuer/delegate keys and signature — not just the resolved
+    /// `Hash28`s `heavy_delegation_pairs()` (its pre-#1092 name) used to —
+    /// so `seed_byron_genesis` can verify each certificate
+    /// (`Certificate.hs::isValid`, design doc §3.3).
+    #[test]
+    fn test_byron_genesis_heavy_delegation_certs_from_mainnet_file() {
+        let path = std::path::Path::new("../../config/mainnet/byron-genesis.json");
+        if !path.exists() {
+            return; // skip if config files not available
+        }
+        let (genesis, _hash) = ByronGenesis::load_with_hash(path).unwrap();
+        let certs = genesis.heavy_delegation_certs();
+        assert_eq!(
+            certs.len(),
+            7,
+            "mainnet has exactly 7 heavyDelegation certs"
+        );
+        for cert in &certs {
+            assert_eq!(cert.issuer_vk.len(), 64);
+            assert_eq!(cert.delegate_vk.len(), 64);
+            assert_eq!(cert.signature.len(), 64);
+            assert_eq!(cert.omega, 0);
+            assert_eq!(
+                dugite_ledger::eras::byron::byron_key_hash(&cert.delegate_vk),
+                cert.delegate,
+                "the resolved delegate hash must match the raw delegate_vk it was derived from"
+            );
+        }
+        // Every issuer must be a distinct genesis key, and every delegate a
+        // distinct delegate — mainnet's 7 genesis keys each delegate to a
+        // DIFFERENT operational key.
+        let issuers: std::collections::BTreeSet<_> = certs.iter().map(|c| c.issuer).collect();
+        let delegates: std::collections::BTreeSet<_> = certs.iter().map(|c| c.delegate).collect();
+        assert_eq!(issuers.len(), 7);
+        assert_eq!(delegates.len(), 7);
     }
 
     #[test]
