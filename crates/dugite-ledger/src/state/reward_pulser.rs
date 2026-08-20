@@ -1096,7 +1096,12 @@ pub struct PoolRewardInfo {
     /// Owners are paid through the leader reward, never as members.
     pub owner_set: std::collections::HashSet<Hash32>,
     /// `poolLeaderReward`, already gated by the pv<=6 registration prefilter.
-    /// `None` when the leader reward is dropped or zero.
+    /// `None` when the prefilter drops the entry entirely (registration
+    /// fails at pv<=6). `Some((_, 0))` is real and expected — Haskell's
+    /// `collectLRs` inserts the `Reward RewardLeader` Set element whenever
+    /// the prefilter passes regardless of the computed amount (confirmed
+    /// against a real cardano-node 11.0.1 capture,
+    /// `tests/fixtures/nesru/{pulsing,complete-nonzero}.hex`).
     pub leader: Option<(Hash32, u64)>,
 }
 
