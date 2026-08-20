@@ -4407,8 +4407,27 @@ impl ConnectionLifecycleManager {
     ///
     /// This is the entry point for connections accepted by the TCP listener.
     /// The listener performs the handshake and creates a `PeerConnection`, then
-    /// passes it here for lifecycle management. We start warm + server protocols
-    /// and register the connection in the peer manager.
+    /// passes it here for lifecycle management. We start server protocols and
+    /// register the connection in the peer manager.
+    ///
+    /// Deliberately does NOT start our own KeepAlive-client (warm) protocol on
+    /// this connection (#1102). Only an OUTBOUND connection — one dugite itself
+    /// dialed via `register_warm_connection`/`promote_to_warm` — runs a
+    /// KeepAlive-client, because peer liveness monitoring is driven by the
+    /// side that CHOSE to connect (matches Haskell's InboundGovernor, which is
+    /// responder-only: it never spontaneously pings a peer that dialed IN).
+    /// An accepted connection only ever serves — a peer that connects to us
+    /// and never dials us back may not implement a KeepAlive-server at all,
+    /// e.g. `cardano-cli ping`, whose minimal client only sends
+    /// `MsgKeepAlive`/reads `MsgKeepAliveResponse` and has no responder logic.
+    /// Starting a KeepAlive-client here sent it an unsolicited `MsgKeepAlive`
+    /// ~2s after accept (see `make_keepalive_task`'s startup delay), which it
+    /// could not handle — `cardano-cli ping --count 3` reproduced this on
+    /// every run (2 round trips finish inside the 2s window; a 3rd does not).
+    /// A genuine duplex peer (one dugite ALSO has an outbound connection to)
+    /// is already monitored by that outbound connection's own KeepAlive-client
+    /// — see the `existing_to_peer` branch below — so nothing is lost for
+    /// real peer-to-peer topologies.
     ///
     /// Inbound and outbound to the same remote may coexist as long as their
     /// `(local, remote)` tuples differ — matching Haskell's
@@ -4431,8 +4450,8 @@ impl ConnectionLifecycleManager {
     ///
     /// # Errors
     ///
-    /// Returns `LifecycleError::Connection` if the inbound's warm/server
-    /// protocols fail to start.
+    /// Returns `LifecycleError::Connection` if the inbound's server protocols
+    /// fail to start.
     pub async fn register_inbound_connection(
         &mut self,
         addr: SocketAddr,
@@ -4459,8 +4478,10 @@ impl ConnectionLifecycleManager {
         // Record handshake RTT for Prometheus metrics.
         self.metrics.record_handshake_rtt(rtt_ms);
 
-        let keepalive_fn = self.make_keepalive_task(addr);
-        conn.start_warm_protocols(keepalive_fn)?;
+        // #1102: do NOT start our own KeepAlive-client (warm protocol) on an
+        // accepted connection — see the doc comment above. Only server
+        // (responder) protocols run here; liveness pinging is the
+        // OUTBOUND connection's job.
         self.start_server_protocols_on(addr, &mut conn)?;
 
         let existing_to_peer = self.has_any_to(addr);
@@ -5607,6 +5628,58 @@ mod tests {
             "a trusted peer must register successfully under the clamp, got {result:?}"
         );
         assert_eq!(lc.connection_count(), 1);
+    }
+
+    /// #1102: an ACCEPTED (inbound) connection must never spawn its own
+    /// KeepAlive-client (warm) task, even when a real keepalive client
+    /// channel is present on the connection object (as production's
+    /// `PeerConnection::accept()` currently subscribes unconditionally).
+    ///
+    /// Root cause reproduced live: dugite sent an unsolicited `MsgKeepAlive`
+    /// toward `cardano-cli ping` ~2s after accept (the startup delay in
+    /// `make_keepalive_task`), which only implements the KeepAlive CLIENT
+    /// role and has no responder — the connection reset, and
+    /// `cardano-cli ping --count 3` failed with
+    /// `PingClientKeepAliveProtocolFailure` on every run (`--count 2`
+    /// finishes inside the 2s window and never triggers it). Fixed by
+    /// deleting the `start_warm_protocols` call from
+    /// `register_inbound_connection` — liveness pinging is exclusively the
+    /// job of a genuine OUTBOUND connection (`register_warm_connection` /
+    /// `promote_to_warm`), which is unaffected by this test.
+    ///
+    /// `fake_with_hot_channels` gives a WORKING `keepalive_client_channel`
+    /// (its `.direction` field says `Outbound`, but `register_inbound_connection`
+    /// never reads `conn.direction` — only whether client channels are
+    /// present decides whether a warm task can be started), so this test
+    /// would have gone RED under the pre-fix code: `start_warm_protocols`
+    /// would have succeeded and pushed `"keepalive"` onto `warm_tasks`.
+    #[tokio::test]
+    async fn register_inbound_connection_never_starts_keepalive_client() {
+        let mut lc = ConnectionLifecycleManager::new_for_test();
+        let mut pm = NodePeerManager::new(crate::node::networking::PeerManagerConfig::default());
+
+        let addr: SocketAddr = "10.0.0.12:3001".parse().unwrap();
+        let conn = PeerConnection::fake_with_hot_channels(addr);
+        let cid = ConnectionId {
+            local: conn.local_addr,
+            remote: addr,
+        };
+
+        let result = lc
+            .register_inbound_connection(addr, conn, 1.0, &mut pm)
+            .await;
+        assert!(result.is_ok(), "inbound registration failed: {result:?}");
+
+        let registered = lc
+            .connections
+            .get(&cid)
+            .expect("registered connection must be present");
+        assert!(
+            registered.warm_task_names_for_test().is_empty(),
+            "an accepted connection must not run a KeepAlive-client warm task; \
+             found: {:?}",
+            registered.warm_task_names_for_test()
+        );
     }
 
     /// connected_addrs deduplicates — one entry per remote even with duplex pair.

@@ -1490,6 +1490,18 @@ impl PeerConnection {
         self.hot_tasks.iter().map(|(name, _, _)| *name).collect()
     }
 
+    /// The protocol names currently in `warm_tasks`, in push order.
+    ///
+    /// Used to prove #1102's fix: `register_inbound_connection` must never
+    /// spawn a KeepAlive-client (warm) task on an ACCEPTED connection — only
+    /// a genuine outbound dial (`register_warm_connection` /
+    /// `promote_to_warm`) may. An accepted connection that starts one sends
+    /// an unsolicited `MsgKeepAlive` toward a peer that may only implement
+    /// the client role (e.g. `cardano-cli ping`), which cannot handle it.
+    pub fn warm_task_names_for_test(&self) -> Vec<&'static str> {
+        self.warm_tasks.iter().map(|(name, _, _)| *name).collect()
+    }
+
     /// Create a `PeerConnection` backed by caller-supplied channels and a real
     /// `MuxHandle` for the `stop_hot_protocols_and_recover()` integration test.
     ///
