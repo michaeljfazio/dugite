@@ -124,7 +124,7 @@ pub async fn run_n2n_handshake_server(
     for &our_version in n2n::N2N_VERSIONS {
         if let Some(their_data) = remote_versions.get(&our_version) {
             // Check if we can accept this version
-            if let Some(_accepted) = our_data.accept(their_data) {
+            if let Some(accepted) = our_data.accept(their_data) {
                 // #880: if the peer opened in query mode, reply with
                 // MsgQueryReply (our version table, tag 3) instead of
                 // MsgAcceptVersion and flag the result as `query` so the caller
@@ -141,8 +141,19 @@ pub async fn run_n2n_handshake_server(
                         query: true,
                     });
                 }
-                // Send MsgAcceptVersion
-                let msg = encode_accept_version_n2n(our_version, our_data);
+                // #1104: MsgAcceptVersion must carry the NEGOTIATED
+                // (accepted) version_data, not our own raw local data.
+                // Haskell's `acceptableVersion` (Cardano.Network.NodeToNode.Version)
+                // returns `Accept NodeToNodeVersionData { diffusionMode =
+                // diffusionMode local `min` diffusionMode remote, peerSharing =
+                // peerSharing local <> peerSharing remote, ... }` — a per-field
+                // min/AND/OR reduction of local and remote, NOT a copy of
+                // either side's raw proposal — and the Handshake protocol
+                // driver (Ouroboros.Network.Protocol.Handshake.Server) sends
+                // exactly that `Accept`-computed record in `MsgAcceptVersion`.
+                // Sending `our_data` unmodified told a peer e.g. peer_sharing
+                // was enabled when the negotiated (AND'd) value was disabled.
+                let msg = encode_accept_version_n2n(our_version, &accepted);
                 channel.send(msg).await.map_err(HandshakeError::from)?;
                 return Ok(HandshakeResult {
                     version: our_version,
@@ -206,7 +217,7 @@ pub async fn run_n2c_handshake_server(
     // Find highest common version (N2C versions are already logical after decode)
     for &our_version in n2c::N2C_VERSIONS {
         if let Some(their_data) = remote_versions.get(&our_version) {
-            if let Some(_accepted) = our_data.accept(their_data) {
+            if let Some(accepted) = our_data.accept(their_data) {
                 // #1101: if the peer opened in query mode, reply with
                 // MsgQueryReply (our version table, tag 3) instead of
                 // MsgAcceptVersion and flag the result as `query` so the
@@ -222,7 +233,18 @@ pub async fn run_n2c_handshake_server(
                         query: true,
                     });
                 }
-                let msg = encode_accept_version_n2c(our_version, our_data);
+                // #1104: send the NEGOTIATED (accepted) version_data, not our
+                // raw local data — see the identical fix + Haskell grounding
+                // in `run_n2n_handshake_server` above. For N2CVersionData's
+                // current two fields this happens to be byte-identical to
+                // `our_data` in every case reachable here (network_magic must
+                // already match to reach `Some`, and `query` can only differ
+                // in the direction that diverts into the MsgQueryReply arm
+                // above), but using the accepted value is still the correct
+                // and robust thing to send — it stops being an accident the
+                // moment N2CVersionData grows a field with real min/AND/OR
+                // semantics, the way N2NVersionData already has.
+                let msg = encode_accept_version_n2c(our_version, &accepted);
                 channel.send(msg).await.map_err(HandshakeError::from)?;
                 return Ok(HandshakeResult {
                     version: our_version,
@@ -1133,6 +1155,166 @@ mod tests {
         for &v in n2c::N2C_VERSIONS {
             assert!(seen.contains(&v), "query reply missing version {v}");
         }
+    }
+
+    /// #1104: `run_n2n_handshake_server` computed the negotiated
+    /// (`our_data.accept(their_data)`) version_data correctly but then
+    /// discarded it and sent its own raw `our_data` in `MsgAcceptVersion`
+    /// instead. Grounded in `Ouroboros.Network.Protocol.Handshake.Server`'s
+    /// `handshakeServerPeer` (`acceptOrRefuse` -> `Accept agreedData` ->
+    /// `Yield (MsgAcceptVersion vNumber (encodeData vNumber agreedData))`,
+    /// IntersectMBO/ouroboros-network) — the wire reply carries the
+    /// `Accept`-computed record, never a raw local or remote value.
+    ///
+    /// Drives the REAL server function through a `MuxChannel` (same idiom as
+    /// `n2c_query_mode_server_replies_with_query_reply` above). The server
+    /// declares `peer_sharing = true`; the client proposes
+    /// `peer_sharing = false`. `peer_sharing` negotiates by AND
+    /// (`N2NVersionData::accept`), so the correct accepted value is
+    /// `false` — but the server's own raw `our_data.peer_sharing` is `true`.
+    /// Before the fix this test fails (`our_data` sent unmodified, so the
+    /// wire shows `true`); after the fix it passes.
+    #[tokio::test]
+    async fn n2n_accept_version_sends_negotiated_not_raw_local_data() {
+        use bytes::Bytes;
+        use std::sync::atomic::AtomicUsize;
+        use std::sync::Arc;
+        use tokio::sync::mpsc;
+
+        let (egress_tx, mut egress_rx) = mpsc::channel(8);
+        let (ingress_tx, ingress_rx) = mpsc::channel(8);
+        let mut channel = MuxChannel::new(
+            0,
+            crate::mux::Direction::ResponderDir,
+            egress_tx,
+            ingress_rx,
+            65536,
+            Arc::new(AtomicUsize::new(0)),
+        );
+
+        // Server: peer_sharing enabled, full duplex.
+        let our_data = N2NVersionData::new(2, false, true);
+        let our_data_for_check = our_data.clone();
+        let handle =
+            tokio::spawn(async move { run_n2n_handshake_server(&mut channel, &our_data).await });
+
+        // Client: peer_sharing DISABLED, and initiator-only (a second field
+        // whose negotiated value also differs from the server's raw data —
+        // min/OR semantics, so the accepted value must be `true` even though
+        // the server's own `initiator_only` is `false`).
+        let their_data = N2NVersionData {
+            network_magic: 2,
+            initiator_only: true,
+            peer_sharing: false,
+            query: false,
+        };
+        let proposal = encode_propose_versions_n2n(n2n::N2N_VERSIONS, &their_data);
+        ingress_tx.send(Bytes::from(proposal)).await.unwrap();
+
+        let result = handle.await.unwrap().unwrap();
+        assert!(!result.query);
+        assert!(!result.simultaneous_open);
+
+        let reply = egress_rx.recv().await.expect("server must reply");
+        let mut dec = Decoder::new(&reply.2);
+        assert_eq!(dec.array().unwrap(), Some(3));
+        assert_eq!(dec.u64().unwrap(), MSG_ACCEPT_VERSION);
+        let _version = dec.u16().unwrap();
+        let sent = N2NVersionData::decode(&mut dec).unwrap();
+
+        // The value actually reachable via the real N2NVersionData::accept()
+        // rule — this is what the wire MUST carry.
+        let expected = our_data_for_check.accept(&their_data).unwrap();
+        assert_eq!(
+            sent, expected,
+            "MsgAcceptVersion must carry the NEGOTIATED version_data, not our_data"
+        );
+        assert!(
+            !sent.peer_sharing,
+            "peer_sharing negotiates by AND(true, false) = false, but the \
+             server's own raw peer_sharing is true — sending true would tell \
+             the peer peer sharing is enabled when it is not"
+        );
+        assert!(
+            sent.initiator_only,
+            "initiator_only negotiates by min/OR(false, true) = true, but \
+             the server's own raw initiator_only is false"
+        );
+        assert_ne!(
+            sent, our_data_for_check,
+            "the negotiated value must differ from our_data in this scenario \
+             — otherwise this test cannot distinguish the fix from the bug"
+        );
+    }
+
+    /// #1104 (N2C half): `run_n2c_handshake_server` has the identical
+    /// discard-the-accepted-value pattern that `run_n2n_handshake_server` had
+    /// (see `n2n_accept_version_sends_negotiated_not_raw_local_data` above).
+    /// Fixed identically: use `our_data.accept(their_data)`'s result, not
+    /// `our_data`, in the `MsgAcceptVersion` reply.
+    ///
+    /// Unlike N2N this is NOT currently wire-observable: `N2CVersionData` has
+    /// exactly two fields, `network_magic` (must already be EQUAL to reach
+    /// `Some` at all — `accept` early-returns `None` on any mismatch) and
+    /// `query` (OR semantics, gated by a diversion into the `MsgQueryReply`
+    /// arm the instant `their_data.query` is true — the one case where OR
+    /// could raise the accepted value above `our_data.query` never reaches
+    /// this code path). So `accepted == our_data` is a mathematical
+    /// invariant of every reachable call today, and this test cannot fail
+    /// under the pre-fix code — it instead pins the invariant this fix
+    /// relies on. `assert_eq!(sent, our_data)` documents why, and
+    /// `assert_eq!(sent, expected)` is the assertion that stops being
+    /// vacuous the moment `N2CVersionData` grows a field with real
+    /// min/AND/OR semantics, mirroring `N2NVersionData`.
+    #[tokio::test]
+    async fn n2c_accept_version_sends_negotiated_value() {
+        use bytes::Bytes;
+        use std::sync::atomic::AtomicUsize;
+        use std::sync::Arc;
+        use tokio::sync::mpsc;
+
+        let (egress_tx, mut egress_rx) = mpsc::channel(8);
+        let (ingress_tx, ingress_rx) = mpsc::channel(8);
+        let mut channel = MuxChannel::new(
+            0,
+            crate::mux::Direction::ResponderDir,
+            egress_tx,
+            ingress_rx,
+            65536,
+            Arc::new(AtomicUsize::new(0)),
+        );
+
+        let our_data = N2CVersionData::new(2);
+        let our_data_for_check = our_data.clone();
+        let handle =
+            tokio::spawn(async move { run_n2c_handshake_server(&mut channel, &our_data).await });
+
+        let their_data = N2CVersionData {
+            network_magic: 2,
+            query: false,
+        };
+        let proposal = encode_propose_versions_n2c(n2c::N2C_VERSIONS, &their_data);
+        ingress_tx.send(Bytes::from(proposal)).await.unwrap();
+
+        let result = handle.await.unwrap().unwrap();
+        assert!(!result.query);
+
+        let reply = egress_rx.recv().await.expect("server must reply");
+        let mut dec = Decoder::new(&reply.2);
+        assert_eq!(dec.array().unwrap(), Some(3));
+        assert_eq!(dec.u64().unwrap(), MSG_ACCEPT_VERSION);
+        let _wire_version = dec.u16().unwrap();
+        let sent = N2CVersionData::decode(&mut dec).unwrap();
+
+        let expected = our_data_for_check.accept(&their_data).unwrap();
+        assert_eq!(
+            sent, expected,
+            "MsgAcceptVersion must carry the NEGOTIATED version_data"
+        );
+        assert_eq!(
+            sent, our_data_for_check,
+            "reachable N2C fields make accepted == our_data today (see doc comment)"
+        );
     }
 
     #[test]
