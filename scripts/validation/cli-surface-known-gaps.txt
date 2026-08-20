@@ -65,7 +65,7 @@
 # preview, preprod) since the Shelley hard fork; `byron key convert-byron-*`
 # are the only Byron-adjacent commands dugite-cli has ever needed.
 byron genesis genesis	1008	WONTFIX	Byron genesis ceremony command, dead since Shelley HF
-byron genesis print-genesis-hash	1008	WONTFIX	Byron genesis ceremony command, dead since Shelley HF
+byron genesis print-genesis-hash	1008	WONTFIX	Byron genesis ceremony command; testnet/local-devnet/setup.sh:463 calls real cardano-cli for this directly, so the devnet is structurally cardano-cli-dependent here regardless (#1091)
 byron governance create-proposal-vote	1008	WONTFIX	Byron-era update-system tooling, no live network runs Byron governance
 byron governance create-update-proposal	1008	WONTFIX	Byron-era update-system tooling, no live network runs Byron governance
 byron governance submit-proposal-vote	1008	WONTFIX	Byron-era update-system tooling, no live network runs Byron governance
@@ -85,11 +85,11 @@ byron transaction txid	1008	WONTFIX	Byron legacy txid tooling, dead since Shelle
 # cardano-cli-compatible genesis ceremony. `genesis initial-txin` (the one
 # genuinely useful non-ceremony command in this group) was implemented
 # separately, see the changelog note above.
-genesis create-cardano	1008	WONTFIX	Byron+Shelley genesis-bundle ceremony tool; dugite has its own devnet bootstrap
-genesis create-testnet-data	1008	WONTFIX	Testnet genesis-bundle ceremony tool; dugite has its own devnet bootstrap
+genesis create-cardano	1008	WONTFIX	Byron+Shelley genesis-bundle ceremony tool; the devnet requires cardano-cli as its parity oracle anyway (setup.sh calls create-testnet-data directly), so a dugite duplicate buys nothing (#1091)
+genesis create-testnet-data	1008	WONTFIX	Testnet genesis-bundle ceremony tool; testnet/local-devnet/setup.sh:131,251 already calls real cardano-cli for this directly — the devnet is structurally cardano-cli-dependent, not independently bootstrapped by dugite (#1091)
 genesis get-ver-key	1008	WONTFIX	Genesis ceremony key-derivation helper, low value outside that ceremony
 genesis initial-addr	1008	WONTFIX	Genesis ceremony address helper, low value outside that ceremony
-genesis key-gen-delegate	1008	WONTFIX	Genesis ceremony delegate key generation
+genesis key-gen-delegate	1008	WONTFIX	Genesis ceremony delegate key generation; tx-zoo/19-era-negatives/19c:47 already calls real cardano-cli for this directly, same reasoning as create-testnet-data (#1091)
 genesis key-gen-genesis	1008	WONTFIX	Genesis ceremony genesis key generation
 genesis key-gen-utxo	1008	WONTFIX	Genesis ceremony initial-UTxO key generation
 
