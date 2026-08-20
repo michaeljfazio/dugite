@@ -508,13 +508,22 @@ impl TxValidator for LedgerTxValidator {
         // The ledger's era comes from `EraHistory::current_era()`, not from
         // ledger pparams: #985's lesson is that a stale/corrupt protocol version
         // must never drive an era decision.
-        let ledger_era = match self.era_history.try_read() {
-            Ok(h) => Some(h.current_era()),
-            // Lock contention must not manufacture a spurious era rejection;
-            // fall through to the decoder, which is the pre-#1047 behaviour.
-            Err(_) => None,
-        };
-        if let Some(ledger_era) = ledger_era {
+        // #1090: WAIT for era_history rather than skipping the check on
+        // contention. A `try_read()` failure here used to fall through to
+        // the decoder silently, which meant #1047's wire-era protection did
+        // not run in exactly the window a block was being applied. This
+        // acquisition MUST stay scoped to this expression — only the owned
+        // `Era` escapes, so the read guard is dropped right here, BEFORE
+        // the `ledger` acquire a few lines down. That ordering is
+        // load-bearing now that the reads can actually block: sync.rs
+        // holds `ledger` write across an `era_history` read/write
+        // (sync.rs:1629, "Lock order ls->era_history"), so holding this
+        // guard across a blocking `ledger` acquire would invert that order
+        // and create a real AB-BA deadlock against the apply path, not
+        // merely a benign try-lock failure. See the design doc for #1090.
+        let ledger_era =
+            tokio::task::block_in_place(|| self.era_history.blocking_read().current_era());
+        {
             let ledger_era_index = ledger_era.to_era_index();
             if u32::from(era_id) != ledger_era_index {
                 let tx_era = dugite_primitives::era::Era::from_era_index(era_id);
@@ -540,10 +549,25 @@ impl TxValidator for LedgerTxValidator {
             }
         })?;
 
-        let ledger = self
-            .ledger
-            .try_read()
-            .map_err(|_| TxValidationError::LedgerStateUnavailable)?;
+        // #1090: WAIT for the ledger rather than rejecting on contention.
+        // `try_read()` used to fail whenever a block-apply writer held —
+        // or was queued behind readers for — this lock, and the failure
+        // was mapped to a fabricated `LedgerStateUnavailable` rejection
+        // (since deleted) for a transaction on which no validation had
+        // run. cardano-node has no give-up-if-busy path anywhere on its
+        // submission surface (see docs/superpowers/specs/
+        // 2026-08-21-tx-admission-lock-contention-design.md): the mempool
+        // add path blocks-as-queues and never fails an acquire, so the
+        // correct alignment is to wait, not to invent a verdict.
+        // `block_in_place` is this file's own established idiom for a
+        // lock that may briefly block a worker — `LedgerUtxoProvider::
+        // with_pinned` above already takes this EXACT `ledger` lock with
+        // `blocking_read()` for LSQ UTxO queries. It hands the worker's
+        // task queue to a replacement thread while parked, so the wait
+        // does not starve the async pool; the parked duration is bounded
+        // by the writer(s) ahead, which is exactly how long a real verdict
+        // would take to compute against the post-apply state anyway.
+        let ledger = tokio::task::block_in_place(|| self.ledger.blocking_read());
         let tx_size = tx_bytes.len() as u64;
         let current_slot = ledger.tip.point.slot().map(|s| s.0).unwrap_or(0);
 
@@ -579,23 +603,21 @@ impl TxValidator for LedgerTxValidator {
         // `TimeTranslationPastHorizon`. Round-1 P0 regression: without
         // this, dugite admitted a tx with ttl=865 at chain tip 265 and
         // cardano-bp permanently rejected the resulting block.
-        let per_tx_slot_config = match self.era_history.try_read() {
-            Ok(eh) => {
-                let horizon =
-                    eh.safe_zone_horizon_slot(dugite_primitives::time::SlotNo(current_slot));
-                let mut sc = self.slot_config;
-                if let Some(h) = horizon {
-                    sc.safe_zone_horizon_slot = Some(h);
-                }
-                sc
+        // #1090: WAIT for era_history rather than falling back to the
+        // unbounded static SlotConfig on contention — see the `ledger`
+        // acquire above. At this point the `ledger` read guard is ALREADY
+        // held, so this acquisition order is `ledger` then `era_history`,
+        // matching sync.rs's documented order (sync.rs:1629) rather than
+        // inverting it; no new deadlock risk is introduced here.
+        let per_tx_slot_config = tokio::task::block_in_place(|| {
+            let eh = self.era_history.blocking_read();
+            let horizon = eh.safe_zone_horizon_slot(dugite_primitives::time::SlotNo(current_slot));
+            let mut sc = self.slot_config;
+            if let Some(h) = horizon {
+                sc.safe_zone_horizon_slot = Some(h);
             }
-            // Era history briefly contended (held by a writer applying a
-            // block). Fall back to the unbounded static SlotConfig — this
-            // is strictly more permissive, so it cannot newly admit a tx
-            // that the horizon-checking path would have rejected on the
-            // very next attempt.
-            Err(_) => self.slot_config,
-        };
+            sc
+        });
 
         let pv_major = ledger.epochs.protocol_params.protocol_version_major;
         dugite_ledger::validation::validate_transaction_with_context(
@@ -3859,6 +3881,194 @@ mod tests {
         assert!(
             out.contains("dugite_n2c_connections_total 2"),
             "expected n2c_connections_total=2 in:\n{out}"
+        );
+    }
+
+    // ── #1090: tx admission WAITS for a contended ledger lock ───────────
+    //
+    // Design: docs/superpowers/specs/2026-08-21-tx-admission-lock-contention-design.md
+    //
+    // Before the fix, `validate_tx` mapped a `try_read()` failure on a
+    // contended `ledger` lock straight to `Err(LedgerStateUnavailable)` — a
+    // rejection for a transaction on which NO validation had run.
+    // cardano-node has no give-up-if-busy path anywhere on its submission
+    // surface, so the correct behaviour is to WAIT, not to fabricate a
+    // verdict.
+
+    /// A minimal era history whose `current_era()` is Conway. The
+    /// intermediate eras are irrelevant to this test —
+    /// `record_era_transition` does not require walking them one at a
+    /// time.
+    fn conway_era_history_for_test() -> dugite_consensus::EraHistory {
+        let byron = dugite_consensus::EraParams {
+            epoch_size: 21600,
+            slot_length_ms: 20000,
+            safe_zone: 4320,
+            genesis_window: 4320,
+        };
+        let shelley = dugite_consensus::EraParams {
+            epoch_size: 432000,
+            slot_length_ms: 1000,
+            safe_zone: 129600,
+            genesis_window: 129600,
+        };
+        let mut eh = dugite_consensus::EraHistory::from_genesis(byron, shelley, 0);
+        eh.record_era_transition(dugite_primitives::era::Era::Conway, 1);
+        eh
+    }
+
+    /// A minimal, DECODABLE Conway transaction. It has no witnesses and
+    /// spends a UTxO the test ledger never seeded, so it is certain to be
+    /// rejected once real Phase-1 validation runs. That is the point: the
+    /// test does not need the tx to be admitted, only to prove that a REAL
+    /// verdict — not a contention artifact — comes back once the wait ends.
+    fn minimal_decodable_conway_tx_bytes() -> Vec<u8> {
+        let body = dugite_primitives::transaction::TransactionBody {
+            inputs: vec![txin(1)],
+            outputs: vec![txout(1_000_000)],
+            fee: Lovelace(170_000),
+            ttl: None,
+            certificates: vec![],
+            withdrawals: std::collections::BTreeMap::new(),
+            auxiliary_data_hash: None,
+            validity_interval_start: None,
+            mint: std::collections::BTreeMap::new(),
+            script_data_hash: None,
+            collateral: vec![],
+            required_signers: vec![],
+            network_id: None,
+            collateral_return: None,
+            total_collateral: None,
+            reference_inputs: vec![],
+            update: None,
+            voting_procedures: std::collections::BTreeMap::new(),
+            proposal_procedures: vec![],
+            treasury_value: None,
+            donation: None,
+            sub_transactions: vec![],
+            account_balance_intervals: vec![],
+            direct_deposits: std::collections::BTreeMap::new(),
+            guards: vec![],
+        };
+        let witness_set = dugite_primitives::transaction::TransactionWitnessSet {
+            vkey_witnesses: vec![],
+            native_scripts: vec![],
+            bootstrap_witnesses: vec![],
+            plutus_v1_scripts: vec![],
+            plutus_v2_scripts: vec![],
+            plutus_v3_scripts: vec![],
+            plutus_data: vec![],
+            redeemers: vec![],
+            raw_redeemers_cbor: None,
+            raw_plutus_data_cbor: None,
+            original_script_data_hash: None,
+        };
+        let tx = dugite_primitives::transaction::Transaction {
+            hash: Hash32::ZERO,
+            era: dugite_primitives::era::Era::Conway,
+            body,
+            witness_set,
+            is_valid: true,
+            auxiliary_data: None,
+            raw_cbor: None,
+            raw_body_cbor: None,
+            raw_witness_cbor: None,
+        };
+        dugite_serialization::encode_transaction(&tx)
+    }
+
+    /// RED PROOF for #1090.
+    ///
+    /// The assertion is the WAIT ITSELF, not merely the absence of an
+    /// error: `validate_tx` must not return until the contending writer
+    /// has released the `ledger` lock. Asserting only "no error" would not
+    /// bound this — a fast wrong answer computed against a lock that
+    /// SHOULD have been contended could also come back `Err` (a real
+    /// Phase-1 rejection) without ever having waited, and this test would
+    /// stay green under the old `try_read()` behaviour by coincidence.
+    ///
+    /// Disarm the fix (revert `serve.rs`'s three lock acquisitions back to
+    /// `try_read()` and restore the `LedgerStateUnavailable` variant) and
+    /// this goes RED: `validate_tx` returns almost immediately, before
+    /// `writer_released` is set, because `try_read()` fails fast on
+    /// contention instead of waiting.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn validate_tx_waits_for_a_contended_ledger_lock_instead_of_rejecting() {
+        let ledger = Arc::new(RwLock::new(LedgerState::new(
+            ProtocolParameters::mainnet_defaults(),
+        )));
+        let era_history = Arc::new(RwLock::new(conway_era_history_for_test()));
+        let validator = Arc::new(LedgerTxValidator {
+            ledger: ledger.clone(),
+            slot_config: dugite_ledger::plutus::SlotConfig {
+                zero_time: 0,
+                zero_slot: 0,
+                slot_length: 1000,
+                safe_zone_horizon_slot: None,
+            },
+            metrics: Arc::new(crate::metrics::NodeMetrics::new()),
+            mempool: None,
+            network: dugite_primitives::network::NetworkId::Testnet,
+            era_history,
+        });
+
+        let writer_released = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (writer_holds_lock_tx, writer_holds_lock_rx) = tokio::sync::oneshot::channel();
+
+        // Task A: take the write lock FIRST, signal that it holds it, hold
+        // it for a fixed window (simulating a block apply), then release
+        // and record the release.
+        let writer_ledger = ledger.clone();
+        let writer_flag = writer_released.clone();
+        let writer_task = tokio::spawn(async move {
+            let guard = writer_ledger.write().await;
+            writer_holds_lock_tx.send(()).expect("receiver still alive");
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            drop(guard);
+            writer_flag.store(true, std::sync::atomic::Ordering::SeqCst);
+        });
+
+        // Wait until the writer confirms it holds the lock before
+        // submitting — otherwise this test would race the writer instead
+        // of deterministically exercising contention.
+        writer_holds_lock_rx
+            .await
+            .expect("writer task signalled lock acquisition");
+
+        // Task B: submit while the writer holds the lock. `validate_tx` is
+        // synchronous and calls `block_in_place` internally, so it must be
+        // driven from a real async task on a multi-thread runtime — NOT
+        // `spawn_blocking` (tokio's own docs warn that calling
+        // `block_in_place` from a `spawn_blocking` task can deadlock) —
+        // which is exactly how production drives it from the N2C server
+        // loop (`local_tx_submission/server.rs`).
+        let reader_validator = validator.clone();
+        let tx_bytes = minimal_decodable_conway_tx_bytes();
+        let reader_flag = writer_released.clone();
+        let reader_task = tokio::spawn(async move {
+            let result =
+                reader_validator.validate_tx(6 /* Conway wire era index */, &tx_bytes);
+            let released_when_we_returned = reader_flag.load(std::sync::atomic::Ordering::SeqCst);
+            (result, released_when_we_returned)
+        });
+
+        let (result, released_when_we_returned) = reader_task.await.expect("reader task panicked");
+        writer_task.await.expect("writer task panicked");
+
+        assert!(
+            released_when_we_returned,
+            "validate_tx returned before the contending writer released the ledger \
+             lock — it must WAIT for a contended `ledger` lock, not fail fast (#1090)"
+        );
+
+        // The verdict must be a REAL one, computed against the ledger once
+        // it was actually available — never the old fabricated
+        // `LedgerStateUnavailable` (which no longer even compiles; the
+        // variant is deleted). This tx spends a UTxO the test ledger never
+        // seeded, so a real Phase-1 rejection is expected.
+        assert!(
+            result.is_err(),
+            "expected a real Phase-1 rejection (input not found) — got {result:?}"
         );
     }
 }
