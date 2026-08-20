@@ -591,6 +591,7 @@ mod tests {
             transactions: vec![],
             era,
             raw_cbor: None,
+            byron: None,
         }
     }
 
@@ -890,6 +891,7 @@ mod tests {
             transactions: txs,
             era: Era::Conway,
             raw_cbor: None,
+            byron: None,
         };
         let enc = encode_block(&block, &[0x07; 448]);
         let segment = raw_aux_segment(24, true);
@@ -909,6 +911,7 @@ mod tests {
             transactions: txs256,
             era: Era::Conway,
             raw_cbor: None,
+            byron: None,
         };
         let enc256 = encode_block(&block256, &[0x07; 448]);
         assert!(
@@ -928,6 +931,7 @@ mod tests {
             transactions: txs,
             era: Era::Conway,
             raw_cbor: None,
+            byron: None,
         };
         let enc = encode_block(&block, &[0x07; 448]);
         let decoded = crate::decode::decode_block(&enc).expect("block must decode");

@@ -219,6 +219,7 @@ fn decode_babbage_block_mode(
         transactions,
         era: Era::Babbage,
         raw_cbor: None,
+        byron: None,
     })
 }
 

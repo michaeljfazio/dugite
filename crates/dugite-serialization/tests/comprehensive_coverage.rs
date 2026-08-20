@@ -2288,6 +2288,7 @@ fn test_encode_block_era_tags() {
             transactions: vec![],
             era,
             raw_cbor: None,
+            byron: None,
         };
         let enc = encode_block(&block, &[]);
         assert_eq!(enc[0], 0x82, "era {era:?} outer must be array(2)");
@@ -2313,6 +2314,7 @@ fn test_encode_block_invalid_tx_indices() {
         transactions: vec![tx_valid, tx_invalid],
         era: Era::Conway,
         raw_cbor: None,
+        byron: None,
     };
 
     let enc = encode_block(&block, &[]);

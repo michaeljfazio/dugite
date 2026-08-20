@@ -316,6 +316,7 @@ pub(crate) fn decode_alonzo_family_block(
         transactions,
         era,
         raw_cbor: None,
+        byron: None,
     })
 }
 

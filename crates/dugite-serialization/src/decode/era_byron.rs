@@ -63,7 +63,10 @@ use crate::decode::helpers::read_hash32;
 use crate::decode::reader::Reader;
 use crate::error::SerializationError;
 use dugite_primitives::address::Address;
-use dugite_primitives::block::{Block, BlockHeader, OperationalCert, ProtocolVersion, VrfOutput};
+use dugite_primitives::block::{
+    Block, BlockHeader, ByronBlockAux, ByronDlgCert, ByronParamsUpdate, ByronUpdProposal,
+    ByronUpdVote, OperationalCert, ProtocolVersion, VrfOutput,
+};
 use dugite_primitives::era::Era;
 use dugite_primitives::hash::{blake2b_256, Hash32};
 use dugite_primitives::time::{BlockNo, SlotNo};
@@ -72,6 +75,7 @@ use dugite_primitives::transaction::{
     TransactionWitnessSet,
 };
 use dugite_primitives::value::{Lovelace, Value};
+use num_traits::ToPrimitive;
 use std::collections::BTreeMap;
 
 // ============================================================================
@@ -324,6 +328,247 @@ fn decode_byron_tx(
 }
 
 // ============================================================================
+// Byron delegation + update payload decode (#1084)
+// ============================================================================
+//
+// Grounded in `cddl-spec/byron.cddl` (`cardano-ledger-byron` 1.2.0.0) — see
+// `docs/superpowers/specs/2026-08-20-byron-delegation-update-state-design.md`
+// §2.6 for the exact wire shapes reproduced below.
+
+/// Read a Byron `[? x]` — a 0- or 1-element array encoding `Maybe x`.
+///
+/// Haskell's `Bi` instances for `Maybe` use `encodeListLen`, which is always
+/// DEFINITE-length; this reader is therefore definite-only, matching every
+/// other Byron structural reader in this file (`array(N)`, never
+/// `array(indef)`, for a fixed-arity record).
+fn read_byron_maybe<T>(
+    r: &mut Reader<'_>,
+    f: impl FnOnce(&mut Reader<'_>) -> Result<T, SerializationError>,
+) -> Result<Option<T>, SerializationError> {
+    match r.read_array_header()? {
+        Some(0) => Ok(None),
+        Some(1) => Ok(Some(f(r)?)),
+        other => Err(SerializationError::CborDecode(format!(
+            "byron maybe: expected array(0) or array(1), got {other:?}"
+        ))),
+    }
+}
+
+/// Read a `bigint` CDDL field (plain uint or CBOR bignum tag) as a `u64`,
+/// hard-erroring above `u64::MAX` rather than truncating — a silent
+/// truncation on a consensus-adjacent size limit is #952's shape.
+fn read_bigint_u64(r: &mut Reader<'_>) -> Result<u64, SerializationError> {
+    r.read_bigint()?.to_u64().ok_or_else(|| {
+        SerializationError::CborDecode("byron bvermod: value exceeds u64::MAX".into())
+    })
+}
+
+/// Read `bver = [u16, u16, u8]` (major, minor, alt protocol version).
+fn read_bver(r: &mut Reader<'_>) -> Result<(u16, u16, u8), SerializationError> {
+    let n = r.read_array_header()?;
+    if !matches!(n, Some(3)) {
+        return Err(SerializationError::CborDecode(format!(
+            "byron bver: expected array(3), got {n:?}"
+        )));
+    }
+    let major = r.read_uint()?;
+    let minor = r.read_uint()?;
+    let alt = r.read_uint()?;
+    let major = u16::try_from(major)
+        .map_err(|_| SerializationError::CborDecode("byron bver: major exceeds u16".into()))?;
+    let minor = u16::try_from(minor)
+        .map_err(|_| SerializationError::CborDecode("byron bver: minor exceeds u16".into()))?;
+    let alt = u8::try_from(alt)
+        .map_err(|_| SerializationError::CborDecode("byron bver: alt exceeds u8".into()))?;
+    Ok((major, minor, alt))
+}
+
+/// Read one `dlg` element:
+/// `[epoch: u64, issuer: pubkey, delegate: pubkey, certificate: signature]`.
+fn read_byron_dlg_cert(r: &mut Reader<'_>) -> Result<ByronDlgCert, SerializationError> {
+    let n = r.read_array_header()?;
+    if !matches!(n, Some(4)) {
+        return Err(SerializationError::CborDecode(format!(
+            "byron dlg cert: expected array(4), got {n:?}"
+        )));
+    }
+    let epoch = r.read_uint()?;
+    let issuer_vk = r.read_bytes_owned()?;
+    let delegate_vk = r.read_bytes_owned()?;
+    let signature = r.read_bytes_owned()?;
+    Ok(ByronDlgCert {
+        epoch,
+        issuer_vk,
+        delegate_vk,
+        signature,
+    })
+}
+
+/// Read `dlgPayload = [* dlg]`.
+fn read_byron_dlg_payload(r: &mut Reader<'_>) -> Result<Vec<ByronDlgCert>, SerializationError> {
+    r.read_array(read_byron_dlg_cert)
+}
+
+/// Read `bvermod` — the 14-field sparse protocol-parameter update record.
+/// Every field is `[? x]`. See [`ByronParamsUpdate`]'s doc for why
+/// `txFeePolicy` is captured raw rather than parsed.
+fn read_byron_bvermod(r: &mut Reader<'_>) -> Result<ByronParamsUpdate, SerializationError> {
+    let n = r.read_array_header()?;
+    if !matches!(n, Some(14)) {
+        return Err(SerializationError::CborDecode(format!(
+            "byron bvermod: expected array(14), got {n:?}"
+        )));
+    }
+    let script_version = read_byron_maybe(r, |r| {
+        let v = r.read_uint()?;
+        u16::try_from(v)
+            .map_err(|_| SerializationError::CborDecode("byron scriptVersion exceeds u16".into()))
+    })?;
+    let slot_duration = read_byron_maybe(r, read_bigint_u64)?;
+    let max_block_size = read_byron_maybe(r, read_bigint_u64)?;
+    let max_header_size = read_byron_maybe(r, read_bigint_u64)?;
+    let max_tx_size = read_byron_maybe(r, read_bigint_u64)?;
+    let max_proposal_size = read_byron_maybe(r, read_bigint_u64)?;
+    let mpc_thd = read_byron_maybe(r, |r| r.read_uint())?;
+    let heavy_del_thd = read_byron_maybe(r, |r| r.read_uint())?;
+    let update_vote_thd = read_byron_maybe(r, |r| r.read_uint())?;
+    let update_proposal_thd = read_byron_maybe(r, |r| r.read_uint())?;
+    let update_implicit = read_byron_maybe(r, |r| r.read_uint())?;
+    let soft_fork_rule = read_byron_maybe(r, |r| {
+        let n = r.read_array_header()?;
+        if !matches!(n, Some(3)) {
+            return Err(SerializationError::CborDecode(format!(
+                "byron softForkRule: expected array(3), got {n:?}"
+            )));
+        }
+        Ok((r.read_uint()?, r.read_uint()?, r.read_uint()?))
+    })?;
+    let tx_fee_policy = read_byron_maybe(r, |r| {
+        let start = r.position();
+        r.skip()?;
+        Ok(r.slice_from(start).to_vec())
+    })?;
+    let unlock_stake_epoch = read_byron_maybe(r, |r| r.read_uint())?;
+    Ok(ByronParamsUpdate {
+        script_version,
+        slot_duration,
+        max_block_size,
+        max_header_size,
+        max_tx_size,
+        max_proposal_size,
+        mpc_thd,
+        heavy_del_thd,
+        update_vote_thd,
+        update_proposal_thd,
+        update_implicit,
+        soft_fork_rule,
+        tx_fee_policy,
+        unlock_stake_epoch,
+    })
+}
+
+/// Read `upprop = [bver, bvermod, softwareVersion, data, attributes, from, signature]`.
+///
+/// `up_id` is `blake2b_256` over this proposal's OWN raw CBOR span, captured
+/// via the same start/end-position discipline `KeepRaw` uses elsewhere in
+/// this decoder (`recoverUpId = hashDecoded`).
+///
+/// **Deviation from the design doc's `ByronUpdProposal` field list**: the
+/// doc's §3.1 sketch omits the proposer key (`from`), but §2.4's own
+/// registration rule requires it — `registerProposal` rejects a proposal
+/// whose `from` key does not resolve (via `Delegation.memberR`) to a genesis
+/// key. That check is unimplementable without capturing the field, so it is
+/// captured here as `proposer_vk` even though the doc's struct sketch did
+/// not list it.
+fn read_byron_upprop(r: &mut Reader<'_>) -> Result<ByronUpdProposal, SerializationError> {
+    let start = r.position();
+    let n = r.read_array_header()?;
+    if !matches!(n, Some(7)) {
+        return Err(SerializationError::CborDecode(format!(
+            "byron upprop: expected array(7), got {n:?}"
+        )));
+    }
+    let protocol_version = read_bver(r)?;
+    let params_update = read_byron_bvermod(r)?;
+    // softwareVersion = [text, u32]
+    let sv_arr = r.read_array_header()?;
+    if !matches!(sv_arr, Some(2)) {
+        return Err(SerializationError::CborDecode(format!(
+            "byron upprop softwareVersion: expected array(2), got {sv_arr:?}"
+        )));
+    }
+    let sv_name = r.read_str_owned()?;
+    let sv_number = r.read_uint()?;
+    let sv_number = u32::try_from(sv_number).map_err(|_| {
+        SerializationError::CborDecode("byron softwareVersion number exceeds u32".into())
+    })?;
+    // data: { * text => [hash,hash,hash,hash] } — opaque, feeds only the raw
+    // span the up_id hash is computed over.
+    r.skip()?;
+    // attributes — opaque, same reason.
+    r.skip()?;
+    // from: pubkey — the proposer's key (see doc comment above).
+    let proposer_vk = r.read_bytes_owned()?;
+    // signature — unverified (Byron signature verification is out of scope;
+    // see the design doc §3.6).
+    r.skip()?;
+
+    let raw = r.slice_from(start);
+    let up_id = blake2b_256(raw);
+    let encoded_len = raw.len() as u64;
+
+    Ok(ByronUpdProposal {
+        up_id,
+        encoded_len,
+        protocol_version,
+        params_update,
+        software_version: (sv_name, sv_number),
+        proposer_vk,
+    })
+}
+
+/// Read one `upvote = [voter: pubkey, proposalId: updid, vote: bool, signature]`.
+///
+/// The `vote: bool` element is decoded and discarded — matching upstream,
+/// whose pinned decoder does `void $ decCBOR @Bool` (negative voting does
+/// not exist in Byron; see the design doc §2.6).
+fn read_byron_upvote(r: &mut Reader<'_>) -> Result<ByronUpdVote, SerializationError> {
+    let n = r.read_array_header()?;
+    if !matches!(n, Some(4)) {
+        return Err(SerializationError::CborDecode(format!(
+            "byron upvote: expected array(4), got {n:?}"
+        )));
+    }
+    let voter_vk = r.read_bytes_owned()?;
+    let proposal_id = read_hash32(r)?;
+    let _vote = r.read_bool()?;
+    let signature = r.read_bytes_owned()?;
+    Ok(ByronUpdVote {
+        voter_vk,
+        proposal_id,
+        signature,
+    })
+}
+
+/// Read `updPayload = [proposal: [? upprop], votes: [* upvote]]` — arity 2,
+/// proposal FIRST (the wire order the design doc's §2.6 CDDL pins; a
+/// synthetic test fixture in this file's own test module had this backwards
+/// before #1084).
+fn read_byron_upd_payload(
+    r: &mut Reader<'_>,
+) -> Result<(Option<ByronUpdProposal>, Vec<ByronUpdVote>), SerializationError> {
+    let n = r.read_array_header()?;
+    if !matches!(n, Some(2)) {
+        return Err(SerializationError::CborDecode(format!(
+            "byron updPayload: expected array(2), got {n:?}"
+        )));
+    }
+    let proposal = read_byron_maybe(r, read_byron_upprop)?;
+    let votes = r.read_array(read_byron_upvote)?;
+    Ok((proposal, votes))
+}
+
+// ============================================================================
 // Byron main block decoder
 // ============================================================================
 
@@ -388,8 +633,12 @@ pub fn decode_byron_main_block(
     let epoch = r.read_uint()?;
     let rel_slot = r.read_uint()?;
 
-    // issuer_pubkey (bytes — skip)
-    r.skip()?;
+    // issuer_pubkey — the block issuer's 64-byte extended verification key.
+    // Captured for `ByronBlockAux` (#1084), which keys the per-block update
+    // endorsement by it. NOT wired into `BlockHeader.issuer_vkey` — see the
+    // design doc §3.1's hazard note: that field feeds the Shelley `bprev`
+    // overlay-schedule read at the era seam and must stay empty for Byron.
+    let issuer_pubkey = r.read_bytes_owned()?;
 
     // difficulty = [uint]
     let diff_arr = r.read_array_header()?;
@@ -400,11 +649,22 @@ pub fn decode_byron_main_block(
     }
     let block_number = r.read_uint()?;
 
-    // block_sig (skip — large structure)
+    // block_sig (skip — large structure; block-signature verification is a
+    // separate, deliberately out-of-scope gap — see the design doc §3.6)
     r.skip()?;
 
-    // field 4: extra_data (skip)
-    r.skip()?;
+    // field 4: extra_data = [blockVersion: bver, softwareVersion, attributes, extraProof]
+    let ed_arr = r.read_array_header()?;
+    if !matches!(ed_arr, Some(4)) {
+        return Err(SerializationError::CborDecode(format!(
+            "byron main block extra_data: expected array(4), got {ed_arr:?}"
+        )));
+    }
+    // blockVersion — the protocol version this block's issuer ENDORSES.
+    let block_version = read_bver(&mut r)?;
+    r.skip()?; // softwareVersion
+    r.skip()?; // attributes
+    r.skip()?; // extraProof
 
     let header_raw = r.slice_from(header_start);
     let header_hash = byron_main_header_hash(header_raw);
@@ -441,10 +701,11 @@ pub fn decode_byron_main_block(
         decode_byron_tx(raw_tx, raw_witness)
     })?;
 
-    // ssc, dlg_payload, upd_payload — skip
+    // ssc — dead subsystem, no oracle output; stays skipped (design doc §3.6).
     r.skip()?;
-    r.skip()?;
-    r.skip()?;
+    // dlgPayload / updPayload (#1084) — decoded into `ByronBlockAux`.
+    let dlg_certs = read_byron_dlg_payload(&mut r)?;
+    let (upd_proposal, upd_votes) = read_byron_upd_payload(&mut r)?;
 
     // -------------------------------------------------------------------------
     // 3. Extra (skip)
@@ -497,11 +758,20 @@ pub fn decode_byron_main_block(
         raw_header_body: None, // Byron (BFT) — no Praos KES
     };
 
+    let byron_aux = ByronBlockAux {
+        protocol_version: block_version,
+        issuer_pubkey,
+        dlg_certs,
+        upd_proposal,
+        upd_votes,
+    };
+
     Ok(Block {
         header,
         transactions,
         era: Era::Byron,
         raw_cbor: None, // set by caller from full block CBOR
+        byron: Some(Box::new(byron_aux)),
     })
 }
 
@@ -637,6 +907,8 @@ pub fn decode_byron_ebb_block(
         transactions: Vec::new(),
         era: Era::Byron,
         raw_cbor: None,
+        // EBBs have no body — no `dlgPayload`/`updPayload` to carry.
+        byron: None,
     })
 }
 
@@ -748,6 +1020,10 @@ mod tests {
         v
     }
 
+    fn cbor_arr0() -> Vec<u8> {
+        vec![0x80u8] // definite-length array(0)
+    }
+
     fn cbor_uint(n: u64) -> Vec<u8> {
         if n == 0 {
             vec![0x00]
@@ -780,6 +1056,18 @@ mod tests {
             v.extend_from_slice(b);
             v
         }
+    }
+
+    /// CBOR text string (major type 3), definite length.
+    fn cbor_text(s: &str) -> Vec<u8> {
+        let b = s.as_bytes();
+        assert!(
+            b.len() <= 23,
+            "cbor_text helper only supports short strings"
+        );
+        let mut v = vec![0x60 | b.len() as u8];
+        v.extend_from_slice(b);
+        v
     }
 
     fn cbor_map0() -> Vec<u8> {
@@ -876,8 +1164,13 @@ mod tests {
         let tx_payload = cbor_indef_arr0();
         let ssc = cbor_uint(0); // placeholder — simplify to a uint
         let dlg_payload = cbor_indef_arr0();
-        // upd_payload = [vote_list, maybe_proposal] — complex; use an empty 2-arr
-        let upd_payload = cbor_arr2(&cbor_indef_arr0(), &cbor_map0());
+        // upd_payload = [proposal: [? upprop], votes: [* upvote]] — proposal
+        // FIRST (design doc §2.6's CDDL). This fixture had the element order
+        // reversed and the wrong shapes (`[votes, map0]`) before #1084; both
+        // elements are now the CORRECT empty forms: `array(0)` for "no
+        // proposal" (`[? upprop]` is definite-length, never indefinite — see
+        // `read_byron_maybe`) and an empty array for "no votes".
+        let upd_payload = cbor_arr2(&cbor_arr0(), &cbor_indef_arr0());
         let body = cbor_arr4(&tx_payload, &ssc, &dlg_payload, &upd_payload);
 
         // extra = []
@@ -1219,5 +1512,219 @@ mod tests {
         data.extend(cbor_bytes(&inner));
         let tx = decode_byron_tx_standalone(&data).unwrap();
         assert_eq!(tx.era, Era::Byron);
+    }
+
+    // -----------------------------------------------------------------------
+    // dlgPayload / updPayload decode (#1084)
+    // -----------------------------------------------------------------------
+
+    /// `dlg = [epoch, issuer, delegate, certificate]`.
+    fn cbor_dlg_cert(epoch: u64, issuer: &[u8], delegate: &[u8], sig: &[u8]) -> Vec<u8> {
+        let mut v = vec![0x84u8];
+        v.extend(cbor_uint(epoch));
+        v.extend(cbor_bytes(issuer));
+        v.extend(cbor_bytes(delegate));
+        v.extend(cbor_bytes(sig));
+        v
+    }
+
+    /// `bvermod` — all 14 fields `[]` (Nothing).
+    fn cbor_empty_bvermod() -> Vec<u8> {
+        let mut v = vec![0x8eu8]; // array(14)
+        for _ in 0..14 {
+            v.extend(cbor_arr0());
+        }
+        v
+    }
+
+    /// `bvermod` with ONLY `maxTxSize` set — the exact shape of the real
+    /// mainnet epoch-16 proposal this design validated against.
+    fn cbor_bvermod_max_tx_size(value: u64) -> Vec<u8> {
+        let mut v = vec![0x8eu8]; // array(14)
+        v.extend(cbor_arr0()); // scriptVersion
+        v.extend(cbor_arr0()); // slotDuration
+        v.extend(cbor_arr0()); // maxBlockSize
+        v.extend(cbor_arr0()); // maxHeaderSize
+        v.extend(cbor_arr1(&cbor_uint(value))); // maxTxSize = Just value
+        for _ in 0..9 {
+            v.extend(cbor_arr0());
+        }
+        v
+    }
+
+    /// `upprop = [bver, bvermod, softwareVersion, data, attributes, from, signature]`.
+    fn cbor_upprop(bver: (u16, u16, u8), bvermod: &[u8], from: &[u8]) -> Vec<u8> {
+        let mut v = vec![0x87u8]; // array(7)
+        v.extend(cbor_arr3(
+            &cbor_uint(bver.0 as u64),
+            &cbor_uint(bver.1 as u64),
+            &cbor_uint(bver.2 as u64),
+        ));
+        v.extend(bvermod);
+        v.extend(cbor_arr2(&cbor_text("cardano-sl"), &cbor_uint(1))); // softwareVersion
+        v.extend(cbor_map0()); // data
+        v.extend(cbor_map0()); // attributes
+        v.extend(cbor_bytes(from)); // proposer pubkey
+        v.extend(cbor_bytes(&[0u8; 64])); // signature (unverified)
+        v
+    }
+
+    /// `upvote = [voter, proposalId, vote, signature]`.
+    fn cbor_upvote(voter: &[u8], proposal_id: &[u8; 32]) -> Vec<u8> {
+        let mut v = vec![0x84u8];
+        v.extend(cbor_bytes(voter));
+        v.extend(cbor_bytes(proposal_id));
+        v.push(0xf5); // true
+        v.extend(cbor_bytes(&[0u8; 64])); // signature
+        v
+    }
+
+    /// A main block whose `dlgPayload` carries one certificate and whose
+    /// `updPayload` carries one proposal (`maxTxSize -> 65536`, matching the
+    /// real mainnet epoch-16 event's shape) plus two votes.
+    fn make_main_inner_with_byron_aux(prev_hash: &[u8; 32]) -> Vec<u8> {
+        let pm = cbor_uint(764824073);
+        let prev = cbor_bytes(prev_hash);
+        let body_proof = cbor_bytes(&[0u8; 32]);
+        let slot_id = cbor_arr2(&cbor_uint(20), &cbor_uint(0));
+        let issuer_pubkey = [0x11u8; 64];
+        let issuer = cbor_bytes(&issuer_pubkey);
+        let difficulty = cbor_arr1(&cbor_uint(50_000));
+        let block_sig = cbor_arr2(&cbor_uint(0), &cbor_bytes(&[0u8; 64]));
+        let cons_data = cbor_arr4(&slot_id, &issuer, &difficulty, &block_sig);
+
+        let extra_data = cbor_arr4(
+            &cbor_arr3(&cbor_uint(0), &cbor_uint(1), &cbor_uint(0)), // blockVersion = 0.1.0
+            &cbor_arr2(&cbor_text("cardano-sl"), &cbor_uint(1)),
+            &cbor_map0(),
+            &cbor_bytes(&[0u8; 32]),
+        );
+        let header = cbor_arr5(&pm, &prev, &body_proof, &cons_data, &extra_data);
+
+        let tx_payload = cbor_indef_arr0();
+        let ssc = cbor_uint(0);
+
+        let dlg_issuer = [0x22u8; 64];
+        let dlg_delegate = [0x33u8; 64];
+        let dlg_payload = {
+            let mut v = vec![0x81u8]; // array(1)
+            v.extend(cbor_dlg_cert(0, &dlg_issuer, &dlg_delegate, &[0u8; 64]));
+            v
+        };
+
+        let proposer = [0x44u8; 64];
+        let bvermod = cbor_bvermod_max_tx_size(65_536);
+        let upprop = cbor_upprop((0, 1, 0), &bvermod, &proposer);
+        let voter_a = [0x55u8; 64];
+        let voter_b = [0x66u8; 64];
+        let fake_proposal_id = [0xEEu8; 32];
+        let votes = {
+            let mut v = vec![0x82u8]; // array(2)
+            v.extend(cbor_upvote(&voter_a, &fake_proposal_id));
+            v.extend(cbor_upvote(&voter_b, &fake_proposal_id));
+            v
+        };
+        let upd_payload = cbor_arr2(&cbor_arr1(&upprop), &votes);
+
+        let body = cbor_arr4(&tx_payload, &ssc, &dlg_payload, &upd_payload);
+        let extra = cbor_indef_arr0();
+        cbor_arr3(&header, &body, &extra)
+    }
+
+    #[test]
+    fn main_block_decodes_dlg_and_upd_payload() {
+        let prev = [0x77; 32];
+        let inner = make_main_inner_with_byron_aux(&prev);
+        let block = decode_byron_main_block(&inner, 0).unwrap();
+        let aux = block.byron.expect("main block must carry ByronBlockAux");
+
+        assert_eq!(aux.protocol_version, (0, 1, 0));
+        assert_eq!(aux.issuer_pubkey, vec![0x11u8; 64]);
+
+        assert_eq!(aux.dlg_certs.len(), 1);
+        assert_eq!(aux.dlg_certs[0].epoch, 0);
+        assert_eq!(aux.dlg_certs[0].issuer_vk, vec![0x22u8; 64]);
+        assert_eq!(aux.dlg_certs[0].delegate_vk, vec![0x33u8; 64]);
+
+        let proposal = aux.upd_proposal.expect("proposal must decode");
+        assert_eq!(proposal.protocol_version, (0, 1, 0));
+        assert_eq!(proposal.params_update.max_tx_size, Some(65_536));
+        assert_eq!(proposal.params_update.max_block_size, None);
+        assert_eq!(proposal.proposer_vk, vec![0x44u8; 64]);
+        assert_eq!(proposal.software_version, ("cardano-sl".to_string(), 1));
+
+        assert_eq!(aux.upd_votes.len(), 2);
+        assert_eq!(aux.upd_votes[0].voter_vk, vec![0x55u8; 64]);
+        assert_eq!(aux.upd_votes[1].voter_vk, vec![0x66u8; 64]);
+        assert_eq!(aux.upd_votes[0].proposal_id.as_bytes(), &[0xEEu8; 32]);
+    }
+
+    #[test]
+    fn up_id_is_blake2b256_of_the_proposals_own_raw_cbor_span() {
+        let prev = [0x88; 32];
+        let inner = make_main_inner_with_byron_aux(&prev);
+        let block = decode_byron_main_block(&inner, 0).unwrap();
+        let aux = block.byron.unwrap();
+        let proposal = aux.upd_proposal.unwrap();
+
+        // Recompute the raw upprop span independently and hash it — must
+        // match `up_id` exactly (`recoverUpId = hashDecoded`).
+        let bvermod = cbor_bvermod_max_tx_size(65_536);
+        let upprop_raw = cbor_upprop((0, 1, 0), &bvermod, &[0x44u8; 64]);
+        let expected = blake2b_256(&upprop_raw);
+        assert_eq!(proposal.up_id, expected);
+        assert_eq!(proposal.encoded_len, upprop_raw.len() as u64);
+    }
+
+    #[test]
+    fn ebb_never_carries_byron_aux() {
+        let prev = [0x99; 32];
+        let inner = make_ebb_inner(764824073, &prev, 5, 12345);
+        let block = decode_byron_ebb_block(&inner, 0).unwrap();
+        assert!(block.byron.is_none());
+    }
+
+    #[test]
+    fn main_block_with_empty_payloads_has_some_aux_but_no_proposal() {
+        // `make_main_inner` (used by the other main-block tests) has empty
+        // dlg/upd payloads; #1084 must still populate `Some(ByronBlockAux)`
+        // for every main block (only EBBs are `None`), just with empty
+        // vecs/None fields.
+        let prev = [0x00; 32];
+        let inner = make_main_inner(764824073, &prev, 2, 150, 42000);
+        let block = decode_byron_main_block(&inner, 0).unwrap();
+        let aux = block.byron.expect("main block always carries Some(aux)");
+        assert!(aux.dlg_certs.is_empty());
+        assert!(aux.upd_proposal.is_none());
+        assert!(aux.upd_votes.is_empty());
+    }
+
+    #[test]
+    fn bvermod_wrong_arity_rejected() {
+        // array(13) instead of array(14).
+        let mut bad = vec![0x8du8];
+        for _ in 0..13 {
+            bad.extend(cbor_arr0());
+        }
+        let mut r = Reader::new(&bad);
+        assert!(read_byron_bvermod(&mut r).is_err());
+    }
+
+    #[test]
+    fn upprop_with_all_empty_bvermod_decodes_to_default_params_update() {
+        let bvermod = cbor_empty_bvermod();
+        let upprop = cbor_upprop((1, 0, 0), &bvermod, &[0x00u8; 64]);
+        let mut r = Reader::new(&upprop);
+        let proposal = read_byron_upprop(&mut r).expect("must decode");
+        assert!(proposal.params_update.is_empty());
+    }
+
+    #[test]
+    fn byron_maybe_rejects_multi_element_array() {
+        // array(2) is neither "Nothing" (0) nor "Just x" (1).
+        let bad = cbor_arr2(&cbor_uint(1), &cbor_uint(2));
+        let mut r = Reader::new(&bad);
+        let result = read_byron_maybe(&mut r, |r| r.read_uint());
+        assert!(result.is_err());
     }
 }

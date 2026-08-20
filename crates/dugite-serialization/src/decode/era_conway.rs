@@ -279,6 +279,7 @@ fn decode_conway_block_mode(
         transactions,
         era,
         raw_cbor: None,
+        byron: None,
     })
 }
 
