@@ -178,7 +178,27 @@ fn build_new_likelihoods(
 /// ```haskell
 /// -- Rupd.hs, the JustRight arm
 /// SJust p@(Pulsing _ _) -> SJust <$> pulseStep p
+///
+/// -- PulsingReward.hs — pulseStep's clause order, verbatim:
+/// pulseStep (Complete r_) = pure (Complete r_, mempty)
+/// pulseStep p@(Pulsing _ pulser) | done pulser = completeStep p   -- checked BEFORE pulsing
+/// pulseStep (Pulsing rewsnap pulser) = do
+///   p2 <- pulseM pulser
+///   pure (Pulsing rewsnap p2, event)                              -- stays Pulsing even if THIS pulse drains it
 /// ```
+///
+/// Two timing facts fall directly out of that clause order, both oracle-
+/// verified against real source (not inferred): the tick that CREATES the
+/// pulser (`SNothing -> SJust (Pulsing ...)`, in `apply.rs`) performs ZERO
+/// pulses — `startStep` is a pure constructor, and `pulseStep`'s advancing
+/// clause only matches when `ru` is ALREADY `SJust (Pulsing ...)` on entry,
+/// which is only true starting the NEXT tick. And completion has a ONE-TICK
+/// LAG: `done` is checked BEFORE pulsing, so a pulse that exhausts the queue
+/// still returns wrapped in `Pulsing` for THAT tick; only the FOLLOWING
+/// tick's `done` check (with no new pulse) promotes to `Complete`. This
+/// function's structure below mirrors both: the "just built the fold" branch
+/// returns without pulsing, and the `is_complete()` check happens BEFORE any
+/// call to `fold.pulse(...)`, never after.
 ///
 /// Runs only inside the pulsing window: `rupd_monetary` is `Some` exactly when
 /// the epoch has passed its `4k/f` mark, so this is a no-op before the freeze
@@ -192,14 +212,17 @@ fn build_new_likelihoods(
 /// makes the differential property meaningful in production and not just in
 /// the proptest.
 ///
-/// Also promotes `epochs.rupd_snapshot` from `Pulsing` to `Complete` the
-/// instant the fold finishes, and — on the FIRST pulse of the epoch — fills
-/// in the frozen snapshot's `likelihoods`/`leaders` (`rewLikelihoods`/
-/// `rewLeaders`), which cannot be known until the per-pool table exists. Both
-/// are wire-only (#1071): `rupd_snapshot` is a read-only mirror of
-/// `rupd_monetary`'s gate (see `EpochSubState::rupd_snapshot`'s doc for why
-/// it is a separate field), and neither feeds `compute_reward_update`, which
-/// still derives its own answer from the GO snapshot at the boundary.
+/// Also promotes `epochs.rupd_snapshot` from `Pulsing` to `Complete` — ONE
+/// TICK after the fold internally finishes, never on the same tick, per the
+/// `pulseStep` clause order quoted above — and, on the tick the fold is
+/// BUILT (never the same tick as a pulse), fills in the frozen snapshot's
+/// `likelihoods`/`leaders` (`rewLikelihoods`/`rewLeaders`), which cannot be
+/// known until the per-pool table exists. Both are wire-only (#1071):
+/// `rupd_snapshot` is a read-only mirror of `rupd_monetary`'s gate (see
+/// `EpochSubState::rupd_snapshot`'s doc for why it is a separate field), and
+/// neither feeds `compute_reward_update`, which still derives its own answer
+/// from the GO snapshot at the boundary — this function's timing affects only
+/// what `nesRu` reports mid-epoch, never a credited amount.
 pub(crate) fn pulse_rupd_member_fold(
     epochs: &mut super::substates::EpochSubState,
     prev_d: &dugite_primitives::transaction::Rational,
@@ -214,7 +237,21 @@ pub(crate) fn pulse_rupd_member_fold(
         return; // no GO snapshot yet (first two epochs)
     };
     if epochs.rupd_fold.is_complete() {
-        return; // `completeStep` is idempotent; so is this
+        // `completeStep`'s Pulsing -> Complete transition, for the WIRE arm
+        // (#1071) ONLY — `epochs.rupd_fold`'s own `is_done()` already turned
+        // true the instant the LAST pulse drained the queue, on a PREVIOUS
+        // call to this function; that internal bookkeeping is immediate and
+        // deliberately untouched by this fix (`compute_reward_update`'s
+        // `prepulsed` consumer needs it to be). What was wrong is *this* wire
+        // promotion happening on the SAME tick as that draining pulse — see
+        // the `pulseStep` clause order quoted above the doc comment. `.take()`
+        // + `.complete()` is idempotent (`PulsingRewUpdate::complete` is a
+        // no-op on an already-`Complete` value), so repeating it on every
+        // subsequent tick is harmless; it only actually flips state once.
+        if let Some(snap_state) = epochs.rupd_snapshot.take() {
+            epochs.rupd_snapshot = Some(snap_state.complete());
+        }
+        return; // `completeStep` on an already-complete fold does no fold work
     }
     // At pv<=6, `rupd_addrs_rew == None` does NOT mean "no prefilter" — it means
     // the frozen `fvAddrsRew` has not been captured yet, and folding under it
@@ -304,6 +341,14 @@ pub(crate) fn pulse_rupd_member_fold(
             snap.likelihoods = likelihoods;
             snap.leaders = leaders;
         }
+        // Haskell's `startStep` (the `SNothing -> SJust` arm in `Rupd.hs`) is
+        // a PURE CONSTRUCTOR: it builds the unadvanced pulser and returns
+        // immediately. `pulseStep`'s fold-advancing clause only matches when
+        // `ru` is ALREADY `SJust (Pulsing ...)` on entry to a tick — true
+        // starting the NEXT tick, never this one. Falling through to the
+        // pulse below on the SAME call that just built the fold would
+        // perform a pulse Haskell's creation tick never performs.
+        return;
     }
 
     let fold_state = &mut epochs.rupd_fold;
@@ -319,15 +364,12 @@ pub(crate) fn pulse_rupd_member_fold(
         registered: &registered,
     };
     fold.pulse(n, &ctx);
-
-    if fold.is_done() {
-        // `completeStep`'s Pulsing -> Complete transition, for the WIRE
-        // arm (#1071). Consensus is unaffected either way —
-        // `PulsingRewUpdate::applies_at_boundary` is `true` for both.
-        if let Some(snap_state) = epochs.rupd_snapshot.take() {
-            epochs.rupd_snapshot = Some(snap_state.complete());
-        }
-    }
+    // Deliberately NO `is_done()` check/promotion here. Haskell's `pulseStep`
+    // wraps the post-pulse state in `Pulsing` UNCONDITIONALLY, even when this
+    // exact pulse exhausts the queue — the wire only becomes `Complete`
+    // starting the tick AFTER this one, via the `is_complete()` check at the
+    // top of this function. Promoting here would be the one-tick-early bug
+    // this function exists to avoid.
 }
 
 /// Haskell `mkPoolRewardInfo` over every pool in the GO snapshot.
@@ -485,13 +527,18 @@ fn build_pool_reward_table(
         // leader reward is never credited → stays in the pot → undistributed →
         // returned to reserves (matches Haskell deltaR2). Member rewards are
         // gated independently by the per-member prefilter in the fold below.
-        let leader = if operator_reward > 0 {
-            let op_key = LedgerState::reward_account_to_hash(&pool_reg.reward_account);
-            let included = prev_protocol_version_major >= 7 || registered_at_startstep(&op_key);
-            included.then_some((op_key, operator_reward))
-        } else {
-            None
-        };
+        //
+        // Deliberately NOT gated on `operator_reward > 0`: Haskell's
+        // `collectLRs` inserts the `Reward RewardLeader` Set element whenever
+        // the prefilter passes, with no amount check — a real cardano-node
+        // 11.0.1 capture carries a `[1, pool, 0]` leader entry
+        // (`tests/fixtures/nesru/{pulsing,complete-nonzero}.hex`, #1071
+        // follow-up). `compute_reward_update`'s aggregation step is what
+        // decides whether a zero-amount entry here is allowed to affect the
+        // credited total — see the comment at its leader-rewards loop.
+        let op_key = LedgerState::reward_account_to_hash(&pool_reg.reward_account);
+        let included = prev_protocol_version_major >= 7 || registered_at_startstep(&op_key);
+        let leader = included.then_some((op_key, operator_reward));
 
         pool_reward_table.insert(
             *pool_id,
@@ -961,6 +1008,17 @@ pub fn compute_reward_update(
         reward_entries.entry(cred).or_default().extend(entries);
     }
 
+    // `raw_rewards` (the WIRE `rs` field, #1071) and `reward_entries` (which
+    // feeds the CREDITED-amount aggregation below) diverge starting here, and
+    // deliberately: a real cardano-node 11.0.1 capture
+    // (`tests/fixtures/nesru/{pulsing,complete-nonzero}.hex`) shows Haskell's
+    // `Set Reward` carries a LeaderReward entry with amount **0** whenever the
+    // pv<=6 registration prefilter passes, regardless of the computed amount —
+    // `collectLRs` never filters on amount, only on registration. Cloned
+    // BEFORE the leader-rewards loop below adds anything, so this starts as
+    // exactly the member-fold entries both collections share.
+    let mut raw_reward_entries = reward_entries.clone();
+
     // ---- leader rewards ---------------------------------------------------
     //
     // Separate from the member fold, exactly as upstream keeps `collectLRs`
@@ -969,19 +1027,40 @@ pub fn compute_reward_update(
     // must not be paid twice.
     for info in pool_reward_table.values() {
         if let Some((op_key, amount)) = info.leader {
-            reward_entries
+            // Wire-only (`rs`): unconditional, matching Haskell's `Set Reward`
+            // exactly — the entry exists whenever the prefilter passes, zero
+            // amount included.
+            raw_reward_entries
                 .entry(op_key)
                 .or_default()
                 .push((false, info.pool_id, amount));
+            // Aggregation (`reward_map`/`total_distributed` below, including
+            // the pv<=2 `Set.deleteFindMin` selection a few lines down): a
+            // zero-amount leader entry must NOT enter it. For pv>2 this would
+            // be a no-op (summing a 0 changes nothing), but at pv<=2 the
+            // selection picks the LOWEST `(is_member, pool_id)` entry
+            // regardless of amount, so an always-present zero leader entry
+            // would win that selection over a nonzero member entry for the
+            // same credential — a real behaviour change to an already-
+            // validated consensus path (mainnet epochs 208-236 run pv<=2) that
+            // is explicitly OUT OF SCOPE for this wire-shape fix. Excluding it
+            // here reproduces today's pre-#1071-followup aggregation exactly.
+            if amount > 0 {
+                reward_entries
+                    .entry(op_key)
+                    .or_default()
+                    .push((false, info.pool_id, amount));
+            }
         }
     }
 
     // #1071: `rs` — the UNAGGREGATED per-source entries, matching Haskell's
-    // wire `RewardUpdate.rs :: Map (Credential Staking) (Set Reward)`. Cloned
-    // BEFORE the aggregating loop below consumes `reward_entries`, so this is
-    // the one and only place either form is derived — the aggregation logic
-    // itself is not duplicated (the #932/#938/#985 N-copies trap).
-    let raw_rewards: HashMap<Hash32, Vec<RewardEntry>> = reward_entries
+    // wire `RewardUpdate.rs :: Map (Credential Staking) (Set Reward)`. Built
+    // from `raw_reward_entries`, NOT `reward_entries` — see above for why the
+    // two differ (zero-amount leader entries). This is the one and only place
+    // either form is derived — the aggregation logic itself is not duplicated
+    // (the #932/#938/#985 N-copies trap).
+    let raw_rewards: HashMap<Hash32, Vec<RewardEntry>> = raw_reward_entries
         .iter()
         .map(|(cred, entries)| {
             (
@@ -2476,6 +2555,356 @@ mod tests {
             metadata_url: None,
             metadata_hash: None,
         }
+    }
+
+    // ─── #1071 follow-up (defect 3): zero-amount leader rewards ────────────
+
+    /// A leader reward computing to EXACTLY ZERO must still produce a
+    /// `PoolRewardInfo::leader` entry, not `None`. Matches a REAL
+    /// cardano-node 11.0.1 capture: both `tests/fixtures/nesru/pulsing.hex`
+    /// (`rewLeaders`) and `complete-nonzero.hex` (`rs`) carry a
+    /// `[1, pool, 0]` LeaderReward entry. Haskell's `collectLRs` never gates
+    /// on amount, only on the pv<=6 registration prefilter
+    /// (`hardforkBabbageForgoRewardPrefilter pv || isAccountRegistered op`)
+    /// — dugite previously ALSO gated on `operator_reward > 0`, silently
+    /// dropping this real case.
+    ///
+    /// Cost=0, margin=0, and no self-delegation is the concrete scenario
+    /// that makes `operator_reward` compute to exactly 0: with
+    /// `pool_reward > cost`, `operator_reward = cost + floor((margin +
+    /// (1-margin)*(self/σ)) * (pool_reward - cost))`, and `cost=0, margin=0,
+    /// self=0` makes the whole bracket 0 regardless of how large
+    /// `pool_reward` is.
+    #[test]
+    fn zero_amount_leader_reward_is_a_present_table_entry_not_none() {
+        const POOL: u8 = 0x50;
+        const MEMBER: u8 = 0x51;
+        let pool_id = h28(POOL);
+        let member_cred = cred32(MEMBER);
+        let op_key = cred32(0xd0);
+
+        let mut delegations: HashMap<Hash32, Hash28> = HashMap::new();
+        let mut stake_distribution: HashMap<Hash32, Lovelace> = HashMap::new();
+        delegations.insert(member_cred, pool_id);
+        stake_distribution.insert(member_cred, Lovelace(1_000_000_000_000));
+
+        let mut pool_stake: HashMap<Hash28, Lovelace> = HashMap::new();
+        pool_stake.insert(pool_id, Lovelace(1_000_000_000_000));
+
+        let mut pool_params: HashMap<Hash28, PoolRegistration> = HashMap::new();
+        // cost=0, margin=0/1, pledge=0, owners=[] (no self-delegation).
+        pool_params.insert(pool_id, pool_reg(pool_id, 0, 0, (0, 1), vec![], 0xd0));
+
+        let go = StakeSnapshot {
+            epoch: EpochNo(10),
+            delegations: Arc::new(delegations),
+            pool_stake,
+            pool_params: Arc::new(pool_params),
+            stake_distribution: Arc::new(stake_distribution),
+            epoch_fees: Lovelace(0),
+            epoch_block_count: 0,
+            epoch_blocks_by_pool: Arc::new(HashMap::new()),
+        };
+        let mut bprev: HashMap<Hash28, u64> = HashMap::new();
+        bprev.insert(pool_id, 10);
+
+        let mut params = dugite_primitives::protocol_params::ProtocolParameters::mainnet_defaults();
+        params.a0 = rat(3, 10);
+        params.n_opt = 500;
+
+        let registered = |_: &Hash32| true;
+        let table = super::build_pool_reward_table(
+            &go,
+            &bprev,
+            &params,
+            params.n_opt.max(1),
+            1_000_000_000,     // reward_pot
+            2_000_000_000_000, // total_stake
+            1_000_000_000_000, // total_active_stake
+            10,                // total_blocks_in_epoch
+            true,              // d_ge_4_5 — bypasses blocks-made dependence
+            1,
+            1,
+            11, // prev_protocol_version_major
+            &registered,
+        );
+
+        let info = table.get(&pool_id).expect(
+            "pool must produce a table entry: pool_active_stake>0, \
+             reward_pot>0, d_ge_4_5=true makes pool_reward=max_pool \
+             regardless of blocks_made",
+        );
+        assert!(
+            info.pool_reward > 0,
+            "sanity: the pool's whole reward pot must be nonzero for this \
+             test to mean anything (got {})",
+            info.pool_reward
+        );
+        assert_eq!(info.cost, 0);
+        assert_eq!(info.margin_num, 0);
+        assert_eq!(
+            info.leader,
+            Some((op_key, 0)),
+            "cost=0, margin=0, self_delegated=0 must produce \
+             operator_reward=0 — and the table entry must be PRESENT \
+             (Some((op_key, 0))), matching Haskell's Set Reward always \
+             carrying the LeaderReward entry once the prefilter passes, \
+             not None"
+        );
+    }
+
+    /// End to end: the zero-amount leader entry from the test above must
+    /// reach `raw_rewards` (the WIRE `rs` field's source) while being
+    /// EXCLUDED from `rewards` (the credited-amount map) — a 0 lovelace
+    /// credit is not a credit, and this is the aggregation-logic boundary
+    /// the fix deliberately does not cross (see the comment at
+    /// `compute_reward_update`'s leader-rewards loop).
+    #[test]
+    fn zero_amount_leader_reward_reaches_raw_rewards_but_not_credited_rewards() {
+        const POOL: u8 = 0x52;
+        const MEMBER: u8 = 0x53;
+        let pool_id = h28(POOL);
+        let member_cred = cred32(MEMBER);
+        let op_key = cred32(0xd3);
+
+        let mut delegations: HashMap<Hash32, Hash28> = HashMap::new();
+        let mut stake_distribution: HashMap<Hash32, Lovelace> = HashMap::new();
+        delegations.insert(member_cred, pool_id);
+        stake_distribution.insert(member_cred, Lovelace(1_000_000_000_000));
+
+        let mut pool_stake: HashMap<Hash28, Lovelace> = HashMap::new();
+        pool_stake.insert(pool_id, Lovelace(1_000_000_000_000));
+
+        let mut pool_params: HashMap<Hash28, PoolRegistration> = HashMap::new();
+        pool_params.insert(pool_id, pool_reg(pool_id, 0, 0, (0, 1), vec![], 0xd3));
+
+        let go = StakeSnapshot {
+            epoch: EpochNo(10),
+            delegations: Arc::new(delegations),
+            pool_stake,
+            pool_params: Arc::new(pool_params),
+            stake_distribution: Arc::new(stake_distribution),
+            epoch_fees: Lovelace(0),
+            epoch_block_count: 0,
+            epoch_blocks_by_pool: Arc::new(HashMap::new()),
+        };
+        let mut bprev: HashMap<Hash28, u64> = HashMap::new();
+        bprev.insert(pool_id, 10);
+
+        let mut params = dugite_primitives::protocol_params::ProtocolParameters::mainnet_defaults();
+        params.a0 = rat(3, 10);
+        params.n_opt = 500;
+        // rho=1/1 makes `expansion = floor(rho * reserves) = reserves`
+        // trivially, so the frozen `MonetaryStep.delta_r1` below can be
+        // chosen freely and still satisfy `compute_reward_update`'s
+        // consistency `debug_assert_eq!`.
+        params.rho = rat(1, 1);
+
+        let monetary = crate::state::reward_pulser::MonetaryStep {
+            delta_r1: 1_000, // must equal floor(rho * reserves) = 1 * 1_000
+            delta_t1: 0,
+            r: 1_000_000_000, // the pool-distribution reward pot, chosen freely
+            expected_blocks: 0,
+            total_stake: 2_000_000_000_000,
+        };
+
+        let rupd = super::compute_reward_update(
+            &params,
+            &rat(1, 1), // prev_d — d_ge_4_5=true, matching the frozen expansion
+            11,         // prev_protocol_version_major (pv>2: aggregation, not deleteFindMin)
+            Some(&go),
+            &bprev,
+            Lovelace(0), // ss_fee
+            Lovelace(1_000),
+            Lovelace(0),
+            &HashMap::new(),
+            None,
+            86_400,
+            0,
+            super::super::MAX_LOVELACE_SUPPLY,
+            &Default::default(),
+            Some(monetary),
+            None,
+        );
+
+        let raw = rupd.raw_rewards.get(&op_key).expect(
+            "raw_rewards (the WIRE rs field's source) must carry the \
+             zero-amount leader entry",
+        );
+        assert_eq!(raw.len(), 1);
+        assert!(!raw[0].is_member, "LeaderReward, not MemberReward");
+        assert_eq!(raw[0].pool_id, pool_id);
+        assert_eq!(raw[0].amount, 0);
+
+        assert!(
+            !rupd.rewards.contains_key(&op_key),
+            "a ZERO-lovelace entry must never appear in the CREDITED \
+             rewards map — this is the aggregation-logic boundary this fix \
+             deliberately does not cross"
+        );
+    }
+
+    // ─── #1071 follow-up (defect 2): pulse/completion TIMING ───────────────
+
+    /// The tick that CREATES the pulser performs ZERO pulses, and the wire
+    /// only shows `Complete` starting the tick AFTER the one whose pulse
+    /// drains the queue — never on that same tick. Both facts are oracle-
+    /// verified against `PulsingReward.hs`'s `pulseStep` clause order (see
+    /// `pulse_rupd_member_fold`'s own doc for the quoted source), not
+    /// inferred.
+    ///
+    /// Drives FOUR successive calls to `pulse_rupd_member_fold`, each one
+    /// standing in for one block/tick, over a 3-credential queue with
+    /// `pulse_size` forced to 1 (via `security_param_k=1`) so each tick can
+    /// pulse at most one credential — three ticks to drain, a fourth to
+    /// observe the completion lag. Before this fix, tick 0 also pulsed
+    /// (draining the queue one tick early) and tick "3" (the draining tick)
+    /// already showed `Complete`.
+    #[test]
+    fn pulse_rupd_member_fold_matches_haskells_creation_and_completion_timing() {
+        use crate::state::reward_pulser::{
+            FreeVars, MonetaryStep, PulsingRewUpdate, RewardSnapShot,
+        };
+        use crate::state::LedgerState;
+
+        const POOL: u8 = 0x60;
+        let pool_id = h28(POOL);
+
+        let mut delegations: HashMap<Hash32, Hash28> = HashMap::new();
+        let mut stake_distribution: HashMap<Hash32, Lovelace> = HashMap::new();
+        for i in 0..3u8 {
+            let cred = cred32(0x61 + i);
+            delegations.insert(cred, pool_id);
+            stake_distribution.insert(cred, Lovelace(1_000_000_000));
+        }
+        let mut pool_stake: HashMap<Hash28, Lovelace> = HashMap::new();
+        pool_stake.insert(pool_id, Lovelace(3_000_000_000));
+        let mut pool_params: HashMap<Hash28, PoolRegistration> = HashMap::new();
+        pool_params.insert(
+            pool_id,
+            pool_reg(pool_id, 0, 340_000_000, (1, 20), vec![], 0x70),
+        );
+
+        let go = StakeSnapshot {
+            epoch: EpochNo(10),
+            delegations: Arc::new(delegations),
+            pool_stake,
+            pool_params: Arc::new(pool_params),
+            stake_distribution: Arc::new(stake_distribution),
+            epoch_fees: Lovelace(0),
+            epoch_block_count: 0,
+            epoch_blocks_by_pool: Arc::new(HashMap::new()),
+        };
+
+        let params = dugite_primitives::protocol_params::ProtocolParameters::mainnet_defaults();
+        let mut state = LedgerState::new(params.clone());
+        state.epochs.snapshots.go = Some(go);
+        state.epochs.prev_protocol_params = params;
+        state.epochs.prev_protocol_version_major = 11; // pv>=7: no pv<=6 prefilter gate
+        state.epochs.prev_d = rat(0, 1);
+
+        // Simulate the CREATION tick's freeze (mirrors `apply.rs`'s
+        // mark-crossing block, BEFORE it calls `pulse_rupd_member_fold`):
+        // `rupd_monetary`/`rupd_snapshot = Some(Pulsing(...))` are set, but
+        // the fold itself (`rupd_fold.fold`) does not exist yet.
+        let monetary = MonetaryStep {
+            delta_r1: 0,
+            delta_t1: 0,
+            r: 1_000_000_000,
+            expected_blocks: 0,
+            total_stake: 10_000_000_000_000,
+        };
+        state.epochs.rupd_monetary = Some(monetary);
+        state.epochs.rupd_pulser_started = true;
+        state.epochs.rupd_snapshot = Some(PulsingRewUpdate::Pulsing(Box::new(RewardSnapShot {
+            fees: Lovelace(0),
+            protocol_version: (11, 0),
+            non_myopic: Default::default(),
+            delta_r1: Lovelace(0),
+            r: Lovelace(1_000_000_000),
+            delta_t1: Lovelace(0),
+            likelihoods: HashMap::new(),
+            leaders: HashMap::new(),
+            free_vars: FreeVars {
+                addrs_rew: None,
+                total_stake: 10_000_000_000_000,
+                prot_ver: (11, 0),
+            },
+        })));
+
+        let k: u64 = 1; // pulse_size = max(1, ceil(3 / (4*1))) = 1
+        let call = |state: &mut LedgerState| {
+            let prev_d = state.epochs.prev_d.clone();
+            let pv = state.epochs.prev_protocol_version_major;
+            let epoch_length = state.epoch_length;
+            super::pulse_rupd_member_fold(&mut state.epochs, &prev_d, pv, k, epoch_length);
+        };
+        let is_pulsing = |state: &LedgerState| {
+            matches!(
+                state.epochs.rupd_snapshot,
+                Some(PulsingRewUpdate::Pulsing(_))
+            )
+        };
+        let is_complete = |state: &LedgerState| {
+            matches!(
+                state.epochs.rupd_snapshot,
+                Some(PulsingRewUpdate::Complete(_))
+            )
+        };
+
+        // Tick 0 — the SAME tick that just froze the pulser above: must
+        // build the fold WITHOUT pulsing it.
+        call(&mut state);
+        assert_eq!(
+            state.epochs.rupd_fold.remaining(),
+            3,
+            "the creation tick must perform ZERO pulses — Haskell's \
+             `startStep` is a pure constructor; `pulseStep`'s advancing \
+             clause only matches starting the NEXT tick"
+        );
+        assert!(
+            is_pulsing(&state),
+            "wire must still read Pulsing after the creation tick"
+        );
+
+        // Tick 1 — the first REAL pulse.
+        call(&mut state);
+        assert_eq!(
+            state.epochs.rupd_fold.remaining(),
+            2,
+            "tick 1 is the first tick that actually pulses"
+        );
+        assert!(is_pulsing(&state));
+
+        // Tick 2.
+        call(&mut state);
+        assert_eq!(state.epochs.rupd_fold.remaining(), 1);
+        assert!(is_pulsing(&state));
+
+        // Tick 3 — this pulse DRAINS the queue (the 3rd and last credential).
+        // The internal fold becomes done as a RESULT of this call, but the
+        // wire must still read Pulsing: completion has a one-tick lag.
+        call(&mut state);
+        assert_eq!(state.epochs.rupd_fold.remaining(), 0, "queue now drained");
+        assert!(
+            state.epochs.rupd_fold.is_complete(),
+            "internal bookkeeping (`InFlightFold::is_complete`) is \
+             immediate — that is correct and untouched by this fix"
+        );
+        assert!(
+            is_pulsing(&state),
+            "the WIRE must NOT show Complete on the SAME tick that drained \
+             the queue — this is the one-tick lag `pulseStep`'s clause \
+             order requires (`done` is checked BEFORE pulsing, never after)"
+        );
+
+        // Tick 4 — no new pulse (the fold is already exhausted); THIS tick
+        // promotes the wire to Complete.
+        call(&mut state);
+        assert!(
+            is_complete(&state),
+            "one tick after the draining pulse, the wire must show Complete"
+        );
     }
 
     /// Byte-exact replica of the **real** preview epoch-1363 reward calculation

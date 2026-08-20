@@ -18709,10 +18709,13 @@ fn first_pulse_applies_the_pv6_prefilter_to_the_queue_head() {
          the prefilter has nothing to exclude and the test is vacuous"
     );
 
-    // Slot 101 is strictly past the mark (first + 100), so THIS block starts the
-    // pulser, captures fvAddrsRew and takes the first pulse — the one pulse the
-    // defect can reach. Slot 102 folds the second credential, which exists only
-    // to make the non-vacuity assertion below possible.
+    // Slot 101 is strictly past the mark (first + 100), so THIS block starts
+    // the pulser and captures fvAddrsRew — but (#1071 follow-up: the creation
+    // tick performs ZERO pulses, matching Haskell's `startStep` being a pure
+    // constructor) takes no pulse itself. Slot 102 is the FIRST tick that
+    // actually pulses, folding the queue head — the one pulse the #1074
+    // defect can reach. Slot 103 folds the second credential, which exists
+    // only to make the non-vacuity assertion below possible.
     let block1 = make_test_block(101, 1, Hash32::ZERO, vec![]);
     state
         .apply_block(&block1, BlockValidationMode::ApplyOnly)
@@ -18721,6 +18724,10 @@ fn first_pulse_applies_the_pv6_prefilter_to_the_queue_head() {
     state
         .apply_block(&block2, BlockValidationMode::ApplyOnly)
         .expect("second block must apply");
+    let block3 = make_test_block(103, 3, *block2.hash(), vec![]);
+    state
+        .apply_block(&block3, BlockValidationMode::ApplyOnly)
+        .expect("third block must apply");
 
     assert!(
         state.epochs.rupd_monetary.is_some(),
@@ -18740,9 +18747,11 @@ fn first_pulse_applies_the_pv6_prefilter_to_the_queue_head() {
         .expect("the trigger block must have built and pulsed the fold");
     assert!(
         fold.is_done(),
-        "pulse_size is 1 and two blocks landed, so both credentials must have \
-         been folded; an unfinished fold means the queue was larger than \
-         intended and the assertions below would read a partial answer"
+        "pulse_size is 1 and three blocks landed (block1 creates the pulser \
+         with zero pulses, block2 and block3 each take one), so both \
+         credentials must have been folded; an unfinished fold means the \
+         queue was larger than intended and the assertions below would read \
+         a partial answer"
     );
     let entries = fold.into_entries();
 

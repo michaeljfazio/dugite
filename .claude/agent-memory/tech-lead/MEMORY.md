@@ -8,6 +8,7 @@
 
 ## #1071 nesRu wire arms — SNothing/Complete real, Pulsing deferred (2026-08-20)
 - [Full writeup](issue-1071-nesru-wire-arms.md) — kept rupd_pulser_started/rupd_monetary UNTOUCHED (40+ tests), added parallel rupd_snapshot. RewardUpdate.rs is tag-258 Set at PV>=9, threshold-23 BOTH levels (oracle-verified, not analogy). Pulsing needs StakePoolSnapShot/StakeWithDelegation/Reward types dugite doesn't have anywhere — SNothing fallback, not fabricated.
+- [Complete-arm follow-up, 4 defects (2026-08-21, UNCOMMITTED)](issue-1071-complete-arm-followup-4-defects.md) — rs key was bstr(32) not array(2)[disc,hash28] (disc ALREADY in byte 28, nothing to thread); outer sort is script-first not hash-major; zero-amount leader entries wrongly dropped (real captures prove `[1,pool,0]`); creation-tick pulses 0 times + Complete lags the drain tick by one. Coordinating task's cited design doc never existed in this worktree — re-grounded from raw fixtures + 2 oracle dispatches.
 
 ## #1088 snapshot map-ordering fix (2026-08-20)
 - [Full writeup](issue-1088-snapshot-map-ordering-fix.md) — 42 field decls (54 instances) moved HashMap/imbl→BTreeMap or new `*Wire` mirrors. Replaces `snapshot_one_bump_invariant.rs` w/ version-pinned hash guard. Disarming ONE 2-entry field is only ~50% likely to fail — RED-prove by reverting the whole fix.

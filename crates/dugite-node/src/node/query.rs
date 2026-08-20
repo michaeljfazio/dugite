@@ -86,6 +86,35 @@ fn sort_reward_wire_entries(entries: &mut [crate::node::n2c_query::types::Reward
     entries.sort_by(|a, b| (a.is_member, &a.pool_id).cmp(&(b.is_member, &b.pool_id)));
 }
 
+/// Order `rs`'s OUTER credential keys (#1071 follow-up) the way Haskell's
+/// derived `Ord Credential` does — mirroring
+/// `dugite_primitives::credentials::Credential::cmp_ledger` for these
+/// already-typed-`Hash32` keys, since reconstructing a `Credential` just to
+/// call that comparator would be a pointless round-trip.
+///
+/// Each key is 32 bytes: `0..28` is the raw credential hash,
+/// `28` is `Credential::to_typed_hash32()`'s discriminator (`0` = KeyHashObj,
+/// `1` = ScriptHashObj). `ScriptHashObj` is `Credential`'s FIRST data
+/// constructor upstream, so the derived `Ord` puts every `ScriptHashObj`
+/// BEFORE every `KeyHashObj` — the opposite of the numeric discriminator —
+/// and only THEN breaks ties on the hash. A plain `Vec<u8>`/byte-string
+/// compare gets both of these backwards: it compares the hash FIRST (byte 28
+/// only breaks a tie that real distinct hashes never produce) and, on the
+/// rare occasion it did decide anything by byte 28, would rank key(0) before
+/// script(1) — numeric order, not constructor-declaration order.
+fn sort_reward_wire_credentials(
+    rs: &mut [(Vec<u8>, Vec<crate::node::n2c_query::types::RewardWireEntry>)],
+) {
+    rs.sort_by(|a, b| {
+        // rank: ScriptHashObj (byte28 == 1) -> 0 (sorts first); KeyHashObj
+        // (byte28 == 0) -> 1 (sorts second).
+        let rank = |cred: &Vec<u8>| u8::from(cred[28] == 0);
+        rank(&a.0)
+            .cmp(&rank(&b.0))
+            .then_with(|| a.0[..28].cmp(&b.0[..28]))
+    });
+}
+
 /// The `drepExpiry` value that `GetDRepState` must report for one DRep.
 ///
 /// Two distinct things are going on, and dugite previously did neither (#912).
@@ -1182,9 +1211,11 @@ impl Node {
                             (cred.as_ref().to_vec(), wire_entries)
                         })
                         .collect();
-                    // The outer Map is also key-ordered upstream; a HashMap
-                    // iterated above would otherwise vary across runs.
-                    rs.sort_by(|a, b| a.0.cmp(&b.0));
+                    // The outer Map is also key-ordered upstream (a HashMap
+                    // iterated above would otherwise vary across runs) — by
+                    // Haskell's `Ord Credential`, NOT a flat byte compare.
+                    // See `sort_reward_wire_credentials`.
+                    sort_reward_wire_credentials(&mut rs);
 
                     crate::node::n2c_query::types::PossibleRewardUpdateSnapshot::Complete(Box::new(
                         crate::node::n2c_query::types::CompletedRewardUpdateSnapshot {
@@ -1831,6 +1862,97 @@ mod tests {
             "member entries break ties by ascending pool id"
         );
         assert_eq!(entries[2].pool_id, vec![0x02]);
+    }
+
+    // ─── sort_reward_wire_credentials (#1071 follow-up) ────────────────────
+
+    /// `rs`'s outer map must sort `ScriptHashObj` credentials BEFORE every
+    /// `KeyHashObj` credential, regardless of hash bytes — the OPPOSITE of
+    /// the numeric wire discriminator (0=key, 1=script) — because
+    /// `ScriptHashObj` is `Credential`'s first data constructor upstream and
+    /// its derived `Ord` compares by constructor declaration order first
+    /// (oracle-verified against `Cardano.Ledger.Credential`, pinned revision
+    /// `faa7a9dc347697b11d4da5b7818b1731e11aeeef`; mirrors
+    /// `dugite_primitives::credentials::Credential::cmp_ledger`, which
+    /// implements the identical rule for an unrelated call site).
+    ///
+    /// No real `nesRu` capture in `tests/fixtures/nesru/` contains a script
+    /// staking credential (the seeding devnet used only key-hash credentials),
+    /// so this direction is deliberately synthetic rather than fixture-
+    /// derived — labelled as such rather than presented as a capture. The
+    /// hash bytes are chosen so a NAIVE lexicographic `Vec<u8>` compare over
+    /// the full 32-byte key (i.e. comparing byte 28 LAST, and numerically
+    /// rather than by rank when it does) would produce the OPPOSITE order —
+    /// this is the case that discriminates the fix from the bug it replaces.
+    #[test]
+    fn sort_reward_wire_credentials_sorts_script_before_keyhash() {
+        use crate::node::n2c_query::types::RewardWireEntry;
+
+        let dummy_entries = || {
+            vec![RewardWireEntry {
+                is_member: true,
+                pool_id: vec![0u8; 28],
+                amount: 1,
+            }]
+        };
+
+        // Key credential whose hash bytes are numerically SMALLER than the
+        // script credential's — a naive byte-major compare (ignoring the
+        // discriminator's RANK) would put this FIRST. It must not.
+        let mut key_cred = vec![0x00u8; 28];
+        key_cred.push(0x00); // KeyHashObj
+                             // Script credential, numerically LARGER hash — must still sort
+                             // first, because ScriptHashObj outranks KeyHashObj regardless of
+                             // hash bytes.
+        let mut script_cred = vec![0xffu8; 28];
+        script_cred.push(0x01); // ScriptHashObj
+
+        let mut rs = vec![
+            (key_cred.clone(), dummy_entries()),
+            (script_cred.clone(), dummy_entries()),
+        ];
+        super::sort_reward_wire_credentials(&mut rs);
+
+        assert_eq!(
+            rs[0].0, script_cred,
+            "ScriptHashObj must sort BEFORE KeyHashObj even with a \
+             numerically larger hash — Credential's derived Ord compares \
+             the constructor tag first, not the hash bytes"
+        );
+        assert_eq!(rs[1].0, key_cred);
+    }
+
+    /// Within one discriminator, ties break on ascending hash bytes — two
+    /// script credentials, or two key credentials, sort exactly like a plain
+    /// byte compare on bytes `0..28`.
+    #[test]
+    fn sort_reward_wire_credentials_breaks_ties_by_ascending_hash_within_a_discriminator() {
+        use crate::node::n2c_query::types::RewardWireEntry;
+
+        let dummy_entries = || {
+            vec![RewardWireEntry {
+                is_member: true,
+                pool_id: vec![0u8; 28],
+                amount: 1,
+            }]
+        };
+
+        let mut key_hi = vec![0xffu8; 28];
+        key_hi.push(0x00);
+        let mut key_lo = vec![0x01u8; 28];
+        key_lo.push(0x00);
+
+        let mut rs = vec![
+            (key_hi.clone(), dummy_entries()),
+            (key_lo.clone(), dummy_entries()),
+        ];
+        super::sort_reward_wire_credentials(&mut rs);
+
+        assert_eq!(
+            rs[0].0, key_lo,
+            "ascending hash within the same discriminator"
+        );
+        assert_eq!(rs[1].0, key_hi);
     }
 
     #[test]
