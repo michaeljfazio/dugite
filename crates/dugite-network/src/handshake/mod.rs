@@ -260,6 +260,166 @@ pub async fn run_n2c_handshake_server(
     })
 }
 
+/// Query the peer's full supported-version table over N2N
+/// (`dugite-cli ping -Q`/`--query-versions`, #1091).
+///
+/// Distinct from `run_n2n_handshake_client`'s `HandshakeResult`, which
+/// collapses a query reply into a single best-match version and DISCARDS
+/// each entry's `N2NVersionData` (`decode_handshake_response`'s
+/// `MSG_QUERY_REPLY` arm — correct for #880's negotiation-diagnostic use,
+/// insufficient for listing every version with its own initiator/peer-
+/// sharing flags, which is what `ping -Q` needs to report).
+///
+/// Handles two reply shapes, both verified against real peers: a
+/// `MsgQueryReply` (tag 3) carrying the full version table — what a real
+/// cardano-node's N2C/N2N server sends — and, for interop with a server
+/// that does not implement query mode at all, a plain `MsgAcceptVersion`
+/// (tag 1) is treated as a one-entry table (the single version it
+/// accepted). A real `cardano-cli ping -Q` against dugite-node's own N2C
+/// socket was observed doing exactly this fallback.
+pub async fn query_n2n_versions(
+    channel: &mut MuxChannel,
+    network_magic: u64,
+) -> Result<Vec<(u16, N2NVersionData)>, HandshakeError> {
+    let mut our_data = N2NVersionData::new(network_magic, true, false);
+    our_data.query = true;
+    let msg = encode_propose_versions_n2n(n2n::N2N_VERSIONS, &our_data);
+    channel.send(msg).await.map_err(HandshakeError::from)?;
+
+    let response = tokio::time::timeout(HANDSHAKE_TIMEOUT, channel.recv())
+        .await
+        .map_err(|_| HandshakeError::Timeout)?
+        .map_err(HandshakeError::from)?;
+
+    decode_query_reply_n2n(&response)
+}
+
+/// As [`query_n2n_versions`], for N2C.
+pub async fn query_n2c_versions(
+    channel: &mut MuxChannel,
+    network_magic: u64,
+) -> Result<Vec<(u16, N2CVersionData)>, HandshakeError> {
+    let mut our_data = N2CVersionData::new(network_magic);
+    our_data.query = true;
+    let msg = encode_propose_versions_n2c(n2c::N2C_VERSIONS, &our_data);
+    channel.send(msg).await.map_err(HandshakeError::from)?;
+
+    let response = tokio::time::timeout(HANDSHAKE_TIMEOUT, channel.recv())
+        .await
+        .map_err(|_| HandshakeError::Timeout)?
+        .map_err(HandshakeError::from)?;
+
+    decode_query_reply_n2c(&response)
+}
+
+fn decode_query_reply_n2n(data: &[u8]) -> Result<Vec<(u16, N2NVersionData)>, HandshakeError> {
+    let mut dec = Decoder::new(data);
+    let _ = dec
+        .array()
+        .map_err(|e| HandshakeError::DecodeError(e.to_string()))?;
+    let tag = dec
+        .u64()
+        .map_err(|e| HandshakeError::DecodeError(e.to_string()))?;
+
+    if tag == MSG_ACCEPT_VERSION {
+        // Server does not implement query mode; it just accepted the best
+        // common version. Report that single version — see doc comment.
+        let version = dec
+            .u16()
+            .map_err(|e| HandshakeError::DecodeError(e.to_string()))?;
+        let data = N2NVersionData::decode(&mut dec)
+            .map_err(|e| HandshakeError::DecodeError(e.to_string()))?;
+        return Ok(vec![(version, data)]);
+    }
+    if tag == MSG_REFUSE {
+        return Err(decode_refuse_reason(&mut dec));
+    }
+    if tag != MSG_QUERY_REPLY {
+        return Err(HandshakeError::DecodeError(format!(
+            "expected MsgQueryReply (tag 3), got {tag}"
+        )));
+    }
+
+    let map_len = dec
+        .map()
+        .map_err(|e| HandshakeError::DecodeError(e.to_string()))?
+        .ok_or_else(|| HandshakeError::DecodeError("indefinite map not supported".to_string()))?;
+    if map_len > MAX_HANDSHAKE_VERSIONS {
+        return Err(HandshakeError::DecodeError(format!(
+            "MsgQueryReply: too many versions ({map_len} > {MAX_HANDSHAKE_VERSIONS})"
+        )));
+    }
+    let mut versions = Vec::new();
+    for _ in 0..map_len {
+        let version = dec
+            .u16()
+            .map_err(|e| HandshakeError::DecodeError(e.to_string()))?;
+        if n2n::N2N_VERSIONS.contains(&version) {
+            let data = N2NVersionData::decode(&mut dec)
+                .map_err(|e| HandshakeError::DecodeError(e.to_string()))?;
+            versions.push((version, data));
+        } else {
+            dec.skip()
+                .map_err(|e| HandshakeError::DecodeError(e.to_string()))?;
+        }
+    }
+    Ok(versions)
+}
+
+fn decode_query_reply_n2c(data: &[u8]) -> Result<Vec<(u16, N2CVersionData)>, HandshakeError> {
+    let mut dec = Decoder::new(data);
+    let _ = dec
+        .array()
+        .map_err(|e| HandshakeError::DecodeError(e.to_string()))?;
+    let tag = dec
+        .u64()
+        .map_err(|e| HandshakeError::DecodeError(e.to_string()))?;
+
+    if tag == MSG_ACCEPT_VERSION {
+        let wire_version = dec
+            .u16()
+            .map_err(|e| HandshakeError::DecodeError(e.to_string()))?;
+        let version = n2c::decode_n2c_version(wire_version);
+        let data = N2CVersionData::decode(&mut dec)
+            .map_err(|e| HandshakeError::DecodeError(e.to_string()))?;
+        return Ok(vec![(version, data)]);
+    }
+    if tag == MSG_REFUSE {
+        return Err(decode_refuse_reason(&mut dec));
+    }
+    if tag != MSG_QUERY_REPLY {
+        return Err(HandshakeError::DecodeError(format!(
+            "expected MsgQueryReply (tag 3), got {tag}"
+        )));
+    }
+
+    let map_len = dec
+        .map()
+        .map_err(|e| HandshakeError::DecodeError(e.to_string()))?
+        .ok_or_else(|| HandshakeError::DecodeError("indefinite map not supported".to_string()))?;
+    if map_len > MAX_HANDSHAKE_VERSIONS {
+        return Err(HandshakeError::DecodeError(format!(
+            "MsgQueryReply: too many versions ({map_len} > {MAX_HANDSHAKE_VERSIONS})"
+        )));
+    }
+    let mut versions = Vec::new();
+    for _ in 0..map_len {
+        let wire_version = dec
+            .u16()
+            .map_err(|e| HandshakeError::DecodeError(e.to_string()))?;
+        let logical_version = n2c::decode_n2c_version(wire_version);
+        if n2c::N2C_VERSIONS.contains(&logical_version) {
+            let data = N2CVersionData::decode(&mut dec)
+                .map_err(|e| HandshakeError::DecodeError(e.to_string()))?;
+            versions.push((logical_version, data));
+        } else {
+            dec.skip()
+                .map_err(|e| HandshakeError::DecodeError(e.to_string()))?;
+        }
+    }
+    Ok(versions)
+}
+
 // ─── Encoding helpers ───
 
 /// Encode MsgProposeVersions for N2N: `[0, {version: version_data, ...}]`.
@@ -760,6 +920,7 @@ fn decode_handshake_response_n2c(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::protocol::PROTOCOL_HANDSHAKE;
 
     /// #880: query mode — the responder answers a query-mode proposal with
     /// MsgQueryReply (tag 3, the version table), and the client decodes it as a
@@ -1122,5 +1283,163 @@ mod tests {
             let result = decode_propose_versions_n2n(&buf);
             assert!(result.is_err(), "count {n} > MAX must fail; got: Ok(..)");
         }
+    }
+
+    // ── #1091: `ping -Q`/`--query-versions` full-table decode ────────────
+
+    /// The common case: a real `MsgQueryReply` carrying every version the
+    /// peer supports, each with its OWN `N2NVersionData` — this is what a
+    /// real `cardano-node` sends (see `dugite-cli`'s `ping.rs` module doc
+    /// for the live capture this is grounded in).
+    #[test]
+    fn decode_query_reply_n2n_full_table() {
+        let mut data_by_version = BTreeMap::new();
+        data_by_version.insert(n2n::N2N_V14, N2NVersionData::new(2, false, true));
+        data_by_version.insert(n2n::N2N_V15, N2NVersionData::new(2, true, false));
+        let mut buf = Vec::new();
+        let mut enc = Encoder::new(&mut buf);
+        enc.array(2).unwrap();
+        enc.u64(MSG_QUERY_REPLY).unwrap();
+        enc.map(data_by_version.len() as u64).unwrap();
+        for (v, d) in &data_by_version {
+            enc.u16(*v).unwrap();
+            d.encode(&mut enc);
+        }
+
+        let versions = decode_query_reply_n2n(&buf).unwrap();
+        assert_eq!(versions.len(), 2);
+        let map: BTreeMap<u16, N2NVersionData> = versions.into_iter().collect();
+        assert_eq!(map, data_by_version);
+    }
+
+    /// A server that does NOT implement query mode (dugite-node's own N2C
+    /// handshake responder, at time of writing — see `ping.rs`'s module
+    /// doc) replies with a plain `MsgAcceptVersion` instead of
+    /// `MsgQueryReply`. Real `cardano-cli ping -Q` tolerates this and
+    /// reports the one accepted version; `decode_query_reply_n2n` must do
+    /// the same rather than erroring on an "unexpected tag".
+    #[test]
+    fn decode_query_reply_n2n_falls_back_to_plain_accept() {
+        let data = N2NVersionData::new(2, true, false);
+        let accept = encode_accept_version_n2n(n2n::N2N_V15, &data);
+        let versions = decode_query_reply_n2n(&accept).unwrap();
+        assert_eq!(versions, vec![(n2n::N2N_V15, data)]);
+    }
+
+    #[test]
+    fn decode_query_reply_n2n_propagates_refuse() {
+        let msg = encode_refuse_with_reason(2, n2n::N2N_V15, "nope");
+        let result = decode_query_reply_n2n(&msg);
+        assert!(matches!(result, Err(HandshakeError::Refused { .. })));
+    }
+
+    #[test]
+    fn decode_query_reply_n2n_rejects_unexpected_tag() {
+        let msg =
+            encode_propose_versions_n2n(n2n::N2N_VERSIONS, &N2NVersionData::new(2, true, false));
+        // A bare MsgProposeVersions (tag 0) is neither a reply nor an accept.
+        let result = decode_query_reply_n2n(&msg);
+        assert!(result.is_err());
+    }
+
+    /// As `decode_query_reply_n2n_full_table`, for N2C — including the
+    /// bit-15 wire encoding round-trip.
+    #[test]
+    fn decode_query_reply_n2c_full_table() {
+        let mut data_by_version = BTreeMap::new();
+        data_by_version.insert(n2c::N2C_V16, N2CVersionData::new(2));
+        data_by_version.insert(n2c::N2C_V23, N2CVersionData::new(2));
+        let mut buf = Vec::new();
+        let mut enc = Encoder::new(&mut buf);
+        enc.array(2).unwrap();
+        enc.u64(MSG_QUERY_REPLY).unwrap();
+        enc.map(data_by_version.len() as u64).unwrap();
+        for (v, d) in &data_by_version {
+            enc.u16(n2c::encode_n2c_version(*v)).unwrap();
+            d.encode(&mut enc);
+        }
+
+        let versions = decode_query_reply_n2c(&buf).unwrap();
+        assert_eq!(versions.len(), 2);
+        let map: BTreeMap<u16, N2CVersionData> = versions.into_iter().collect();
+        assert_eq!(map, data_by_version);
+    }
+
+    /// Live-verified fallback (see `ping.rs`'s module doc): dugite-node's
+    /// N2C handshake server does not implement query mode at all and
+    /// always replies with a plain `MsgAcceptVersion`.
+    #[test]
+    fn decode_query_reply_n2c_falls_back_to_plain_accept() {
+        let data = N2CVersionData::new(2);
+        let accept = encode_accept_version_n2c(n2c::N2C_V23, &data);
+        let versions = decode_query_reply_n2c(&accept).unwrap();
+        assert_eq!(versions, vec![(n2c::N2C_V23, data)]);
+    }
+
+    #[tokio::test]
+    async fn query_n2n_versions_over_a_real_channel() {
+        let (mut client_ch, mut server_rx, server_tx) = make_test_mux_channel(PROTOCOL_HANDSHAKE);
+
+        let data = N2NVersionData::new(9, true, false);
+        let accept = encode_accept_version_n2n(n2n::N2N_V15, &data);
+        let server = tokio::spawn(async move {
+            let _proposal = server_rx.recv().await.unwrap();
+            server_tx.send(bytes::Bytes::from(accept)).await.unwrap();
+        });
+
+        let versions = query_n2n_versions(&mut client_ch, 9).await.unwrap();
+        assert_eq!(versions, vec![(n2n::N2N_V15, data)]);
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn query_n2c_versions_over_a_real_channel() {
+        let (mut client_ch, mut server_rx, server_tx) = make_test_mux_channel(PROTOCOL_HANDSHAKE);
+
+        let mut table = BTreeMap::new();
+        table.insert(n2c::N2C_V16, N2CVersionData::new(9));
+        table.insert(n2c::N2C_V23, N2CVersionData::new(9));
+        let mut reply = Vec::new();
+        let mut enc = Encoder::new(&mut reply);
+        enc.array(2).unwrap();
+        enc.u64(MSG_QUERY_REPLY).unwrap();
+        enc.map(table.len() as u64).unwrap();
+        for (v, d) in &table {
+            enc.u16(n2c::encode_n2c_version(*v)).unwrap();
+            d.encode(&mut enc);
+        }
+        let server = tokio::spawn(async move {
+            let _proposal = server_rx.recv().await.unwrap();
+            server_tx.send(bytes::Bytes::from(reply)).await.unwrap();
+        });
+
+        let versions = query_n2c_versions(&mut client_ch, 9).await.unwrap();
+        assert_eq!(versions.len(), 2);
+        let map: BTreeMap<u16, N2CVersionData> = versions.into_iter().collect();
+        assert_eq!(map, table);
+        server.await.unwrap();
+    }
+
+    /// Minimal `MuxChannel` test harness, mirroring the one in
+    /// `protocol/keepalive/client.rs`'s own tests: an mpsc pair standing in
+    /// for the mux's egress/ingress routing.
+    fn make_test_mux_channel(
+        protocol_id: u16,
+    ) -> (
+        MuxChannel,
+        tokio::sync::mpsc::Receiver<(u16, crate::mux::Direction, bytes::Bytes)>,
+        tokio::sync::mpsc::Sender<bytes::Bytes>,
+    ) {
+        let (egress_tx, egress_rx) = tokio::sync::mpsc::channel(8);
+        let (ingress_tx, ingress_rx) = tokio::sync::mpsc::channel(8);
+        let channel = MuxChannel::new(
+            protocol_id,
+            crate::mux::Direction::InitiatorDir,
+            egress_tx,
+            ingress_rx,
+            4 * 1024 * 1024,
+            std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        );
+        (channel, egress_rx, ingress_tx)
     }
 }

@@ -34,7 +34,7 @@
 //! not hold — confirmed by comparing this module's HRPs are correct for the
 //! DEFAULT mode, not by re-deriving the CIP-129 claim.
 
-use crate::hash::Hash28;
+use crate::hash::{Hash28, Hash32};
 use bech32::{Bech32, Hrp};
 
 /// HRP for a DRep key-hash credential.
@@ -311,6 +311,137 @@ pub fn encode_cc_cold_from_cbor(
             expected: "0 (key) or 1 (script)".to_string(),
         }),
     }
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// CIP-0129 encoding (`--output-cip129` / `cip-format cip-129 …`)
+// ──────────────────────────────────────────────────────────────────────────────
+//
+// True CIP-129 (https://github.com/cardano-foundation/CIPs/tree/master/CIP-0129)
+// is a DIFFERENT, LONGER encoding than the module-level default above: it
+// prepends a single HEADER BYTE to the 28-byte hash (29-byte payload, not 28)
+// and uses ONE Bech32 HRP per governance-identifier namespace regardless of
+// key-vs-script — the header byte carries that distinction instead of the
+// HRP. Governance action IDs have no header byte at all; their payload is
+// simply `txid(32) || index_u16_be(2)` = 34 bytes under the `gov_action` HRP.
+//
+// The header-byte layout is `(type << 4) | cred_kind`:
+//   type:      0 = Constitutional Committee HOT, 1 = CC COLD, 2 = DRep
+//   cred_kind: 2 = key-hash credential, 3 = script-hash credential
+//
+// Verified empirically against a real cardano-cli 11.0.1, NOT taken from a
+// written spec re-derivation (this repo's standing rule for wire-format
+// claims — see `test_drep_key_matches_real_cardano_cli_output` above for the
+// same discipline applied to the non-CIP129 form):
+//   - `cardano-cli conway governance drep id --output-cip129` on a freshly
+//     generated DRep vkey produced `drep1yt97pt...` which bech32-decodes to
+//     header `0x22` + the SAME 28-byte hash `--output-hex` reports.
+//   - `cardano-cli cip-format cip-129 committee-cold-key`/`committee-hot-key`
+//     on freshly generated CC cold/hot vkeys produced headers `0x12`/`0x02`
+//     over `blake2b_224(vkey)`.
+//   - `cardano-cli cip-format cip-129 governance-action-id
+//     --governance-action-hex <txid>#<index>` on `aa..aa#1`, `bb..bb#7`
+//     decoded to `aa..aa 0001` / `bb..bb 0007` — txid followed by a 2-byte
+//     BIG-ENDIAN index, no header byte, HRP `gov_action`.
+//
+// Script-credential headers (`0x23`/`0x13`/`0x03`) are exposed for API
+// symmetry with the module's `CredKind`-based helpers above, but no in-tree
+// caller reaches them yet: every `cip-format cip-129 {drep,committee-*-key}`
+// subcommand's input surface is a verification KEY only (no script-hash
+// flag), matching cardano-cli's own `--help` for those three subcommands.
+
+/// HRP for a CIP-129 DRep identifier (key or script — the header byte
+/// disambiguates).
+pub const HRP_CIP129_DREP: &str = "drep";
+
+/// HRP for a CIP-129 Constitutional Committee hot identifier.
+pub const HRP_CIP129_CC_HOT: &str = "cc_hot";
+
+/// HRP for a CIP-129 Constitutional Committee cold identifier.
+pub const HRP_CIP129_CC_COLD: &str = "cc_cold";
+
+/// HRP for a CIP-129 governance action identifier.
+pub const HRP_CIP129_GOV_ACTION: &str = "gov_action";
+
+/// CIP-129 header byte for a DRep key-hash credential.
+pub const CIP129_HEADER_DREP_KEY: u8 = 0x22;
+/// CIP-129 header byte for a DRep script-hash credential.
+pub const CIP129_HEADER_DREP_SCRIPT: u8 = 0x23;
+/// CIP-129 header byte for a Constitutional Committee cold key-hash credential.
+pub const CIP129_HEADER_CC_COLD_KEY: u8 = 0x12;
+/// CIP-129 header byte for a Constitutional Committee cold script-hash credential.
+pub const CIP129_HEADER_CC_COLD_SCRIPT: u8 = 0x13;
+/// CIP-129 header byte for a Constitutional Committee hot key-hash credential.
+pub const CIP129_HEADER_CC_HOT_KEY: u8 = 0x02;
+/// CIP-129 header byte for a Constitutional Committee hot script-hash credential.
+pub const CIP129_HEADER_CC_HOT_SCRIPT: u8 = 0x03;
+
+fn cip129_header(kind: CredKind, key_header: u8, script_header: u8) -> u8 {
+    match kind {
+        CredKind::Key => key_header,
+        CredKind::Script => script_header,
+    }
+}
+
+/// Encode a 28-byte hash as a CIP-129 DRep identifier: HRP `drep`, payload
+/// `header || hash` (29 bytes).
+pub fn encode_drep_cip129(hash: &Hash28, kind: CredKind) -> Result<String, GovernanceIdError> {
+    encode_cip129_credential(
+        HRP_CIP129_DREP,
+        cip129_header(kind, CIP129_HEADER_DREP_KEY, CIP129_HEADER_DREP_SCRIPT),
+        hash,
+    )
+}
+
+/// Encode a 28-byte hash as a CIP-129 Constitutional Committee cold
+/// identifier: HRP `cc_cold`, payload `header || hash` (29 bytes).
+pub fn encode_cc_cold_cip129(hash: &Hash28, kind: CredKind) -> Result<String, GovernanceIdError> {
+    encode_cip129_credential(
+        HRP_CIP129_CC_COLD,
+        cip129_header(
+            kind,
+            CIP129_HEADER_CC_COLD_KEY,
+            CIP129_HEADER_CC_COLD_SCRIPT,
+        ),
+        hash,
+    )
+}
+
+/// Encode a 28-byte hash as a CIP-129 Constitutional Committee hot
+/// identifier: HRP `cc_hot`, payload `header || hash` (29 bytes).
+pub fn encode_cc_hot_cip129(hash: &Hash28, kind: CredKind) -> Result<String, GovernanceIdError> {
+    encode_cip129_credential(
+        HRP_CIP129_CC_HOT,
+        cip129_header(kind, CIP129_HEADER_CC_HOT_KEY, CIP129_HEADER_CC_HOT_SCRIPT),
+        hash,
+    )
+}
+
+/// Encode a governance action ID as a CIP-129 identifier: HRP `gov_action`,
+/// payload `txid(32) || index_u16_be(2)` (34 bytes) — no header byte.
+///
+/// `index` is a `u16` because `GovActionIx` upstream is `Word16`; a proposal
+/// index above 65535 cannot occur (a block cannot carry that many proposal
+/// procedures) so this is not a narrowing concern in practice.
+pub fn encode_governance_action_id_cip129(
+    txid: &Hash32,
+    index: u16,
+) -> Result<String, GovernanceIdError> {
+    let mut payload = Vec::with_capacity(34);
+    payload.extend_from_slice(txid.as_bytes());
+    payload.extend_from_slice(&index.to_be_bytes());
+    encode_governance_id(HRP_CIP129_GOV_ACTION, &payload)
+}
+
+fn encode_cip129_credential(
+    hrp: &str,
+    header: u8,
+    hash: &Hash28,
+) -> Result<String, GovernanceIdError> {
+    let mut payload = Vec::with_capacity(29);
+    payload.push(header);
+    payload.extend_from_slice(hash.as_bytes());
+    encode_governance_id(hrp, &payload)
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -610,6 +741,116 @@ mod tests {
     }
 
     // ── Known-value test (Bech32 is deterministic) ───────────────────────────
+
+    // ── CIP-129 tests ─────────────────────────────────────────────────────
+
+    /// Byte-exact against `cardano-cli conway governance drep id
+    /// --output-cip129` on the SAME key as
+    /// `test_drep_key_matches_real_cardano_cli_output` above. Captured
+    /// 2026-08-21.
+    #[test]
+    fn test_drep_cip129_matches_real_cardano_cli_output() {
+        let hex = "cbe0ada60857a7e5bd74bada35ffcc72f57c33818004b9b4a81d76f1";
+        let mut bytes = [0u8; 28];
+        for (i, b) in bytes.iter_mut().enumerate() {
+            *b = u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16).unwrap();
+        }
+        let h = Hash28::from_bytes(bytes);
+        let encoded = encode_drep_cip129(&h, CredKind::Key).expect("encode should succeed");
+        assert_eq!(
+            encoded, "drep1yt97ptdxppt60edawjad5d0le3e02lpnsxqqfwd54qwhdugx0pfsd",
+            "must match real cardano-cli's --output-cip129 output exactly"
+        );
+    }
+
+    /// Byte-exact against `cardano-cli cip-format cip-129 committee-cold-key`
+    /// on a freshly generated CC cold vkey. Captured 2026-08-21.
+    #[test]
+    fn test_cc_cold_cip129_matches_real_cardano_cli_output() {
+        let hex = "09bf61e03b26b70687a1a69cf9e294e354e1a6996f38c883ca9618fe";
+        let mut bytes = [0u8; 28];
+        for (i, b) in bytes.iter_mut().enumerate() {
+            *b = u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16).unwrap();
+        }
+        let h = Hash28::from_bytes(bytes);
+        let encoded = encode_cc_cold_cip129(&h, CredKind::Key).expect("encode should succeed");
+        assert_eq!(
+            encoded,
+            "cc_cold1zgym7c0q8vntwp585xnfe70zjn34fcdxn9hn3jyre2tp3lsr7q8h4"
+        );
+    }
+
+    /// Byte-exact against `cardano-cli cip-format cip-129 committee-hot-key`
+    /// on a freshly generated CC hot vkey. Captured 2026-08-21.
+    #[test]
+    fn test_cc_hot_cip129_matches_real_cardano_cli_output() {
+        let hex = "3de4eb79130fa1e044367d1d4f04a166c917d268e9a1bc8899ed7612";
+        let mut bytes = [0u8; 28];
+        for (i, b) in bytes.iter_mut().enumerate() {
+            *b = u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16).unwrap();
+        }
+        let h = Hash28::from_bytes(bytes);
+        let encoded = encode_cc_hot_cip129(&h, CredKind::Key).expect("encode should succeed");
+        assert_eq!(
+            encoded,
+            "cc_hot1qg77f6mezv86rczyxe736ncy59nvj97jdr56r0ygn8khvysvzmeuw"
+        );
+    }
+
+    /// Byte-exact against `cardano-cli cip-format cip-129
+    /// governance-action-id --governance-action-hex <64 0xaa bytes>#1`.
+    /// Captured 2026-08-21.
+    #[test]
+    fn test_governance_action_id_cip129_matches_real_cardano_cli_output() {
+        let txid = Hash32::from_bytes([0xaa; 32]);
+        let encoded = encode_governance_action_id_cip129(&txid, 1).expect("encode");
+        assert_eq!(
+            encoded,
+            "gov_action1424242424242424242424242424242424242424242424242424qqqgwfzv8a"
+        );
+    }
+
+    /// Second capture with a different txid and a two-digit index (7), to
+    /// pin the index as encoded big-endian rather than confirm only the
+    /// low-order-byte-matches-index=1 case. Captured 2026-08-21.
+    #[test]
+    fn test_governance_action_id_cip129_index_seven() {
+        let txid = Hash32::from_bytes([0xbb; 32]);
+        let encoded = encode_governance_action_id_cip129(&txid, 7).expect("encode");
+        assert_eq!(
+            encoded,
+            "gov_action1hwamhwamhwamhwamhwamhwamhwamhwamhwamhwamhwamhwamhwasqpctedwqr"
+        );
+    }
+
+    /// The header byte is the ONLY thing distinguishing a CIP-129 key
+    /// credential from a script credential sharing the same hash and HRP —
+    /// verifies the two never collide.
+    #[test]
+    fn test_cip129_key_and_script_headers_distinct() {
+        let h = test_hash();
+        let key = encode_drep_cip129(&h, CredKind::Key).unwrap();
+        let script = encode_drep_cip129(&h, CredKind::Script).unwrap();
+        assert_ne!(key, script);
+    }
+
+    /// All four CIP-129 namespaces (drep/cc_cold/cc_hot header-byte forms,
+    /// plus gov_action) must be pairwise distinct even over the same 28
+    /// input bytes, so a DRep id can never collide with a CC identifier.
+    #[test]
+    fn test_cip129_namespaces_pairwise_distinct() {
+        let h = test_hash();
+        let ids = [
+            encode_drep_cip129(&h, CredKind::Key).unwrap(),
+            encode_cc_cold_cip129(&h, CredKind::Key).unwrap(),
+            encode_cc_hot_cip129(&h, CredKind::Key).unwrap(),
+        ];
+        for i in 0..ids.len() {
+            for j in (i + 1)..ids.len() {
+                assert_ne!(ids[i], ids[j]);
+            }
+        }
+    }
 
     #[test]
     fn test_known_drep_key_encoding() {
