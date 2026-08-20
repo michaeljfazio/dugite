@@ -4622,19 +4622,31 @@ impl Node {
                 }
             };
 
-            // Snapshot of non-public IPs explicitly authorised by the static
-            // topology (e.g. a co-located cardano-node relay at 127.0.0.1).
-            // Non-public-IP inbound peers NOT in this set are rejected, so
-            // an adversarial peer cannot trick us into accepting connections
-            // that appear to come from internal/intranet hosts.
+            // Snapshot of statically-configured peer IPs, used below only to
+            // exempt declared peers from the per-IP rate-limit window (#996)
+            // — NOT to gate inbound acceptance by source-IP class. #1100:
+            // dugite previously also rejected any non-public-IP (loopback/
+            // RFC1918/link-local/…) inbound TCP connection outright unless
+            // its source IP appeared in this same set, closing the bearer
+            // before the Handshake mini-protocol ever ran. That has no
+            // upstream counterpart: `Ouroboros.Network.Server`'s accept loop
+            // (`ouroboros-network/framework/lib/Ouroboros/Network/Server.hs`)
+            // never inspects `remoteAddress` for anything but tracing — the
+            // ONLY gates on the accept path are the count-based
+            // `AcceptedConnectionsLimit` (global hard/soft/delay) consulted
+            // via `includeInboundConnection`, and every connection that
+            // clears them proceeds straight to Handshake regardless of
+            // source IP. Confirmed empirically too: a real cardano-node
+            // probed the same way over loopback (`cardano-cli ping --host
+            // 127.0.0.1 ...`) completes the handshake cleanly, which an
+            // IP-class gate on our side cannot reproduce. Removing the gate
+            // does not reopen the self-connection bug the original commit
+            // (f2e2663118) was chasing — that is prevented at dial time by
+            // `NodePeerManager::is_self_addr`, used by `add_config_peer`/
+            // `add_ledger_peer`/`add_shared_peer` before dugite ever attempts
+            // an outbound connection to itself, and is unaffected by this.
             let static_topology_ips: std::collections::HashSet<std::net::IpAddr> =
                 self.peer_manager.read().await.static_topology_ips();
-            let static_non_public_ips: std::collections::HashSet<std::net::IpAddr> =
-                static_topology_ips
-                    .iter()
-                    .copied()
-                    .filter(|ip| crate::node::networking::is_non_public_ip(*ip))
-                    .collect();
 
             // A-001 / A-002 (security audit 2026-05-19): gate every inbound
             // connection through a Semaphore (global cap) and a ConnectionManager
@@ -4687,27 +4699,6 @@ impl Node {
                         accept_result = tcp_listener.accept() => {
                             match accept_result {
                                 Ok((stream, peer_addr)) => {
-                                    // Non-public IPs (loopback, RFC1918, link-local,
-                                    // multicast, …) are only permitted when explicitly
-                                    // listed in the static topology. This allows
-                                    // co-located BP+relay over 127.0.0.1 while
-                                    // rejecting any other internal-IP connection that
-                                    // could only come from misconfiguration or abuse.
-                                    // Public IPs are always accepted; outbound self-
-                                    // connection is already prevented by
-                                    // NodePeerManager::is_self_addr. Matches Haskell
-                                    // ouroboros-network's PeerSharing IP-class filter
-                                    // combined with localRoots overrides.
-                                    if crate::node::networking::is_non_public_ip(peer_addr.ip())
-                                        && !static_non_public_ips.contains(&peer_addr.ip())
-                                    {
-                                        debug!(
-                                            %peer_addr,
-                                            "N2N inbound rejected: non-public IP not in static topology"
-                                        );
-                                        drop(stream);
-                                        continue;
-                                    }
                                     // G1 (#547): per-IP sliding-window rate limit
                                     // (catches tight reconnect loops). 60-second window.
                                     //
