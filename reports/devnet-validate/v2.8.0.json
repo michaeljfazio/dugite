@@ -1,7 +1,7 @@
 {
   "schema_version": 2,
-  "timestamp": "2026-08-20T20:41:40Z",
-  "git_rev": "073f130c9cbda8f1a4508a354b27fd3a9074ded4",
+  "timestamp": "2026-08-21T03:19:17Z",
+  "git_rev": "2423d782043895e9653dd389be7f3714956a0af9",
   "release_tag": null,
   "preset": "standard",
   "cardano_node_version": "11.0.1",
@@ -16,22 +16,22 @@
     {
       "name": "baseline",
       "pass": true,
-      "evidence_dir": "evidence-archive/auto/round1-20260820T184824Z",
+      "evidence_dir": "evidence-archive/auto/round1-20260820T231249Z",
       "duration_seconds": 120,
-      "git_rev": "073f130c9cbda8f1a4508a354b27fd3a9074ded4",
+      "git_rev": "2423d782043895e9653dd389be7f3714956a0af9",
       "cardano_node_version": "11.0.1",
       "cardano_cli_version": "11.0.0.0",
       "blocks": {
-        "total_forges": 50,
-        "canonical": 50,
+        "total_forges": 47,
+        "canonical": 47,
         "orphans": 0,
         "orphan_rate": 0.0000
       },
       "tip_age": {
-        "avg_seconds": 1.67,
-        "p99_seconds": 10.00
+        "avg_seconds": 2.02,
+        "p99_seconds": 6.00
       },
-      "chain_density": 0.420,
+      "chain_density": 0.388,
       "tx_zoo": {
         "status": "ok",
         "pass": 151,
@@ -139,22 +139,22 @@
     {
       "name": "parity-oracle",
       "pass": true,
-      "evidence_dir": "evidence-archive/auto/round1p-20260820T191327Z",
+      "evidence_dir": "evidence-archive/auto/round1p-20260821T011153Z",
       "duration_seconds": 120,
-      "git_rev": "073f130c9cbda8f1a4508a354b27fd3a9074ded4",
+      "git_rev": "2423d782043895e9653dd389be7f3714956a0af9",
       "cardano_node_version": "11.0.1",
       "cardano_cli_version": "11.0.0.0",
       "blocks": {
-        "total_forges": 70,
-        "canonical": 70,
+        "total_forges": 51,
+        "canonical": 51,
         "orphans": 0,
         "orphan_rate": 0.0000
       },
       "tip_age": {
-        "avg_seconds": 1.21,
+        "avg_seconds": 1.25,
         "p99_seconds": 5.00
       },
-      "chain_density": 0.583,
+      "chain_density": 0.429,
       "tx_zoo": {
         "status": "absent",
         "pass": null,
@@ -354,22 +354,22 @@
     {
       "name": "epoch-boundary",
       "pass": true,
-      "evidence_dir": "evidence-archive/auto/round2-20260820T192953Z",
+      "evidence_dir": "evidence-archive/auto/round2-20260821T012946Z",
       "duration_seconds": 1800,
-      "git_rev": "073f130c9cbda8f1a4508a354b27fd3a9074ded4",
+      "git_rev": "2423d782043895e9653dd389be7f3714956a0af9",
       "cardano_node_version": "11.0.1",
       "cardano_cli_version": "11.0.0.0",
       "blocks": {
-        "total_forges": 933,
-        "canonical": 874,
-        "orphans": 59,
-        "orphan_rate": 0.0632
+        "total_forges": 924,
+        "canonical": 862,
+        "orphans": 62,
+        "orphan_rate": 0.0671
       },
       "tip_age": {
-        "avg_seconds": 1.42,
+        "avg_seconds": 1.70,
         "p99_seconds": 6.00
       },
-      "chain_density": 0.484,
+      "chain_density": 0.477,
       "tx_zoo": {
         "status": "short",
         "pass": 49,
@@ -389,11 +389,11 @@
       "log_errors": {
         "dugite-bp": {
           "errors": 0,
-          "warns": 6
+          "warns": 5
         },
         "dugite-relay": {
           "errors": 0,
-          "warns": 7
+          "warns": 12
         },
         "cardano-bp": {
           "errors": 0,
@@ -477,22 +477,22 @@
     {
       "name": "restart",
       "pass": true,
-      "evidence_dir": "evidence-archive/auto/20260820T200516Z",
+      "evidence_dir": "evidence-archive/auto/20260821T020514Z",
       "duration_seconds": 60,
-      "git_rev": "073f130c9cbda8f1a4508a354b27fd3a9074ded4",
+      "git_rev": "2423d782043895e9653dd389be7f3714956a0af9",
       "cardano_node_version": "11.0.1",
       "cardano_cli_version": "11.0.0.0",
       "blocks": {
-        "total_forges": 23,
-        "canonical": 23,
+        "total_forges": 31,
+        "canonical": 31,
         "orphans": 0,
         "orphan_rate": 0.0000
       },
       "tip_age": {
-        "avg_seconds": 1.71,
-        "p99_seconds": 5.00
+        "avg_seconds": 1.25,
+        "p99_seconds": 2.00
       },
-      "chain_density": 0.404,
+      "chain_density": 0.564,
       "tx_zoo": {
         "status": "absent",
         "pass": null,
@@ -602,7 +602,7 @@
     "pass": true,
     "rounds_pass": 4,
     "rounds_fail": 0,
-    "total_canonical_blocks": 1017,
+    "total_canonical_blocks": 991,
     "total_tx_zoo_pass": 200,
     "total_tx_zoo_fail": 1,
     "invalid_forges_detected": 0,
