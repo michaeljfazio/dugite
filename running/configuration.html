@@ -219,7 +219,7 @@ reported — see <a href="./config-editor.html">Configuration Editor</a>.</p>
 <tr><td><code>NetworkMagic</code></td><td>integer</td><td>auto</td><td>Network magic number. If omitted, derived from <code>Network</code> (764824073 for mainnet)</td></tr>
 <tr><td><code>DiffusionMode</code></td><td>string</td><td><code>"InitiatorAndResponder"</code></td><td>Controls inbound connection acceptance. <code>"InitiatorAndResponder"</code> (default): relay mode, accepts inbound N2N connections. <code>"InitiatorOnly"</code>: block producer mode, outbound only (no listening port opened)</td></tr>
 <tr><td><code>PeerSharing</code></td><td>boolean/null</td><td><code>null</code></td><td>Enable the peer sharing mini-protocol. When <code>null</code> (default), peer sharing is automatically disabled for block producers (when <code>--shelley-kes-key</code> is provided) and enabled for relays. Set explicitly to override</td></tr>
-<tr><td><code>ConsensusMode</code></td><td>string</td><td><code>"Praos"</code></td><td><code>"Praos"</code> (default) or <code>"Genesis"</code> (trustless bulk sync). <code>"PraosMode"</code> / <code>"GenesisMode"</code> are accepted legacy aliases. The <code>--consensus-mode</code> CLI flag, taking <code>praos</code> or <code>genesis</code>, overrides this field</td></tr>
+<tr><td><code>ConsensusMode</code></td><td>string</td><td><code>"PraosMode"</code></td><td><code>"PraosMode"</code> (default) or <code>"GenesisMode"</code> (trustless bulk sync) — the values a real cardano-node config actually uses (verified against cardano-node 11.0.1, which rejects any other spelling). <code>"Praos"</code> / <code>"Genesis"</code> are accepted as dugite-only legacy aliases. The <code>--consensus-mode</code> CLI flag, taking <code>praos</code> or <code>genesis</code>, overrides this field</td></tr>
 <tr><td><code>ExperimentalHardForksEnabled</code></td><td>boolean</td><td><code>false</code></td><td>Advertise readiness for the next major protocol version. <code>false</code> → the node signals <code>ProtVer 11 0</code> in forged headers and rejects headers whose on-chain protocol version exceeds 11; <code>true</code> → signals <code>ProtVer 12 0</code> (Dijkstra) and accepts up to 12. Must stay <code>false</code> on mainnet. The shipped <code>config/preview/config.json</code> sets it <code>true</code></td></tr>
 </tbody></table>
 </div>
@@ -284,7 +284,7 @@ would hurt Genesis sync.</p>
 <h4 id="genesis-mode-sync-targets"><a class="header" href="#genesis-mode-sync-targets">Genesis-mode sync targets</a></h4>
 <p>A second target set applies while the node is in Genesis-mode bulk sync. It is
 parsed and validated unconditionally, but only takes effect when
-<code>ConsensusMode</code> is <code>"Genesis"</code>.</p>
+<code>ConsensusMode</code> is <code>"GenesisMode"</code>.</p>
 <div class="table-wrapper"><table><thead><tr><th>Field</th><th>Type</th><th>Default</th><th>Description</th></tr></thead><tbody>
 <tr><td><code>SyncTargetNumberOfActivePeers</code></td><td>integer</td><td>5</td><td>Active peers during Genesis bulk sync</td></tr>
 <tr><td><code>SyncTargetNumberOfEstablishedPeers</code></td><td>integer</td><td>10</td><td>Established peers during Genesis bulk sync</td></tr>
@@ -314,7 +314,7 @@ ceilings for the big-ledger-peer counts)</li>
 </div>
 <h3 id="ouroboros-genesis-tuning"><a class="header" href="#ouroboros-genesis-tuning">Ouroboros Genesis Tuning</a></h3>
 <p><code>LowLevelGenesisOptions</code> mirrors cardano-node's object of the same name and is
-only consulted when <code>ConsensusMode</code> is <code>"Genesis"</code>. Omit the whole object to get
+only consulted when <code>ConsensusMode</code> is <code>"GenesisMode"</code>. Omit the whole object to get
 the upstream defaults.</p>
 <pre><code class="language-json">"LowLevelGenesisOptions": {
   "EnableCSJ": true,
