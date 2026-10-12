@@ -1298,13 +1298,19 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "993b95dc1b248e3f5747dcb017a41d6e75853a2e5ee4504f7d537c5b8dffdae4"
 
 [[package]]
-name = "dashu-int"
-version = "0.4.2"
+name = "dashu-base"
+version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d6a93d93dc2aca9a071e6ecb2af883441e8b34357a1037bc536e1c52b0d3c713"
+checksum = "98a4867772ef92740ddb786be2aa7407f6588c2f5713cfa3e7ec747dc3a8a221"
+
+[[package]]
+name = "dashu-int"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "09237178fe9f89615eb6ba5516fc8c061a4fb203e9550f823f8fbcc4c30e3520"
 dependencies = [
  "cfg-if",
- "dashu-base",
+ "dashu-base 0.5.0",
  "num-modular",
  "num-order",
  "rustversion",
@@ -1544,7 +1550,7 @@ version = "2.8.0"
 dependencies = [
  "criterion",
  "curve25519-dalek 3.2.0 (git+https://github.com/iquerejeta/curve25519-dalek?branch=ietf03_vrf_compat_ell2)",
- "dashu-base",
+ "dashu-base 0.4.3",
  "dashu-int",
  "dugite-primitives",
  "ed25519-dalek",
@@ -3777,9 +3783,9 @@ dependencies = [
 
 [[package]]
 name = "num-modular"
-version = "0.6.1"
+version = "0.6.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "17bb261bf36fa7d83f4c294f834e91256769097b3cb505d44831e0a179ac647f"
+checksum = "fc41a1374056e9672221567958a66c16be12d0e2c1b408761e14d901c237d5e0"
 
 [[package]]
 name = "num-order"
