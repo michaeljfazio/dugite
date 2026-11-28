@@ -96,7 +96,7 @@ fn has_any_file(dir: &Path) -> bool {
     }
 }
 
-fn workspace_root() -> PathBuf {
+pub(crate) fn workspace_root() -> PathBuf {
     let mut dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     loop {
         let cargo = dir.join("Cargo.toml");

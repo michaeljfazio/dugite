@@ -10,6 +10,13 @@
 
 use dugite_conformance::upstream::{cardano_base, fixtures, ledger_rules_replay, mithril, status};
 
+// The LEDGER / NEWEPOCH apply-and-compare checks of the checker itself: the
+// expected-results contract, and proof that each compared group can go red.
+#[path = "ledger_rules_checks/bites.rs"]
+mod ledger_rules_bites;
+#[path = "ledger_rules_checks/contract.rs"]
+mod ledger_rules_contract;
+
 // ── Status banner (always runs) ───────────────────────────────────────────────
 
 #[test]
