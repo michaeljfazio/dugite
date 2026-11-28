@@ -76,7 +76,7 @@ just query-tip              # dugite-cli query tip against ./node.sock
 just bump-utxorpc-spec v0.19.2   # refresh vendored utxorpc/spec protos
 ```
 
-Per-area conformance filters also exist (`just test-conformance-cardano-base`, `-cardano-ledger`, `-cardano-node`, `-ledger-rules`, `-mithril`, `-ouroboros-consensus`, `-status`). These are for iteration only — the "N skipped" count they print is the tests belonging to *other* areas, not a coverage gap. Use `just test-conformance-upstream` for the unfiltered run.
+Per-area conformance filters also exist (`just test-conformance-cardano-base`, `-cardano-ledger`, `-cardano-node`, `-ledger-rules-decode`, `-mithril`, `-ouroboros-consensus`, `-status`). These are for iteration only — the "N skipped" count they print is the tests belonging to *other* areas, not a coverage gap. Use `just test-conformance-upstream` for the unfiltered run.
 
 ## Layout
 

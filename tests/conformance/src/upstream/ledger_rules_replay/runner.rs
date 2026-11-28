@@ -1,33 +1,31 @@
-//! Phase 4 — Runner: validate ImpSpec vectors against Dugite's engine.
-//!
-//! ## Current validation (Phase 4)
+//! Runner: decode checks on ImpSpec vectors.  No ledger rule is applied.
 //!
 //! For each vector the runner dispatches on the `rule` field derived from the
-//! directory name:
+//! directory name and decodes what the vector carries:
 //!
 //! - **ConwayNEWEPOCH** (and any `*NEWEPOCH*` rule): reads the initial epoch
 //!   number from `st_cbor[0]` and the signal epoch number from `sig_cbor`,
-//!   then validates the hard invariant `signal_epoch > initial_epoch`.
+//!   then checks `signal_epoch > initial_epoch`.  When `st_out_cbor` exists,
+//!   its epoch must equal the signal (Haskell's output against its own input;
+//!   no Dugite epoch transition runs).
 //!
-//! - **ConwayUTXO** (and any `*UTXO*` rule): calls
+//! - **ConwayUTXO** (and any `*UTXO*` rule), and LEDGER: calls
 //!   `dugite_serialization::decode_transaction(era_id, sig_cbor)` on the
-//!   signal file and returns `Failed` if it errors.
+//!   signal file and returns `Failed` if it errors.  The transaction is not
+//!   validated or applied.
 //!
 //! - **POOL / CERT / CERTS / DELEG / GOVCERT / GOV / ENACT / RATIFY**:
-//!   structural shape decode of the native STS signal — verifies the CBOR
-//!   layout without full semantic execution.
+//!   structural shape decode of the native STS signal; verifies the CBOR
+//!   layout only.
 //!
-//! - **Unknown rules**: returns `Skipped` (no validation available yet).
+//! - **Unknown rules**: returns `Skipped` (no check available).
 //!
-//! ## Phase 4 follow-on: full ledger replay
+//! ## Not done here
 //!
-//! Full ledger execution (apply_tx / apply_tick / apply_epoch) requires:
-//! 1. A `LedgerState::from_cbor(imp_spec_format)` bridge for the `arr[7]`
-//!    NewEpochState encoding (tracked as a separate ledger bridge task).
-//! 2. Real ImpSpec fixture files generated from the Haskell toolchain.
-//!
-//! Until both are available the runner provides the deepest validation
-//! achievable without that bridge.
+//! Applying the rule to the initial state and comparing the result with
+//! `st_out` would need a `LedgerState` bridge for the `arr[7]` NewEpochState
+//! encoding.  That does not exist, so no check in this file exercises Dugite's
+//! ledger.
 
 use dugite_serialization::decode_transaction;
 
@@ -44,7 +42,8 @@ use crate::upstream::ledger_rules_replay::{
 /// Outcome of validating one ImpSpec vector.
 #[derive(Debug)]
 pub enum RunOutcome {
-    /// NEWEPOCH invariant validated: signal_epoch > initial_epoch.
+    /// NEWEPOCH decode checks passed: signal_epoch > initial_epoch (and the
+    /// vector's own `st_out` epoch equals the signal, when present).
     NewEpochValidated {
         initial_epoch: u64,
         signal_epoch: u64,
@@ -159,7 +158,8 @@ fn is_native_sig_rule(rule: &str) -> Option<&'static str> {
     None
 }
 
-/// Validate `vec` according to its rule and return the outcome.
+/// Run the decode checks for `vec`'s rule and return the outcome.  No ledger
+/// rule is applied.
 ///
 /// The `era_id` used for tx decoding is derived from the rule name prefix.
 pub fn run_vector(vec: &ImpVector) -> RunOutcome {
@@ -290,7 +290,7 @@ fn run_newepoch(vec: &ImpVector) -> RunOutcome {
     }
 }
 
-/// Validate a UTXO/LEDGER vector by decoding the signal as a transaction.
+/// Decode a UTXO/LEDGER vector's signal as a transaction (decode only).
 fn run_tx_signal(vec: &ImpVector) -> RunOutcome {
     let era_id = era_id_from_rule(&vec.rule);
     match decode_transaction(era_id, &vec.sig_cbor) {

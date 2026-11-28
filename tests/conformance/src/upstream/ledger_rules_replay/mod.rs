@@ -1,8 +1,23 @@
-//! Phase 4 — ImpSpec ledger-rule replay.
+//! ImpSpec ledger-rule vectors: signal DECODE checks (no ledger rule is applied).
 //!
-//! This module replays cardano-ledger ImpSpec test vectors through Dugite's
-//! ledger engine and compares the resulting state against the expected state
-//! encoded in each vector directory.
+//! This module reads the cardano-ledger ImpSpec vectors and checks that they
+//! decode.  It does NOT replay them through Dugite's ledger engine and does NOT
+//! compare any resulting state.  What each vector actually gets:
+//!
+//! - every vector: the `st` blob decodes as CBOR (`bridge::decode_state`);
+//! - UTXO and LEDGER: the signal decodes as a transaction
+//!   (`dugite_serialization::decode_transaction`);
+//! - POOL, CERT, CERTS, DELEG, GOVCERT, GOV, ENACT, RATIFY: the signal has the
+//!   expected CBOR shape;
+//! - NEWEPOCH: the signal epoch is greater than the initial epoch, and, when
+//!   the vector ships `st_out`, Haskell's own post-state epoch equals the
+//!   signal.  That is a consistency check of the fixture against itself; no
+//!   Dugite epoch transition runs.
+//!
+//! `compare::compare_states` has no caller: nothing produces a Dugite-side
+//! state to compare.  The tests are named `*_decode` /
+//! `ledger_rules_signal_decode` for that reason.  A real ledger check (apply
+//! the rule, compare the state) is a separate piece of work.
 //!
 //! ## Corpus generation: patched ImpSpec (official Haskell test vectors)
 //!
@@ -34,7 +49,8 @@
 //!
 //! Each test-case directory under a rule directory is decoded as one `ImpVector`.
 //! See `vector.rs` for the decoder, `bridge.rs` for state/signal decoding,
-//! `runner.rs` for validation, and `compare.rs` for state comparison.
+//! `runner.rs` for the decode checks, and `compare.rs` for a state-comparison
+//! helper that nothing calls yet.
 
 pub mod bridge;
 pub mod compare;
@@ -53,7 +69,8 @@ use std::path::Path;
 /// ## Current state
 ///
 /// This list is empty — all NEWEPOCH/LEDGER/POOL/CERT/CERTS/DELEG/GOVCERT/
-/// GOV/ENACT/RATIFY vectors pass their structural decode checks.
+/// GOV/ENACT/RATIFY vectors pass their structural decode checks (an empty list
+/// says nothing about ledger-rule conformance: no rule is applied).
 ///
 /// Per-rule entries follow this format when a divergence is found:
 /// ```

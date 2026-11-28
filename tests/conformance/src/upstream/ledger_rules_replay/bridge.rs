@@ -1,4 +1,4 @@
-//! Phase 4 — Bridge: inspect and decode ImpSpec CBOR blobs.
+//! Bridge: inspect and decode ImpSpec CBOR blobs (decode only; nothing here applies a ledger rule).
 //!
 //! Each ImpSpec test case is stored as 4 separate CBOR files:
 //!   conformance_dump_ctx.cbor  — ExecContext
@@ -74,7 +74,7 @@
 //! **ENACT**: `[GovActionId, GovAction]` — array(2) where GovActionId is array(2)[bstr(32), uint].
 //! **RATIFY**: definite array of GovActionState elements, each array(7).
 //!
-//! ## Future work (Phase 4 follow-on)
+//! ## Future work
 //!
 //! Once `dugite-ledger` exposes a public deserialization API for
 //! `NewEpochState` / `LedgerState`, replace the raw-CBOR path with a full

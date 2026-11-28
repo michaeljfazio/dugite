@@ -40,7 +40,7 @@ Fixtures land in `tests/conformance/upstream/fixtures/`, which is gitignored —
 | ouroboros-consensus | IntersectMBO/ouroboros-consensus | Block / header golden files per era | passing |
 | cardano-ledger | IntersectMBO/cardano-ledger | Genesis JSON, CDDL schema, golden transactions | passing |
 | cardano-node | IntersectMBO/cardano-node | Genesis spec files | passing |
-| ledger-rules (ImpSpec) | IntersectMBO/cardano-ledger | ~8100 CBOR STS-rule vectors from ImpSpec, across 11 rule families | passing — `SKIP_LIST` empty |
+| ledger-rules (ImpSpec), decode only | IntersectMBO/cardano-ledger | ~8100 CBOR STS-rule vectors from ImpSpec, across 11 rule families; signals are decoded, no ledger rule is applied | decode checks passing — `SKIP_LIST` empty |
 | cardano-base | IntersectMBO/cardano-base | VRF v03 crypto test vectors | passing |
 | mithril | input-output-hk/mithril | Certificate fixture JSON | passing |
 
@@ -120,21 +120,27 @@ just download-upstream-fixtures
 just test-conformance-cardano-node
 ```
 
-### ledger-rules (ImpSpec)
+### ledger-rules (ImpSpec) — signal decode only
 
 **Source:** [IntersectMBO/cardano-ledger](https://github.com/IntersectMBO/cardano-ledger) ImpSpec, SHA-pinned in `sources.toml`. The corpus regeneration pipeline builds cardano-ledger from source (GHC 9.6.5 + cabal 3.10.x, ≈35 min cold / 5 min cached) and runs the upstream ImpSpec conformance suite with `CONFORMANCE_CBOR_DUMP_PATH` set to capture every test vector as CBOR.
 
-**What's validated:** Eleven STS-rule families, not just the two headline ones — `NEWEPOCH` and `ConwayNEWEPOCH` (epoch-boundary transitions), `LEDGER` (transaction application), `POOL`, `CERT`, `CERTS`, `DELEG`, `GOVCERT`, `GOV`, `ENACT`, and `RATIFY`. The current corpus holds roughly 8,100 captured test-case directories. The harness replays each CBOR vector through the corresponding dugite ledger code path and compares the resulting state byte-for-byte.
+**What's validated:** that each captured vector decodes. No ledger rule is applied and no state is compared. Eleven STS-rule families are covered — `NEWEPOCH` and `ConwayNEWEPOCH`, `LEDGER`, `POOL`, `CERT`, `CERTS`, `DELEG`, `GOVCERT`, `GOV`, `ENACT`, and `RATIFY` — across roughly 8,100 captured test-case directories. Per rule:
+
+- `LEDGER` and `UTXO`: the signal decodes as a transaction.
+- `POOL`, `CERT`, `CERTS`, `DELEG`, `GOVCERT`, `GOV`, `ENACT`, `RATIFY`: the signal has the expected CBOR shape.
+- `NEWEPOCH`: the signal epoch is greater than the initial epoch and, when the vector ships a post-state, that post-state's epoch equals the signal (Haskell's output against its own input; no Dugite epoch transition runs).
+
+The state-comparison helper `compare::compare_states` has no caller. A check that applies the rule through dugite's ledger and compares the result is not implemented yet, so a pass here says nothing about ledger-rule conformance.
 
 Note that an empty `SKIP_LIST` means no vector is skipped *by policy*. A vector can still report `Skipped` at runtime if the runner cannot construct its precondition; that is visible in the run output, not hidden by the list.
 
-**Status:** passing. `SKIP_LIST` in `tests/conformance/src/upstream/ledger_rules_replay/mod.rs` is empty.
+**Status:** decode checks passing. `SKIP_LIST` in `tests/conformance/src/upstream/ledger_rules_replay/mod.rs` is empty.
 
 **Replay locally:**
 
 ```bash
 just download-upstream-fixtures
-just test-conformance-ledger-rules
+just test-conformance-ledger-rules-decode
 ```
 
 ### cardano-base

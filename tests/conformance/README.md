@@ -1,29 +1,31 @@
-# Formal Ledger Specification Conformance Tests
+# Hand-written Ledger Conformance Vectors
 
-This directory contains infrastructure for validating Dugite's ledger
-implementation against the Cardano formal ledger specification.
+This directory holds a small set of hand-written JSON test vectors and the
+Rust harness that runs them against Dugite's ledger code.
 
-## Architecture
+## What the vectors are
 
-```
-Agda formal spec ──► Haskell (MAlonzo) ──► JSON test vectors ──► Rust test harness
-     (source)           (compiled)            (intermediate)         (validation)
-```
+**The 58 vectors in `vectors/` are hand-written.** They are NOT generated from
+the Agda formal ledger specification, and there is no Agda -> Haskell
+generator: the `generator/` directory that earlier versions of this file
+described does not exist, and nothing in this repository compiles the spec.
 
-**Source**: The Cardano formal ledger specification is written in Agda at
-[IntersectMBO/formal-ledger-specifications](https://github.com/IntersectMBO/formal-ledger-specifications)
-(branch `conway-v1.0`).
+Their expected outputs are not an independent oracle. They were written by
+hand and edited to follow code changes (for example commit `bc6f2bf5e7`, which
+changed DRep expiry handling and the vectors that depend on it). A vector that
+passes shows that Dugite still behaves the way the vector's author expected
+when it was last edited, not that it agrees with the Haskell node or the
+formal spec.
 
-**Compilation**: The Agda spec compiles to Haskell via MAlonzo, producing the
-`cardano-ledger-executable-spec` library with step functions for each STS rule.
+For comparisons against upstream sources see the `upstream/` fixtures and
+`docs/src/reference/conformance.md`. Note that the `ledger-rules` area there
+only decodes its fixtures (`just test-conformance-ledger-rules-decode`); it
+applies no ledger rule.
 
-**Test vectors**: A Haskell generator (`generator/Main.hs`) calls the step
-functions with various inputs and serializes the results as JSON. The current
-vectors in `vectors/` are hand-crafted examples that demonstrate the schema.
-
-**Validation**: The Rust crate `dugite-conformance` loads the JSON vectors,
+**Validation**: The `dugite-conformance` crate loads the JSON vectors,
 converts them to Dugite types via adapter functions, runs the corresponding
-ledger function, and compares the result against the expected output.
+ledger function, and compares the result against the expected output in the
+vector.
 
 ## Directory Structure
 
@@ -43,9 +45,7 @@ tests/conformance/
 │   ├── cert/               # CERT rule vectors
 │   ├── gov/                # GOV rule vectors
 │   └── epoch/              # EPOCH rule vectors
-└── generator/              # Haskell test vector generator (TODO)
-    ├── Main.hs             # Generator scaffold
-    └── cabal.project       # Cabal project file
+└── upstream/               # Pinned upstream fixture manifests (separate harness)
 ```
 
 ## Running Tests
@@ -74,7 +74,7 @@ cargo test -p dugite-conformance conformance_epoch
 
 | Rule   | Status        | Description |
 |--------|--------------|-------------|
-| UTXO   | 15 vectors   | Transaction validation against UTxO state (success + failure) |
+| UTXO   | 30 vectors   | Transaction validation against UTxO state (success + failure) |
 | CERT   | 14 vectors   | Certificate processing (delegation, registration, DRep, failure) |
 | GOV    | 8 vectors    | Governance proposal submission and voting (Conway era) |
 | EPOCH  | 6 vectors    | Epoch boundary transitions (proposal expiry, pool retirement, DRep inactivity) |
@@ -110,8 +110,8 @@ For failure cases:
 
 ### Type Mapping
 
-The Agda formal spec uses abstract types. The test vectors use simplified
-representations that map to Dugite's concrete types:
+The vectors use simplified representations of the spec's abstract types that
+map to Dugite's concrete types:
 
 | Agda Type     | JSON Representation          | Dugite Type              |
 |---------------|------------------------------|---------------------------|
@@ -121,39 +121,6 @@ representations that map to Dugite's concrete types:
 | Coin          | Integer (lovelace)           | `Lovelace(u64)`           |
 | UTxO          | Array of `{tx_hash, index, output}` | `UtxoSet`          |
 | PParams       | Subset of protocol params    | `ProtocolParameters`      |
-
-## Regenerating Test Vectors (Haskell Generator)
-
-The Haskell generator requires a Nix environment with the compiled Agda spec.
-This is a complex build that requires ~30 minutes and significant disk space.
-
-### Prerequisites
-
-- [Nix](https://nixos.org/download.html) with flakes enabled
-- ~10GB disk space for the Agda/GHC build cache
-
-### Steps
-
-```bash
-# 1. Enter the formal spec Nix shell
-nix develop github:IntersectMBO/formal-ledger-specifications/conway-v1.0
-
-# 2. Navigate to the generator
-cd tests/conformance/generator
-
-# 3. Build and run
-cabal run conformance-generator -- --output-dir ../vectors/
-```
-
-### Using the Reference Pattern
-
-The formal-ledger-specifications repo includes a conformance example at
-`conformance-example/test/UtxowSpec.hs` that demonstrates how to:
-
-1. Import the compiled Agda step functions
-2. Construct test inputs using QuickCheck generators
-3. Call the step function and compare results
-4. Serialize to/from the test vector format
 
 ## Adding New Rules
 
@@ -173,8 +140,8 @@ The formal-ledger-specifications repo includes a conformance example at
 
 ## Limitations
 
-- The hand-crafted vectors test basic scenarios. Full coverage requires the
-  Haskell generator with property-based testing.
+- The vectors are hand-written and cover basic scenarios only. Their expected
+  outputs are not derived from the Agda spec or the Haskell node.
 - UTXO validation skips witness verification (signatures/scripts) since test
   vectors use simplified types without cryptographic material.
 - The CERT runner simulates certificate application directly rather than going
