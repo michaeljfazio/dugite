@@ -15,10 +15,16 @@
 //! input has no matching Spend redeemer" for a tx Haskell accepted (preview
 //! Babbage tx `4c4afd46…77b6`, block 2,160,646).
 //!
-//! At PV >= 9 `phase1` Rule 1b already rejects any duplicate, so deduplicating
-//! here changes nothing for a tx that can pass; the helper is therefore
-//! protocol-version independent, exactly like `dugite_uplc::tx_info_populate::sort_inputs`
-//! which builds the Plutus `ScriptContext` from the same view.
+//! At PV >= 9 a duplicate never reaches these consumers in a tx that can pass,
+//! so deduplicating here changes nothing for it; the helper is therefore
+//! protocol-version independent, exactly like
+//! `dugite_uplc::tx_info_populate::sort_inputs`, which builds the Plutus
+//! `ScriptContext` from the same view. Who rejects the duplicate differs per
+//! field: `phase1` Rule 1b checks ONLY `body.inputs`, while a duplicate
+//! collateral or reference input at PV >= 9 is rejected only by the Conway wire
+//! decoder (`era_conway.rs` `read_set_strict`, keys 13 and 18). A tx built in
+//! memory with a duplicate collateral input therefore gets no PV >= 9
+//! `DuplicateInput` from the validator; the wire decoder is the gate.
 
 use dugite_primitives::transaction::TransactionInput;
 

@@ -206,7 +206,17 @@ fn tx_in_cbor(enc: &mut Encoder<&mut Vec<u8>>, id: &[u8; 32]) {
 /// `spend_copies` times (a plain definite array, NO set tag) and lists the
 /// collateral input `collateral_copies` times, with one Spend redeemer at
 /// index 0. `pv` selects the cost-model view the script-data hash is over.
-fn build_tx_cbor(pv: u64, script: &[u8], spend_copies: usize, collateral_copies: usize) -> Vec<u8> {
+/// `salt` is added to the fee so that every test builds a tx with its OWN hash:
+/// the WARN capture is one global sink filtered by tx hash, and two tests that
+/// shared a hash would read each other's lines.
+fn build_tx_cbor(
+    pv: u64,
+    script: &[u8],
+    spend_copies: usize,
+    collateral_copies: usize,
+    salt: u64,
+) -> Vec<u8> {
+    let fee = FEE + salt;
     let params = params_at(pv);
     let redeemer_ex = (100_000u64, 10_000_000u64);
 
@@ -263,9 +273,9 @@ fn build_tx_cbor(pv: u64, script: &[u8], spend_copies: usize, collateral_copies:
     recipient.extend_from_slice(&[0xBB; 28]);
     enc.bytes(&recipient).unwrap();
     enc.u8(1).unwrap();
-    enc.u64(SCRIPT_UTXO_VALUE - FEE).unwrap();
+    enc.u64(SCRIPT_UTXO_VALUE - fee).unwrap();
     enc.u8(2).unwrap();
-    enc.u64(FEE).unwrap();
+    enc.u64(fee).unwrap();
     enc.u8(11).unwrap();
     enc.bytes(sdh.as_bytes()).unwrap();
     enc.u8(13).unwrap();
@@ -368,7 +378,7 @@ fn apply_single_tx_block(
 fn pv8_duplicate_script_input_is_accepted_by_mempool_validation() {
     let script = always_succeeds_v2();
     let (ledger, utxo) = ledger_at(8, &script, 5_000_000);
-    let tx = decode(BABBAGE_ERA_ID, &build_tx_cbor(8, &script, 2, 1));
+    let tx = decode(BABBAGE_ERA_ID, &build_tx_cbor(8, &script, 2, 1, 1));
     assert_eq!(
         tx.body.inputs.len(),
         2,
@@ -386,7 +396,7 @@ fn pv8_duplicate_script_input_is_accepted_by_mempool_validation() {
 fn pv8_duplicate_script_input_is_accepted_by_apply_block_validate_all() {
     let script = always_succeeds_v2();
     let (ledger, _utxo) = ledger_at(8, &script, 5_000_000);
-    let tx = decode(BABBAGE_ERA_ID, &build_tx_cbor(8, &script, 2, 1));
+    let tx = decode(BABBAGE_ERA_ID, &build_tx_cbor(8, &script, 2, 1, 2));
     assert_eq!(tx.body.inputs.len(), 2);
     let (result, warns) = apply_single_tx_block(ledger, tx, Era::Babbage, 8);
     assert!(
@@ -405,7 +415,7 @@ fn pv8_duplicate_script_input_is_accepted_by_apply_block_validate_all() {
 fn pv8_single_script_input_control_is_accepted() {
     let script = always_succeeds_v2();
     let (ledger, utxo) = ledger_at(8, &script, 5_000_000);
-    let tx = decode(BABBAGE_ERA_ID, &build_tx_cbor(8, &script, 1, 1));
+    let tx = decode(BABBAGE_ERA_ID, &build_tx_cbor(8, &script, 1, 1, 3));
     assert_eq!(tx.body.inputs.len(), 1);
     let errors = mempool_errors(&ledger, &utxo, &tx);
     assert!(errors.is_empty(), "control must pass; got {errors:?}");
@@ -417,7 +427,7 @@ fn pv8_single_script_input_control_is_accepted() {
 fn pv8_duplicate_input_does_not_inflate_the_redeemer_index_range() {
     let script = always_succeeds_v2();
     let (ledger, utxo) = ledger_at(8, &script, 5_000_000);
-    let mut tx = decode(BABBAGE_ERA_ID, &build_tx_cbor(8, &script, 2, 1));
+    let mut tx = decode(BABBAGE_ERA_ID, &build_tx_cbor(8, &script, 2, 1, 4));
     tx.witness_set.redeemers[0].index = 1;
     let errors = mempool_errors(&ledger, &utxo, &tx);
     assert!(
@@ -439,7 +449,7 @@ fn pv8_duplicate_collateral_input_is_counted_once() {
     // required = ceil(150% * 300_000) = 450_000. One copy is 300_000 (short);
     // two copies would read 600_000 (enough) if the duplicate were summed.
     let (ledger, utxo) = ledger_at(8, &script, 300_000);
-    let tx = decode(BABBAGE_ERA_ID, &build_tx_cbor(8, &script, 1, 2));
+    let tx = decode(BABBAGE_ERA_ID, &build_tx_cbor(8, &script, 1, 2, 5));
     assert_eq!(tx.body.collateral.len(), 2);
     let errors = mempool_errors(&ledger, &utxo, &tx);
     assert!(
@@ -455,7 +465,7 @@ fn pv8_duplicate_collateral_input_does_not_trip_max_collateral_inputs() {
     let script = always_succeeds_v2();
     let (mut ledger, utxo) = ledger_at(8, &script, 5_000_000);
     ledger.epochs.protocol_params.max_collateral_inputs = 1;
-    let tx = decode(BABBAGE_ERA_ID, &build_tx_cbor(8, &script, 1, 2));
+    let tx = decode(BABBAGE_ERA_ID, &build_tx_cbor(8, &script, 1, 2, 6));
     assert_eq!(tx.body.collateral.len(), 2);
     let errors = mempool_errors(&ledger, &utxo, &tx);
     assert!(
@@ -473,14 +483,14 @@ fn pv8_duplicate_collateral_input_does_not_trip_max_collateral_inputs() {
 #[test]
 fn pv9_wire_decoder_rejects_a_duplicate_input() {
     let script = always_succeeds_v2();
-    let cbor = build_tx_cbor(9, &script, 2, 1);
+    let cbor = build_tx_cbor(9, &script, 2, 1, 7);
     assert!(
         decode_transaction(CONWAY_ERA_ID, &cbor).is_err(),
         "decodeSetEnforceNoDuplicates: a duplicate input must not decode at PV9+"
     );
     // And the same bytes with the duplicate removed do decode (the rejection is
     // the duplicate, not the fixture).
-    let ok = build_tx_cbor(9, &script, 1, 1);
+    let ok = build_tx_cbor(9, &script, 1, 1, 8);
     assert!(decode_transaction(CONWAY_ERA_ID, &ok).is_ok());
 }
 
@@ -489,7 +499,7 @@ fn pv9_duplicate_input_is_rejected_by_mempool_validation() {
     let script = always_succeeds_v2();
     let (ledger, utxo) = ledger_at(9, &script, 5_000_000);
     // The Babbage decoder keeps the duplicate; PV9 validation must reject it.
-    let tx = decode(BABBAGE_ERA_ID, &build_tx_cbor(9, &script, 2, 1));
+    let tx = decode(BABBAGE_ERA_ID, &build_tx_cbor(9, &script, 2, 1, 9));
     assert_eq!(tx.body.inputs.len(), 2);
     let errors = mempool_errors(&ledger, &utxo, &tx);
     assert!(
@@ -504,7 +514,7 @@ fn pv9_duplicate_input_is_rejected_by_mempool_validation() {
 fn pv9_duplicate_input_is_flagged_by_apply_block_validate_all() {
     let script = always_succeeds_v2();
     let (ledger, _utxo) = ledger_at(9, &script, 5_000_000);
-    let tx = decode(BABBAGE_ERA_ID, &build_tx_cbor(9, &script, 2, 1));
+    let tx = decode(BABBAGE_ERA_ID, &build_tx_cbor(9, &script, 2, 1, 10));
     let (result, warns) = apply_single_tx_block(ledger, tx, Era::Conway, 9);
     let flagged = result.is_err() || warns.iter().any(|l| l.contains("DuplicateInput"));
     assert!(
@@ -521,10 +531,11 @@ fn pv9_duplicate_input_is_flagged_by_apply_block_validate_all() {
 // a PlutusV2 reference script (key 18 reference input), so its hash is checked
 // against the address credential below.
 //
-// Only the index-addressed Phase-1 consumers are asserted: the preview PV8
-// PlutusV2 cost model is not reproduced here, so script-data-hash and Phase-2
-// results are out of scope for this fixture (the synthetic tests above cover
-// the clean-pass verdict).
+// Protocol parameters are preview epoch 587 from Koios `epoch_params`
+// (protocol 8.0, fees 44/155381, the real PlutusV1/V2 cost models), so the
+// script-integrity hash and Phase-2 evaluation are the real ones. Haskell
+// accepted this block, so the verdict on both paths must be a clean pass; on
+// main the only error is `MissingSpendRedeemer { index: 1 }`.
 // ---------------------------------------------------------------------------
 
 mod real_preview_tx {
@@ -555,6 +566,41 @@ mod real_preview_tx {
                     .unwrap(),
             )),
         })
+    }
+
+    fn preview_587_params() -> ProtocolParameters {
+        let models: serde_json::Value =
+            serde_json::from_slice(&fixture_bytes("preview_epoch_587_cost_models.json"))
+                .expect("json");
+        let vec_of = |k: &str| -> Vec<i64> {
+            models[k]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|v| v.as_i64().unwrap())
+                .collect()
+        };
+        let mut p = ProtocolParameters::mainnet_defaults();
+        p.protocol_version_major = 8;
+        p.protocol_version_minor = 0;
+        p.min_fee_a = 44;
+        p.min_fee_b = 155_381;
+        p.max_tx_size = 16_384;
+        p.max_val_size = 5_000;
+        p.collateral_percentage = 150;
+        p.max_collateral_inputs = 3;
+        p.ada_per_utxo_byte = dugite_primitives::value::Lovelace(4_310);
+        p.max_tx_ex_units = dugite_primitives::transaction::ExUnits {
+            mem: 14_000_000,
+            steps: 10_000_000_000,
+        };
+        p.cost_models.plutus_v1 = Some(vec_of("PlutusV1"));
+        p.cost_models.plutus_v2 = Some(vec_of("PlutusV2"));
+        p
+    }
+
+    fn fixture_bytes(name: &str) -> Vec<u8> {
+        std::fs::read(format!("{FIXTURES}/{name}")).expect("fixture")
     }
 
     fn setup() -> (LedgerState, UtxoSet, Transaction) {
@@ -617,7 +663,7 @@ mod real_preview_tx {
             ),
         ];
 
-        let params = params_at(8);
+        let params = preview_587_params();
         let mut ledger = LedgerState::new(params.clone());
         ledger.epochs.protocol_params = params;
         ledger.epoch_length = 100;
@@ -638,29 +684,24 @@ mod real_preview_tx {
         (ledger, utxo_set, tx)
     }
 
-    fn is_index_error(e: &ValidationError) -> bool {
-        matches!(
-            e,
-            ValidationError::MissingSpendRedeemer { .. }
-                | ValidationError::MissingRedeemer { .. }
-                | ValidationError::ExtraRedeemer { .. }
-                | ValidationError::RedeemerIndexOutOfRange { .. }
-        )
-    }
-
     #[test]
-    fn real_tx_has_no_redeemer_index_error_on_the_mempool_path() {
+    fn real_tx_is_accepted_by_mempool_validation() {
         let (ledger, utxo, tx) = setup();
         let errors = mempool_errors(&ledger, &utxo, &tx);
-        let bad: Vec<_> = errors.iter().filter(|e| is_index_error(e)).collect();
-        assert!(bad.is_empty(), "got {bad:?} (all errors: {errors:?})");
+        assert!(
+            errors.is_empty(),
+            "Haskell accepted this tx; got {errors:?}"
+        );
     }
 
     #[test]
-    fn real_tx_has_no_redeemer_index_error_on_the_apply_block_path() {
+    fn real_tx_is_accepted_by_apply_block_validate_all() {
         let (ledger, _utxo, tx) = setup();
-        let (_result, warns) = apply_single_tx_block(ledger, tx, Era::Babbage, 8);
-        let bad: Vec<_> = warns.iter().filter(|l| l.contains("edeemer")).collect();
-        assert!(bad.is_empty(), "got {bad:?}");
+        let (result, warns) = apply_single_tx_block(ledger, tx, Era::Babbage, 8);
+        assert!(result.is_ok(), "got {result:?}");
+        assert!(
+            warns.is_empty(),
+            "no Phase-1/Phase-2 divergence; got {warns:?}"
+        );
     }
 }
