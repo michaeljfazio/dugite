@@ -25,7 +25,7 @@ use dugite_primitives::time::{BlockNo, EpochNo, SlotNo};
 use dugite_primitives::value::Lovelace;
 use tokio::sync::mpsc;
 
-use super::connection_lifecycle::FetchedBlock;
+use super::connection_lifecycle::{FetchedBlock, PeerFailureKind};
 use super::{Node, NodeArgs};
 use crate::config::NodeConfig;
 use crate::forge::{forge_block, BlockProducerConfig, BlockProducerCredentials};
@@ -97,6 +97,7 @@ struct Harness {
     node: Node,
     creds: BlockProducerCredentials,
     tx: mpsc::Sender<FetchedBlock>,
+    peer_rx: mpsc::Receiver<(std::net::SocketAddr, PeerFailureKind)>,
     _dir: tempfile::TempDir,
 }
 
@@ -183,10 +184,13 @@ impl Harness {
         let (tx, rx) = mpsc::channel(16);
         let mut node = node;
         node.fetched_blocks_rx = Some(rx);
+        let (peer_tx, peer_rx) = mpsc::channel(16);
+        node.peer_failure_tx = Some(peer_tx);
         Harness {
             node,
             creds,
             tx,
+            peer_rx,
             _dir: dir,
         }
     }
@@ -208,6 +212,10 @@ impl Harness {
             .metrics
             .header_validation_failures_total
             .load(Ordering::Relaxed)
+    }
+
+    async fn has_block(&self, hash: &Hash32) -> bool {
+        self.node.chain_db.read().await.has_block(hash)
     }
 
     async fn is_marked_invalid(&self, hash: &Hash32) -> bool {
@@ -358,9 +366,11 @@ fn byron_ebb(prev_hash: &Hash32, epoch: u64, block_no: u64) -> Vec<u8> {
     e.into_writer()
 }
 
-/// Everything a rejected, wrongly tagged block must leave behind.
+/// Everything a rejected, wrongly tagged block must leave behind, and what it
+/// must NOT: the copy shares the honest block's hash, so that hash may be
+/// neither blacklisted nor left in the ChainDB.
 async fn assert_rejected(
-    h: &Harness,
+    h: &mut Harness,
     bad: &Block,
     era_before: Era,
     parent: (u64, Hash32),
@@ -379,70 +389,35 @@ async fn assert_rejected(
         "ChainDB tip is the parent"
     );
     assert!(
-        h.is_marked_invalid(bad.hash()).await,
-        "block marked invalid"
+        !h.is_marked_invalid(bad.hash()).await,
+        "the hash must NOT be blacklisted: the era tag is not part of it"
+    );
+    assert!(
+        !h.has_block(bad.hash()).await,
+        "the re-tagged bytes must not stay in the ChainDB under that hash"
     );
     assert_eq!(
         h.header_failures(),
         failures_before + 1,
         "header-validation failure counted exactly once"
     );
+    let (_peer, kind) = h.peer_rx.try_recv().expect("the serving peer is reported");
+    assert_eq!(kind, PeerFailureKind::ProtocolFault);
+    assert!(h.peer_rx.try_recv().is_err(), "reported exactly once");
 }
 
-/// Would chain selection prefer the rejected block over `honest` at equal
-/// height (the Praos tiebreak: opcert, then lower leader VRF within the slot
-/// window)?
-fn rejected_block_wins_the_tiebreak(rejected: &Block, honest: &Block) -> bool {
-    use dugite_consensus::chain_selection::{ChainPreference, ChainSelection};
-    use dugite_primitives::block::Tip;
-    let era = honest.header.protocol_version.era();
-    let slot_window = match era {
-        Era::Conway | Era::Dijkstra => 5,
-        _ => u64::MAX,
-    };
-    let mut sel = ChainSelection::new();
-    sel.set_tip(Tip {
-        point: Point::Specific(honest.header.slot, honest.header.header_hash),
-        block_number: honest.header.block_number,
-    });
-    let cand = Tip {
-        point: Point::Specific(rejected.header.slot, rejected.header.header_hash),
-        block_number: rejected.header.block_number,
-    };
-    matches!(
-        sel.prefer_chain_with_headers(&cand, &honest.header, &rejected.header, era, slot_window),
-        ChainPreference::PreferCandidate
-    )
-}
-
-/// The chain must go on after a rejected block: an honest sibling at the same
+/// The chain must go on after a rejected block: an honest block at the same
 /// height arrives and the ledger ends on it.
-///
-/// The sibling is chosen so that the Praos tiebreak does NOT rank the rejected
-/// block above it. When it does, chain selection finds the rejected block as
-/// the preferred fork tip, refuses the pass (`StoreButDontChange`) and returns
-/// `StoredAsFork` even though the honest block already extended the ChainDB's
-/// selected chain, so the ChainDB tip moves and the ledger does not: that wedge
-/// is filed separately and does not depend on this change.
 async fn assert_honest_block_applies(
     h: &mut Harness,
-    bad: &Block,
     era: Era,
     pv: u64,
     parent: (u64, Hash32),
     after_slot: u64,
 ) {
-    let mut from = after_slot + 1;
-    let (slot, cbor) = loop {
-        let (slot, cbor) = h
-            .honest_leader_block(era, pv, from, from + 200, 2, parent.1)
-            .await;
-        let candidate = h.decode(&cbor).unwrap();
-        if !rejected_block_wins_the_tiebreak(bad, &candidate) {
-            break (slot, cbor);
-        }
-        from = slot + 1;
-    };
+    let (slot, cbor) = h
+        .honest_leader_block(era, pv, after_slot + 1, after_slot + 200, 2, parent.1)
+        .await;
     let honest = h.deliver(&cbor).await;
     assert_eq!(
         h.ledger_tip_point().await,
@@ -487,8 +462,19 @@ async fn retagged_case(honest_era: Era, pv: u64, new_tag: u8) {
 
     let failures = h.header_failures();
     let bad = h.deliver(&bad_cbor).await;
-    assert_rejected(&h, &bad, honest_era, parent, failures).await;
-    assert_honest_block_applies(&mut h, &bad, honest_era, pv, parent, slot).await;
+    assert_rejected(&mut h, &bad, honest_era, parent, failures).await;
+
+    // The re-tagged copy arrived FIRST. The honest copy has the SAME hash and
+    // must still apply.
+    assert_eq!(bad.hash(), honest_block.hash(), "same header, same hash");
+    let honest = h.deliver(&honest_cbor).await;
+    assert_eq!(
+        h.ledger_tip_point().await,
+        Point::Specific(SlotNo(slot), *honest.hash()),
+        "the honest copy with the same hash must apply after the re-tagged one"
+    );
+    assert_eq!(h.ledger_era().await, honest_era);
+    assert_eq!(h.chain_db_tip_point().await, h.ledger_tip_point().await);
 }
 
 /// A Babbage tag on a Conway-era block at PV10 (the reported case).
@@ -517,8 +503,8 @@ async fn byron_ebb_extending_the_tip_is_rejected_on_a_conway_ledger() {
 
     let failures = h.header_failures();
     let bad = h.deliver(&ebb_cbor).await;
-    assert_rejected(&h, &bad, Era::Conway, parent, failures).await;
-    assert_honest_block_applies(&mut h, &bad, Era::Conway, 10, parent, parent.0).await;
+    assert_rejected(&mut h, &bad, Era::Conway, parent, failures).await;
+    assert_honest_block_applies(&mut h, Era::Conway, 10, parent, parent.0).await;
 }
 
 /// FINDING (reported in the PR): on main, a peer-supplied `[0, ebb]` block IS
@@ -613,6 +599,60 @@ async fn conway_tag_mid_epoch_on_a_babbage_ledger_is_rejected() {
 
     let failures = h.header_failures();
     let bad = h.deliver(&cbor).await;
-    assert_rejected(&h, &bad, Era::Babbage, parent, failures).await;
-    assert_honest_block_applies(&mut h, &bad, Era::Babbage, 8, parent, slot).await;
+    assert_rejected(&mut h, &bad, Era::Babbage, parent, failures).await;
+    assert_honest_block_applies(&mut h, Era::Babbage, 8, parent, slot).await;
+}
+
+/// The re-tagged copy is stored first because it does not extend the ledger tip
+/// yet (the pre-storage check cannot decide), and is rejected later, when a
+/// fork through it is replayed. The stored copy must then be removed and its
+/// hash left usable, so the honest copy still applies.
+#[tokio::test(flavor = "multi_thread")]
+async fn retagged_copy_stored_out_of_order_is_removed_when_its_fork_is_replayed() {
+    let mut h = Harness::new(10).await;
+    let a = h.bootstrap(Era::Conway, 10).await;
+
+    // Chain A -> X (applied): the ledger tip is X.
+    let (x_slot, x_cbor) = h
+        .honest_leader_block(Era::Conway, 10, a.0 + 1, a.0 + 100, 2, a.1)
+        .await;
+    let x = h.deliver(&x_cbor).await;
+    assert_eq!(
+        h.ledger_tip_point().await,
+        Point::Specific(SlotNo(x_slot), *x.hash())
+    );
+
+    // A competing branch A -> B -> E, with B delivered RE-TAGGED.
+    let (b_slot, b_cbor) = h
+        .honest_leader_block(Era::Conway, 10, x_slot + 1, x_slot + 100, 2, a.1)
+        .await;
+    let b = h.decode(&b_cbor).unwrap();
+    let (_, e_cbor) = h
+        .honest_leader_block(Era::Conway, 10, b_slot + 1, b_slot + 100, 3, *b.hash())
+        .await;
+    let failures = h.header_failures();
+    let b_bad = h.deliver(&retag(&b_cbor, 6)).await;
+    assert_eq!(b_bad.hash(), b.hash());
+    // Whether the fork A -> B' is replayed on arrival of B' (it wins the equal
+    // height tiebreak) or on arrival of E, the replay is where it is rejected.
+    h.deliver(&e_cbor).await;
+
+    assert_eq!(h.ledger_era().await, Era::Conway);
+    assert!(
+        !h.is_marked_invalid(b.hash()).await,
+        "the hash must NOT be blacklisted"
+    );
+    assert!(
+        !h.has_block(b.hash()).await,
+        "the re-tagged copy must be removed from the ChainDB"
+    );
+    assert_eq!(h.header_failures(), failures + 1);
+    assert_eq!(h.chain_db_tip_point().await, h.ledger_tip_point().await);
+
+    // The honest copy of B (same hash) is accepted, and the chain moves on
+    // through it.
+    h.deliver(&b_cbor).await;
+    assert!(h.has_block(b.hash()).await);
+    assert!(!h.is_marked_invalid(b.hash()).await);
+    assert_eq!(h.chain_db_tip_point().await, h.ledger_tip_point().await);
 }
