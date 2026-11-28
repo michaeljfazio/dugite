@@ -40,6 +40,9 @@ upstream-conformance = ["dep:minicbor", "dep:cddl"]
 [dev-dependencies]
 tempfile = { workspace = true }
 minicbor = { workspace = true }
+# The no-reuse audit parses the sources of the two serialization crates.
+syn = { version = "2", features = ["full"] }
+quote = "1"
 
 [[test]]
 name = "upstream_tests"

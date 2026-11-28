@@ -63,8 +63,10 @@ fn encoded(f: impl FnOnce() -> Vec<u8>) -> Result<Vec<u8>, Failure> {
     }
 }
 
-/// A codec for a value that carries no preserved input bytes.
-fn plain<T: NoPreservedBytes + 'static>(
+/// A codec for a value that carries no preserved input bytes.  The statement is checked on every
+/// value, not just declared: the `Debug` rendering must show no populated byte `Option` or
+/// `raw_*`/`original_*` field (the same independent check the scrubbed codecs end with).
+fn plain<T: NoPreservedBytes + std::fmt::Debug + 'static>(
     decode: impl Fn(&[u8]) -> Result<T, SerializationError> + Clone + 'static,
     encode: impl Fn(&T) -> Vec<u8> + 'static,
 ) -> Codec {
@@ -73,6 +75,13 @@ fn plain<T: NoPreservedBytes + 'static>(
         decode: Box::new(move |b| d(b).map(|_| ()).map_err(|e| e.to_string())),
         reencode: Box::new(move |b| {
             let value = decode(b).map_err(|e| Failure::Decode(e.to_string()))?;
+            let left = super::scrub::independent_preserved_bytes(&format!("{value:?}"));
+            if !left.is_empty() {
+                std::panic::panic_any(HarnessDefect(format!(
+                    "a value declared free of preserved bytes shows: {}",
+                    left.join(", ")
+                )));
+            }
             encoded(|| encode(&value))
         }),
     }

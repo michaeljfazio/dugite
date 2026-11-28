@@ -535,6 +535,8 @@ pub fn guards_json(era: CborEra, corpus: &Corpus, run: &EraRun) -> Value {
         "discriminating_valid_samples": totals.discriminating_total,
         "discriminating_valid_samples_passed": totals.discriminating_pass,
         "samples_with_opaque_reemitted_input": totals.opaque_reemitted,
+        "opaque_reemission_is_recognised_for_rules": ["address"],
+        "decoded_form_hints_the_encoder_honours": ["TransactionOutput.is_legacy (array or map output)"],
         "echo_proof_valid_samples": totals.echo_proof_total,
         "echo_proof_valid_samples_passed": totals.echo_proof_pass,
         "invalid_samples": totals.invalid_total,
@@ -556,7 +558,8 @@ pub fn summary(guards: &Value) -> String {
         "{era} (protocol {pv}): {passed}/{samples} samples pass; {with}/{rules} rules have a decoder; \
          {disc} of {valid} valid samples have input != expected ({disc_pass} pass), \
          {echo} cannot be passed by echoing the input ({echo_pass} pass); \
-         {inv_pass} of {inv_refused} refused invalid samples counted ({inv} invalid in all)",
+         {inv_pass} of {inv_refused} refused invalid samples counted ({inv} invalid in all); \
+         the encoder honours the decoded form hint TransactionOutput.is_legacy",
         era = guards["era"].as_str().unwrap_or("?"),
         pv = guards["protocol_version"].as_str().unwrap_or("?"),
         passed = g("passed"),

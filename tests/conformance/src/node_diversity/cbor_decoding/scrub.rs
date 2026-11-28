@@ -104,11 +104,29 @@ pub const NOT_PRESERVED_BYTES: &[(&str, &str, &str)] = &[
     ("PoolParams", "reward_account", "an address or reward account: the item's own value"),
     ("ProposalProcedure", "return_addr", "an address or reward account: the item's own value"),
     ("Withdrawal", "reward_account", "an address or reward account: the item's own value"),
-    ("GovAction", "withdrawals", "reward-account keys of a map: the item's own value"),
+    ("GovAction::TreasuryWithdrawals", "withdrawals", "reward-account keys of a map: the item's own value"),
     ("SubTransaction", "direct_deposits", "reward-account keys of a map: the item's own value"),
     ("SubTransaction", "withdrawals", "reward-account keys of a map: the item's own value"),
     ("TransactionBody", "direct_deposits", "reward-account keys of a map: the item's own value"),
     ("TransactionBody", "withdrawals", "reward-account keys of a map: the item's own value"),
+    ("ByronAddressPayload", "root", "opaque input re-emitted verbatim by the address encoder (see the `attributes` entry)"),
+    ("DatumOption", "datum_hash", "ledger-state / MemPack snapshot import type: not decoded by any rule of the dataset"),
+    ("MemPackTxOut", "datum_hash", "ledger-state / MemPack snapshot import type: not decoded by any rule of the dataset"),
+    ("Hash", "0", "the hash's own bytes: the item's own value"),
+    ("HaskellRelay::SingleHostAddr", "1", "ledger-state snapshot import type: not decoded by any rule of the dataset"),
+    ("HaskellRelay::SingleHostAddr", "2", "ledger-state snapshot import type: not decoded by any rule of the dataset"),
+    ("PlutusData::Bytes", "0", "a PlutusData byte string: the item's own value"),
+    ("RawKeyWalker", "data", "decode helper, never part of a decoded value"),
+    ("TvarIterator", "data", "decode helper, never part of a decoded value"),
+    ("Relay::SingleHostAddr", "ipv4", "the relay's own address bytes: the item's own value"),
+    ("Relay::SingleHostAddr", "ipv6", "the relay's own address bytes: the item's own value"),
+    ("ScriptRef::PlutusV1", "0", "a Plutus script: a byte string that is the item's value; the CBOR wrapper around it is not kept"),
+    ("ScriptRef::PlutusV2", "0", "a Plutus script: a byte string that is the item's value; the CBOR wrapper around it is not kept"),
+    ("ScriptRef::PlutusV3", "0", "a Plutus script: a byte string that is the item's value; the CBOR wrapper around it is not kept"),
+    ("ScriptRef::PlutusV4", "0", "a Plutus script: a byte string that is the item's value; the CBOR wrapper around it is not kept"),
+    ("ScriptRefKind::Native", "0", "ledger-state / MemPack snapshot import type: not decoded by any rule of the dataset"),
+    ("ScriptRefKind::Plutus", "body", "ledger-state / MemPack snapshot import type: not decoded by any rule of the dataset"),
+    ("TransactionMetadatum::Bytes", "0", "a metadatum byte string: the item's own value"),
 ];
 
 /// A decoded type that is KNOWN to hold no preserved input bytes, anywhere inside it.
@@ -402,7 +420,15 @@ impl Scrub for Block {
 
 /// Field names that hold byte content, not preserved input, and may be populated in a decoded
 /// value (an empty `Option<Vec<u8>>` is never a hit; these are populated ones).
-const CONTENT_OPTION_BYTES: &[&str] = &["tx_fee_policy", "ipv4", "ipv6"];
+const CONTENT_OPTION_BYTES: &[&str] = &[
+    "tx_fee_policy",
+    "ipv4",
+    "ipv6",
+    "plutus_v1",
+    "plutus_v2",
+    "plutus_v3",
+    "plutus_v4",
+];
 
 /// Look at the `Debug` rendering of a value for a populated preserved-bytes field, without
 /// consulting [`Scrub`]: any field named `raw_*` / `*_raw` / `original_*` holding `Some(..)`, and
@@ -453,110 +479,185 @@ mod tests {
     use super::*;
     use crate::node_diversity::pins::repo_root;
 
-    /// The type spellings that carry bytes: a plain or optional byte vector, shared or boxed byte
-    /// slices, `Bytes`, and the raw-capturing wrappers.
-    const BYTE_TYPES: [&str; 7] = [
-        "Vec<u8>",
-        "Bytes",
-        "Arc<[u8]>",
-        "Box<[u8]>",
-        "KeepRaw<",
-        "KeepRawOwned<",
-        "&'b [u8]",
-    ];
+    /// Type spellings that carry bytes, matched on the type with whitespace removed, after
+    /// resolving type aliases: a byte vector, `Bytes`, any byte slice (`Arc<[u8]>`, `Box<[u8]>`,
+    /// `Cow<'_, [u8]>`, `&[u8]`), a fixed byte array, and the raw-capturing wrappers.  Also inside
+    /// `Option`, tuples and maps, because the match is on the rendered type.
+    const BYTE_TYPES: [&str; 5] = ["Vec<u8>", "Bytes", "[u8]", "[u8;", "KeepRaw"];
 
-    /// Every `(owner, field, type)` of a struct or enum-variant field in `dugite-primitives` and
-    /// `dugite-serialization` (outside `#[cfg(test)]` code) whose type carries bytes
-    /// ([`BYTE_TYPES`], also inside `Option`), or whose name looks like preserved bytes
-    /// (`raw_*`, `*_raw`, `original_*`), whatever its type.
+    fn render(t: &impl quote::ToTokens) -> String {
+        t.to_token_stream().to_string().replace(' ', "")
+    }
+
+    fn is_cfg_test(attrs: &[syn::Attribute]) -> bool {
+        attrs
+            .iter()
+            .any(|a| a.path().is_ident("cfg") && render(a).contains("test"))
+    }
+
+    fn rs_files(dir: std::path::PathBuf, out: &mut Vec<std::path::PathBuf>) {
+        for entry in std::fs::read_dir(&dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                rs_files(path, out);
+            } else if path.extension().is_some_and(|e| e == "rs") {
+                out.push(path);
+            }
+        }
+    }
+
+    #[derive(Default)]
+    struct Found {
+        aliases: Vec<(String, String)>,
+        /// (owner, field, rendered type)
+        fields: Vec<(String, String, String)>,
+    }
+
+    fn walk(items: &[syn::Item], found: &mut Found) {
+        use syn::{Fields, Item};
+        fn record(owner: &str, fields: &Fields, found: &mut Found) {
+            for (i, f) in fields.iter().enumerate() {
+                let name = f
+                    .ident
+                    .as_ref()
+                    .map_or_else(|| i.to_string(), ToString::to_string);
+                found.fields.push((owner.to_string(), name, render(&f.ty)));
+            }
+        }
+        for item in items {
+            match item {
+                Item::Struct(s) if !is_cfg_test(&s.attrs) => {
+                    record(&s.ident.to_string(), &s.fields, found)
+                }
+                Item::Enum(e) if !is_cfg_test(&e.attrs) => {
+                    for v in &e.variants {
+                        record(&format!("{}::{}", e.ident, v.ident), &v.fields, found);
+                    }
+                }
+                Item::Type(t) if !is_cfg_test(&t.attrs) => {
+                    found.aliases.push((t.ident.to_string(), render(&t.ty)));
+                }
+                Item::Mod(m) if !is_cfg_test(&m.attrs) => {
+                    if let Some((_, inner)) = &m.content {
+                        walk(inner, found);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// `ty` followed by the target of every alias it mentions (repeatedly), so `Option<Wire>` with
+    /// `type Wire = Vec<u8>` is seen as carrying bytes.
+    fn with_aliases(ty: &str, aliases: &[(String, String)]) -> String {
+        let mut out = ty.to_string();
+        for _ in 0..4 {
+            let mut grew = false;
+            for (name, target) in aliases {
+                let mentioned = out.match_indices(name.as_str()).any(|(i, _)| {
+                    let before = out[..i].chars().next_back();
+                    let after = out[i + name.len()..].chars().next();
+                    !before.is_some_and(|c| c.is_alphanumeric() || c == '_')
+                        && !after.is_some_and(|c| c.is_alphanumeric() || c == '_')
+                });
+                if mentioned && !out.contains(target.as_str()) {
+                    out.push('|');
+                    out.push_str(target);
+                    grew = true;
+                }
+            }
+            if !grew {
+                break;
+            }
+        }
+        out
+    }
+
+    /// Every `(owner, field, type)` of a struct field, tuple field or enum-variant field (named or
+    /// positional, the type wherever the source puts it) in `dugite-primitives` and
+    /// `dugite-serialization`, excluding `#[cfg(test)]` items, whose type carries bytes
+    /// ([`BYTE_TYPES`], through aliases) or whose name looks like preserved bytes (`raw_*`,
+    /// `*_raw`, `original_*`).  Parsed with `syn`, so layout does not matter.  Enum variants are
+    /// owned as `Enum::Variant`; positional fields are named `0`, `1`, ...
     fn candidate_fields() -> Vec<(String, String, String)> {
         let mut files = Vec::new();
-        let mut stack = vec![
-            repo_root().join("crates/dugite-primitives/src"),
+        rs_files(repo_root().join("crates/dugite-primitives/src"), &mut files);
+        rs_files(
             repo_root().join("crates/dugite-serialization/src"),
-        ];
-        while let Some(d) = stack.pop() {
-            for entry in std::fs::read_dir(&d).unwrap() {
-                let path = entry.unwrap().path();
-                if path.is_dir() {
-                    stack.push(path);
-                } else if path.extension().is_some_and(|e| e == "rs") {
-                    files.push(path);
-                }
-            }
-        }
+            &mut files,
+        );
         files.sort();
-        let mut found = Vec::new();
+        let mut found = Found::default();
         for file in files {
             let text = std::fs::read_to_string(&file).unwrap();
-            let mut owner = String::new();
-            // Brace depth inside the current struct or enum; fields are only read inside one, so
-            // function parameters and match arms are not mistaken for fields.
-            let mut depth: i32 = 0;
-            for line in text.lines() {
-                let t = line.trim();
-                if t.starts_with("#[cfg(test)]") {
-                    break;
-                }
-                if t.starts_with("//") {
-                    continue;
-                }
-                let opens = t.matches('{').count() as i32;
-                let closes = t.matches('}').count() as i32;
-                if depth <= 0 {
-                    let decl = [
-                        "pub struct ",
-                        "pub(crate) struct ",
-                        "struct ",
-                        "pub enum ",
-                        "pub(crate) enum ",
-                        "enum ",
-                    ]
-                    .iter()
-                    .find_map(|kw| t.strip_prefix(kw));
-                    if let Some(rest) = decl {
-                        owner = rest
-                            .split(|c: char| !c.is_alphanumeric() && c != '_')
-                            .next()
-                            .unwrap_or("")
-                            .to_string();
-                        if rest.contains('(') && !rest.contains('{') {
-                            // tuple struct: `struct X(pub Vec<u8>);`
-                            if BYTE_TYPES.iter().any(|b| rest.contains(b)) {
-                                found.push((owner.clone(), "0".to_string(), rest.to_string()));
-                            }
-                        }
-                        depth = opens - closes;
-                        continue;
-                    }
-                    continue;
-                }
-                let inside = depth;
-                depth += opens - closes;
-                if inside <= 0 || t.contains("=>") || t.contains("fn ") {
-                    continue;
-                }
-                let t = t.strip_prefix("pub(crate) ").unwrap_or(t);
-                let t = t.strip_prefix("pub ").unwrap_or(t);
-                let Some((name, ty)) = t.split_once(':') else {
-                    continue;
-                };
-                let name = name.trim();
-                let ty = ty.trim().trim_end_matches(',').trim();
-                if name.is_empty() || !name.chars().all(|c| c.is_alphanumeric() || c == '_') {
-                    continue;
-                }
-                let by_name = name.starts_with("raw_")
-                    || name.ends_with("_raw")
-                    || name.starts_with("original_");
-                if BYTE_TYPES.iter().any(|b| ty.contains(b)) || by_name {
-                    found.push((owner.clone(), name.to_string(), ty.to_string()));
-                }
+            let ast = syn::parse_file(&text)
+                .unwrap_or_else(|e| panic!("{} does not parse: {e}", file.display()));
+            walk(&ast.items, &mut found);
+        }
+        candidates_of(&found)
+    }
+
+    fn candidates_of(found: &Found) -> Vec<(String, String, String)> {
+        let mut out = Vec::new();
+        for (owner, field, ty) in &found.fields {
+            let by_name = field.starts_with("raw_")
+                || field.ends_with("_raw")
+                || field.starts_with("original_");
+            let resolved = with_aliases(ty, &found.aliases);
+            if BYTE_TYPES.iter().any(|b| resolved.contains(b)) || by_name {
+                out.push((owner.clone(), field.clone(), ty.clone()));
             }
         }
-        found.sort();
-        found.dedup();
-        found
+        out.sort();
+        out.dedup();
+        out
+    }
+
+    /// The scan, on a source snippet: the shapes a line-based scan missed.
+    #[test]
+    fn the_scan_sees_every_field_shape() {
+        let src = r#"
+            type Wire = Vec<u8>;
+            pub enum E { Kept(Vec<u8>), Named { x: std::borrow::Cow<'static, [u8]> } }
+            pub struct Next {
+                pub field:
+                    Option<Wire>,
+            }
+            pub struct Multi(
+                pub u32,
+                pub Box<[u8]>,
+            );
+            pub struct Arc1 { a: std::sync::Arc<[u8]>, b: bytes::Bytes, c: Wrapper }
+            pub struct Named2 { pub raw_thing: u64 }
+            #[cfg(test)]
+            mod tests { pub struct Hidden { pub v: Vec<u8> } }
+            pub struct AfterTests { pub v: Vec<u8> }
+            pub struct Clean { pub n: u64 }
+        "#;
+        let mut found = Found::default();
+        walk(&syn::parse_file(src).unwrap().items, &mut found);
+        let got: Vec<String> = candidates_of(&found)
+            .into_iter()
+            .map(|(o, f, _)| format!("{o}.{f}"))
+            .collect();
+        for want in [
+            "E::Kept.0",
+            "E::Named.x",
+            "Next.field",
+            "Multi.1",
+            "Arc1.a",
+            "Arc1.b",
+            "Named2.raw_thing",
+            "AfterTests.v",
+        ] {
+            assert!(got.iter().any(|g| g == want), "missed {want}: {got:?}");
+        }
+        for not in ["Hidden.v", "Clean.n", "Multi.0", "Arc1.c"] {
+            assert!(
+                !got.iter().any(|g| g == not),
+                "wrongly found {not}: {got:?}"
+            );
+        }
     }
 
     fn owner_matches(audited: &str, owner: &str) -> bool {
