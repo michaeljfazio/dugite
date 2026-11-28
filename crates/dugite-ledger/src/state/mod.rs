@@ -3373,6 +3373,11 @@ pub enum LedgerError {
     },
     #[error("Block body size mismatch: actual serialized size {actual} != header claimed size {claimed} (WrongBlockBodySizeBBODY)")]
     WrongBlockBodySize { actual: u64, claimed: u64 },
+    /// The raw block bytes of a Shelley+ block could not be walked to measure the body
+    /// (BBODY `WrongBlockBodySizeBBODY` is an equality check, so an unmeasurable body can
+    /// never be accepted).
+    #[error("Block body size could not be measured from the raw block bytes")]
+    BlockBodyUnmeasurable,
     /// Phase-2 collection/context error on a block transaction — Haskell
     /// `UtxosFailure (CollectErrors …)` (Babbage+), raised regardless of
     /// the `is_valid` tag. Block-fatal at apply (#733): a block containing

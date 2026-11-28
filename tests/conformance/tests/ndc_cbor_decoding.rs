@@ -219,7 +219,7 @@ fn the_decoders_populate_preserved_bytes_and_the_harness_clears_all_of_them() {
                 }
                 match rule.as_str() {
                     "block" => probe!(dec::block(b, e)),
-                    "header" => probe!(dec::block_header(b)),
+                    "header" => probe!(dec::block_header(b, e)),
                     "transaction" => probe!(dec::transaction(b, e)),
                     "transaction_body" => probe!(dec::transaction_body(b, e)),
                     "sub_transaction_body" => probe!(dec::sub_transaction_body(b)),
