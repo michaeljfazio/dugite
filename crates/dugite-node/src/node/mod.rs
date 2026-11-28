@@ -535,6 +535,53 @@ fn import_inline_datum(inline_cbor: &[u8]) -> dugite_primitives::transaction::Ou
     }
 }
 
+/// Undo a block apply that returned `Err`, before the ledger lock is released.
+///
+/// The ledger's undo journal has already reverted the UTxO set; this restores
+/// every other sub-state from the LedgerSeq, whose tip is the pre-block state
+/// (`LedgerState::restore_after_failed_apply`). Holding the ledger write lock
+/// across the failed apply and this call means no reader, snapshot or other
+/// apply ever sees the partially-applied state.
+///
+/// If the seq cannot reconstruct the pre-block state the in-memory ledger is
+/// no longer a state of any chain. The process exits WITHOUT the graceful
+/// shutdown, whose final snapshot would persist that state; the next start
+/// recovers from the last good snapshot. Continuing would diverge.
+pub(crate) fn undo_failed_block_apply(
+    ls: &mut LedgerState,
+    seq: &dugite_ledger::ledger_seq::LedgerSeq,
+    slot: dugite_primitives::time::SlotNo,
+    hash: &dugite_primitives::hash::Hash32,
+) {
+    if !ls.restore_after_failed_apply(seq) {
+        error!(
+            slot = slot.0,
+            hash = %hash.to_hex(),
+            ledger_tip = ?ls.tip.point,
+            seq_tip = ?seq.tip_point(),
+            seq_incoherent = seq.is_incoherent(),
+            "A rejected block left a partially-applied ledger that the LedgerSeq \
+             cannot restore. Exiting without saving a snapshot; the next start \
+             recovers from the last saved one."
+        );
+        std::process::exit(1);
+    }
+}
+
+/// Whether a block's body is proven to be the body its header commits to:
+/// a Shelley-based block whose raw bytes pass the header's body-hash check.
+///
+/// Only then is a ledger failure a property of the block the header hash
+/// names, and only then may the hash enter the invalid-block cache. A Byron
+/// body (dugite does not check the Byron body proof) or a block without its
+/// raw bytes is never proven bound.
+pub(crate) fn body_bound_to_header(block: &dugite_primitives::block::Block) -> bool {
+    block.era.is_shelley_based()
+        && block.raw_cbor.as_deref().is_some_and(|raw| {
+            dugite_consensus::praos::validate_block_body_hash(&block.header, raw).is_ok()
+        })
+}
+
 /// Flatten a `LedgerState` into the primitive [`GovernanceSnapshot`] consumed
 /// by [`crate::metrics::NodeMetrics::set_governance_snapshot`].
 ///
@@ -754,6 +801,10 @@ pub struct Node {
     /// Receiver for peer failure reports from protocol tasks (e.g. fetch timeout).
     /// The main run loop drains this to call `peer_failed()` for reputation scoring.
     peer_failure_rx: Option<mpsc::Receiver<(SocketAddr, PeerFailureKind)>>,
+    /// Sending half of the same channel, so the block-apply path can report
+    /// the peer that served an invalid block (Haskell `InvalidBlockPunishment`).
+    /// Set in `run` alongside `peer_failure_rx`.
+    peer_failure_tx: Option<mpsc::Sender<(SocketAddr, PeerFailureKind)>>,
     /// Receiver for KeepAlive RTT measurements from connected peers.
     /// The main run loop uses these to update PeerManager EWMA and RTT gauges.
     keepalive_rtt_rx: Option<mpsc::Receiver<(SocketAddr, f64)>>,
@@ -2858,6 +2909,7 @@ impl Node {
                 .unwrap_or(256),
             shutdown_rx_for_flush: None,
             peer_failure_rx: None,
+            peer_failure_tx: None,
             keepalive_rtt_rx: None,
             query_handler,
             peer_manager: Arc::new(RwLock::new({
@@ -5086,6 +5138,7 @@ impl Node {
         let (fetched_blocks_tx, fetched_blocks_rx) =
             mpsc::channel::<FetchedBlock>(fetched_blocks_cap);
         let (peer_failure_tx, peer_failure_rx) = mpsc::channel::<(SocketAddr, PeerFailureKind)>(64);
+        self.peer_failure_tx = Some(peer_failure_tx.clone());
         let (keepalive_rtt_tx, keepalive_rtt_rx) = mpsc::channel::<(SocketAddr, f64)>(256);
         let candidate_chains: Arc<RwLock<HashMap<SocketAddr, CandidateChainState>>> =
             Arc::new(RwLock::new(HashMap::new()));
@@ -6533,6 +6586,68 @@ impl Node {
 
     // ─── apply_fetched_block() ──────────────────────────────────────────────
 
+    /// Reject a block a peer served that failed validation when it was
+    /// applied — its Praos header, or its body in the ledger.
+    ///
+    /// Haskell `ChainSel.validateCandidate` (ouroboros-consensus
+    /// `136122cc66`), on `ValidateLedgerError`, does three things: records the
+    /// block in the invalid-block set (`addInvalidBlock varInvalid e pt`),
+    /// keeps the chain at the last valid block (`Diff.truncate
+    /// (castPoint lastValid) chainDiff`), and punishes the peer that sent it
+    /// (`InvalidBlockPunishment.enact punishment … BlockItself`, which throws
+    /// `PeerSentAnInvalidBlockException` to that peer's client thread and so
+    /// tears its connection down). The first two are
+    /// [`Self::abandon_failed_fork`] with the parent as the intersection; the
+    /// third is a `ProtocolFault` report for `peer`.
+    ///
+    /// The ledger must already be at `parent` — for a ledger failure, the
+    /// caller has run [`undo_failed_block_apply`] first.
+    ///
+    /// `hash_is_invalid` says whether the failure is a property of the block
+    /// its header hash names. The header hash commits to the header and,
+    /// through the header's body hash, to the body — but only a body that has
+    /// been checked against that body hash is that block's body. Haskell's
+    /// BlockFetch client checks `blockMatchesHeader` on receipt, so a
+    /// substituted body never reaches chain selection and never enters the
+    /// invalid-block set. When the body is not proven bound to the header
+    /// (a Byron block, whose body proof dugite does not check, or a body that
+    /// failed the check), caching the hash would let a peer that serves a
+    /// corrupted body for an honest header blacklist the honest block. Then
+    /// the chain is truncated and the peer punished, but the hash stays
+    /// adoptable from another peer.
+    async fn reject_invalid_peer_block(
+        &self,
+        peer: SocketAddr,
+        bad_hash: dugite_primitives::hash::Hash32,
+        reason: &str,
+        parent: &dugite_primitives::block::Point,
+        hash_is_invalid: bool,
+    ) {
+        if hash_is_invalid {
+            self.abandon_failed_fork(bad_hash, reason, parent).await;
+        } else {
+            self.truncate_selected_chain(parent).await;
+            warn!(
+                bad = %bad_hash.to_hex(),
+                reason,
+                "Dropped a block whose body is not proven to match its header: \
+                 rolled back to its parent, block hash NOT marked invalid"
+            );
+        }
+        if let Some(ref tx) = self.peer_failure_tx {
+            // `try_send`: this runs on the run loop, which is also the
+            // channel's only reader, so waiting for room could never end.
+            if let Err(e) = tx.try_send((peer, PeerFailureKind::ProtocolFault)) {
+                warn!(
+                    %peer,
+                    bad = %bad_hash.to_hex(),
+                    error = %e,
+                    "Could not report the peer that served an invalid block"
+                );
+            }
+        }
+    }
+
     /// Abandon a fork whose replay failed (a body-hash mismatch or a ledger
     /// apply error on a fork-replayed block).
     ///
@@ -6557,21 +6672,28 @@ impl Node {
                 .await
                 .insert(bad_hash, reason.to_string());
         }
-        {
-            let mut db = self.chain_db.write().await;
-            if let Err(e) = db.rollback_to_point(intersection) {
-                error!(error = %e, "abandon_failed_fork: volatile rollback to intersection failed");
-            }
-        }
-        // Roll the ledger back to the intersection to stay consistent with the
-        // (now rolled-back) VolatileDB selected chain.
-        let _ = self.handle_ledger_rollback(intersection).await;
+        self.truncate_selected_chain(intersection).await;
         warn!(
             bad = %bad_hash.to_hex(),
             reason,
             "Abandoned failed fork: marked block invalid and rolled back to the \
              intersection (VolatileDB preserved — no resync)"
         );
+    }
+
+    /// Roll the VolatileDB selected chain and the ledger back to
+    /// `intersection`, a valid common ancestor, without recording anything as
+    /// invalid.
+    async fn truncate_selected_chain(&self, intersection: &dugite_primitives::block::Point) {
+        {
+            let mut db = self.chain_db.write().await;
+            if let Err(e) = db.rollback_to_point(intersection) {
+                error!(error = %e, "Rollback of the selected chain to the intersection failed");
+            }
+        }
+        // Roll the ledger back to the intersection to stay consistent with the
+        // (now rolled-back) VolatileDB selected chain.
+        let _ = self.handle_ledger_rollback(intersection).await;
     }
 
     /// Apply a block fetched by a per-peer BlockFetch worker to the ledger.
@@ -7036,6 +7158,20 @@ impl Node {
                                             "Fork replay: ledger apply failed: {e} — \
                                                          abandoning fork (block marked invalid)"
                                         );
+                                        // Undo the partial apply first: the rollback
+                                        // below is a no-op when this is the first
+                                        // fork block (the ledger is already at the
+                                        // intersection), and otherwise rewinds only
+                                        // the blocks that were pushed to the seq.
+                                        {
+                                            let seq = self.ledger_seq.read().await;
+                                            undo_failed_block_apply(
+                                                &mut ls,
+                                                &seq,
+                                                fork_slot,
+                                                &fork_block.header.header_hash,
+                                            );
+                                        }
                                         // Release the ledger lock before abandon_failed_fork
                                         // (it re-acquires ledger + chain_db).
                                         drop(ls);
@@ -7406,6 +7542,12 @@ impl Node {
         // We check AFTER storage because the block is keyed by header hash
         // in ChainDB; a body-hash mismatch is a data integrity error from
         // this peer, not a chain-selection issue.
+        //
+        // `body_bound_to_header` records whether the check ran and passed. Only
+        // then is a ledger failure a property of the block the header hash
+        // names, and only then may that hash go into the invalid-block cache
+        // (see `reject_invalid_peer_block`). Byron bodies are not checked.
+        let mut body_bound_to_header = false;
         if block.era.is_shelley_based() {
             if let Some(raw_cbor) = block.raw_cbor.as_deref() {
                 if let Err(e) =
@@ -7418,8 +7560,16 @@ impl Node {
                         error = %e,
                         "Block body hash verification failed — rejecting block (substitution / corruption)"
                     );
+                    // Haskell's BlockFetch client treats a body that does not
+                    // match its header as a protocol violation by the peer
+                    // (`blockMatchesHeader`). The hash is not marked invalid:
+                    // the header may be honest.
+                    if let Some(ref tx) = self.peer_failure_tx {
+                        let _ = tx.try_send((fetched.peer, PeerFailureKind::ProtocolFault));
+                    }
                     return;
                 }
+                body_bound_to_header = true;
             }
         }
 
@@ -7560,10 +7710,13 @@ impl Node {
                 let ls = self.ledger_state.read().await;
                 ls.tip.point.clone()
             };
-            self.abandon_failed_fork(
+            // The header itself is invalid, whatever body came with it.
+            self.reject_invalid_peer_block(
+                fetched.peer,
                 block_hash,
                 "apply-time Praos header validation failed",
                 &parent_point,
+                true,
             )
             .await;
             return;
@@ -7814,24 +7967,32 @@ impl Node {
                     (delta, items)
                 }
                 Err(e) => {
-                    // Issue #669 — surface this as a hard operator-actionable
-                    // signal.  The earlier `warn! + return` was indistinguishable
-                    // from a silent network gap: the chain stops advancing but
-                    // there's no metric increment and no error-level entry, so
-                    // monitoring sees only the absence of further "Chain extended"
-                    // lines.  An apply failure on a fetched block is always one
-                    // of:
-                    //   (a) a dugite bug (the network accepts the block; we
-                    //       mis-validate).  Loud ERROR + metric so the operator
-                    //       files an issue instead of mistaking it for upstream
-                    //       silence.  See #668 for the canonical case.
-                    //   (b) a peer feeding bad data.  Same loud signal; the peer
-                    //       is implicitly throttled by the existing fetch-rate
-                    //       controls and follow-up work (#669) will add explicit
-                    //       per-peer disqualification on apply failure.
+                    // The block reached here as `AddedAsTip`: ChainDB's selected
+                    // chain already ends in it, one block ahead of the ledger.
+                    // Haskell handles a ledger failure here exactly like the
+                    // header failure above — the block goes into the invalid-
+                    // block set, the chain stays at its parent, the peer that
+                    // sent it is punished (`ChainSel.validateCandidate`,
+                    // `ValidateLedgerError`). Merely returning left the invalid
+                    // block as the ChainDB tip: re-fetched and re-rejected
+                    // forever, never cached as invalid, and adopted without
+                    // validation by the next restart's replay.
+                    //
+                    // First undo the partial apply, under the lock the apply
+                    // held, so nothing ever sees it.
+                    {
+                        let seq = self.ledger_seq.read().await;
+                        undo_failed_block_apply(&mut ls, &seq, block_slot, &block_hash);
+                    }
+                    let parent_point = ls.tip.point.clone();
+                    drop(ls);
                     self.metrics
                         .block_apply_failures
                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    // ERROR, not WARN: on a network cardano-node accepts this
+                    // block, so this is either a peer serving an invalid block
+                    // or a dugite validation bug — the operator must be able to
+                    // tell from the error which one.
                     error!(
                         peer = %fetched.peer,
                         slot = block_slot.0,
@@ -7839,13 +8000,17 @@ impl Node {
                         hash = %block_hash.to_hex(),
                         prev = %block.prev_hash().to_hex(),
                         txs = block.transactions.len(),
-                        "Fetched block failed ledger apply: {e} \
-                         — chain advance halted at this block. \
-                         Investigate the validation error above; the same \
-                         block will be re-fetched from this and other peers \
-                         and will keep failing until the underlying issue is \
-                         resolved."
+                        "Fetched block failed ledger apply: {e} — block marked \
+                         invalid, chain kept at its parent, peer reported"
                     );
+                    self.reject_invalid_peer_block(
+                        fetched.peer,
+                        block_hash,
+                        "ledger apply failed",
+                        &parent_point,
+                        body_bound_to_header,
+                    )
+                    .await;
                     return;
                 }
             }
@@ -10774,6 +10939,16 @@ impl Node {
                             delta
                         }
                         Err(e) => {
+                            // Undo the partial apply before anything else sees it.
+                            {
+                                let seq = self.ledger_seq.read().await;
+                                undo_failed_block_apply(
+                                    &mut ls,
+                                    &seq,
+                                    next_slot,
+                                    &block.header.header_hash,
+                                );
+                            }
                             // Haskell: TraceForgedInvalidBlock (Error) — own block failed validation.
                             error!(
                                 target: "forge",
@@ -11494,6 +11669,55 @@ mod tests {
         assert!(config.shelley_genesis_hash.is_none());
         assert!(config.alonzo_genesis_hash.is_none());
         assert!(config.conway_genesis_hash.is_none());
+    }
+
+    /// A block's hash may be cached as invalid only when its body is proven to
+    /// be the one its header commits to; otherwise a peer serving a corrupted
+    /// body for an honest header could blacklist the honest block.
+    #[test]
+    fn test_body_bound_to_header_only_for_a_checked_matching_body() {
+        let path = format!(
+            "{}/../dugite-serialization/tests/test_vectors/conway.hex",
+            env!("CARGO_MANIFEST_DIR")
+        );
+        let cbor =
+            hex::decode(std::fs::read_to_string(&path).expect("fixture").trim()).expect("hex");
+        let block = dugite_serialization::decode_block(&cbor).expect("decode");
+        assert!(block.raw_cbor.is_some(), "the decoder keeps the raw bytes");
+        assert!(
+            super::body_bound_to_header(&block),
+            "the honest body is bound"
+        );
+
+        // Swap the aux-data and invalid-txs components: the framing stays
+        // valid, the body hash does not.
+        let comps = dugite_serialization::extract_block_body_components(&cbor).expect("components");
+        let aux_off = comps[2].as_ptr() as usize - cbor.as_ptr() as usize;
+        let inv_off = comps[3].as_ptr() as usize - cbor.as_ptr() as usize;
+        let mut tampered = cbor[..aux_off].to_vec();
+        tampered.extend_from_slice(comps[3]);
+        tampered.extend_from_slice(comps[2]);
+        tampered.extend_from_slice(&cbor[inv_off + comps[3].len()..]);
+        let mut substituted = block.clone();
+        substituted.raw_cbor = Some(tampered);
+        assert!(
+            !super::body_bound_to_header(&substituted),
+            "a substituted body is not bound"
+        );
+
+        let mut no_raw = block.clone();
+        no_raw.raw_cbor = None;
+        assert!(
+            !super::body_bound_to_header(&no_raw),
+            "an unchecked body is not bound"
+        );
+
+        let mut byron = block;
+        byron.era = dugite_primitives::era::Era::Byron;
+        assert!(
+            !super::body_bound_to_header(&byron),
+            "a Byron body is never bound"
+        );
     }
 
     /// Regression test: BlockProvider methods must not panic when called

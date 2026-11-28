@@ -2997,7 +2997,43 @@ impl LedgerState {
         seq.rollback(n);
 
         // Step 4: replace non-UTxO state from the seq's reconstructed tip.
-        let new_state = seq.tip_state();
+        self.install_non_utxo_state(seq.tip_state());
+
+        Some(n)
+    }
+
+    /// Undo a block apply that returned `Err`, using the [`LedgerSeq`] whose
+    /// tip is the state before that block.
+    ///
+    /// A `ValidateAll` apply that fails has already undone its UTxO changes
+    /// (its undo journal, see `apply_block_impl`), but the epoch tick, era
+    /// translation and the transactions before the failing one may have
+    /// changed every other sub-state. The block never advanced `self.tip`, so
+    /// the seq's tip — the last block pushed — is the pre-block state; this
+    /// replaces every non-UTxO field with it, exactly as
+    /// [`Self::rollback_via_seq`] does for a rollback of `n >= 1` blocks.
+    ///
+    /// Returns `false`, changing nothing, when the seq cannot reconstruct
+    /// that state: its window is incoherent (#985), or its tip is not the
+    /// ledger tip. The caller must then treat the ledger as unusable.
+    ///
+    /// Haskell: a rejected block leaves no trace, because `applyBlockEither`
+    /// returns `Left` and its partially-applied state is dropped
+    /// (`Cardano.Ledger.Shelley.API.Validation`, cardano-ledger `f649f975`).
+    pub fn restore_after_failed_apply(&mut self, seq: &crate::ledger_seq::LedgerSeq) -> bool {
+        // `find_rollback_n` is `None` on an incoherent window and treats the
+        // two spellings of Origin as equal; `Some(0)` is "the seq tip IS the
+        // ledger tip".
+        if seq.find_rollback_n(&self.tip.point) != Some(0) {
+            return false;
+        }
+        self.install_non_utxo_state(seq.tip_state());
+        true
+    }
+
+    /// Replace every field a block apply can change, except the UTxO set and
+    /// its diff window, with `new_state`'s.
+    fn install_non_utxo_state(&mut self, new_state: LedgerState) {
         self.certs = new_state.certs;
         self.gov = new_state.gov;
         self.consensus = new_state.consensus;
@@ -3016,8 +3052,11 @@ impl LedgerState {
         // #1084: same rationale — `byron` lives directly on `LedgerState`,
         // tracked via `LedgerDelta::byron_snapshot`.
         self.byron = new_state.byron;
-
-        Some(n)
+        // Keyed by source-map identity, so it would miss anyway; dropping it
+        // keeps the restored state free of anything derived from the
+        // discarded one.
+        self.cached_validation_registry = None;
+        self.phase2_apply_horizon = None;
     }
 }
 

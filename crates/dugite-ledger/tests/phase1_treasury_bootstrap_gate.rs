@@ -386,22 +386,25 @@ fn pv9_apply_block_reports_bootstrap_rejection_without_the_account_failure() {
     let (tx, _dest, ret) = unregistered_destination_tx(0x62);
     let (mut ledger, _utxo) = ledger_at(9);
     pre_register_account(&mut ledger, &ret);
-    let (_result, warns) = apply_single_tx_block(&mut ledger, tx);
-    let text = warns.join("\n");
-    // The apply WARN lists every failure, joined by "; ": exactly one, the
-    // bootstrap rejection.
-    let line = warns
-        .iter()
-        .find(|l| l.contains("Phase-1 validation divergence"))
-        .unwrap_or_else(|| panic!("no Phase-1 divergence logged; got {warns:?}"));
-    let listed = line.split("errors=").nth(1).unwrap_or("");
+    let tx_hex = tx.hash.to_hex();
+    let (result, warns) = apply_single_tx_block(&mut ledger, tx);
+    // A Phase-1 failure rejects the block; the rejection lists every failure
+    // of the tx, joined by "; ": exactly one, the bootstrap rejection.
+    let err = result.expect_err("the PV9 bootstrap restriction must reject the block");
+    let listed = err
+        .split_once(&format!("{tx_hex}: "))
+        .map(|(_, l)| l)
+        .unwrap_or_else(|| panic!("the rejection must name the tx; got {err}"));
     assert!(
         listed.starts_with("DisallowedProposalDuringBootstrap") && !listed.contains("; "),
         "the whole PV9 failure list must be the bootstrap rejection; got {listed}"
     );
     assert!(
-        !text.contains("TreasuryWithdrawalReturnAccountsDoNotExist"),
-        "the account check is skipped at PV9; got {warns:?}"
+        !err.contains("TreasuryWithdrawalReturnAccountsDoNotExist")
+            && !warns
+                .join("\n")
+                .contains("TreasuryWithdrawalReturnAccountsDoNotExist"),
+        "the account check is skipped at PV9; got {err}, warns {warns:?}"
     );
 }
 

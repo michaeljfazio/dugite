@@ -121,6 +121,13 @@ pub struct UtxoSet {
     /// The in-memory `utxos` HashMap is unused when this is set.
     #[serde(skip)]
     store: Option<UtxoStore>,
+    /// Undo journal: while `Some`, every `insert` / `remove` records the
+    /// entry's PRIOR value (`None` = absent), oldest first, so
+    /// [`Self::rollback_journal`] can restore the set exactly. Opened by
+    /// [`Self::begin_journal`] around a block apply whose failure must leave
+    /// no trace. Never persisted.
+    #[serde(skip)]
+    journal: Option<Vec<(TransactionInput, Option<TransactionOutput>)>>,
 }
 
 impl UtxoSet {
@@ -130,7 +137,43 @@ impl UtxoSet {
             address_index: HashMap::new(),
             indexing_enabled: true,
             store: None,
+            journal: None,
         }
+    }
+
+    /// Start recording an undo journal (see [`Self::rollback_journal`]).
+    /// Replaces any journal already open.
+    pub fn begin_journal(&mut self) {
+        self.journal = Some(Vec::new());
+    }
+
+    /// Stop recording and drop the journal: the changes made since
+    /// [`Self::begin_journal`] are kept.
+    pub fn commit_journal(&mut self) {
+        self.journal = None;
+    }
+
+    /// Stop recording and undo every change made since
+    /// [`Self::begin_journal`], newest first, so each entry (with the address
+    /// index, and the LSM store when one is attached) is back to its value
+    /// before the first change. No-op when no journal is open.
+    pub fn rollback_journal(&mut self) {
+        let Some(entries) = self.journal.take() else {
+            return;
+        };
+        for (input, prior) in entries.into_iter().rev() {
+            match prior {
+                Some(output) => self.insert(input, output),
+                None => {
+                    self.remove(&input);
+                }
+            }
+        }
+    }
+
+    /// `true` while an undo journal is open.
+    pub fn journal_is_open(&self) -> bool {
+        self.journal.is_some()
     }
 
     /// Attach an LSM-backed UtxoStore. All subsequent operations will delegate to it.
@@ -319,6 +362,12 @@ impl UtxoSet {
 
     /// Insert a new UTxO
     pub fn insert(&mut self, input: TransactionInput, output: TransactionOutput) {
+        if self.journal.is_some() {
+            let prior = self.lookup(&input);
+            if let Some(j) = self.journal.as_mut() {
+                j.push((input.clone(), prior));
+            }
+        }
         if let Some(ref mut store) = self.store {
             store.insert(input, output);
             return;
@@ -340,6 +389,14 @@ impl UtxoSet {
 
     /// Remove a UTxO (mark as spent)
     pub fn remove(&mut self, input: &TransactionInput) -> Option<TransactionOutput> {
+        let removed = self.remove_unjournaled(input);
+        if let (Some(j), Some(output)) = (self.journal.as_mut(), removed.as_ref()) {
+            j.push((input.clone(), Some(output.clone())));
+        }
+        removed
+    }
+
+    fn remove_unjournaled(&mut self, input: &TransactionInput) -> Option<TransactionOutput> {
         if let Some(ref mut store) = self.store {
             return store.remove(input);
         }
@@ -532,6 +589,7 @@ impl Clone for UtxoSet {
             // This is fine: LedgerState clones are only used in tests,
             // and production code shares via Arc<RwLock<LedgerState>>.
             store: None,
+            journal: None,
         }
     }
 }
@@ -819,5 +877,73 @@ mod tests {
 
         utxo_set.remove(&input);
         assert_eq!(utxo_set.len(), 0);
+    }
+
+    fn input(byte: u8) -> TransactionInput {
+        TransactionInput {
+            transaction_id: Hash32::from_bytes([byte; 32]),
+            index: 0,
+        }
+    }
+
+    /// Spend, create, create-then-spend, and a no-op remove inside one
+    /// journal; `rollback_journal` must restore exactly the prior set, and
+    /// `commit_journal` must keep every change. Run on both backends: the LSM
+    /// store is what a node runs with.
+    fn journal_round_trip(mut set: UtxoSet) {
+        set.insert(input(1), make_output(1));
+        set.insert(input(2), make_output(2));
+        let mut before = set.iter();
+        before.sort_by(|a, b| a.0.cmp(&b.0));
+
+        set.begin_journal();
+        set.remove(&input(1));
+        set.insert(input(3), make_output(3));
+        set.insert(input(4), make_output(4));
+        set.remove(&input(4));
+        set.remove(&input(9));
+        set.rollback_journal();
+        assert!(!set.journal_is_open());
+        let mut after = set.iter();
+        after.sort_by(|a, b| a.0.cmp(&b.0));
+        assert_eq!(after, before, "rollback must restore the exact prior set");
+        assert_eq!(set.len(), 2);
+
+        set.begin_journal();
+        set.remove(&input(1));
+        set.insert(input(3), make_output(3));
+        set.commit_journal();
+        assert!(!set.contains(&input(1)));
+        assert_eq!(set.lookup(&input(3)).unwrap().value.coin.0, 3);
+        // A rollback with no open journal is a no-op.
+        set.rollback_journal();
+        assert!(set.contains(&input(3)));
+    }
+
+    #[test]
+    fn test_journal_round_trip_in_memory() {
+        journal_round_trip(UtxoSet::new());
+    }
+
+    /// An insert over a live entry journals the entry's old value, so the
+    /// rollback puts it back. (No block apply overwrites a live entry; this
+    /// pins the journal's semantics, in memory only because `UtxoStore`
+    /// counts an overwriting insert as a new entry.)
+    #[test]
+    fn test_journal_rolls_back_an_overwrite() {
+        let mut set = UtxoSet::new();
+        set.insert(input(2), make_output(2));
+        set.begin_journal();
+        set.insert(input(2), make_output(20));
+        set.rollback_journal();
+        assert_eq!(set.lookup(&input(2)).unwrap().value.coin.0, 2);
+        assert_eq!(set.len(), 1);
+    }
+
+    #[test]
+    fn test_journal_round_trip_lsm_store() {
+        let mut set = UtxoSet::new();
+        set.attach_store(crate::utxo_store::UtxoStore::new_temp().unwrap());
+        journal_round_trip(set);
     }
 }

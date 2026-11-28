@@ -16,7 +16,7 @@
 //! - Pre-Conway protocol parameter update proposal collection
 //! - Dispatching nonce evolution and block production tracking (`evolve_nonce`)
 
-use super::{credential_to_hash, BlockValidationMode, LedgerError, LedgerState};
+use super::{BlockValidationMode, LedgerError, LedgerState};
 use crate::eras::byron::{apply_byron_block, ByronApplyMode, ByronFeePolicy};
 use crate::eras::{EraRules, EraRulesImpl, RuleContext};
 use crate::ledger_seq::{BlockFieldsDelta, LedgerDelta};
@@ -29,7 +29,6 @@ use crate::validation::{calculate_ref_script_size, ValidationError};
 use dugite_primitives::block::{Block, Point};
 use dugite_primitives::era::Era;
 use dugite_primitives::time::EpochNo;
-use dugite_primitives::transaction::Certificate;
 use dugite_primitives::value::Lovelace;
 use std::sync::Arc;
 use tracing::{debug, trace, warn};
@@ -57,6 +56,104 @@ fn phase2_collect_fatal_enabled() -> bool {
             .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
             .unwrap_or(true)
     })
+}
+
+/// `true` for the validator errors that describe the Phase-2 (Plutus)
+/// outcome rather than a Phase-1 predicate: the `is_valid` tag disagreeing
+/// with evaluation, a collection error, or a dugite-CEK panic.
+fn is_phase2_outcome_error(e: &ValidationError) -> bool {
+    matches!(
+        e,
+        ValidationError::ScriptFailed(_)
+            | ValidationError::IsValidTagMismatch { .. }
+            | ValidationError::Phase2CollectError(_)
+            | ValidationError::Phase2EvalPanic(_)
+    )
+}
+
+/// Decide what a `ValidateAll` block apply does with the validator's errors
+/// for one transaction of a block received from a peer.
+///
+/// **Every Phase-1 error rejects the whole block.** Haskell applies a block
+/// body through `BBODY` → `LEDGERS` → `LEDGER`, folding each transaction over
+/// the state left by the previous one
+/// (`Cardano.Ledger.Shelley.Rules.Ledgers.ledgersTransition`:
+/// `foldM (\ !curLedgerState (ix, tx) -> … trans @(EraRule "LEDGER" era) …)`),
+/// and any predicate failure in that tree makes the block a `Left`
+/// (`Cardano.Ledger.Shelley.API.Validation.applyBlockEither`:
+/// `f : fs -> Left $ BlockTransitionError $ f :| fs`). ouroboros-consensus
+/// applies every block it has not validated before with `STS.ValidateAll`
+/// (`Ouroboros.Consensus.Ledger.Abstract.defaultApplyBlockLedgerResult`);
+/// only re-application of an already-validated block uses `ValidateNone`,
+/// which is dugite's [`BlockValidationMode::ApplyOnly`]. There is no
+/// tolerated Phase-1 class, and no "missing input" tolerance: the UTxO the
+/// block is validated against is the full state reached by applying every
+/// predecessor, so an unresolved input means the block (or the local state)
+/// is wrong. Sources: cardano-ledger `f649f975`, ouroboros-consensus
+/// `136122cc66`.
+///
+/// Phase-2 outcomes keep their existing apply-time semantics: a Babbage+
+/// collection error is block-fatal (Haskell `UtxosFailure (CollectErrors …)`,
+/// raised for either tag), while an `is_valid` disagreement with dugite's CEK
+/// and a CEK panic are logged. Haskell rejects a tag mismatch too
+/// (`ValidationTagMismatch`); tolerating it here is a separate decision about
+/// the evaluator's maturity and is not changed by this function.
+fn reject_or_tolerate_confirmed_tx_errors(
+    block: &Block,
+    tx: &dugite_primitives::transaction::Transaction,
+    errors: Vec<ValidationError>,
+) -> Result<(), LedgerError> {
+    if errors.iter().any(|e| !is_phase2_outcome_error(e)) {
+        let err_str: Vec<String> = errors.iter().map(|e| e.to_string()).collect();
+        return Err(LedgerError::BlockTxValidationFailed {
+            slot: block.slot().0,
+            tx_hash: tx.hash.to_hex(),
+            errors: err_str.join("; "),
+        });
+    }
+    for e in &errors {
+        match e {
+            ValidationError::Phase2CollectError(msg)
+                if block.era >= Era::Babbage && phase2_collect_fatal_enabled() =>
+            {
+                return Err(LedgerError::Phase2CollectErrors {
+                    slot: block.slot().0,
+                    tx_hash: tx.hash.to_hex(),
+                    error: msg.clone(),
+                });
+            }
+            ValidationError::ScriptFailed(msg) => {
+                warn!(
+                    tx_hash = %tx.hash.to_hex(),
+                    slot = block.slot().0,
+                    error = %msg,
+                    "Plutus evaluation divergence: uplc says scripts fail but block \
+                     is_valid=true on-chain — trusting on-chain consensus"
+                );
+            }
+            ValidationError::IsValidTagMismatch { .. } => {
+                warn!(
+                    tx_hash = %tx.hash.to_hex(),
+                    slot = block.slot().0,
+                    "Plutus evaluation divergence: uplc says scripts PASS but block \
+                     is_valid=false on-chain — trusting on-chain consensus (tx applied \
+                     as invalid; dugite CEK over-permissive)"
+                );
+            }
+            other => {
+                // Alonzo collection error (time translation never arms the
+                // horizon there) or a dugite-CEK panic.
+                warn!(
+                    tx_hash = %tx.hash.to_hex(),
+                    slot = block.slot().0,
+                    error = %other,
+                    "Phase-2 evaluation could not complete on a confirmed block — \
+                     trusting on-chain consensus"
+                );
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Apply the result of a block's Phase-2 (Plutus) evaluation: convert the
@@ -236,7 +333,43 @@ impl LedgerState {
     /// `true`, Step 8d's `run_phase2_parallel` + fatality loop is skipped and the
     /// captured `phase2_work_items` are returned for later pooled evaluation;
     /// when `false`, the drain runs inline and an empty vec is returned.
+    ///
+    /// **A rejected `ValidateAll` block leaves the UTxO set as it found it.**
+    /// The body below mutates the state transaction by transaction, so an
+    /// `Err` part-way through a block would otherwise keep the effects of
+    /// the transactions (and the epoch tick, and any era translation) that
+    /// ran before the failing step. Haskell's block application is a pure
+    /// function: `applyBlockEither` returns `Left` and the ticked,
+    /// partially-applied state is discarded
+    /// (`Cardano.Ledger.Shelley.API.Validation`, cardano-ledger
+    /// `f649f975`). The UTxO set is undone here, through its undo journal;
+    /// every other sub-state is undone by the caller, which holds the
+    /// [`crate::ledger_seq::LedgerSeq`] whose tip is the pre-block state
+    /// ([`Self::restore_after_failed_apply`]). `ApplyOnly` re-applies our
+    /// own already-validated blocks and keeps the unjournaled fast path.
     fn apply_block_impl(
+        &mut self,
+        block: &Block,
+        mode: BlockValidationMode,
+        defer_phase2: bool,
+    ) -> Result<Vec<Phase2WorkItem>, LedgerError> {
+        let journal =
+            mode == BlockValidationMode::ValidateAll && !self.utxo.utxo_set.journal_is_open();
+        if journal {
+            self.utxo.utxo_set.begin_journal();
+        }
+        let result = self.apply_block_impl_unjournaled(block, mode, defer_phase2);
+        if journal {
+            if result.is_ok() {
+                self.utxo.utxo_set.commit_journal();
+            } else {
+                self.utxo.utxo_set.rollback_journal();
+            }
+        }
+        result
+    }
+
+    fn apply_block_impl_unjournaled(
         &mut self,
         block: &Block,
         mode: BlockValidationMode,
@@ -1101,7 +1234,7 @@ impl LedgerState {
             mut block_registered_pool_ids,
             mut block_registered_drep_ids,
             mut block_registered_vrf_keys,
-            block_committee_member_keys,
+            mut block_committee_member_keys,
             mut block_committee_resigned_keys,
             mut block_vote_delegation_keys,
             // `block_active_proposals` is `mut` so we can update it after each
@@ -1423,88 +1556,15 @@ impl LedgerState {
                 let has_redeemers = !tx.witness_set.redeemers.is_empty();
 
                 if tx.is_valid {
-                    // Conway LEDGERS: treasury value check.
-                    //
-                    // Haskell `Cardano.Ledger.Conway.Rules.Ledger.hs:364,442` checks
-                    // `declared == actual` where `actual = ChainAccountState.casTreasury`
-                    // (frozen at block entry, constant intra-block — every tx in the
-                    // block compares against the SAME pre-block treasury value).
-                    //
-                    // Issue #678: the previous self-correction
-                    // (`self.epochs.treasury = declared_treasury`) silently masked
-                    // upstream treasury-calculation drift during live sync. Removing
-                    // the snap exposes the underlying divergence — the
-                    // MismatchedTreasuryValue WARN now points at a real per-epoch
-                    // accounting bug that must be fixed in the treasury update path,
-                    // not papered over here. Same masking-removed pattern as
-                    // #438 / #481 / #624 / #626.
-                    if self.epochs.protocol_params.protocol_version_major >= 9 {
-                        if let Some(declared_treasury) = tx.body.treasury_value {
-                            if declared_treasury.0 != self.epochs.treasury.0 {
-                                let delta =
-                                    declared_treasury.0.saturating_sub(self.epochs.treasury.0)
-                                        as i128
-                                        - self.epochs.treasury.0.saturating_sub(declared_treasury.0)
-                                            as i128;
-                                warn!(
-                                    tx_hash = %tx.hash.to_hex(),
-                                    slot = block.slot().0,
-                                    declared = declared_treasury.0,
-                                    actual = self.epochs.treasury.0,
-                                    delta_lovelace = delta,
-                                    "TreasuryValueMismatch — dugite's treasury differs \
-                                     from on-chain declared value (issue #678). \
-                                     The self-correction was removed; treasury \
-                                     accumulates over epoch boundaries from this point."
-                                );
-                            }
-                        }
-                    }
+                    // The Conway treasury-value check (Haskell
+                    // `validateTreasuryValue`, `ConwayTreasuryValueMismatch`,
+                    // against the treasury at block entry) is the validator's
+                    // below: a mismatch rejects the block.
 
-                    // Conway LEDGERS: unelected committee member check.
-                    //
-                    // Per Haskell GOVCERT (`checkAndOverwriteCommitteeMemberState`)
-                    // the cold credential must be a CURRENT committee member OR a
-                    // potential FUTURE member (named in `members_to_add` of a live
-                    // UpdateCommittee proposal) — `isCurrentMember ||
-                    // isPotentialFutureMember`.
-                    //
-                    // Aggregate one WARN per tx, not one per cert: a single
-                    // CommitteeHotAuth tx can carry 30+ certs; per-cert logging
-                    // produced a 186K-line / 1GB+ log over a single Conway sync
-                    // (#22 follow-up).
-                    if self.epochs.protocol_params.protocol_version_major >= 9 {
-                        let mut unelected: Vec<String> = Vec::new();
-                        let mut eligible: Option<
-                            std::collections::HashSet<dugite_primitives::hash::Hash32>,
-                        > = None;
-                        for cert in &tx.body.certificates {
-                            if let Certificate::CommitteeHotAuth {
-                                cold_credential, ..
-                            } = cert
-                            {
-                                let cold_key = credential_to_hash(cold_credential);
-                                let eligible = eligible.get_or_insert_with(|| {
-                                    self.gov.governance.committee_auth_eligible_members()
-                                });
-                                if !eligible.contains(&cold_key) {
-                                    unelected.push(cold_key.to_hex());
-                                }
-                            }
-                        }
-                        if !unelected.is_empty() {
-                            warn!(
-                                tx_hash = %tx.hash.to_hex(),
-                                slot = block.slot().0,
-                                count = unelected.len(),
-                                first_cold_key = %unelected[0],
-                                "CommitteeHotAuth for cold credential(s) neither in the \
-                                 current committee nor in any live UpdateCommittee \
-                                 proposal — committee state may be stale; trusting \
-                                 on-chain consensus"
-                            );
-                        }
-                    }
+                    // A CommitteeHotAuth for a credential that is neither a
+                    // current nor a potential future member is rejected by the
+                    // validator below (`UnelectedCommitteeMember`, Haskell
+                    // `ConwayCommitteeIsUnknown`).
 
                     // Full Phase-1 + Phase-2 validation
                     //
@@ -1635,84 +1695,7 @@ impl LedgerState {
                         t_validate += start.elapsed();
                     }
                     if let Err(errors) = result {
-                        let has_script_failure = errors
-                            .iter()
-                            .any(|e| matches!(e, ValidationError::ScriptFailed(_)));
-                        if has_script_failure {
-                            warn!(
-                                tx_hash = %tx.hash.to_hex(),
-                                slot = block.slot().0,
-                                errors = ?errors.iter().filter(|e| matches!(e, ValidationError::ScriptFailed(_)))
-                                    .map(|e| e.to_string()).collect::<Vec<_>>(),
-                                "Plutus evaluation divergence: uplc says scripts fail but block is_valid=true on-chain — \
-                                 trusting on-chain consensus (likely marginal budget difference)"
-                            );
-                        } else {
-                            let is_utxo_gap_only = errors.iter().all(|e| {
-                                matches!(
-                                    e,
-                                    ValidationError::InputNotFound(_)
-                                        | ValidationError::CollateralNotFound(_)
-                                        | ValidationError::CollateralMismatch { .. }
-                                        | ValidationError::InsufficientCollateral { .. }
-                                        | ValidationError::ValueNotConserved { .. }
-                                        | ValidationError::MultiAssetNotConserved { .. }
-                                )
-                            });
-                            if is_utxo_gap_only {
-                                let err_str: Vec<String> =
-                                    errors.iter().map(|e| e.to_string()).collect();
-                                debug!(
-                                    tx_hash = %tx.hash.to_hex(),
-                                    slot = block.slot().0,
-                                    errors = %err_str.join("; "),
-                                    "Phase-1 UTxO-gap errors on confirmed block (inputs not yet \
-                                     in store due to partial replay) — outputs will still be \
-                                     inserted by best-effort apply"
-                                );
-                            } else {
-                                // #733 (sequential builds): a phase-2
-                                // collection error from the inline eval is
-                                // block-fatal in Babbage+ unless any input
-                                // failed to resolve (UTxO-gap carve-out).
-                                // Parallel builds surface this via the
-                                // Step 8d outcomes instead (phase-2 was
-                                // skipped here).
-                                let has_collect = errors
-                                    .iter()
-                                    .any(|e| matches!(e, ValidationError::Phase2CollectError(_)));
-                                let has_utxo_gap = errors.iter().any(|e| {
-                                    matches!(
-                                        e,
-                                        ValidationError::InputNotFound(_)
-                                            | ValidationError::CollateralNotFound(_)
-                                            | ValidationError::ReferenceInputNotFound(_)
-                                    )
-                                });
-                                if has_collect
-                                    && !has_utxo_gap
-                                    && block.era >= Era::Babbage
-                                    && phase2_collect_fatal_enabled()
-                                {
-                                    let err_str: Vec<String> =
-                                        errors.iter().map(|e| e.to_string()).collect();
-                                    return Err(LedgerError::Phase2CollectErrors {
-                                        slot: block.slot().0,
-                                        tx_hash: tx.hash.to_hex(),
-                                        error: err_str.join("; "),
-                                    });
-                                }
-                                let err_str: Vec<String> =
-                                    errors.iter().map(|e| e.to_string()).collect();
-                                warn!(
-                                    tx_hash = %tx.hash.to_hex(),
-                                    slot = block.slot().0,
-                                    errors = %err_str.join("; "),
-                                    "Phase-1 validation divergence on confirmed block — \
-                                     trusting on-chain consensus"
-                                );
-                            }
-                        }
+                        reject_or_tolerate_confirmed_tx_errors(block, tx, errors)?;
                     }
                     // ValidationContext consumed by validate_transaction_with_context.
                     // `block_reward_accounts_snap` / `block_stake_key_deposits_snap`
@@ -1969,6 +1952,14 @@ impl LedgerState {
                         }
                     }
                     block_active_proposals = std::sync::Arc::new(updated_proposals);
+                    // GOVCERT's `isPotentialFutureMember` reads the committee
+                    // proposals threaded through LEDGERS, so a member named by
+                    // an UpdateCommittee proposed earlier in this block may
+                    // authorise a hot key in a later tx. The eligibility set
+                    // is current members plus every live proposal's
+                    // `members_to_add`; rebuild it from the live state.
+                    block_committee_member_keys =
+                        std::sync::Arc::new(self.gov.governance.committee_auth_eligible_members());
                 }
 
                 // ── Step 8b-post: refresh cert-derived validation registries ──
@@ -1987,9 +1978,9 @@ impl LedgerState {
                 // `block_active_proposals` sequential refresh for every
                 // cert-mutated registry. Guarded on cert presence so the common
                 // (payment) tx keeps the O(1) pre-block-snapshot fast path.
-                // `block_committee_member_keys` is intentionally excluded — it
-                // changes via governance ratification / `UpdateCommittee`
-                // proposals, not certificates.
+                // `block_committee_member_keys` is refreshed with the proposal
+                // registry above: it changes via ratification (epoch boundary)
+                // and `UpdateCommittee` proposals, not certificates.
                 if mode == BlockValidationMode::ValidateAll && !tx.body.certificates.is_empty() {
                     block_registered_pool_ids =
                         std::sync::Arc::new(self.certs.pool_params.keys().copied().collect());
@@ -2623,6 +2614,7 @@ impl LedgerState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::state::credential_to_hash;
     use dugite_primitives::address::{Address, ByronAddress, EnterpriseAddress};
     use dugite_primitives::block::{BlockHeader, OperationalCert, ProtocolVersion, VrfOutput};
     use dugite_primitives::credentials::Credential;
@@ -2631,6 +2623,7 @@ mod tests {
     use dugite_primitives::network::NetworkId;
     use dugite_primitives::protocol_params::ProtocolParameters;
     use dugite_primitives::time::{BlockNo, SlotNo};
+    use dugite_primitives::transaction::Certificate;
     use dugite_primitives::transaction::{
         ExUnits, OutputDatum, Redeemer, RedeemerTag, ScriptRef, Transaction, TransactionInput,
         TransactionOutput,
@@ -3637,8 +3630,12 @@ mod tests {
         };
         seed_utxo(&mut state, input.clone(), make_output(5_000_000));
 
-        let tx = make_simple_tx(0xD1, vec![input], vec![make_output(4_500_000)], 500_000);
-        // Two byte-identical copies of the same transaction (same hash).
+        let sk = spender_key();
+        let mut state = LedgerState::new(ProtocolParameters::mainnet_defaults());
+        seed_utxo(&mut state, input.clone(), output_to_key(&sk, 5_000_000));
+        let mut tx = make_simple_tx(0xD1, vec![input], vec![make_output(4_500_000)], 500_000);
+        sign_tx(&mut tx, &sk);
+        // Two byte-identical copies of the same, otherwise valid, transaction.
         let block = make_test_block(Era::Conway, 1_000, 1, 9, 0, vec![tx.clone(), tx]);
 
         let result = state.apply_block(&block, BlockValidationMode::ValidateAll);
@@ -3653,6 +3650,563 @@ mod tests {
                 "expected a BadInputsUTxO/duplicate error, got: {errors}"
             );
         }
+    }
+
+    // ── Phase-1 failures on a peer block are block-fatal ──────────────────
+    //
+    // Haskell applies a block body through BBODY → LEDGERS → LEDGER; any
+    // LEDGER predicate failure makes `applyBlockEither` return `Left`, so the
+    // whole block is invalid. These tests go through `apply_block` itself.
+
+    const SPENDER_SEED: [u8; 32] = [0x5Au8; 32];
+
+    fn spender_key() -> dugite_crypto::keys::PaymentSigningKey {
+        dugite_crypto::keys::PaymentSigningKey::from_bytes(&SPENDER_SEED).unwrap()
+    }
+
+    /// An output locked by `sk`'s verification key.
+    fn output_to_key(sk: &dugite_crypto::keys::PaymentSigningKey, coin: u64) -> TransactionOutput {
+        let mut out = make_output(coin);
+        out.address = Address::Enterprise(EnterpriseAddress {
+            network: NetworkId::Mainnet,
+            payment: Credential::VerificationKey(sk.verification_key().hash()),
+        });
+        out
+    }
+
+    fn sign_tx(tx: &mut Transaction, sk: &dugite_crypto::keys::PaymentSigningKey) {
+        tx.witness_set
+            .vkey_witnesses
+            .push(dugite_primitives::transaction::VKeyWitness {
+                vkey: sk.verification_key().to_bytes().to_vec(),
+                signature: sk.sign(tx.hash.as_bytes()),
+            });
+    }
+
+    fn conway_state() -> LedgerState {
+        let mut params = ProtocolParameters::mainnet_defaults();
+        params.protocol_version_major = 9;
+        LedgerState::new(params)
+    }
+
+    #[test]
+    fn test_validate_all_applies_a_valid_block() {
+        let sk = spender_key();
+        let mut state = conway_state();
+        let input = TransactionInput {
+            transaction_id: Hash32::from_bytes([0x61u8; 32]),
+            index: 0,
+        };
+        seed_utxo(&mut state, input.clone(), output_to_key(&sk, 5_000_000));
+        let mut tx = make_simple_tx(
+            0x62,
+            vec![input.clone()],
+            vec![make_output(4_800_000)],
+            200_000,
+        );
+        sign_tx(&mut tx, &sk);
+        let block = make_test_block(Era::Conway, 1_000, 1, 9, 0, vec![tx]);
+
+        state
+            .apply_block(&block, BlockValidationMode::ValidateAll)
+            .expect("a valid, witnessed tx must apply under ValidateAll");
+        assert!(!state.utxo.utxo_set.contains(&input), "input must be spent");
+        assert!(
+            state.utxo.utxo_set.contains(&TransactionInput {
+                transaction_id: Hash32::from_bytes([0x62u8; 32]),
+                index: 0,
+            }),
+            "output must be created"
+        );
+        assert_eq!(state.tip.point.slot(), Some(SlotNo(1_000)));
+    }
+
+    /// The ImpSpec `LEDGER/test_5019` class: a Conway stake registration whose
+    /// declared deposit differs from `ppKeyDeposit`. Haskell DELEG fails
+    /// `IncorrectDepositDELEG`; the block is invalid. dugite used to log
+    /// "Phase-1 validation divergence on confirmed block" and apply it.
+    #[test]
+    fn test_validate_all_rejects_block_with_phase1_invalid_tx() {
+        let sk = spender_key();
+        let mut state = conway_state();
+        let key_deposit = state.epochs.protocol_params.key_deposit.0;
+        let input = TransactionInput {
+            transaction_id: Hash32::from_bytes([0x63u8; 32]),
+            index: 0,
+        };
+        seed_utxo(&mut state, input.clone(), output_to_key(&sk, 10_000_000));
+        let declared = key_deposit + 1;
+        let mut tx = make_simple_tx(
+            0x64,
+            vec![input.clone()],
+            vec![make_output(10_000_000 - 200_000 - declared)],
+            200_000,
+        );
+        let stake_cred = Credential::VerificationKey(sk.verification_key().hash());
+        tx.body.certificates = vec![Certificate::ConwayStakeRegistration {
+            credential: stake_cred.clone(),
+            deposit: Lovelace(declared),
+        }];
+        sign_tx(&mut tx, &sk);
+        let block = make_test_block(Era::Conway, 1_000, 1, 9, 0, vec![tx]);
+
+        let result = state.apply_block(&block, BlockValidationMode::ValidateAll);
+        match &result {
+            Err(LedgerError::BlockTxValidationFailed { errors, .. }) => assert!(
+                errors.contains(
+                    &ValidationError::StakeRegistrationDepositMismatch {
+                        declared,
+                        expected: key_deposit,
+                    }
+                    .to_string()
+                ),
+                "rejection must name the deposit mismatch, got: {errors}"
+            ),
+            other => panic!("ValidateAll must reject the block, got: {other:?}"),
+        }
+        assert!(
+            state.utxo.utxo_set.contains(&input),
+            "rejected block must not spend its input"
+        );
+        assert!(
+            !state
+                .certs
+                .stake_key_deposits
+                .contains_key(&credential_to_hash(&stake_cred)),
+            "rejected block must not register the stake credential"
+        );
+        assert_eq!(state.tip.point.slot(), None, "tip must not advance");
+
+        // ApplyOnly (re-application of an already-validated block, Haskell
+        // `ValidateNone`) still runs no predicates.
+        let mut replay = conway_state();
+        seed_utxo(&mut replay, input.clone(), output_to_key(&sk, 10_000_000));
+        replay
+            .apply_block(&block, BlockValidationMode::ApplyOnly)
+            .expect("ApplyOnly runs no validation predicates");
+    }
+
+    // ── A rejected block leaves no trace ──────────────────────────────────
+    //
+    // Haskell `applyBlockEither` returns `Left` and the ticked, partially
+    // applied state is discarded. dugite applies a block in place, so the UTxO
+    // set is undone by its journal inside `apply_block` and every other
+    // sub-state by `restore_after_failed_apply` from the LedgerSeq.
+
+    /// Everything a block can change, in a form two separately-built states
+    /// can be compared in: the snapshot wire view (every map ordered, #1088)
+    /// and the sorted UTxO set.
+    fn ledger_fingerprint(
+        s: &LedgerState,
+    ) -> (Vec<u8>, Vec<(TransactionInput, TransactionOutput)>) {
+        let snap = crate::state::snapshot_format::LedgerStateSnapshot::from(s);
+        let mut utxo = s.utxo.utxo_set.iter();
+        utxo.sort_by(|a, b| a.0.cmp(&b.0));
+        (
+            bincode::serialize(&snap).expect("snapshot serializes"),
+            utxo,
+        )
+    }
+
+    /// A valid signed spend that also registers a stake credential with the
+    /// correct deposit, so it changes the UTxO set, the certificate state, the
+    /// deposit pot and the fee pot.
+    fn valid_spend_and_register(
+        sk: &dugite_crypto::keys::PaymentSigningKey,
+        input: TransactionInput,
+        id: u8,
+        key_deposit: u64,
+    ) -> Transaction {
+        let mut tx = make_simple_tx(
+            id,
+            vec![input],
+            vec![make_output(10_000_000 - 200_000 - key_deposit)],
+            200_000,
+        );
+        tx.body.certificates = vec![Certificate::ConwayStakeRegistration {
+            credential: Credential::VerificationKey(sk.verification_key().hash()),
+            deposit: Lovelace(key_deposit),
+        }];
+        sign_tx(&mut tx, sk);
+        tx
+    }
+
+    /// A signed spend whose only fault is a stake registration declaring the
+    /// wrong deposit (Haskell `IncorrectDepositDELEG`).
+    fn bad_deposit_spend(
+        sk: &dugite_crypto::keys::PaymentSigningKey,
+        input: TransactionInput,
+        id: u8,
+        key_deposit: u64,
+    ) -> Transaction {
+        let other = dugite_crypto::keys::PaymentSigningKey::from_bytes(&[0x5Bu8; 32]).unwrap();
+        let declared = key_deposit + 1;
+        let mut tx = make_simple_tx(
+            id,
+            vec![input],
+            vec![make_output(10_000_000 - 200_000 - declared)],
+            200_000,
+        );
+        tx.body.certificates = vec![Certificate::ConwayStakeRegistration {
+            credential: Credential::VerificationKey(other.verification_key().hash()),
+            deposit: Lovelace(declared),
+        }];
+        sign_tx(&mut tx, sk);
+        sign_tx(&mut tx, &other);
+        tx
+    }
+
+    fn txin(byte: u8) -> TransactionInput {
+        TransactionInput {
+            transaction_id: Hash32::from_bytes([byte; 32]),
+            index: 0,
+        }
+    }
+
+    /// The failing transaction is the block's SECOND: the first is valid and
+    /// has already been applied when the second is rejected. The block is
+    /// still invalid as a whole, and `apply_block` leaves the UTxO set exactly
+    /// as it was — the first transaction's input unspent, its output absent.
+    #[test]
+    fn test_validate_all_rejects_block_whose_second_tx_is_invalid() {
+        let sk = spender_key();
+        let mut state = conway_state();
+        let key_deposit = state.epochs.protocol_params.key_deposit.0;
+        seed_utxo(&mut state, txin(0x71), output_to_key(&sk, 10_000_000));
+        seed_utxo(&mut state, txin(0x72), output_to_key(&sk, 10_000_000));
+        let utxo_before = ledger_fingerprint(&state).1;
+
+        let tx_a = valid_spend_and_register(&sk, txin(0x71), 0x73, key_deposit);
+        let tx_b = bad_deposit_spend(&sk, txin(0x72), 0x74, key_deposit);
+        let tx_b_hash = tx_b.hash;
+        let block = make_test_block(Era::Conway, 1_000, 1, 9, 0, vec![tx_a, tx_b]);
+
+        match state.apply_block(&block, BlockValidationMode::ValidateAll) {
+            Err(LedgerError::BlockTxValidationFailed {
+                tx_hash, errors, ..
+            }) => {
+                assert_eq!(
+                    tx_hash,
+                    tx_b_hash.to_hex(),
+                    "the SECOND tx is the one rejected"
+                );
+                assert!(
+                    errors.contains(
+                        &ValidationError::StakeRegistrationDepositMismatch {
+                            declared: key_deposit + 1,
+                            expected: key_deposit,
+                        }
+                        .to_string()
+                    ),
+                    "rejection must name the deposit mismatch, got: {errors}"
+                );
+            }
+            other => panic!("ValidateAll must reject the block, got: {other:?}"),
+        }
+        assert_eq!(
+            ledger_fingerprint(&state).1,
+            utxo_before,
+            "the rejected block's first tx must leave no UTxO change behind"
+        );
+        assert_eq!(state.tip.point.slot(), None, "tip must not advance");
+    }
+
+    /// Through the LedgerSeq, as the node does: after a valid block, a block
+    /// whose second tx is invalid, and which is also the first block of a new
+    /// epoch (so the epoch tick has run when the tx is rejected), is undone
+    /// byte-for-byte — UTxO, certificates, governance, pots, epoch, nonces —
+    /// and the ledger then accepts the honest block at the same position.
+    #[test]
+    fn test_restore_after_failed_apply_leaves_no_trace() {
+        let sk = spender_key();
+        let mut state = conway_state();
+        let key_deposit = state.epochs.protocol_params.key_deposit.0;
+        seed_utxo(&mut state, txin(0x81), output_to_key(&sk, 10_000_000));
+        seed_utxo(&mut state, txin(0x82), output_to_key(&sk, 10_000_000));
+        seed_utxo(&mut state, txin(0x83), output_to_key(&sk, 10_000_000));
+        let mut seq = crate::ledger_seq::LedgerSeq::with_defaults(state.clone_without_utxos(), 100);
+
+        // Block 1 (epoch 0): one valid tx, pushed to the seq.
+        let mut b1_tx = make_simple_tx(
+            0x84,
+            vec![txin(0x81)],
+            vec![make_output(9_800_000)],
+            200_000,
+        );
+        sign_tx(&mut b1_tx, &sk);
+        let b1 = make_test_block(Era::Conway, 1_000, 1, 9, 0, vec![b1_tx]);
+        let d1 = state
+            .apply_block_with_delta(&b1, BlockValidationMode::ValidateAll)
+            .expect("block 1 is valid");
+        seq.push(d1);
+        let before = ledger_fingerprint(&state);
+        let epoch_before = state.epoch;
+
+        // Block 2: first slot of the next epoch; tx_a valid, tx_b invalid.
+        let next_epoch_slot = state.epoch_length + 10;
+        let tx_a = valid_spend_and_register(&sk, txin(0x82), 0x85, key_deposit);
+        let tx_b = bad_deposit_spend(&sk, txin(0x83), 0x86, key_deposit);
+        let mut b2 = make_test_block(
+            Era::Conway,
+            next_epoch_slot,
+            2,
+            9,
+            0,
+            vec![tx_a.clone(), tx_b],
+        );
+        b2.header.prev_hash = b1.header.header_hash;
+
+        let err = state
+            .apply_block_with_delta(&b2, BlockValidationMode::ValidateAll)
+            .expect_err("block 2 carries an invalid tx");
+        assert!(
+            matches!(err, LedgerError::BlockTxValidationFailed { .. }),
+            "got: {err:?}"
+        );
+        // Precondition of the restore, and proof this test exercises it: the
+        // epoch tick and tx_a's certificate DID change the in-place state.
+        assert_ne!(
+            state.epoch, epoch_before,
+            "the epoch tick ran before the rejection"
+        );
+        assert_eq!(
+            ledger_fingerprint(&state).1,
+            before.1,
+            "UTxO undone by the journal"
+        );
+        assert_ne!(
+            ledger_fingerprint(&state).0,
+            before.0,
+            "without the restore the non-UTxO state still holds the partial block"
+        );
+
+        assert!(
+            state.restore_after_failed_apply(&seq),
+            "the seq tip is the ledger tip"
+        );
+        let after = ledger_fingerprint(&state);
+        assert!(
+            after.0 == before.0,
+            "non-UTxO state must be byte-identical to before block 2"
+        );
+        assert_eq!(
+            after.1, before.1,
+            "UTxO set must be identical to before block 2"
+        );
+        assert_eq!(state.epoch, epoch_before);
+
+        // The honest block at the same position — tx_a alone — applies.
+        let mut honest = make_test_block(Era::Conway, next_epoch_slot, 2, 9, 0, vec![tx_a]);
+        honest.header.prev_hash = b1.header.header_hash;
+        state
+            .apply_block_with_delta(&honest, BlockValidationMode::ValidateAll)
+            .expect("the honest successor applies on the restored state");
+        assert!(state.utxo.utxo_set.contains(&TransactionInput {
+            transaction_id: Hash32::from_bytes([0x85u8; 32]),
+            index: 0,
+        }));
+    }
+
+    /// The restore refuses, changing nothing, when the seq's tip is not the
+    /// ledger's tip: the seq cannot describe the pre-block state.
+    #[test]
+    fn test_restore_after_failed_apply_refuses_a_seq_behind_the_ledger() {
+        let sk = spender_key();
+        let mut state = conway_state();
+        seed_utxo(&mut state, txin(0x91), output_to_key(&sk, 10_000_000));
+        let seq = crate::ledger_seq::LedgerSeq::with_defaults(state.clone_without_utxos(), 100);
+        let mut tx = make_simple_tx(
+            0x92,
+            vec![txin(0x91)],
+            vec![make_output(9_800_000)],
+            200_000,
+        );
+        sign_tx(&mut tx, &sk);
+        let b1 = make_test_block(Era::Conway, 1_000, 1, 9, 0, vec![tx]);
+        // Applied but NOT pushed: the seq is one block behind.
+        state
+            .apply_block_with_delta(&b1, BlockValidationMode::ValidateAll)
+            .expect("valid");
+        let before = ledger_fingerprint(&state);
+        assert!(!state.restore_after_failed_apply(&seq));
+        assert!(
+            ledger_fingerprint(&state) == before,
+            "a refused restore changes nothing"
+        );
+    }
+
+    /// Haskell's Alonzo+ LEDGER runs DELEGS/CERTS and GOV only for an
+    /// `IsValid True` transaction, so a certificate an `is_valid = false`
+    /// transaction carries is never checked. A wrong-deposit registration in
+    /// such a tx must not reject the block.
+    #[test]
+    fn test_validate_all_applies_is_valid_false_tx_with_bad_deposit_cert() {
+        let sk = spender_key();
+        let mut state = conway_state();
+        let key_deposit = state.epochs.protocol_params.key_deposit.0;
+        let collateral = TransactionInput {
+            transaction_id: Hash32::from_bytes([0x65u8; 32]),
+            index: 0,
+        };
+        seed_utxo(
+            &mut state,
+            collateral.clone(),
+            output_to_key(&sk, 5_000_000),
+        );
+        let mut tx = make_simple_tx(0x66, vec![collateral.clone()], vec![], 200_000);
+        tx.body.collateral = vec![collateral.clone()];
+        let stake_cred = Credential::VerificationKey(sk.verification_key().hash());
+        tx.body.certificates = vec![Certificate::ConwayStakeRegistration {
+            credential: stake_cred.clone(),
+            deposit: Lovelace(key_deposit + 1),
+        }];
+        tx.is_valid = false;
+        sign_tx(&mut tx, &sk);
+        let block = make_test_block(Era::Conway, 1_000, 1, 9, 0, vec![tx]);
+
+        state
+            .apply_block(&block, BlockValidationMode::ValidateAll)
+            .expect("an is_valid=false tx's certificates are not validated");
+        assert!(
+            !state.utxo.utxo_set.contains(&collateral),
+            "collateral is consumed"
+        );
+        assert!(
+            !state
+                .certs
+                .stake_key_deposits
+                .contains_key(&credential_to_hash(&stake_cred)),
+            "an is_valid=false tx's certificates are not applied"
+        );
+    }
+
+    /// GOVCERT's `isPotentialFutureMember` reads the proposals threaded
+    /// through LEDGERS, so a hot-key authorisation for a member named by an
+    /// UpdateCommittee proposed EARLIER IN THE SAME BLOCK is valid.
+    #[test]
+    fn test_validate_all_same_block_update_committee_then_hot_auth() {
+        let sk = spender_key();
+        let mut params = ProtocolParameters::mainnet_defaults();
+        // UpdateCommittee is not allowed during the PV9 bootstrap phase.
+        params.protocol_version_major = 10;
+        let gov_deposit = params.gov_action_deposit.0;
+        let mut state = LedgerState::new(params);
+        let stake_cred = Credential::VerificationKey(sk.verification_key().hash());
+        state
+            .certs
+            .reward_accounts
+            .insert(credential_to_hash(&stake_cred), Lovelace(0));
+        let return_addr = Address::Reward(dugite_primitives::address::RewardAddress {
+            network: NetworkId::Mainnet,
+            stake: stake_cred.clone(),
+        })
+        .to_bytes();
+
+        let in1 = TransactionInput {
+            transaction_id: Hash32::from_bytes([0x71u8; 32]),
+            index: 0,
+        };
+        let in2 = TransactionInput {
+            transaction_id: Hash32::from_bytes([0x72u8; 32]),
+            index: 0,
+        };
+        seed_utxo(
+            &mut state,
+            in1.clone(),
+            output_to_key(&sk, gov_deposit + 10_000_000),
+        );
+        seed_utxo(&mut state, in2.clone(), output_to_key(&sk, 5_000_000));
+
+        // The new member's cold key: the hot-auth tx needs its witness.
+        let cold_sk = dugite_crypto::keys::PaymentSigningKey::from_bytes(&[0x7Cu8; 32]).unwrap();
+        let cold_cred = Credential::VerificationKey(cold_sk.verification_key().hash());
+
+        let mut tx1 = make_simple_tx(
+            0x73,
+            vec![in1],
+            vec![make_output(10_000_000 - 200_000)],
+            200_000,
+        );
+        tx1.body.proposal_procedures = vec![dugite_primitives::transaction::ProposalProcedure {
+            deposit: Lovelace(gov_deposit),
+            return_addr,
+            gov_action: dugite_primitives::transaction::GovAction::UpdateCommittee {
+                prev_action_id: None,
+                members_to_remove: vec![],
+                members_to_add: [(cold_cred.clone(), 50u64)].into_iter().collect(),
+                threshold: dugite_primitives::transaction::Rational {
+                    numerator: 2,
+                    denominator: 3,
+                },
+            },
+            anchor: dugite_primitives::transaction::Anchor {
+                url: "https://example.com".to_string(),
+                data_hash: Hash32::ZERO,
+            },
+        }];
+        sign_tx(&mut tx1, &sk);
+
+        let mut tx2 = make_simple_tx(
+            0x74,
+            vec![in2],
+            vec![make_output(5_000_000 - 200_000)],
+            200_000,
+        );
+        tx2.body.certificates = vec![Certificate::CommitteeHotAuth {
+            cold_credential: cold_cred.clone(),
+            hot_credential: Credential::VerificationKey(Hash28::from_bytes([0x7Du8; 28])),
+        }];
+        sign_tx(&mut tx2, &sk);
+        sign_tx(&mut tx2, &cold_sk);
+
+        // tx2 alone (the proposal not yet made) is rejected: the member is unknown.
+        let mut alone = state.clone();
+        let only_tx2 = make_test_block(Era::Conway, 1_000, 1, 10, 0, vec![tx2.clone()]);
+        assert!(matches!(
+            alone.apply_block(&only_tx2, BlockValidationMode::ValidateAll),
+            Err(LedgerError::BlockTxValidationFailed { ref errors, .. })
+                if errors.contains("not a current CC member")
+        ));
+
+        let block = make_test_block(Era::Conway, 1_000, 1, 10, 0, vec![tx1, tx2]);
+        state
+            .apply_block(&block, BlockValidationMode::ValidateAll)
+            .expect("a member proposed earlier in the block may authorise a hot key");
+    }
+
+    /// A Phase-2 outcome error must not mask a Phase-1 error in the same tx:
+    /// the `ScriptFailed` tolerance used to short-circuit the whole list.
+    #[test]
+    fn test_confirmed_tx_errors_phase1_is_fatal_even_with_script_failure() {
+        let block = make_test_block(Era::Conway, 1_000, 1, 9, 0, vec![]);
+        let tx = make_simple_tx(0x67, vec![], vec![], 0);
+        let phase1 = || ValidationError::InputNotFound("x#0".to_string());
+        let script = || ValidationError::ScriptFailed("budget".to_string());
+
+        assert!(matches!(
+            reject_or_tolerate_confirmed_tx_errors(&block, &tx, vec![script(), phase1()]),
+            Err(LedgerError::BlockTxValidationFailed { .. })
+        ));
+        assert!(matches!(
+            reject_or_tolerate_confirmed_tx_errors(&block, &tx, vec![phase1()]),
+            Err(LedgerError::BlockTxValidationFailed { .. })
+        ));
+        // Phase-2 tolerances are unchanged by this fix.
+        assert!(reject_or_tolerate_confirmed_tx_errors(&block, &tx, vec![script()]).is_ok());
+        assert!(reject_or_tolerate_confirmed_tx_errors(
+            &block,
+            &tx,
+            vec![ValidationError::Phase2EvalPanic("p".to_string())]
+        )
+        .is_ok());
+        assert!(matches!(
+            reject_or_tolerate_confirmed_tx_errors(
+                &block,
+                &tx,
+                vec![ValidationError::Phase2CollectError("c".to_string())]
+            ),
+            Err(LedgerError::Phase2CollectErrors { .. })
+        ));
     }
 
     #[test]

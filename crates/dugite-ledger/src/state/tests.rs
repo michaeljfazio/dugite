@@ -14161,20 +14161,19 @@ fn make_tx_with_committee_hot_auth(
     }
 }
 
-/// Regression: TreasuryValueMismatch must NOT abort apply_block for confirmed
-/// on-chain blocks.
+/// A Conway tx whose declared `treasury_value` differs from the ledger's
+/// treasury rejects the block in `ValidateAll`, and the ledger's treasury is
+/// not overwritten with the declared value.
 ///
-/// Scenario: our `state.epochs.treasury` is 0, but a Conway block contains a tx with
-/// `treasury_value = 5_000_000_000`.  Prior to the fix, `apply_block` returned
-/// `Err(TreasuryValueMismatch)` and the block's outputs were never inserted.
-/// After the fix, the block applies successfully, the outputs are in the UTxO
-/// set, and `state.epochs.treasury` is updated to the declared value.
+/// Haskell Conway LEDGER compares the declared value with the treasury at
+/// block entry and fails `ConwayTreasuryValueMismatch`; a LEDGER failure
+/// makes the block invalid (`applyBlockEither`). Before #678 dugite copied the
+/// declared value into its own treasury, which hid treasury drift.
 ///
-/// The treasury check only fires in `ValidateAll` mode (at-tip validation),
-/// not in `ApplyOnly` mode (bulk replay).  This test uses `ValidateAll` to
-/// reproduce the exact failure path from slot 107229218.
+/// The check runs only in `ValidateAll`; `ApplyOnly` re-applies already
+/// validated blocks and runs no predicates.
 #[test]
-fn test_treasury_mismatch_does_not_abort_apply_block() {
+fn test_treasury_mismatch_rejects_block_in_validate_all() {
     let mut params = ProtocolParameters::mainnet_defaults();
     // Conway (protocol >= 9) so that the treasury check fires.
     params.protocol_version_major = 9;
@@ -14212,7 +14211,7 @@ fn test_treasury_mismatch_does_not_abort_apply_block() {
     let result = state.apply_block(&block, BlockValidationMode::ValidateAll);
     assert!(
         matches!(result, Err(LedgerError::BlockTxValidationFailed { ref errors, .. })
-            if errors.contains("MismatchedTreasuryValue")),
+            if errors.contains("Treasury value mismatch")),
         "ValidateAll must reject treasury mismatch (no silent correction) per #678; \
          got: {result:?}"
     );
@@ -14224,16 +14223,11 @@ fn test_treasury_mismatch_does_not_abort_apply_block() {
     );
 }
 
-/// Regression: cascading InputNotFound after TreasuryValueMismatch.
-///
-/// Block A: tx_a has treasury_value mismatch → pre-fix: apply_block aborts,
-///   outputs of tx_a never inserted.
-/// Block B (next): tx_b spends tx_a's output → pre-fix: InputNotFound
-///   (cascade failure), node forks from network.
-///
-/// After the fix: tx_a's output is inserted normally, tx_b succeeds.
+/// A block rejected for a treasury mismatch inserts none of its outputs: a
+/// later block that spends one must fail with a missing input, exactly as it
+/// would on a node that never saw the rejected block.
 #[test]
-fn test_treasury_mismatch_no_cascade_in_downstream_block() {
+fn test_treasury_mismatch_rejected_block_inserts_no_outputs() {
     let mut params = ProtocolParameters::mainnet_defaults();
     params.protocol_version_major = 9;
     let mut state = LedgerState::new(params);
@@ -14264,7 +14258,7 @@ fn test_treasury_mismatch_no_cascade_in_downstream_block() {
     let result_a = state.apply_block(&block_a, BlockValidationMode::ValidateAll);
     assert!(
         matches!(result_a, Err(LedgerError::BlockTxValidationFailed { ref errors, .. })
-            if errors.contains("MismatchedTreasuryValue")),
+            if errors.contains("Treasury value mismatch")),
         "Block A must be rejected on treasury mismatch (no silent correction); \
          got: {result_a:?}"
     );
@@ -14276,32 +14270,30 @@ fn test_treasury_mismatch_no_cascade_in_downstream_block() {
         !state.utxo.utxo_set.contains(&output_a),
         "output_a must NOT be in UTxO set when Block A is rejected"
     );
-
-    // The "no cascade" property is preserved because Block A doesn't apply
-    // at all — there's nothing to cascade from. Downstream blocks that
-    // reference rejected outputs would correctly fail Phase-1 InputNotFound.
 }
 
-/// Regression: UnelectedCommitteeMember must NOT abort apply_block for
-/// confirmed on-chain blocks.
+/// A CommitteeHotAuth for a cold credential that is neither a current nor a
+/// potential future committee member rejects the block in `ValidateAll`.
 ///
-/// Scenario: a Conway block contains a CommitteeHotAuth cert for a cold
-/// credential that is NOT in our committee_expiration map (i.e. our committee
-/// state is stale).  Prior to the fix, apply_block returned
-/// `Err(UnelectedCommitteeMember)` and the block's outputs were never inserted.
-/// After the fix, the block applies successfully and outputs are in the UTxO set.
+/// Haskell GOVCERT (`Cardano.Ledger.Conway.Rules.GovCert`,
+/// `checkAndOverwriteCommitteeMemberState`):
+/// `isCurrentMember || isPotentialFutureMember ?! (injectFailure .
+/// ConwayCommitteeIsUnknown) coldCred`, and a LEDGER predicate failure makes
+/// the whole block invalid (`applyBlockEither`). This used to be logged and
+/// the tx applied ("committee state may be stale; trusting on-chain
+/// consensus"), which let a block producer put an unknown-member hot-key
+/// authorisation into dugite's ledger that every Haskell node refuses.
 #[test]
-fn test_unelected_committee_member_does_not_abort_apply_block() {
+fn test_unelected_committee_member_rejects_block_in_validate_all() {
     let mut params = ProtocolParameters::mainnet_defaults();
     params.protocol_version_major = 9;
     let mut state = LedgerState::new(params);
 
-    // Ensure the cold credential is NOT in committee_expiration (stale state).
+    // governance has no committee and no UpdateCommittee proposal, so the
+    // cold credential is neither a current nor a potential future member.
     let cold_cred = Credential::VerificationKey(Hash28::from_bytes([0xD0u8; 28]));
     let hot_cred = Credential::VerificationKey(Hash28::from_bytes([0xD1u8; 28]));
-    // governance.committee_expiration is empty by default for a new LedgerState.
 
-    // Seed input UTxO.
     let seed_input = TransactionInput {
         transaction_id: Hash32::from_bytes([0xD2u8; 32]),
         index: 0,
@@ -14313,97 +14305,31 @@ fn test_unelected_committee_member_does_not_abort_apply_block() {
 
     let tx = make_tx_with_committee_hot_auth(
         0xD3,
-        vec![seed_input],
+        vec![seed_input.clone()],
         vec![make_lovelace_output(9_800_000)],
         cold_cred,
         hot_cred,
     );
-
     let block = make_test_block(2000, 200, Hash32::ZERO, vec![tx]);
 
-    // Use ValidateAll — this is the mode that triggers the committee check
-    // and was the exact code path that caused the cascade failure.
-    state
-        .apply_block(&block, BlockValidationMode::ValidateAll)
-        .expect("UnelectedCommitteeMember must not abort apply_block for confirmed blocks");
-
-    // Block output MUST be in UTxO set.
+    let result = state.apply_block(&block, BlockValidationMode::ValidateAll);
+    assert!(
+        matches!(result, Err(LedgerError::BlockTxValidationFailed { ref errors, .. })
+            if errors.contains("not a current CC member")),
+        "ValidateAll must reject a CommitteeHotAuth for an unknown cold credential; \
+         got: {result:?}"
+    );
     let produced = TransactionInput {
         transaction_id: Hash32::from_bytes([0xD3u8; 32]),
         index: 0,
     };
     assert!(
-        state.utxo.utxo_set.contains(&produced),
-        "Block output must be inserted despite unelected committee member cert"
+        !state.utxo.utxo_set.contains(&produced),
+        "a rejected block's outputs must not be inserted"
     );
-}
-
-/// Regression: cascading InputNotFound after UnelectedCommitteeMember.
-///
-/// Block A: tx_a has an UnelectedCommitteeMember cert → pre-fix: abort, outputs
-///   never inserted.
-/// Block B (next): tx_b spends tx_a's output → pre-fix: InputNotFound.
-///
-/// After the fix: tx_a's output is inserted normally, tx_b succeeds.
-#[test]
-fn test_unelected_committee_member_no_cascade_in_downstream_block() {
-    let mut params = ProtocolParameters::mainnet_defaults();
-    params.protocol_version_major = 9;
-    let mut state = LedgerState::new(params);
-
-    let cold_cred = Credential::VerificationKey(Hash28::from_bytes([0xE0u8; 28]));
-    let hot_cred = Credential::VerificationKey(Hash28::from_bytes([0xE1u8; 28]));
-
-    // Seed input for Block A.
-    let seed_input = TransactionInput {
-        transaction_id: Hash32::from_bytes([0xE2u8; 32]),
-        index: 0,
-    };
-    state
-        .utxo
-        .utxo_set
-        .insert(seed_input.clone(), make_lovelace_output(10_000_000));
-
-    // Block A: CommitteeHotAuth for un-elected cold credential.
-    // Use ValidateAll to trigger the committee check (ApplyOnly skips it).
-    let tx_a = make_tx_with_committee_hot_auth(
-        0xE3,
-        vec![seed_input],
-        vec![make_lovelace_output(9_800_000)],
-        cold_cred,
-        hot_cred,
-    );
-    let block_a = make_test_block(2000, 200, Hash32::ZERO, vec![tx_a]);
-    state
-        .apply_block(&block_a, BlockValidationMode::ValidateAll)
-        .expect("Block A must apply despite unelected committee member cert");
-
-    let output_a = TransactionInput {
-        transaction_id: Hash32::from_bytes([0xE3u8; 32]),
-        index: 0,
-    };
     assert!(
-        state.utxo.utxo_set.contains(&output_a),
-        "output_a must be in UTxO set after Block A"
-    );
-
-    // Block B: spend output_a.
-    let block_a_hash = Hash32::from_bytes([200u8; 32]);
-    let tx_b = make_simple_tx(
-        0xE4,
-        vec![output_a.clone()],
-        vec![make_lovelace_output(9_600_000)],
-    );
-    let block_b = make_test_block(2001, 201, block_a_hash, vec![tx_b]);
-    state
-        .apply_block(&block_b, BlockValidationMode::ApplyOnly)
-        .expect(
-        "Block B must apply — output_a must be visible (no cascade from unelected committee cert)",
-    );
-
-    assert!(
-        !state.utxo.utxo_set.contains(&output_a),
-        "output_a must be consumed by Block B"
+        state.utxo.utxo_set.contains(&seed_input),
+        "a rejected block must not spend its inputs"
     );
 }
 
@@ -18858,11 +18784,9 @@ fn drep_absent_from_the_frozen_registry_is_not_expired() {
 //   Shelley/Rules/Utxo.hs L410-L423   validateTimeToLive: `ttl >= slot`
 //   Allegra/Scripts.hs    L502-L509   inInterval:         `slot < invalidHereafter`
 // `apply_block(ValidateAll)` validates every peer block through
-// `validate_transaction_with_context`. Until Phase-1 failures are block-fatal
-// the verdict only reaches the caller as the "Phase-1 validation divergence"
-// warning, so the test captures that log line: it is the observable output of
-// the production path today, and the assertion keeps its meaning once the
-// failure becomes an `Err`.
+// `validate_transaction_with_context`, and a Phase-1 failure rejects the block
+// with `LedgerError::BlockTxValidationFailed`. The helper accepts the verdict
+// from that `Err` (or from a captured log line).
 
 /// Collects everything the subscriber writes.
 #[derive(Clone, Default)]
@@ -18959,9 +18883,8 @@ fn test_apply_block_allegra_ttl_equal_to_slot_is_expired() {
 // (Core/TxCert.hs L151-154, reached from Shelley/TxCert.hs L596 and
 // Conway/TxCert.hs L795) plus the owners (Shelley/UTxO.hs L237-244).
 // `apply_block(ValidateAll)` validates every peer block through
-// `validate_transaction_with_context`. Phase-1 failures are not yet block-fatal,
-// so the verdict reaches the caller as the "Phase-1 validation divergence"
-// warning; capture it as the observable output of the production path.
+// `validate_transaction_with_context`; a Phase-1 failure rejects the block, so
+// the tests assert on the `Err` it returns.
 
 fn make_pool_params_for_witness_test(operator: Hash28, owner: Hash28) -> PoolParams {
     PoolParams {
@@ -18985,12 +18908,13 @@ fn make_pool_params_for_witness_test(operator: Hash28, owner: Hash28) -> PoolPar
 }
 
 /// Apply a block carrying one RE-registration of an existing pool, signed by
-/// the seeds in `signers`. Returns the operator key hash and the captured log.
+/// the seeds in `signers`, in `ValidateAll`. Returns the operator key hash, the
+/// captured log and the apply result.
 fn apply_pool_reregistration(
     operator_seed: u8,
     owner_seed: u8,
     signers: &[u8],
-) -> (Hash28, String) {
+) -> (Hash28, String, Result<(), crate::state::LedgerError>) {
     let key = |seed: u8| {
         let sk = dugite_crypto::keys::PaymentSigningKey::from_bytes(&[seed; 32]).unwrap();
         let hash = sk.verification_key().hash();
@@ -19053,31 +18977,37 @@ fn apply_pool_reregistration(
         .with_ansi(false)
         .with_max_level(tracing::Level::WARN)
         .finish();
-    let _ = tracing::subscriber::with_default(subscriber, || {
+    let result = tracing::subscriber::with_default(subscriber, || {
         state.apply_block(&block, BlockValidationMode::ValidateAll)
     });
     let logs = String::from_utf8(capture.0.lock().unwrap().clone()).unwrap();
-    (operator, logs)
+    (operator, logs, result)
 }
 
 #[test]
-fn test_apply_block_pool_reregistration_without_operator_witness_is_reported() {
-    // Owner signs, operator does not.
-    let (operator, logs) = apply_pool_reregistration(0xF2, 0xF3, &[0xF3]);
+fn test_apply_block_pool_reregistration_without_operator_witness_rejects_the_block() {
+    // Owner signs, operator does not. A missing witness is a Phase-1 failure,
+    // so the peer block is rejected, naming the operator key.
+    let (operator, logs, result) = apply_pool_reregistration(0xF2, 0xF3, &[0xF3]);
+    let err =
+        result.expect_err("a re-registration without the operator witness must reject the block");
     assert!(
-        logs.contains(&format!(
+        err.to_string().contains(&format!(
             "Missing VKey witness for certificate credential: {}",
             operator.to_hex()
         )),
-        "a re-registration without the operator witness must be flagged for the \
-         operator key {}; log was:\n{logs}",
+        "the rejection must name the operator key {}; error was {err}; log was:\n{logs}",
         operator.to_hex()
     );
 }
 
 #[test]
 fn test_apply_block_pool_reregistration_with_operator_witness_is_not_flagged() {
-    let (_, logs) = apply_pool_reregistration(0xF2, 0xF3, &[0xF2, 0xF3]);
+    let (_, logs, result) = apply_pool_reregistration(0xF2, 0xF3, &[0xF2, 0xF3]);
+    assert!(
+        result.is_ok(),
+        "operator + owner both signed; the block must apply: {result:?}"
+    );
     assert!(
         !logs.contains("Missing VKey witness for certificate credential"),
         "operator + owner both signed; no certificate witness may be reported missing; \
