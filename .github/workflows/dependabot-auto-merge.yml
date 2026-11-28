@@ -1,12 +1,16 @@
 name: Dependabot auto-merge
 
-# Turns on auto-merge for Dependabot semver-PATCH updates. GitHub then merges
-# the PR only after the required checks of the `require-ci` ruleset pass, so
-# this workflow decides WHICH PRs may merge unattended, never WHEN.
+# Turns on auto-merge for a narrow class of Dependabot updates. GitHub then
+# merges the PR only after the required checks of the `require-ci` ruleset
+# pass, so this workflow decides WHICH PRs may merge unattended, never WHEN.
 #
-# Minor and major bumps, and every update to a crate on a consensus or crypto
-# path, stay open for a human review: a patch release there can still change
-# bytes on the wire or an arithmetic result.
+# The check FAILS CLOSED. Auto-merge is enabled only when ALL of these hold:
+#   * the update is a cargo semver-PATCH update;
+#   * the PR changes Cargo.lock and nothing else;
+#   * every crate whose version moves in Cargo.lock is on ALLOW below.
+# Anything else, including a diff this script cannot read, stays open for a
+# human review. A deny-list would let every crate nobody thought of through;
+# consensus, crypto, CBOR and big-integer crates must never be in ALLOW.
 
 on: pull_request
 
@@ -24,20 +28,47 @@ jobs:
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Enable auto-merge for safe patch updates
-        if: steps.meta.outputs.update-type == 'version-update:semver-patch'
+      - name: Enable auto-merge for allow-listed patch updates
+        if: >-
+          steps.meta.outputs.update-type == 'version-update:semver-patch' &&
+          steps.meta.outputs.package-ecosystem == 'cargo'
         env:
-          DEPS: ${{ steps.meta.outputs.dependency-names }}
           PR_URL: ${{ github.event.pull_request.html_url }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          # Crates whose behaviour reaches consensus, signatures, hashing,
-          # CBOR or big-integer arithmetic. Review these by hand.
-          REVIEW='^(ed25519-dalek|curve25519-dalek|ed25519|blake2|blake2b_simd|sha2|sha3|vrf_dalek|kes-summed-ed25519|minicbor|ciborium|num-bigint|num-rational|num-integer|dashu.*|bech32|cddl)$'
-          for dep in $(echo "$DEPS" | tr ',' ' '); do
-            if echo "$dep" | grep -qE "$REVIEW"; then
-              echo "$dep needs a manual review; not enabling auto-merge."
+          set -euo pipefail
+          # Crates with no path into consensus, wire formats, signatures,
+          # hashing or arithmetic. Add to this list only after that check.
+          ALLOW='^(anyhow|thiserror|thiserror-impl|chrono|sysinfo|clap|clap_builder|clap_derive|clap_lex|indicatif|console|ratatui|crossterm|tempfile|criterion|proptest|insta)$'
+
+          files=$(gh pr diff "$PR_URL" --name-only)
+          if [ "$files" != "Cargo.lock" ]; then
+            echo "PR changes more than Cargo.lock; manual review: $files"
+            exit 0
+          fi
+
+          diff=$(gh pr diff "$PR_URL")
+          # A package added to or removed from the lockfile has its name on a
+          # +/- line, which the context-line match below would not see.
+          if printf '%s\n' "$diff" | grep -qE '^[-+]name = '; then
+            echo "Lockfile adds or removes a package; manual review."
+            exit 0
+          fi
+
+          # Crates whose version line changes in the lockfile diff.
+          moved=$(printf '%s\n' "$diff" \
+            | grep -B1 -E '^[-+]version = ' \
+            | sed -n 's/^ name = "\(.*\)"$/\1/p' | sort -u)
+          if [ -z "$moved" ]; then
+            echo "Could not read which crates moved; manual review."
+            exit 0
+          fi
+          for crate in $moved; do
+            if ! printf '%s\n' "$crate" | grep -qE "$ALLOW"; then
+              echo "$crate is not on the allow-list; manual review."
               exit 0
             fi
           done
+
+          echo "Allow-listed patch update ($(echo $moved)); enabling auto-merge."
           gh pr merge --auto --squash "$PR_URL"
