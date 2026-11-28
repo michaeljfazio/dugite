@@ -306,7 +306,15 @@ fn is_registered(ledger: &LedgerState, x: &Signer) -> bool {
 fn ledger_with_registered_drep(
     x: &Signer,
 ) -> (LedgerState, UtxoSet, TransactionInput, u64, Hash32) {
-    let (mut ledger, _) = ledger_at(10);
+    ledger_with_registered_drep_at(x, 10)
+}
+
+/// As [`ledger_with_registered_drep`], at protocol version `pv`.
+fn ledger_with_registered_drep_at(
+    x: &Signer,
+    pv: u64,
+) -> (LedgerState, UtxoSet, TransactionInput, u64, Hash32) {
+    let (mut ledger, _) = ledger_at(pv);
     let tx1 = tx_with(
         0x11,
         seed_input(),
@@ -605,5 +613,121 @@ fn wrong_refund_on_an_in_tx_registered_drep_is_flagged_by_apply_block() {
     assert!(
         flagged,
         "ValidateAll must flag the wrong refund; result {result:?}, warns {warns:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// The delegatee check reads the evolving registry (Deleg.hs L215-226)
+// ---------------------------------------------------------------------------
+
+fn vote_delegation(d: &Signer, x: &Signer) -> Certificate {
+    Certificate::VoteDelegation {
+        credential: d.cred(),
+        drep: DRep::KeyHash(x.cred().to_typed_hash32()),
+    }
+}
+
+fn register_delegator(ledger: &mut LedgerState, d: &Signer) {
+    ledger
+        .certs
+        .reward_accounts
+        .insert(d.cred().to_typed_hash32(), Lovelace(0));
+}
+
+fn is_delegatee_missing(e: &ValidationError) -> bool {
+    matches!(e, ValidationError::DelegateeDRepNotRegistered { .. })
+}
+
+/// `[RegDRep X, VoteDelegation d -> X]`: X is in `vsDRepsL` when the
+/// delegation is checked, so Haskell accepts it. A check that reads only the
+/// pre-tx registry rejects it.
+#[test]
+fn vote_delegation_to_a_drep_registered_earlier_in_the_tx_is_accepted() {
+    let x = Signer::new(0x5D);
+    let d = Signer::new(0x5E);
+    let (mut ledger, utxo) = ledger_at(10);
+    register_delegator(&mut ledger, &d);
+    let tx = tx_with(
+        0x2D,
+        seed_input(),
+        10_000_000,
+        vec![reg(&x), vote_delegation(&d, &x)],
+        DEP_I64,
+        &[&x, &d],
+    );
+    let errors = mempool_errors(&ledger, &utxo, &tx);
+    assert!(
+        errors.is_empty(),
+        "[RegDRep X, VoteDelegation->X] is valid in Haskell; mempool got {errors:?}"
+    );
+    let (result, warns) = apply_single_tx_block(&mut ledger, tx, 1, Hash32::ZERO);
+    assert!(result.is_ok(), "ValidateAll must accept it: {result:?}");
+    assert!(
+        warns.is_empty(),
+        "apply_block must not log a Phase-1 failure for this tx; got {warns:?}"
+    );
+}
+
+const DEP_I64: i64 = DREP_DEPOSIT as i64;
+
+/// `[UnRegDRep X, VoteDelegation d -> X]` with X registered before the tx:
+/// X is gone when the delegation is checked, so a PV10 node rejects it with
+/// `DelegateeDRepNotRegisteredDELEG`. A check that reads only the pre-tx
+/// registry accepts it.
+#[test]
+fn vote_delegation_to_a_drep_unregistered_earlier_in_the_tx_is_rejected_at_pv10() {
+    let x = Signer::new(0x5F);
+    let d = Signer::new(0x60);
+    let (mut ledger, utxo, out, amount, prev) = ledger_with_registered_drep(&x);
+    register_delegator(&mut ledger, &d);
+    let tx = tx_with(
+        0x2E,
+        out,
+        amount,
+        vec![unreg(&x, DREP_DEPOSIT), vote_delegation(&d, &x)],
+        -DEP_I64,
+        &[&x, &d],
+    );
+    let errors = mempool_errors(&ledger, &utxo, &tx);
+    assert!(
+        has(&errors, is_delegatee_missing),
+        "PV10 must raise DelegateeDRepNotRegistered; mempool got {errors:?}"
+    );
+    let (result, warns) = apply_single_tx_block(&mut ledger, tx, 2, prev);
+    assert!(
+        result.is_err()
+            || warns
+                .iter()
+                .any(|l| l.contains("DelegateeDRepNotRegistered")),
+        "ValidateAll must flag it; result {result:?}, warns {warns:?}"
+    );
+}
+
+/// The same sequence at PV9 (Conway bootstrap): `checkDRepRegistered` is
+/// skipped (`unless (hardforkConwayBootstrapPhase pv)`), so the tx is valid.
+#[test]
+fn the_same_vote_delegation_is_accepted_at_pv9() {
+    let x = Signer::new(0x5F);
+    let d = Signer::new(0x60);
+    let (mut ledger, utxo, out, amount, prev) = ledger_with_registered_drep_at(&x, 9);
+    register_delegator(&mut ledger, &d);
+    let tx = tx_with(
+        0x2F,
+        out,
+        amount,
+        vec![unreg(&x, DREP_DEPOSIT), vote_delegation(&d, &x)],
+        -DEP_I64,
+        &[&x, &d],
+    );
+    let errors = mempool_errors(&ledger, &utxo, &tx);
+    assert!(
+        errors.is_empty(),
+        "PV9 skips the delegatee check; mempool got {errors:?}"
+    );
+    let (result, warns) = apply_single_tx_block(&mut ledger, tx, 2, prev);
+    assert!(result.is_ok(), "ValidateAll must accept it: {result:?}");
+    assert!(
+        warns.is_empty(),
+        "apply_block must not log a Phase-1 failure for this tx; got {warns:?}"
     );
 }
