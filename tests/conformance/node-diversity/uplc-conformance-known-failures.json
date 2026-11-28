@@ -1,0 +1,618 @@
+{
+ "comment": "Vectors of the pinned uplc-conformance corpus that dugite currently fails, with the outcome the runner observes and the issue that tracks each. ndc_uplc_conformance.rs fails on a new failure, on a listed vector that now passes, and on a changed outcome; edit this file in the same change as the fix or the pin that moves it.",
+ "failures": [
+  {
+   "id": "builtin_constant_array_emptyarray_v3",
+   "protocol_version": "11.0",
+   "plutus_version": "V3",
+   "issue": 1127,
+   "observed_evaluation": "parse/decode error",
+   "observed_budget": null
+  },
+  {
+   "id": "builtin_constant_array_simplearray_v3",
+   "protocol_version": "11.0",
+   "plutus_version": "V3",
+   "issue": 1127,
+   "observed_evaluation": "parse/decode error",
+   "observed_budget": null
+  },
+  {
+   "id": "builtin_constant_array_unitarray_v3",
+   "protocol_version": "11.0",
+   "plutus_version": "V3",
+   "issue": 1127,
+   "observed_evaluation": "parse/decode error",
+   "observed_budget": null
+  },
+  {
+   "id": "builtin_semantics_indexarray_index_2pow64_plus_one_v3",
+   "protocol_version": "11.0",
+   "plutus_version": "V3",
+   "issue": 1127,
+   "observed_evaluation": "parse/decode error",
+   "observed_budget": null
+  },
+  {
+   "id": "builtin_semantics_indexarray_index_beyond_i128_v3",
+   "protocol_version": "11.0",
+   "plutus_version": "V3",
+   "issue": 1127,
+   "observed_evaluation": "parse/decode error",
+   "observed_budget": null
+  },
+  {
+   "id": "builtin_semantics_indexarray_indexarray_01_v3",
+   "protocol_version": "11.0",
+   "plutus_version": "V3",
+   "issue": 1127,
+   "observed_evaluation": "parse/decode error",
+   "observed_budget": null
+  },
+  {
+   "id": "builtin_semantics_indexarray_indexarray_02_v3",
+   "protocol_version": "11.0",
+   "plutus_version": "V3",
+   "issue": 1127,
+   "observed_evaluation": "parse/decode error",
+   "observed_budget": null
+  },
+  {
+   "id": "builtin_semantics_indexarray_indexarray_03_v3",
+   "protocol_version": "11.0",
+   "plutus_version": "V3",
+   "issue": 1127,
+   "observed_evaluation": "parse/decode error",
+   "observed_budget": null
+  },
+  {
+   "id": "builtin_semantics_indexarray_negative_index_beyond_i128_v3",
+   "protocol_version": "11.0",
+   "plutus_version": "V3",
+   "issue": 1127,
+   "observed_evaluation": "parse/decode error",
+   "observed_budget": null
+  },
+  {
+   "id": "builtin_semantics_insertcoin_key_too_long_1_v3",
+   "protocol_version": "11.0",
+   "plutus_version": "V3",
+   "issue": 1127,
+   "observed_evaluation": "parse/decode error",
+   "observed_budget": null
+  },
+  {
+   "id": "builtin_semantics_insertcoin_key_too_long_2_v3",
+   "protocol_version": "11.0",
+   "plutus_version": "V3",
+   "issue": 1127,
+   "observed_evaluation": "parse/decode error",
+   "observed_budget": null
+  },
+  {
+   "id": "builtin_semantics_insertcoin_long_key_zero_1_v3",
+   "protocol_version": "11.0",
+   "plutus_version": "V3",
+   "issue": 1127,
+   "observed_evaluation": "parse/decode error",
+   "observed_budget": null
+  },
+  {
+   "id": "builtin_semantics_insertcoin_long_key_zero_2_v3",
+   "protocol_version": "11.0",
+   "plutus_version": "V3",
+   "issue": 1127,
+   "observed_evaluation": "parse/decode error",
+   "observed_budget": null
+  },
+  {
+   "id": "builtin_semantics_insertcoin_multi_ccy_empty_v3",
+   "protocol_version": "11.0",
+   "plutus_version": "V3",
+   "issue": 1127,
+   "observed_evaluation": "parse/decode error",
+   "observed_budget": null
+  },
+  {
+   "id": "builtin_semantics_insertcoin_multi_ccy_nonempty_v3",
+   "protocol_version": "11.0",
+   "plutus_version": "V3",
+   "issue": 1127,
+   "observed_evaluation": "parse/decode error",
+   "observed_budget": null
+  },
+  {
+   "id": "builtin_semantics_insertcoin_multi_token_v3",
+   "protocol_version": "11.0",
+   "plutus_version": "V3",
+   "issue": 1127,
+   "observed_evaluation": "parse/decode error",
+   "observed_budget": null
+  },
+  {
+   "id": "builtin_semantics_insertcoin_negative_empty_v3",
+   "protocol_version": "11.0",
+   "plutus_version": "V3",
+   "issue": 1127,
+   "observed_evaluation": "parse/decode error",
+   "observed_budget": null
+  },
+  {
+   "id": "builtin_semantics_insertcoin_no_overflow_v3",
+   "protocol_version": "11.0",
+   "plutus_version": "V3",
+   "issue": 1127,
+   "observed_evaluation": "parse/decode error",
+   "observed_budget": null
+  },
+  {
+   "id": "builtin_semantics_insertcoin_no_underflow_v3",
+   "protocol_version": "11.0",
+   "plutus_version": "V3",
+   "issue": 1127,
+   "observed_evaluation": "parse/decode error",
+   "observed_budget": null
+  },
+  {
+   "id": "builtin_semantics_insertcoin_overflow_v3",
+   "protocol_version": "11.0",
+   "plutus_version": "V3",
+   "issue": 1127,
+   "observed_evaluation": "parse/decode error",
+   "observed_budget": null
+  },
+  {
+   "id": "builtin_semantics_insertcoin_positive_empty_v3",
+   "protocol_version": "11.0",
+   "plutus_version": "V3",
+   "issue": 1127,
+   "observed_evaluation": "parse/decode error",
+   "observed_budget": null
+  },
+  {
+   "id": "builtin_semantics_insertcoin_positive_nonempty_v3",
+   "protocol_version": "11.0",
+   "plutus_version": "V3",
+   "issue": 1127,
+   "observed_evaluation": "parse/decode error",
+   "observed_budget": null
+  },
+  {
+   "id": "builtin_semantics_insertcoin_underflow_v3",
+   "protocol_version": "11.0",
+   "plutus_version": "V3",
+   "issue": 1127,
+   "observed_evaluation": "parse/decode error",
+   "observed_budget": null
+  },
+  {
+   "id": "builtin_semantics_insertcoin_zero_positive_v3",
+   "protocol_version": "11.0",
+   "plutus_version": "V3",
+   "issue": 1127,
+   "observed_evaluation": "parse/decode error",
+   "observed_budget": null
+  },
+  {
+   "id": "builtin_semantics_lengthofarray_lengthofarray_01_v3",
+   "protocol_version": "11.0",
+   "plutus_version": "V3",
+   "issue": 1127,
+   "observed_evaluation": "parse/decode error",
+   "observed_budget": null
+  },
+  {
+   "id": "builtin_semantics_lengthofarray_lengthofarray_02_v3",
+   "protocol_version": "11.0",
+   "plutus_version": "V3",
+   "issue": 1127,
+   "observed_evaluation": "parse/decode error",
+   "observed_budget": null
+  },
+  {
+   "id": "builtin_semantics_lookupcoin_absent_v3",
+   "protocol_version": "11.0",
+   "plutus_version": "V3",
+   "issue": 1127,
+   "observed_evaluation": "parse/decode error",
+   "observed_budget": null
+  },
+  {
+   "id": "builtin_semantics_lookupcoin_present_v3",
+   "protocol_version": "11.0",
+   "plutus_version": "V3",
+   "issue": 1127,
+   "observed_evaluation": "parse/decode error",
+   "observed_budget": null
+  },
+  {
+   "id": "builtin_semantics_rotatebytestring_negative_rotate_beyond_int64_pv10_v3",
+   "protocol_version": "10.0",
+   "plutus_version": "V3",
+   "issue": 1129,
+   "observed_evaluation": "evaluation failure",
+   "observed_budget": null
+  },
+  {
+   "id": "builtin_semantics_rotatebytestring_rotate_beyond_int64_pv10_v3",
+   "protocol_version": "10.0",
+   "plutus_version": "V3",
+   "issue": 1129,
+   "observed_evaluation": "evaluation failure",
+   "observed_budget": null
+  },
+  {
+   "id": "builtin_semantics_scalevalue_by_neg_v3",
+   "protocol_version": "11.0",
+   "plutus_version": "V3",
+   "issue": 1127,
+   "observed_evaluation": "parse/decode error",
+   "observed_budget": null
+  },
+  {
+   "id": "builtin_semantics_scalevalue_by_pos_v3",
+   "protocol_version": "11.0",
+   "plutus_version": "V3",
+   "issue": 1127,
+   "observed_evaluation": "parse/decode error",
+   "observed_budget": null
+  },
+  {
+   "id": "builtin_semantics_scalevalue_by_zero_v3",
+   "protocol_version": "11.0",
+   "plutus_version": "V3",
+   "issue": 1127,
+   "observed_evaluation": "parse/decode error",
+   "observed_budget": null
+  },
+  {
+   "id": "builtin_semantics_scalevalue_no_overflow_v3",
+   "protocol_version": "11.0",
+   "plutus_version": "V3",
+   "issue": 1127,
+   "observed_evaluation": "parse/decode error",
+   "observed_budget": null
+  },
+  {
+   "id": "builtin_semantics_scalevalue_no_underflow_v3",
+   "protocol_version": "11.0",
+   "plutus_version": "V3",
+   "issue": 1127,
+   "observed_evaluation": "parse/decode error",
+   "observed_budget": null
+  },
+  {
+   "id": "builtin_semantics_scalevalue_overflow_v3",
+   "protocol_version": "11.0",
+   "plutus_version": "V3",
+   "issue": 1127,
+   "observed_evaluation": "parse/decode error",
+   "observed_budget": null
+  },
+  {
+   "id": "builtin_semantics_scalevalue_underflow_v3",
+   "protocol_version": "11.0",
+   "plutus_version": "V3",
+   "issue": 1127,
+   "observed_evaluation": "parse/decode error",
+   "observed_budget": null
+  },
+  {
+   "id": "builtin_semantics_shiftbytestring_negative_shift_beyond_int64_pv10_v3",
+   "protocol_version": "10.0",
+   "plutus_version": "V3",
+   "issue": 1129,
+   "observed_evaluation": "evaluation failure",
+   "observed_budget": null
+  },
+  {
+   "id": "builtin_semantics_shiftbytestring_shift_beyond_int64_pv10_v3",
+   "protocol_version": "10.0",
+   "plutus_version": "V3",
+   "issue": 1129,
+   "observed_evaluation": "evaluation failure",
+   "observed_budget": null
+  },
+  {
+   "id": "builtin_semantics_unionvalue_cancel_01_v3",
+   "protocol_version": "11.0",
+   "plutus_version": "V3",
+   "issue": 1127,
+   "observed_evaluation": "parse/decode error",
+   "observed_budget": null
+  },
+  {
+   "id": "builtin_semantics_unionvalue_cancel_02_v3",
+   "protocol_version": "11.0",
+   "plutus_version": "V3",
+   "issue": 1127,
+   "observed_evaluation": "parse/decode error",
+   "observed_budget": null
+  },
+  {
+   "id": "builtin_semantics_unionvalue_combine_v3",
+   "protocol_version": "11.0",
+   "plutus_version": "V3",
+   "issue": 1127,
+   "observed_evaluation": "parse/decode error",
+   "observed_budget": null
+  },
+  {
+   "id": "builtin_semantics_unionvalue_no_overflow_v3",
+   "protocol_version": "11.0",
+   "plutus_version": "V3",
+   "issue": 1127,
+   "observed_evaluation": "parse/decode error",
+   "observed_budget": null
+  },
+  {
+   "id": "builtin_semantics_unionvalue_no_underflow_v3",
+   "protocol_version": "11.0",
+   "plutus_version": "V3",
+   "issue": 1127,
+   "observed_evaluation": "parse/decode error",
+   "observed_budget": null
+  },
+  {
+   "id": "builtin_semantics_unionvalue_overflow_v3",
+   "protocol_version": "11.0",
+   "plutus_version": "V3",
+   "issue": 1127,
+   "observed_evaluation": "parse/decode error",
+   "observed_budget": null
+  },
+  {
+   "id": "builtin_semantics_unionvalue_underflow_v3",
+   "protocol_version": "11.0",
+   "plutus_version": "V3",
+   "issue": 1127,
+   "observed_evaluation": "parse/decode error",
+   "observed_budget": null
+  },
+  {
+   "id": "builtin_semantics_unionvalue_unitl_v3",
+   "protocol_version": "11.0",
+   "plutus_version": "V3",
+   "issue": 1127,
+   "observed_evaluation": "parse/decode error",
+   "observed_budget": null
+  },
+  {
+   "id": "builtin_semantics_unionvalue_unitr_v3",
+   "protocol_version": "11.0",
+   "plutus_version": "V3",
+   "issue": 1127,
+   "observed_evaluation": "parse/decode error",
+   "observed_budget": null
+  },
+  {
+   "id": "builtin_semantics_valuecontains_ccy_missing_v3",
+   "protocol_version": "11.0",
+   "plutus_version": "V3",
+   "issue": 1127,
+   "observed_evaluation": "parse/decode error",
+   "observed_budget": null
+  },
+  {
+   "id": "builtin_semantics_valuecontains_multi_insufficient_v3",
+   "protocol_version": "11.0",
+   "plutus_version": "V3",
+   "issue": 1127,
+   "observed_evaluation": "parse/decode error",
+   "observed_budget": null
+  },
+  {
+   "id": "builtin_semantics_valuecontains_multi_sufficient_v3",
+   "protocol_version": "11.0",
+   "plutus_version": "V3",
+   "issue": 1127,
+   "observed_evaluation": "parse/decode error",
+   "observed_budget": null
+  },
+  {
+   "id": "builtin_semantics_valuecontains_neg_empty_v3",
+   "protocol_version": "11.0",
+   "plutus_version": "V3",
+   "issue": 1127,
+   "observed_evaluation": "parse/decode error",
+   "observed_budget": null
+  },
+  {
+   "id": "builtin_semantics_valuecontains_neg_neg_eq_v3",
+   "protocol_version": "11.0",
+   "plutus_version": "V3",
+   "issue": 1127,
+   "observed_evaluation": "parse/decode error",
+   "observed_budget": null
+  },
+  {
+   "id": "builtin_semantics_valuecontains_neg_neg_gt_v3",
+   "protocol_version": "11.0",
+   "plutus_version": "V3",
+   "issue": 1127,
+   "observed_evaluation": "parse/decode error",
+   "observed_budget": null
+  },
+  {
+   "id": "builtin_semantics_valuecontains_neg_neg_lt_v3",
+   "protocol_version": "11.0",
+   "plutus_version": "V3",
+   "issue": 1127,
+   "observed_evaluation": "parse/decode error",
+   "observed_budget": null
+  },
+  {
+   "id": "builtin_semantics_valuecontains_neg_pos_v3",
+   "protocol_version": "11.0",
+   "plutus_version": "V3",
+   "issue": 1127,
+   "observed_evaluation": "parse/decode error",
+   "observed_budget": null
+  },
+  {
+   "id": "builtin_semantics_valuecontains_pos_empty_v3",
+   "protocol_version": "11.0",
+   "plutus_version": "V3",
+   "issue": 1127,
+   "observed_evaluation": "parse/decode error",
+   "observed_budget": null
+  },
+  {
+   "id": "builtin_semantics_valuecontains_pos_neg_v3",
+   "protocol_version": "11.0",
+   "plutus_version": "V3",
+   "issue": 1127,
+   "observed_evaluation": "parse/decode error",
+   "observed_budget": null
+  },
+  {
+   "id": "builtin_semantics_valuecontains_reflexive_v3",
+   "protocol_version": "11.0",
+   "plutus_version": "V3",
+   "issue": 1127,
+   "observed_evaluation": "parse/decode error",
+   "observed_budget": null
+  },
+  {
+   "id": "builtin_semantics_valuecontains_token_missing_v3",
+   "protocol_version": "11.0",
+   "plutus_version": "V3",
+   "issue": 1127,
+   "observed_evaluation": "parse/decode error",
+   "observed_budget": null
+  },
+  {
+   "id": "builtin_semantics_valuedata_empty_v3",
+   "protocol_version": "11.0",
+   "plutus_version": "V3",
+   "issue": 1127,
+   "observed_evaluation": "parse/decode error",
+   "observed_budget": null
+  },
+  {
+   "id": "builtin_semantics_valuedata_multi_currency_v3",
+   "protocol_version": "11.0",
+   "plutus_version": "V3",
+   "issue": 1127,
+   "observed_evaluation": "parse/decode error",
+   "observed_budget": null
+  },
+  {
+   "id": "builtin_semantics_valuedata_multi_token_v3",
+   "protocol_version": "11.0",
+   "plutus_version": "V3",
+   "issue": 1127,
+   "observed_evaluation": "parse/decode error",
+   "observed_budget": null
+  },
+  {
+   "id": "builtin_semantics_valuedata_negative_quantity_v3",
+   "protocol_version": "11.0",
+   "plutus_version": "V3",
+   "issue": 1127,
+   "observed_evaluation": "parse/decode error",
+   "observed_budget": null
+  },
+  {
+   "id": "builtin_semantics_valuedata_roundtrip_from_value_v3",
+   "protocol_version": "11.0",
+   "plutus_version": "V3",
+   "issue": 1127,
+   "observed_evaluation": "parse/decode error",
+   "observed_budget": null
+  },
+  {
+   "id": "builtin_semantics_valuedata_single_entry_v3",
+   "protocol_version": "11.0",
+   "plutus_version": "V3",
+   "issue": 1127,
+   "observed_evaluation": "parse/decode error",
+   "observed_budget": null
+  },
+  {
+   "id": "program_version_1_0_1_v3",
+   "protocol_version": "11.0",
+   "plutus_version": "V3",
+   "issue": 1128,
+   "observed_evaluation": "(program 1.0.1 (con unit ()))",
+   "observed_budget": {
+    "cpu": 16100,
+    "mem": 200
+   }
+  },
+  {
+   "id": "program_version_1_1_0_before_pv11_v1",
+   "protocol_version": "10.0",
+   "plutus_version": "V1",
+   "issue": 1128,
+   "observed_evaluation": "(program 1.1.0 (con unit ()))",
+   "observed_budget": {
+    "cpu": 16100,
+    "mem": 200
+   }
+  },
+  {
+   "id": "program_version_1_1_0_before_pv11_v2",
+   "protocol_version": "10.0",
+   "plutus_version": "V2",
+   "issue": 1128,
+   "observed_evaluation": "(program 1.1.0 (con unit ()))",
+   "observed_budget": {
+    "cpu": 16100,
+    "mem": 200
+   }
+  },
+  {
+   "id": "program_version_1_2_0_v3",
+   "protocol_version": "11.0",
+   "plutus_version": "V3",
+   "issue": 1128,
+   "observed_evaluation": "(program 1.2.0 (con unit ()))",
+   "observed_budget": {
+    "cpu": 16100,
+    "mem": 200
+   }
+  },
+  {
+   "id": "program_version_2_0_0_v1",
+   "protocol_version": "11.0",
+   "plutus_version": "V1",
+   "issue": 1128,
+   "observed_evaluation": "(program 2.0.0 (con unit ()))",
+   "observed_budget": {
+    "cpu": 16100,
+    "mem": 200
+   }
+  },
+  {
+   "id": "program_version_2_0_0_v3",
+   "protocol_version": "10.0",
+   "plutus_version": "V3",
+   "issue": 1128,
+   "observed_evaluation": "(program 2.0.0 (con unit ()))",
+   "observed_budget": {
+    "cpu": 16100,
+    "mem": 200
+   }
+  },
+  {
+   "id": "program_version_2_0_0_v3",
+   "protocol_version": "11.0",
+   "plutus_version": "V3",
+   "issue": 1128,
+   "observed_evaluation": "(program 2.0.0 (con unit ()))",
+   "observed_budget": {
+    "cpu": 16100,
+    "mem": 200
+   }
+  },
+  {
+   "id": "term_constr_constr_07_v3",
+   "protocol_version": "11.0",
+   "plutus_version": "V3",
+   "issue": 1130,
+   "observed_evaluation": "evaluation failure",
+   "observed_budget": null
+  }
+ ]
+}
