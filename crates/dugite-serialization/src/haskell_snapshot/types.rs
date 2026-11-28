@@ -19,6 +19,29 @@ pub struct HaskellLedgerState {
     pub praos_state: HaskellPraosState,
 }
 
+/// One entry of an inline Haskell `UTxO` map: the `TxIn` and the era's MemPack
+/// `TxOut` bytes (still undecoded — see
+/// [`crate::mempack::txout::decode_mempack_txout`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HaskellUtxoEntry {
+    pub txid: Hash32,
+    pub txix: u64,
+    pub txout_mempack: Vec<u8>,
+}
+
+/// A decoded bare `LedgerState = [CertState, UTxOState]`: everything the LEDGER
+/// rule reads and writes.
+#[derive(Debug)]
+pub struct HaskellBareLedgerState {
+    pub cert_state: HaskellCertState,
+    pub utxo: Vec<HaskellUtxoEntry>,
+    pub deposited: u64,
+    pub fees: u64,
+    pub gov_state: HaskellGovState,
+    pub instant_stake: HashMap<(u8, Hash28), u64>,
+    pub donation: u64,
+}
+
 /// NewEpochState fields extracted from the CBOR.
 #[derive(Debug)]
 pub struct HaskellNewEpochState {

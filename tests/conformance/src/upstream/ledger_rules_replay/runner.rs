@@ -1,40 +1,28 @@
-//! Runner: decode checks on ImpSpec vectors.  No ledger rule is applied.
+//! Runner: validate the ImpSpec vectors that are NOT replayed through the ledger.
 //!
-//! For each vector the runner dispatches on the `rule` field derived from the
-//! directory name and decodes what the vector carries:
+//! LEDGER and NEWEPOCH are applied and compared by [`replay`](super::replay).
+//! This module covers the rest, and only DECODES the signal:
 //!
-//! - **ConwayNEWEPOCH** (and any `*NEWEPOCH*` rule): reads the initial epoch
-//!   number from `st_cbor[0]` and the signal epoch number from `sig_cbor`,
-//!   then checks `signal_epoch > initial_epoch`.  When `st_out_cbor` exists,
-//!   its epoch must equal the signal (Haskell's output against its own input;
-//!   no Dugite epoch transition runs).
+//! - **UTXO** (and any `*UTXO*` rule): decodes the signal as a transaction with
+//!   `dugite_serialization::decode_transaction`.
 //!
-//! - **ConwayUTXO** (and any `*UTXO*` rule), and LEDGER: calls
-//!   `dugite_serialization::decode_transaction(era_id, sig_cbor)` on the
-//!   signal file and returns `Failed` if it errors.  The transaction is not
-//!   validated or applied.
+//! - **POOL / CERT / CERTS / DELEG / GOVCERT / GOV / ENACT / RATIFY**
+//!   (the ExecSpecRule rules, whose states are not a `NewEpochState`):
+//!   structural shape decode of the native STS signal — verifies the CBOR
+//!   layout without executing a rule.
 //!
-//! - **POOL / CERT / CERTS / DELEG / GOVCERT / GOV / ENACT / RATIFY**:
-//!   structural shape decode of the native STS signal; verifies the CBOR
-//!   layout only.
+//! - **Unknown rules**: `Skipped`.
 //!
-//! - **Unknown rules**: returns `Skipped` (no check available).
-//!
-//! ## Not done here
-//!
-//! Applying the rule to the initial state and comparing the result with
-//! `st_out` would need a `LedgerState` bridge for the `arr[7]` NewEpochState
-//! encoding.  That does not exist, so no check in this file exercises Dugite's
-//! ledger.
+//! The ExecSpecRule rules stay decode-only until their states get a bridge of
+//! their own.
 
 use dugite_serialization::decode_transaction;
 
 use crate::upstream::ledger_rules_replay::{
     bridge::{
         decode_cert_signal, decode_certs_signal_count, decode_deleg_signal,
-        decode_enact_signal_shape, decode_epoch_no, decode_gov_signal_shape, decode_govcert_signal,
-        decode_initial_epoch_no, decode_new_epoch_state, decode_pool_signal,
-        decode_ratify_signal_count,
+        decode_enact_signal_shape, decode_gov_signal_shape, decode_govcert_signal,
+        decode_pool_signal, decode_ratify_signal_count,
     },
     vector::ImpVector,
 };
@@ -42,27 +30,6 @@ use crate::upstream::ledger_rules_replay::{
 /// Outcome of validating one ImpSpec vector.
 #[derive(Debug)]
 pub enum RunOutcome {
-    /// NEWEPOCH decode checks passed: signal_epoch > initial_epoch (and the
-    /// vector's own `st_out` epoch equals the signal, when present).
-    NewEpochValidated {
-        initial_epoch: u64,
-        signal_epoch: u64,
-        /// Initial treasury (lovelace) from AccountState, or `None` if
-        /// structural decode of the full NewEpochState failed.
-        treasury: Option<u64>,
-        /// Initial reserves (lovelace) from AccountState.
-        reserves: Option<u64>,
-        /// UTxO entry count from the initial LedgerState.
-        utxo_count: Option<u64>,
-        /// PoolDistr entry count from field[5] of the initial NewEpochState.
-        pool_count: Option<u64>,
-        /// Whether the Haskell expected final state (`st_out_cbor`) was present
-        /// and its epoch number was successfully verified against the signal.
-        ///
-        /// `true`  — `st_out_cbor` was present and the final epoch matched the signal.
-        /// `false` — `st_out_cbor` was absent (synthetic fixture or rejected transition).
-        final_state_validated: bool,
-    },
     /// UTXO signal decoded successfully as a transaction.
     UtxoDecoded { era_id: u16, tx_bytes: usize },
     /// Native STS signal decoded (non-Tx rule: POOL, CERT, CERTS, DELEG, GOVCERT, GOV, ENACT, RATIFY).
@@ -115,8 +82,7 @@ fn era_id_from_rule(rule: &str) -> u16 {
 /// - ENACT   → EnactSignal    — enactment signal, NOT a full Tx
 /// - RATIFY  → RatifySignal   — ratification signal, NOT a full Tx
 fn is_tx_signal_rule(rule: &str) -> bool {
-    let upper = rule.to_uppercase();
-    upper.contains("LEDGER") || upper.contains("UTXO")
+    rule.to_uppercase().contains("UTXO")
 }
 
 /// Identify native STS signal rules (non-Tx, non-NEWEPOCH rules).
@@ -158,16 +124,19 @@ fn is_native_sig_rule(rule: &str) -> Option<&'static str> {
     None
 }
 
-/// Run the decode checks for `vec`'s rule and return the outcome.  No ledger
-/// rule is applied.
+/// Validate `vec` according to its rule and return the outcome.
 ///
 /// The `era_id` used for tx decoding is derived from the rule name prefix.
 pub fn run_vector(vec: &ImpVector) -> RunOutcome {
     let rule = vec.rule.as_str();
-    let upper = rule.to_uppercase();
 
-    if upper.contains("NEWEPOCH") {
-        run_newepoch(vec)
+    if super::replay::rule_kind(rule).is_some() {
+        RunOutcome::Failed {
+            detail: format!(
+                "rule '{rule}' is applied and compared by `replay::replay_vector`, \
+                 not decoded by the runner"
+            ),
+        }
     } else if is_tx_signal_rule(rule) {
         run_tx_signal(vec)
     } else if let Some(rule_type) = is_native_sig_rule(rule) {
@@ -193,104 +162,7 @@ pub fn run_vector(vec: &ImpVector) -> RunOutcome {
     }
 }
 
-/// Validate a NEWEPOCH vector.
-///
-/// Gating invariant: `signal_epoch > initial_epoch`.
-///
-/// The signal for NEWEPOCH is a bare CBOR u64 (target epoch number).
-/// The initial epoch number is field [0] of the NewEpochState `array(7)`.
-///
-/// When `st_out_cbor` is present (real Haskell-generated vectors), the
-/// final state epoch (field [0] of the post-transition NewEpochState) is
-/// decoded and verified to equal `signal_epoch`.  A mismatch fails the test.
-///
-/// Additionally, `decode_new_epoch_state` is called on the initial state blob
-/// to extract treasury + reserves from `AccountState`.  A failure here is
-/// non-fatal — only the epoch-invariant is gating.
-fn run_newepoch(vec: &ImpVector) -> RunOutcome {
-    let initial_epoch = match decode_initial_epoch_no(&vec.st_cbor) {
-        Ok(n) => n,
-        Err(e) => {
-            return RunOutcome::Failed {
-                detail: format!("st_cbor decode (initial epoch_no): {e}"),
-            }
-        }
-    };
-
-    let signal_epoch = match decode_epoch_no(&vec.sig_cbor) {
-        Ok(n) => n,
-        Err(e) => {
-            return RunOutcome::Failed {
-                detail: format!("sig_cbor decode (signal epoch_no): {e}"),
-            }
-        }
-    };
-
-    if signal_epoch <= initial_epoch {
-        // Conway NEWEPOCH: when signal <= nesEL, Haskell returns the same state
-        // (no-op transition). This is a valid STS outcome. Skip rather than fail:
-        // Dugite's runner only validates advancing transitions for now.
-        return RunOutcome::Skipped {
-            reason: format!(
-                "NEWEPOCH no-op: signal_epoch ({signal_epoch}) \
-                 <= initial_epoch ({initial_epoch}) — valid Haskell no-op, not yet validated"
-            ),
-        };
-    }
-
-    // Best-effort: decode the full initial NewEpochState for diagnostic fields.
-    // Failure here is non-fatal — the epoch-invariant is the gating check.
-    let (treasury, reserves, utxo_count, pool_count) = match decode_new_epoch_state(&vec.st_cbor) {
-        Ok(nes) => (
-            Some(nes.treasury),
-            Some(nes.reserves),
-            nes.ledger_state.utxo_count,
-            Some(nes.pool_distr_count),
-        ),
-        Err(e) => {
-            eprintln!("[ledger-rules] WARN decode_new_epoch_state (non-fatal): {e}");
-            (None, None, None, None)
-        }
-    };
-
-    // Gating check: if Haskell's expected final state is present, verify that
-    // its epoch number (field[0] of the post-transition NewEpochState) equals
-    // the signal epoch.  This validates that the STS rule advanced the epoch
-    // counter correctly.
-    let mut final_state_validated = false;
-    if let Some(st_out) = &vec.st_out_cbor {
-        match decode_initial_epoch_no(st_out) {
-            Ok(final_epoch) => {
-                if final_epoch != signal_epoch {
-                    return RunOutcome::Failed {
-                        detail: format!(
-                            "Final state epoch ({final_epoch}) != signal epoch ({signal_epoch}): \
-                             Haskell's post-transition NewEpochState[0] must equal the signal"
-                        ),
-                    };
-                }
-                final_state_validated = true;
-            }
-            Err(e) => {
-                return RunOutcome::Failed {
-                    detail: format!("Could not decode final state epoch from st_out_cbor: {e}"),
-                };
-            }
-        }
-    }
-
-    RunOutcome::NewEpochValidated {
-        initial_epoch,
-        signal_epoch,
-        treasury,
-        reserves,
-        utxo_count,
-        pool_count,
-        final_state_validated,
-    }
-}
-
-/// Decode a UTXO/LEDGER vector's signal as a transaction (decode only).
+/// Validate a UTXO vector by decoding the signal as a transaction.
 fn run_tx_signal(vec: &ImpVector) -> RunOutcome {
     let era_id = era_id_from_rule(&vec.rule);
     match decode_transaction(era_id, &vec.sig_cbor) {

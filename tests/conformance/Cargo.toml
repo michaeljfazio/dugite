@@ -8,7 +8,7 @@ build = "build.rs"
 [dependencies]
 dugite-primitives = { workspace = true }
 dugite-crypto = { workspace = true }
-dugite-serialization = { workspace = true }
+dugite-serialization = { workspace = true, features = ["conformance-rules"] }
 dugite-ledger = { workspace = true }
 # ledger-rules runner (#1125): the SAME rejection conversion and ApplyTxErr encoder the node uses,
 # and the era history the node builds its per-tx horizon from.
@@ -47,6 +47,9 @@ upstream-conformance = ["dep:cddl"]
 tempfile = { workspace = true }
 # ledger-rules: the oracle (cardano-node) report ships zstd-compressed in the NDC checkout.
 zstd = { workspace = true }
+# The cbor-decoding no-reuse audit parses the sources of the two serialization crates.
+syn = { version = "2", features = ["full"] }
+quote = "1"
 
 [[test]]
 name = "upstream_tests"
