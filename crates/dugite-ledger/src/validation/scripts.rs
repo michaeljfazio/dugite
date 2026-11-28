@@ -1106,7 +1106,7 @@ pub(super) fn check_extraneous_script_witnesses(
 /// - PlutusV1: PV >= 5 (Alonzo)
 /// - PlutusV2: PV >= 7 (Babbage)
 /// - PlutusV3: PV >= 9 (Conway)
-pub(super) fn check_malformed_script_witnesses(
+pub(crate) fn check_malformed_script_witnesses(
     tx: &Transaction,
     params: &ProtocolParameters,
     errors: &mut Vec<ValidationError>,
