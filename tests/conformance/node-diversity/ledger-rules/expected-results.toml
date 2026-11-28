@@ -28,8 +28,8 @@ issue = 1160
 id = "00052"
 expected = "BadInputsUTxO"
 observed = "pass"
-class = "ledger-rules: rules hidden behind the indefinite-map decode refusal that would still diverge (shadow run)"
-issue = 1160
+class = "ledger: collateral inputs missing from the UTxO are not reported as BadInputsUTxO unless the tx has Plutus scripts"
+issue = 1222
 
 [[entry]]
 id = "00055"
@@ -147,8 +147,8 @@ issue = 1180
 id = "00149"
 expected = "InvalidPrevGovActionId"
 observed = "pass"
-class = "ledger-rules: rules hidden behind the indefinite-map decode refusal that would still diverge (shadow run)"
-issue = 1160
+class = "ledger: InvalidPrevGovActionId accepts a parent of a different governance purpose (in-flight or earlier in the same tx)"
+issue = 1223
 
 [[entry]]
 id = "00167"

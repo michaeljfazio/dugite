@@ -1,8 +1,19 @@
 //! Block-path decode conformance against the r2rationality `cardano-cbor-dataset`
 //! (the corpus pinned in `tests/conformance/node-diversity/corpora.toml`).
 //!
-//! The dataset classifies every sample by what the Haskell node decoder does with it:
-//! `valid` / `manual-valid` decode, `invalid-zap-*` / `manual-invalid` are refused.  This
+//! The dataset classifies every sample by what ITS pinned Haskell decoder does with it:
+//! `valid` / `manual-valid` decode, `invalid-zap-*` / `manual-invalid` are refused.  The
+//! dataset Dockerfile pins cardano-ledger `6176e413`, which is NEWER than the `f649f975` of
+//! cardano-node 11.1.3, so the classification is not the node's in two known places:
+//!
+//! * `header` and `header_body`: the dataset marks 34 and 23 indefinite samples valid, but
+//!   they are invalid for 11.1.3, where the Praos header is `RecD` (see #1224);
+//! * `auxiliary_data_array`: the dataset classifies it with the non-annotator decoder, not
+//!   the transaction-path one (see the #1169 comment).
+//!
+//! A future corpus bump must be checked against these deltas and must not push the decoders
+//! the wrong way (these tests only drive `block`, `transaction`, `babbage_transaction_output`,
+//! `data` and `network_id`; the header is covered by `recd_definite_only.rs`).  This
 //! test drives the samples through the REAL dugite entry points the node uses
 //! (`decode_block`, `decode_block_minimal`, `decode_transaction`, `decode_transaction_output`)
 //! and requires the same verdict.

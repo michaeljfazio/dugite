@@ -206,8 +206,9 @@ impl<'b> Reader<'b> {
     ///     unless isBreak $ cborError $ DecoderErrorCustom name "Excess terms in array"
     /// ```
     ///
-    /// `RecD`, `Summands`/`decodeRecordSum` and `CBORGroup` all go through it, so
-    /// every fixed-shape record built from them accepts both array forms. An
+    /// `Summands`/`decodeRecordSum`, `CBORGroup` and the hand-written `decodeRecordNamed` records
+    /// go through it, so every fixed-shape record built from them accepts both array forms
+    /// (`RecD` does NOT: see [`read_definite_record_header`](Self::read_definite_record_header)). An
     /// indefinite array with FEWER than `n` elements fails inside the field
     /// decoders (the break byte is not a valid field); one with MORE fails in
     /// `close_record`. Records Haskell decodes with an explicit
@@ -240,8 +241,10 @@ impl<'b> Reader<'b> {
     /// `ifDecoderVersionAtLeast (natVersion @12) decodeExUnits $ decode $ RecD ...`) and accept
     /// the indefinite form; dugite keeps the definite-only rule until Dijkstra is live.
     ///
-    /// (Unverified and deliberately not modelled: by that reading Haskell below v12 would
-    /// also accept `9f ff <fields>`; dugite rejects it.)
+    /// Verified against `Coders.hs:482` and `Decoder.hs:700-708`: the break is read right after
+    /// the head and the fields afterwards, so Haskell below v12 ACCEPTS `9f ff <fields>` for
+    /// these types. dugite rejects it (a structural walk sees `[]` followed by stray items);
+    /// tracked in #1221, which needs a span-based walker and is out of scope for this reader.
     ///
     /// Types affected: the Mary value pair, `ExUnits`, `Prices`, `GovActionId`,
     /// `VotingProcedure`, `ProposalProcedure`, `Constitution`, `Anchor`, and the Praos header
