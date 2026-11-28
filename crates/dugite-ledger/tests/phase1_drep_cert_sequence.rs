@@ -437,6 +437,37 @@ fn unreg_then_reg_of_a_registered_drep_is_accepted_by_apply_block() {
     );
 }
 
+/// The shape of two preview transactions that cardano-node accepted and the
+/// Phase-1 block rejection made dugite reject before the left-to-right fix:
+/// 8d5726c0e7cb207a3f5881d29a7ceba71f578c2165a2261340c242bdba6875dd (block
+/// 2,495,228, slot 60,004,300) and
+/// 6d10f35a99ffc1c828f89df316a0f07177d8b4fd601920594c882bad3014c26e (block
+/// 2,498,928, slot 60,104,754). Each is certificate 0 `UnRegDRep X`,
+/// certificate 1 `RegDRep X`, with X registered. Both PVs a Conway block can
+/// carry are covered: under ValidateAll the block must apply.
+#[test]
+fn preview_unreg_then_reg_blocks_apply_at_pv9_and_pv10() {
+    for (pv, seed) in [(9u64, 0x61u8), (10, 0x62)] {
+        let x = Signer::new(seed);
+        let (mut ledger, _utxo, out, amount, prev) = ledger_with_registered_drep_at(&x, pv);
+        let tx = tx_with(
+            seed,
+            out,
+            amount,
+            vec![unreg(&x, DREP_DEPOSIT), reg(&x)],
+            0,
+            &[&x],
+        );
+        let (result, warns) = apply_single_tx_block(&mut ledger, tx, 2, prev);
+        assert!(result.is_ok(), "pv{pv}: the block must apply: {result:?}");
+        assert!(
+            warns.is_empty(),
+            "pv{pv}: no Phase-1 failure logged: {warns:?}"
+        );
+        assert!(is_registered(&ledger, &x), "pv{pv}: X ends registered");
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Negative controls: Haskell rejects these, dugite must keep rejecting
 // ---------------------------------------------------------------------------

@@ -18911,12 +18911,13 @@ fn make_pool_params_for_witness_test(operator: Hash28, owner: Hash28) -> PoolPar
 }
 
 /// Apply a block carrying one RE-registration of an existing pool, signed by
-/// the seeds in `signers`. Returns the operator key hash and the captured log.
+/// the seeds in `signers`, in `ValidateAll`. Returns the operator key hash, the
+/// captured log and the apply result.
 fn apply_pool_reregistration(
     operator_seed: u8,
     owner_seed: u8,
     signers: &[u8],
-) -> (Hash28, String) {
+) -> (Hash28, String, Result<(), crate::state::LedgerError>) {
     let key = |seed: u8| {
         let sk = dugite_crypto::keys::PaymentSigningKey::from_bytes(&[seed; 32]).unwrap();
         let hash = sk.verification_key().hash();
@@ -18979,31 +18980,37 @@ fn apply_pool_reregistration(
         .with_ansi(false)
         .with_max_level(tracing::Level::WARN)
         .finish();
-    let _ = tracing::subscriber::with_default(subscriber, || {
+    let result = tracing::subscriber::with_default(subscriber, || {
         state.apply_block(&block, BlockValidationMode::ValidateAll)
     });
     let logs = String::from_utf8(capture.0.lock().unwrap().clone()).unwrap();
-    (operator, logs)
+    (operator, logs, result)
 }
 
 #[test]
-fn test_apply_block_pool_reregistration_without_operator_witness_is_reported() {
-    // Owner signs, operator does not.
-    let (operator, logs) = apply_pool_reregistration(0xF2, 0xF3, &[0xF3]);
+fn test_apply_block_pool_reregistration_without_operator_witness_rejects_the_block() {
+    // Owner signs, operator does not. A missing witness is a Phase-1 failure,
+    // so the peer block is rejected, naming the operator key.
+    let (operator, logs, result) = apply_pool_reregistration(0xF2, 0xF3, &[0xF3]);
+    let err =
+        result.expect_err("a re-registration without the operator witness must reject the block");
     assert!(
-        logs.contains(&format!(
+        err.to_string().contains(&format!(
             "Missing VKey witness for certificate credential: {}",
             operator.to_hex()
         )),
-        "a re-registration without the operator witness must be flagged for the \
-         operator key {}; log was:\n{logs}",
+        "the rejection must name the operator key {}; error was {err}; log was:\n{logs}",
         operator.to_hex()
     );
 }
 
 #[test]
 fn test_apply_block_pool_reregistration_with_operator_witness_is_not_flagged() {
-    let (_, logs) = apply_pool_reregistration(0xF2, 0xF3, &[0xF2, 0xF3]);
+    let (_, logs, result) = apply_pool_reregistration(0xF2, 0xF3, &[0xF2, 0xF3]);
+    assert!(
+        result.is_ok(),
+        "operator + owner both signed; the block must apply: {result:?}"
+    );
     assert!(
         !logs.contains("Missing VKey witness for certificate credential"),
         "operator + owner both signed; no certificate witness may be reported missing; \
