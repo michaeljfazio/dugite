@@ -1812,6 +1812,56 @@ mod tests {
         }
     }
 
+    /// The semantics variant comes from the SCRIPT's language and the block's protocol version:
+    /// `consByteString 256` wraps (lenient `fromIntegral`) for PlutusV2 and fails (strict `Word8`
+    /// range check) for PlutusV3. Forcing one variant for both makes one of the two assertions
+    /// fail, which is what bounds `run_cek`'s variant selection.
+    #[test]
+    fn gated_evaluation_selects_the_semantics_variant_from_language_and_pv() {
+        let cons = Program {
+            version: ver(1, 0, 0),
+            term: Term::App(
+                Rc::new(Term::App(
+                    Rc::new(Term::Builtin(crate::term::BuiltinId::ConsByteString)),
+                    Rc::new(Term::Const(Constant::Integer(BigInt::from(256)))),
+                )),
+                Rc::new(Term::Const(Constant::ByteString(vec![]))),
+            ),
+        };
+        let bytes = cons.to_cbor().unwrap();
+        let v2_models = CostModels {
+            plutus_v2: Some(vec![1; 332]),
+            ..CostModels::default()
+        };
+        let v3_models = CostModels {
+            plutus_v3: Some(vec![1; 350]),
+            ..CostModels::default()
+        };
+        let lenient = eval_script_bytes_gated(
+            &bytes,
+            ScriptLanguage::PlutusV2,
+            8,
+            &v2_models,
+            big_budget(),
+        )
+        .expect("PlutusV2 consByteString wraps 256 to 0");
+        assert!(matches!(
+            lenient.value,
+            crate::machine::Value::Const(Constant::ByteString(ref b)) if b == &[0u8]
+        ));
+        let strict = eval_script_bytes_gated(
+            &bytes,
+            ScriptLanguage::PlutusV3,
+            10,
+            &v3_models,
+            big_budget(),
+        );
+        assert!(
+            matches!(strict, Err(ProgramEvalError::Eval { .. })),
+            "PlutusV3 consByteString 256 must fail: {strict:?}"
+        );
+    }
+
     /// The cost model is resolved before the bytes are even looked at: undecodable bytes with
     /// no usable model are a cost-model refusal, never a (scorable) decode failure.
     #[test]
