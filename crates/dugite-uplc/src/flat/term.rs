@@ -2393,7 +2393,12 @@ mod tests {
                 (ScriptLanguage::PlutusV4, 12),
             ] {
                 for pv in from..=12 {
-                    for v in [ver(1, 0, 0), ver(1, 1, 0)] {
+                    // Only versions the program-version gate allows here, so a
+                    // rejection can only come from the constant.
+                    for v in [ver(1, 0, 0), ver(1, 1, 0)]
+                        .into_iter()
+                        .filter(|v| plc_version_available_in(v, lang, pv))
+                    {
                         validate_program_availability(t, &v, lang, pv).unwrap_or_else(|e| {
                             panic!("{lang:?} at PV{pv} must accept {t:?}: {e:?}")
                         });
