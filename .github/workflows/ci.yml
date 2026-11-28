@@ -158,6 +158,68 @@ jobs:
           token: ${{ secrets.CODECOV_TOKEN }}
           fail_ci_if_error: false
 
+  # The node-diversity `ledger-rules` strict gate (#1125, Phase 2b of #1114).
+  #
+  # Runs the 368 shared phase-one fixtures through dugite's own validation path and names every
+  # failure from the ApplyTxErr BYTES the node would send.  Every fixture must match, except the
+  # entries of tests/conformance/node-diversity/ledger-rules/expected-results.toml, each tied to an
+  # open issue.  The gate fails on an unknown divergence, on an entry that now matches, on an entry
+  # whose observed result changed, and on a change to the committed raised-failure snapshot.
+  #
+  # The corpora are pinned in tests/conformance/node-diversity/corpora.toml and verified by the
+  # fetch script (commit / SHA-256); a pin that does not verify fails this job.  Making this a
+  # REQUIRED status check is a branch-protection setting, not something a workflow can do.
+  ledger-rules-gate:
+    name: Node-diversity ledger-rules gate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install protoc
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@1.97.0
+
+      - name: Cache cargo registry and build
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target/debug
+          key: ${{ runner.os }}-cargo-ledger-rules-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-ledger-rules-
+            ${{ runner.os }}-cargo-conformance-
+
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@nextest
+
+      # Verifies every pin: NDC and Amaru by commit, the fixtures against Amaru's, the three
+      # protocol-parameter files NDC lacks by SHA-256.
+      - name: Fetch and verify the ledger-rules corpus
+        run: scripts/node-diversity/fetch-corpora.sh ledger-rules
+
+      - name: Every expected-results entry names an open issue
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: scripts/node-diversity/check-expected-issues.sh
+
+      - name: Run the ledger-rules gate and its red-proofs
+        env:
+          DUGITE_NDC_REQUIRE: "1"
+        run: cargo nextest run -p dugite-conformance --test ndc_ledger_rules --profile ci --no-tests=fail
+
+      - name: Write the ledger-rules report
+        env:
+          DUGITE_NDC_REQUIRE: "1"
+          DUGITE_NDC_REPORT: ${{ github.workspace }}/target/node-diversity/reports/ledger-rules.json
+        run: |
+          cargo nextest run -p dugite-conformance --test ndc_reports --no-tests=fail \
+            -E 'test(=ndc_report_ledger_rules)'
+          cat "$DUGITE_NDC_REPORT.status.json"
+
   coverage:
     runs-on: ubuntu-latest
     steps:

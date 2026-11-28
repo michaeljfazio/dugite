@@ -82,6 +82,10 @@ fn generate(
             run,
         );
     }
+    if scenario == Scenario::LedgerRules {
+        // Phase 2b (#1125): the real runner.
+        return dugite_conformance::node_diversity::ledger_rules::report::generate(pins, run);
+    }
     if scenario == Scenario::UplcConformance {
         return generate_uplc_conformance(run);
     }

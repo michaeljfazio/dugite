@@ -12,6 +12,7 @@ The runners themselves are Phases 2a-2d.
 | Report envelopes, writer, schema validation | `tests/conformance/src/node_diversity/` |
 | Runners and harness tests | `tests/conformance/tests/ndc_reports.rs` |
 | Score with NDC's own builder | `scripts/node-diversity/score-reports.sh` |
+| `ledger-rules` runner and strict gate (#1125) | `ledger-rules/README.md`, `just ndc-gate` |
 | Recipes | `just ndc-fetch`, `ndc-report <scenario>`, `ndc-reports`, `ndc-score`, `ndc-selftest` |
 
 ```sh
@@ -179,14 +180,14 @@ version and Plutus language is used, with the scenario's 10B CPU / 14M MEM.
   decoder arm that says it is "not yet wired" are reported as `evaluator panic`,
   `evaluator internal error` and `decoder not yet wired`; no expectation names them, so they never score,
   and a run that produces one writes an `error` report and fails. (A decoder that simply lacks a case
-  and says "unknown ..." is a `parse/decode error`; #1127 tracks 62 of those.)
+  and says "unknown ..." is a `parse/decode error`.)
 
-**What the 990 mean** (as pinned; `just ndc-score`): 703 vectors pass on the full textual result and
-budget; 287 pass on the class alone (218 `evaluation failure`, 62 `parse/decode error`, 7
+**What the 1052 mean** (as pinned; `just ndc-score`): 746 vectors pass on the full textual result and
+budget; 306 pass on the class alone (237 `evaluation failure`, 62 `parse/decode error`, 7
 `out of budget`), where nothing but the class is compared. Of the 62 `parse/decode error` passes, 58 are
-the text parser rejecting a `.uplc` and 4 are the flat decoder. The 74 failures are pinned in
-`uplc-conformance-known-failures.json` with the observed outcome and the issue tracking each (#1127,
-#1128, #1129, #1130); `ndc_uplc_conformance.rs` fails on a new failure, on a listed vector that now
+the text parser rejecting a `.uplc` and 4 are the flat decoder. The 12 failures are pinned in
+`uplc-conformance-known-failures.json` with the observed outcome and the issue tracking each (#1128,
+#1129, #1130); `ndc_uplc_conformance.rs` fails on a new failure, on a listed vector that now
 passes, and on a changed outcome. Reporting itself never fails on a score.
 
 **What cannot go red.** Mutation checks against this corpus show the protocol version handed to the
