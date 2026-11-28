@@ -228,7 +228,8 @@ pub fn decode_wrapped_block_header(
         2 => era_shelley::decode_shelley_block_header(inner),
         3..=5 => era_alonzo::decode_alonzo_block_header(inner),
         6 => era_babbage::decode_babbage_block_header(inner),
-        7 | 8 => era_conway::decode_conway_block_header(inner),
+        7 => era_conway::decode_conway_block_header(inner, dugite_primitives::era::Era::Conway),
+        8 => era_conway::decode_conway_block_header(inner, dugite_primitives::era::Era::Dijkstra),
         0 | 1 => Err(SerializationError::CborDecode(format!(
             "wrapped header: Byron era_tag {era_tag} unsupported by decode_wrapped_block_header"
         ))),
@@ -300,7 +301,8 @@ pub fn decode_wire_wrapped_block_header(
         1 => era_shelley::decode_shelley_block_header(inner),
         2..=4 => era_alonzo::decode_alonzo_block_header(inner),
         5 => era_babbage::decode_babbage_block_header(inner),
-        6 | 7 => era_conway::decode_conway_block_header(inner),
+        6 => era_conway::decode_conway_block_header(inner, dugite_primitives::era::Era::Conway),
+        7 => era_conway::decode_conway_block_header(inner, dugite_primitives::era::Era::Dijkstra),
         0 => Err(SerializationError::CborDecode(
             "wire wrapped header: Byron (hfc index 0) unsupported by decode_wire_wrapped_block_header"
                 .into(),

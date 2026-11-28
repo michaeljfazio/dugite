@@ -612,15 +612,14 @@ fn read_alonzo_tx_output(
     r: &mut Reader<'_>,
     _era: Era,
 ) -> Result<TransactionOutput, SerializationError> {
+    // Haskell `Alonzo/TxOut.hs`: `decodeListLenOrIndef`; definite 2 or 3, or an indefinite
+    // array of 2 or 3 elements closed by a break ("Excess terms in txout" otherwise).
     let arr_len = r.read_array_header()?;
-    let n = match arr_len {
-        Some(2) | Some(3) => arr_len.unwrap(),
-        _ => {
-            return Err(SerializationError::CborDecode(format!(
-                "alonzo tx_out: expected array(2) or array(3), got {arr_len:?}"
-            )));
-        }
-    };
+    if !matches!(arr_len, Some(2) | Some(3) | None) {
+        return Err(SerializationError::CborDecode(format!(
+            "alonzo tx_out: expected array(2) or array(3), got {arr_len:?}"
+        )));
+    }
 
     let addr_bytes = r.read_bytes_owned()?;
     let address = Address::from_bytes(&addr_bytes)
@@ -628,12 +627,17 @@ fn read_alonzo_tx_output(
 
     let value = read_value(r)?;
 
-    let datum = if n == 3 {
+    let has_datum_hash = match arr_len {
+        Some(n) => n == 3,
+        None => r.peek_major()? != Type::Break,
+    };
+    let datum = if has_datum_hash {
         let dh = read_hash32(r)?;
         OutputDatum::DatumHash(dh)
     } else {
         OutputDatum::None
     };
+    r.close_record(arr_len.is_none())?;
 
     Ok(TransactionOutput {
         address,
@@ -672,13 +676,10 @@ pub(crate) fn read_value(r: &mut Reader<'_>) -> Result<Value, SerializationError
             let coin = r.read_uint()?;
             Ok(Value::lovelace(coin))
         }
-        Type::Array => {
-            let arr_len = r.read_array_header()?;
-            if !matches!(arr_len, Some(2)) {
-                return Err(SerializationError::CborDecode(format!(
-                    "value array: expected array(2), got {arr_len:?}"
-                )));
-            }
+        Type::Array | Type::ArrayIndef => {
+            // Haskell `decodeMaryValue` pair is `RecD MaryValue` below decoder version 12:
+            // an indefinite array fails (see `read_definite_record_header`).
+            r.read_definite_record_header("value array", 2)?;
             let coin = Lovelace(r.read_uint()?);
             let multi_asset = read_multiasset_map_u64(r)?;
             if multi_asset.is_empty() {
@@ -1111,7 +1112,7 @@ fn read_native_script(r: &mut Reader<'_>) -> Result<NativeScript, SerializationE
             NativeScript::ScriptAny(scripts)
         }
         3 => {
-            let n = r.read_uint()? as u32;
+            let n = r.read_native_script_threshold()?;
             let scripts = r.read_array(read_native_script)?;
             NativeScript::ScriptNOfK(n, scripts)
         }

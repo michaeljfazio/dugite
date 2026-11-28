@@ -33,8 +33,8 @@
 //    "transaction validation failed", for a failure it has no typed encoding for.  A row keyed on
 //    the constructor alone would score every fallback as the failure it stood in for, so the
 //    constructor has no name here.  The cost is stated, not hidden: dugite sends the typed
-//    `BadInputsUTxO` where a real node sends the mempool text (fixtures 00050, 00074, decided by
-//    #1138 today; their shadow runs match by name).
+//    `BadInputsUTxO` where a real node sends the mempool text (fixtures 00050, 00074, which
+//    match by name since #1138 was fixed).
 //  * `OutputTooSmallUTxO` (UTXO tag 9) -> `BabbageOutputTooSmallUTxO` ([scarab] only): Conway's
 //    check raises `BabbageOutputTooSmallUTxO` (tag 21); a node that sends tag 9 sends different
 //    bytes from cardano-node.

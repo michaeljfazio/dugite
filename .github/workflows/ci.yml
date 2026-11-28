@@ -86,7 +86,17 @@ jobs:
       - name: Install cargo-nextest
         uses: taiki-e/install-action@nextest
 
+      # The Haskell-classified cardano-cbor-dataset (pinned in
+      # tests/conformance/node-diversity/corpora.toml, verified by commit) drives
+      # crates/dugite-serialization/tests/cbor_dataset_block_path.rs through the block-path
+      # decoders. Without it those tests skip and pass; with DUGITE_CBOR_DATASET_REQUIRE=1 a
+      # missing corpus FAILS them.
+      - name: Fetch and verify the cbor-decoding dataset
+        run: scripts/node-diversity/fetch-corpora.sh cbor
+
       - name: Run all tests (unit, property, conformance, golden)
+        env:
+          DUGITE_CBOR_DATASET_REQUIRE: "1"
         run: cargo nextest run --workspace --profile ci
 
       - name: Upload test results to Codecov

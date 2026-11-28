@@ -123,8 +123,8 @@ pub fn block(bytes: &[u8], era: Era) -> Res<Block> {
 }
 
 /// A block header `[header_body, kes_signature]`.
-pub fn block_header(bytes: &[u8]) -> Res<BlockHeader> {
-    conway::decode_conway_block_header(bytes)
+pub fn block_header(bytes: &[u8], era: Era) -> Res<BlockHeader> {
+    conway::decode_conway_block_header(bytes, era)
 }
 
 pub fn transaction(bytes: &[u8], era: Era) -> Res<Transaction> {
