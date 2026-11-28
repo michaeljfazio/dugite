@@ -18,6 +18,72 @@ use dugite_primitives::value::Lovelace;
 
 use super::{ValidationContext, ValidationError};
 
+/// The DRep registry (`vsDRepsL`) as it evolves while a transaction's
+/// certificates are applied left to right.
+///
+/// Haskell folds the certificates of one transaction in order, each against
+/// the state the previous one produced, and the GOVCERT predicates read
+/// `vsDRepsL` of THAT evolving state:
+///
+/// ```haskell
+/// -- cardano-ledger f649f9751074d2ab3de033fc3912f29c9862c1f5
+/// -- eras/conway/impl/src/Cardano/Ledger/Conway/Rules/Certs.hs L242-246
+///   gamma :|> txCert -> do
+///     certState' <-
+///       trans @(CERTS era) $ TRC (env, certState, gamma)
+///     trans @(EraRule "CERT" era) $
+///       TRC (CertEnv pp currentEpoch committee committeeProposals, certState', txCert)
+/// ```
+///
+/// `RegDRep` (Rules/GovCert.hs L210-219) requires
+/// `Map.notMember cred (certState ^. certVStateL . vsDRepsL)`; `UnRegDRep`
+/// (L234-242) requires `isJust mDRepState` and compares the refund with the
+/// deposit stored in that DRep's state. So `[RegDRep X, UnRegDRep X]` and
+/// `[UnRegDRep X, RegDRep X]` (X already registered) are both accepted.
+///
+/// The overlay shadows the pre-tx set, the same way the stake-key checks
+/// shadow `reward_accounts` with `in_tx_registered` / `in_tx_deregistered`.
+pub(super) struct DRepRegistryOverlay<'a> {
+    /// The registry before the first certificate of the transaction.
+    base: &'a HashSet<Hash32>,
+    /// Registered earlier in this tx, with the deposit that cert declared.
+    added: std::collections::HashMap<Hash32, u64>,
+    /// Members of `base` unregistered earlier in this tx.
+    removed: HashSet<Hash32>,
+}
+
+impl<'a> DRepRegistryOverlay<'a> {
+    pub(super) fn new(base: &'a HashSet<Hash32>) -> Self {
+        Self {
+            base,
+            added: std::collections::HashMap::new(),
+            removed: HashSet::new(),
+        }
+    }
+
+    /// Is `key` in `vsDRepsL` at this point of the left-to-right walk?
+    pub(super) fn contains(&self, key: &Hash32) -> bool {
+        self.added.contains_key(key) || (self.base.contains(key) && !self.removed.contains(key))
+    }
+
+    /// The deposit declared by an in-tx `RegDRep` for `key`, if any.
+    pub(super) fn in_tx_deposit(&self, key: &Hash32) -> Option<u64> {
+        self.added.get(key).copied()
+    }
+
+    /// Apply a `RegDRep` carrying `deposit`.
+    pub(super) fn register(&mut self, key: Hash32, deposit: u64) {
+        self.removed.remove(&key);
+        self.added.insert(key, deposit);
+    }
+
+    /// Apply an `UnRegDRep`.
+    pub(super) fn unregister(&mut self, key: Hash32) {
+        self.added.remove(&key);
+        self.removed.insert(key);
+    }
+}
+
 /// Return the human-readable certificate type name when the certificate is
 /// Conway-only (requires protocol version >= 9). Returns `None` for
 /// pre-Conway certificates that are valid in all post-Shelley eras.
