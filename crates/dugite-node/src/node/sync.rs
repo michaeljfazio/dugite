@@ -3149,7 +3149,10 @@ impl Node {
                                         None
                                     };
                                 match tokio::task::block_in_place(|| {
-                                    ls.apply_block_with_delta(&block, BlockValidationMode::ValidateAll)
+                                    ls.apply_block_with_delta(
+                                        &block,
+                                        BlockValidationMode::ValidateAll,
+                                    )
                                 }) {
                                     Ok(delta) => delta_opt = Some(delta),
                                     Err(e) => {
@@ -3161,18 +3164,31 @@ impl Node {
                                         }
                                         let parent_point = ls.tip.point.clone();
                                         drop(ls);
+                                        // The VolatileDB stores a fetched block before
+                                        // its body hash is checked, so a stored body is
+                                        // not necessarily the one its header commits to.
+                                        // Only a body proven bound to the header makes
+                                        // the failure a property of the hash; otherwise
+                                        // marking the hash invalid would blacklist an
+                                        // honest block a peer served corrupted.
+                                        let body_bound = crate::node::body_bound_to_header(&block);
                                         error!(
                                             slot = next_slot.0,
                                             hash = %next_hash.to_hex(),
+                                            body_bound,
                                             "Replay: VolatileDB block failed ledger validation: \
-                                             {e} — block marked invalid, chain kept at its parent"
+                                             {e} — chain kept at its parent"
                                         );
-                                        self.abandon_failed_fork(
-                                            next_hash,
-                                            "startup replay: ledger apply failed",
-                                            &parent_point,
-                                        )
-                                        .await;
+                                        if body_bound {
+                                            self.abandon_failed_fork(
+                                                next_hash,
+                                                "startup replay: ledger apply failed",
+                                                &parent_point,
+                                            )
+                                            .await;
+                                        } else {
+                                            self.truncate_selected_chain(&parent_point).await;
+                                        }
                                         break;
                                     }
                                 }

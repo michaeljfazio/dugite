@@ -568,6 +568,20 @@ pub(crate) fn undo_failed_block_apply(
     }
 }
 
+/// Whether a block's body is proven to be the body its header commits to:
+/// a Shelley-based block whose raw bytes pass the header's body-hash check.
+///
+/// Only then is a ledger failure a property of the block the header hash
+/// names, and only then may the hash enter the invalid-block cache. A Byron
+/// body (dugite does not check the Byron body proof) or a block without its
+/// raw bytes is never proven bound.
+pub(crate) fn body_bound_to_header(block: &dugite_primitives::block::Block) -> bool {
+    block.era.is_shelley_based()
+        && block.raw_cbor.as_deref().is_some_and(|raw| {
+            dugite_consensus::praos::validate_block_body_hash(&block.header, raw).is_ok()
+        })
+}
+
 /// Flatten a `LedgerState` into the primitive [`GovernanceSnapshot`] consumed
 /// by [`crate::metrics::NodeMetrics::set_governance_snapshot`].
 ///
@@ -6588,14 +6602,38 @@ impl Node {
     ///
     /// The ledger must already be at `parent` — for a ledger failure, the
     /// caller has run [`undo_failed_block_apply`] first.
+    ///
+    /// `hash_is_invalid` says whether the failure is a property of the block
+    /// its header hash names. The header hash commits to the header and,
+    /// through the header's body hash, to the body — but only a body that has
+    /// been checked against that body hash is that block's body. Haskell's
+    /// BlockFetch client checks `blockMatchesHeader` on receipt, so a
+    /// substituted body never reaches chain selection and never enters the
+    /// invalid-block set. When the body is not proven bound to the header
+    /// (a Byron block, whose body proof dugite does not check, or a body that
+    /// failed the check), caching the hash would let a peer that serves a
+    /// corrupted body for an honest header blacklist the honest block. Then
+    /// the chain is truncated and the peer punished, but the hash stays
+    /// adoptable from another peer.
     async fn reject_invalid_peer_block(
         &self,
         peer: SocketAddr,
         bad_hash: dugite_primitives::hash::Hash32,
         reason: &str,
         parent: &dugite_primitives::block::Point,
+        hash_is_invalid: bool,
     ) {
-        self.abandon_failed_fork(bad_hash, reason, parent).await;
+        if hash_is_invalid {
+            self.abandon_failed_fork(bad_hash, reason, parent).await;
+        } else {
+            self.truncate_selected_chain(parent).await;
+            warn!(
+                bad = %bad_hash.to_hex(),
+                reason,
+                "Dropped a block whose body is not proven to match its header: \
+                 rolled back to its parent, block hash NOT marked invalid"
+            );
+        }
         if let Some(ref tx) = self.peer_failure_tx {
             // `try_send`: this runs on the run loop, which is also the
             // channel's only reader, so waiting for room could never end.
@@ -6634,21 +6672,28 @@ impl Node {
                 .await
                 .insert(bad_hash, reason.to_string());
         }
-        {
-            let mut db = self.chain_db.write().await;
-            if let Err(e) = db.rollback_to_point(intersection) {
-                error!(error = %e, "abandon_failed_fork: volatile rollback to intersection failed");
-            }
-        }
-        // Roll the ledger back to the intersection to stay consistent with the
-        // (now rolled-back) VolatileDB selected chain.
-        let _ = self.handle_ledger_rollback(intersection).await;
+        self.truncate_selected_chain(intersection).await;
         warn!(
             bad = %bad_hash.to_hex(),
             reason,
             "Abandoned failed fork: marked block invalid and rolled back to the \
              intersection (VolatileDB preserved — no resync)"
         );
+    }
+
+    /// Roll the VolatileDB selected chain and the ledger back to
+    /// `intersection`, a valid common ancestor, without recording anything as
+    /// invalid.
+    async fn truncate_selected_chain(&self, intersection: &dugite_primitives::block::Point) {
+        {
+            let mut db = self.chain_db.write().await;
+            if let Err(e) = db.rollback_to_point(intersection) {
+                error!(error = %e, "Rollback of the selected chain to the intersection failed");
+            }
+        }
+        // Roll the ledger back to the intersection to stay consistent with the
+        // (now rolled-back) VolatileDB selected chain.
+        let _ = self.handle_ledger_rollback(intersection).await;
     }
 
     /// Apply a block fetched by a per-peer BlockFetch worker to the ledger.
@@ -7497,6 +7542,12 @@ impl Node {
         // We check AFTER storage because the block is keyed by header hash
         // in ChainDB; a body-hash mismatch is a data integrity error from
         // this peer, not a chain-selection issue.
+        //
+        // `body_bound_to_header` records whether the check ran and passed. Only
+        // then is a ledger failure a property of the block the header hash
+        // names, and only then may that hash go into the invalid-block cache
+        // (see `reject_invalid_peer_block`). Byron bodies are not checked.
+        let mut body_bound_to_header = false;
         if block.era.is_shelley_based() {
             if let Some(raw_cbor) = block.raw_cbor.as_deref() {
                 if let Err(e) =
@@ -7509,8 +7560,16 @@ impl Node {
                         error = %e,
                         "Block body hash verification failed — rejecting block (substitution / corruption)"
                     );
+                    // Haskell's BlockFetch client treats a body that does not
+                    // match its header as a protocol violation by the peer
+                    // (`blockMatchesHeader`). The hash is not marked invalid:
+                    // the header may be honest.
+                    if let Some(ref tx) = self.peer_failure_tx {
+                        let _ = tx.try_send((fetched.peer, PeerFailureKind::ProtocolFault));
+                    }
                     return;
                 }
+                body_bound_to_header = true;
             }
         }
 
@@ -7651,11 +7710,13 @@ impl Node {
                 let ls = self.ledger_state.read().await;
                 ls.tip.point.clone()
             };
+            // The header itself is invalid, whatever body came with it.
             self.reject_invalid_peer_block(
                 fetched.peer,
                 block_hash,
                 "apply-time Praos header validation failed",
                 &parent_point,
+                true,
             )
             .await;
             return;
@@ -7947,6 +8008,7 @@ impl Node {
                         block_hash,
                         "ledger apply failed",
                         &parent_point,
+                        body_bound_to_header,
                     )
                     .await;
                     return;
@@ -11607,6 +11669,55 @@ mod tests {
         assert!(config.shelley_genesis_hash.is_none());
         assert!(config.alonzo_genesis_hash.is_none());
         assert!(config.conway_genesis_hash.is_none());
+    }
+
+    /// A block's hash may be cached as invalid only when its body is proven to
+    /// be the one its header commits to; otherwise a peer serving a corrupted
+    /// body for an honest header could blacklist the honest block.
+    #[test]
+    fn test_body_bound_to_header_only_for_a_checked_matching_body() {
+        let path = format!(
+            "{}/../dugite-serialization/tests/test_vectors/conway.hex",
+            env!("CARGO_MANIFEST_DIR")
+        );
+        let cbor =
+            hex::decode(std::fs::read_to_string(&path).expect("fixture").trim()).expect("hex");
+        let block = dugite_serialization::decode_block(&cbor).expect("decode");
+        assert!(block.raw_cbor.is_some(), "the decoder keeps the raw bytes");
+        assert!(
+            super::body_bound_to_header(&block),
+            "the honest body is bound"
+        );
+
+        // Swap the aux-data and invalid-txs components: the framing stays
+        // valid, the body hash does not.
+        let comps = dugite_serialization::extract_block_body_components(&cbor).expect("components");
+        let aux_off = comps[2].as_ptr() as usize - cbor.as_ptr() as usize;
+        let inv_off = comps[3].as_ptr() as usize - cbor.as_ptr() as usize;
+        let mut tampered = cbor[..aux_off].to_vec();
+        tampered.extend_from_slice(comps[3]);
+        tampered.extend_from_slice(comps[2]);
+        tampered.extend_from_slice(&cbor[inv_off + comps[3].len()..]);
+        let mut substituted = block.clone();
+        substituted.raw_cbor = Some(tampered);
+        assert!(
+            !super::body_bound_to_header(&substituted),
+            "a substituted body is not bound"
+        );
+
+        let mut no_raw = block.clone();
+        no_raw.raw_cbor = None;
+        assert!(
+            !super::body_bound_to_header(&no_raw),
+            "an unchecked body is not bound"
+        );
+
+        let mut byron = block;
+        byron.era = dugite_primitives::era::Era::Byron;
+        assert!(
+            !super::body_bound_to_header(&byron),
+            "a Byron body is never bound"
+        );
     }
 
     /// Regression test: BlockProvider methods must not panic when called
