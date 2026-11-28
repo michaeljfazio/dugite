@@ -1525,10 +1525,13 @@ version = "2.8.0"
 dependencies = [
  "cddl",
  "chrono",
+ "dugite-consensus",
  "dugite-crypto",
  "dugite-ledger",
+ "dugite-network",
  "dugite-primitives",
  "dugite-serialization",
+ "dugite-tx-admission",
  "hex",
  "jsonschema",
  "minicbor 0.26.5",
@@ -1539,6 +1542,7 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.18",
  "toml",
+ "zstd",
 ]
 
 [[package]]

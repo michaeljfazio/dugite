@@ -1,0 +1,104 @@
+# The `ledger-rules` runner and strict gate
+
+Phase 2b of #1114 (#1125). 368 phase-one transaction fixtures from
+pragma-org/node-diversity-conformance (NDC), PV9/PV10, all preprod; the pins are in `../corpora.toml`.
+cardano-node scores 368/368 on them.
+
+```sh
+just ndc-gate                 # fetch + verify the corpus, run the gate and its red-proofs, check the issues
+just ndc-report ledger-rules  # write the schema-valid report (target/node-diversity/reports/ledger-rules.json)
+DUGITE_NDC_UPDATE_SNAPSHOT=1 just ndc-gate   # rewrite raised-snapshot.json after a REVIEWED change
+```
+
+CI runs it as the job **`Node-diversity ledger-rules gate`** (`.github/workflows/ci.yml`, job id
+`ledger-rules-gate`). Whether it is a *required* status check is a branch-protection setting.
+
+## What a result is
+
+For each fixture the runner (`tests/conformance/src/node_diversity/ledger_rules/`):
+
+1. decodes the transaction with `dugite_serialization::decode_transaction` (a refusal is `DecodingFailure`);
+2. builds a real `LedgerState` from `initial_state` and asks it for `mempool_validation_context()`
+   (`state.rs`; never a hand-built context);
+3. calls `validate_transaction_with_context`, exactly as `LedgerTxValidator::validate_tx` does;
+4. converts the ledger's failures with `dugite_tx_admission::rejection_from_validation_errors` at the
+   fixture's protocol version (the conversion the node uses, moved out of `dugite-node`) and encodes them
+   with `encode_apply_tx_err`;
+5. **decodes those bytes** through `tag_table.rs` and names each failure from its tag path.
+
+When several failures are raised the report carries the expected one if it is among them, else the
+first one that has a scenario name (the scenario's rule). The generic `ConwayMempoolFailure` fallback
+has no name: it is a failure and can never be a match. A rejection whose failures have no scenario name
+is reported with a placeholder that is not the fixture's expectation (the schema can only carry the
+scenario's 81 names); the gate compares the true value, `unmapped:<constructor>`.
+
+## The tag table (`tag_table.rs`) and the name table (`ndc_names.rs`)
+
+`tag_table.rs` is transcribed from cardano-ledger, never from dugite's encoder. Every constructor quotes
+its source line at revision `226b002d5b5e83e24355f8a28ab214f3259eabda` (tag
+`cardano-ledger-conway-1.22.1.0`, the revision cardano-node 11.0.1's `cabal.project` pins). The tags do
+not depend on the protocol version (a constructor keeps its tag; the version decides which one the ledger
+raises, e.g. `IncorrectDepositDELEG` below PV11, `DepositIncorrectDELEG` from it, and that choice is made
+by the conversion above, at the fixture's version).
+
+It is checked three ways:
+
+* `the_tag_table_decodes_the_haskell_golden`: a **Haskell-produced** `ApplyTxErr`.
+  `goldens/ApplyTxErr_Conway` is
+  `ouroboros-consensus-cardano/golden/cardano/QueryVersion3/CardanoNodeToClientVersion19/ApplyTxErr_Conway`
+  of IntersectMBO/ouroboros-consensus (last changed in `90c220fe61130c8b9793bbe9c75ce0a9a59397bb`, bytes
+  copied unchanged, SHA-256 `d57c0f43771b4cd3d7033d727d91a146877f8960969b35524cb470bbfb23503b`). It is the one
+  Conway `ApplyTxErr` golden upstream publishes and exercises one path:
+  `ConwayCertsFailure/CertFailure/DelegFailure/DelegateeStakePoolNotRegisteredDELEG` `[2, 1, 1, 6]`. The other
+  96 constructors rest on the quoted source lines; no upstream golden covers them.
+* every row's `source` line was re-read at the pinned revision (the constructor name and tag are on that
+  line; POOL and `Credential` are hand-written `encodeListLen` code, so their line carries the tag literal).
+* `a_wrong_tag_table_entry_turns_a_fixture_red`: a table that swaps two constructors turns a fixture red.
+
+`ndc_names.rs` maps a Haskell constructor to the scenario's name where they differ. Rows are read from
+Yano, Dingo, Scarab and Gerolamo, which map the same Haskell failures onto the same names, and from the
+fixtures. Four rows that appeared in those sources are deliberately NOT carried, because each would turn a
+wire-level divergence into a match (see the comment at the top of the file).
+
+## The context is the ledger's
+
+`state.rs` populates the ledger's own state (UTxO, reward accounts, pools, DReps, committee, proposals,
+roots, pots, constitution guardrail). Interpretations the fixtures force, each stated where it is made:
+
+* `valid_until` is a member's term in the enacted committee; `status` is its authorisation state. A member with a
+  `status` and no term is authorised but unelected (00171, 00217); one with neither is a bare member (00211).
+* `guardrail_script` absent or null still enacts a constitution (with no guardrail).
+* a fixture's output with an indefinite outer map is made definite **in state only**; the transaction is never
+  touched (see below).
+* `PREPROD_SYSTEM_START_MS`, `k = 2160`, magic 1; the fixture's era history supplies the epoch size and the
+  per-transaction safe-zone horizon.
+
+Tests: `context_none_set_is_the_documented_one` (exactly the documented context fields are `None`:
+the Shelley-Babbage MIR fields, and `drep_deposits`, which the node's own context builder leaves unset, see
+the `drep-incorrect-refund` class) and `dropping_each_initial_state_section_is_observable` (the negative
+control: dropping a section turns fixtures red; `governance_activity` is the one section no rule reads).
+
+## The contract
+
+`expected-results.toml` lists every fixture dugite does not match: `(id, observed result)`, a class and an
+**open** issue (`scripts/node-diversity/check-expected-issues.sh`). It is not a skip list. The gate fails on an
+unknown id, on an entry whose fixture now matches, on an observed result that changed, and on a fixture that
+fails without an entry. `raised-snapshot.json` is the full set of failures raised per fixture, so a new
+over-rejection shows as a diff. Red-proofs: `gate_fails_on_*`.
+
+Never edit an entry to make a number match. Fix the ledger and delete the entry.
+
+## The shadow run
+
+108 fixtures are refused at decode because dugite does not accept an indefinite-length output map (#1138), so
+no rule runs on them. For those, the runner re-runs the rules on the transaction with only the outer map
+header of each output made definite, keeping the original body bytes, hash and size. It is a diagnostic: it
+appears in the snapshot and in #1160, never in the contract.
+
+## What this does not prove
+
+* Six fixtures are `ValidationTagMismatch`, so the set is not purely phase-one.
+* PV9/PV10 only (three fixtures override to PV11); no evidence for PV11 behaviour in general or for Dijkstra.
+* Names are read from the bytes, but the bytes' payloads are not compared (the scenario scores names only), except
+  the `ValidationTagMismatch` narrowing.
+* One `ApplyTxErr` golden path (see above).

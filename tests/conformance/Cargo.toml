@@ -10,6 +10,11 @@ dugite-primitives = { workspace = true }
 dugite-crypto = { workspace = true }
 dugite-serialization = { workspace = true }
 dugite-ledger = { workspace = true }
+# ledger-rules runner (#1125): the SAME rejection conversion and ApplyTxErr encoder the node uses,
+# and the era history the node builds its per-tx horizon from.
+dugite-network = { workspace = true }
+dugite-tx-admission = { workspace = true }
+dugite-consensus = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
@@ -23,8 +28,9 @@ sha2 = { workspace = true }
 toml = { workspace = true }
 chrono = { workspace = true }
 jsonschema = { version = "0.63", default-features = false }
-# Optional: only compiled when upstream-conformance feature is active.
-minicbor   = { workspace = true, optional = true }
+# The ledger-rules runner decodes the ApplyTxErr bytes with it; the upstream-conformance feature
+# uses it too.
+minicbor   = { workspace = true }
 # Pin to anweiss/cddl main branch: range map keys (* N..M => rule) and array map
 # keys ({ + [k1, k2] => v }) were added in PR #536 (merged 2026-05-13), after the
 # last crates.io release (0.10.5, 2026-04-02).  Update to a crates.io version once
@@ -32,10 +38,12 @@ minicbor   = { workspace = true, optional = true }
 cddl = { git = "https://github.com/anweiss/cddl.git", branch = "main", optional = true }
 
 [features]
-upstream-conformance = ["dep:minicbor", "dep:cddl"]
+upstream-conformance = ["dep:cddl"]
 
 [dev-dependencies]
 tempfile = { workspace = true }
+# ledger-rules: the oracle (cardano-node) report ships zstd-compressed in the NDC checkout.
+zstd = { workspace = true }
 
 [[test]]
 name = "upstream_tests"
