@@ -1,0 +1,43 @@
+name: Dependabot auto-merge
+
+# Turns on auto-merge for Dependabot semver-PATCH updates. GitHub then merges
+# the PR only after the required checks of the `require-ci` ruleset pass, so
+# this workflow decides WHICH PRs may merge unattended, never WHEN.
+#
+# Minor and major bumps, and every update to a crate on a consensus or crypto
+# path, stay open for a human review: a patch release there can still change
+# bytes on the wire or an arithmetic result.
+
+on: pull_request
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  auto-merge:
+    if: github.event.pull_request.user.login == 'dependabot[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - id: meta
+        uses: dependabot/fetch-metadata@v2
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Enable auto-merge for safe patch updates
+        if: steps.meta.outputs.update-type == 'version-update:semver-patch'
+        env:
+          DEPS: ${{ steps.meta.outputs.dependency-names }}
+          PR_URL: ${{ github.event.pull_request.html_url }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # Crates whose behaviour reaches consensus, signatures, hashing,
+          # CBOR or big-integer arithmetic. Review these by hand.
+          REVIEW='^(ed25519-dalek|curve25519-dalek|ed25519|blake2|blake2b_simd|sha2|sha3|vrf_dalek|kes-summed-ed25519|minicbor|ciborium|num-bigint|num-rational|num-integer|dashu.*|bech32|cddl)$'
+          for dep in $(echo "$DEPS" | tr ',' ' '); do
+            if echo "$dep" | grep -qE "$REVIEW"; then
+              echo "$dep needs a manual review; not enabling auto-merge."
+              exit 0
+            fi
+          done
+          gh pr merge --auto --squash "$PR_URL"
