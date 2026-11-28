@@ -1,0 +1,12 @@
+[package]
+name = "dugite-tx-admission"
+version.workspace = true
+edition.workspace = true
+description = "Ledger rejection to wire-level TxValidationError conversion, shared by the node and the conformance harness"
+
+[dependencies]
+dugite-primitives = { workspace = true }
+dugite-serialization = { workspace = true }
+dugite-ledger = { workspace = true }
+dugite-network = { workspace = true }
+hex = { workspace = true }

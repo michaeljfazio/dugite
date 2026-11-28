@@ -1750,6 +1750,7 @@ dependencies = [
  "dugite-rpc",
  "dugite-serialization",
  "dugite-storage",
+ "dugite-tx-admission",
  "dugite-uplc",
  "ed25519-dalek",
  "fs2",
@@ -1881,6 +1882,17 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "tracing",
+]
+
+[[package]]
+name = "dugite-tx-admission"
+version = "2.8.0"
+dependencies = [
+ "dugite-ledger",
+ "dugite-network",
+ "dugite-primitives",
+ "dugite-serialization",
+ "hex",
 ]
 
 [[package]]
