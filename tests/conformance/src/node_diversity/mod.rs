@@ -20,5 +20,6 @@
 //! The runners themselves are Phases 2a-2d of #1114.  Until then each is a stub that writes a
 //! schema-valid report marked [`report::ReportStatus::Stub`]: it carries no result.
 
+pub mod cbor_decoding;
 pub mod pins;
 pub mod report;

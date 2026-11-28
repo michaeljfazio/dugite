@@ -74,6 +74,14 @@ fn generate(
     pins: &Pins,
     run: &RunInfo,
 ) -> Result<(ReportStatus, String, Value), String> {
+    if scenario == Scenario::CborDecoding {
+        return dugite_conformance::node_diversity::cbor_decoding::generate_for_runner(
+            &corpora_dir(),
+            era,
+            pins,
+            run,
+        );
+    }
     let note = stub_note(scenario).to_string();
     Ok((
         ReportStatus::Stub,
