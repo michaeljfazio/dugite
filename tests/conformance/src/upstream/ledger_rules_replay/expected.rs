@@ -67,6 +67,38 @@ pub fn manifest_tag() -> Result<String, String> {
         .ok_or_else(|| format!("no `tag` in {}", p.display()))
 }
 
+/// The title each issue must have on GitHub. Written into the file header and
+/// checked against GitHub by `scripts/node-diversity/check-expected-issues.sh`
+/// (open, in this repository, titled as here), so a closed, missing or retitled
+/// issue fails the CI gate. Every issue [`issue_for`] can return is listed.
+pub const ISSUE_TITLES: &[(u64, &str)] = &[
+    (1132, "ledger: Haskell snapshot import drops cgsDRepPulsingState, so nothing ratifies at the first Conway boundary after import"),
+    (1133, "ledger: Haskell snapshot import drops cgsFuturePParams"),
+    (1134, "ledger: Haskell snapshot import ignores cgsCommittee = SNothing (no-confidence)"),
+    (1190, "ledger: validator accepts a committee cold-key resignation (cert 15) that Haskell rejects"),
+    (1191, "ledger: validator accepts a DRep unregistration whose refund differs from the deposit"),
+    (1192, "ledger: validator accepts a proposal whose deposit differs from ppGovActionDeposit"),
+    (1194, "ledger: instant_stake keeps zero-stake entries (Haskell invariant: never zero)"),
+    (1195, "ledger: DRep unregistration keeps the DRep's votes on proposals"),
+    (1196, "ledger: non-myopic pool likelihoods differ from Haskell at NEWEPOCH"),
+    (1197, "ledger: mark snapshot keeps delegations of zero-stake credentials"),
+    (1198, "ledger: dormant_epochs differs from Haskell at NEWEPOCH"),
+];
+
+/// The number of LEDGER and NEWEPOCH vectors each pinned corpus holds. A corpus
+/// with fewer (a truncated download) fails instead of passing on what is left; a
+/// new corpus tag must be added here with its counts.
+pub const CORPUS_COUNTS: &[(&str, usize, usize)] =
+    &[("conformance-corpus-v20261128-084556", 7478, 530)];
+
+/// `(LEDGER, NEWEPOCH)` vector counts pinned for `tag`.
+pub fn pinned_counts(tag: &str) -> Option<(usize, usize)> {
+    CORPUS_COUNTS
+        .iter()
+        .find(|(t, _, _)| *t == tag)
+        .map(|(_, l, n)| (*l, *n))
+}
+
 /// One recorded entry.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Entry {
@@ -80,6 +112,8 @@ pub struct Entry {
 pub struct Expected {
     pub corpus_tag: String,
     pub entries: BTreeMap<String, Entry>,
+    /// `# issue #N: title` header lines: what each linked issue must be titled.
+    pub issue_titles: BTreeMap<u64, String>,
 }
 
 /// `#NNNN`, or several joined by commas.
@@ -94,9 +128,20 @@ impl Expected {
     /// Parse the file text.
     pub fn parse(text: &str) -> Result<Self, String> {
         let mut e = Expected::default();
-        for (n, line) in text.lines().enumerate() {
+        for (n_idx, line) in text.lines().enumerate() {
+            let n = n_idx;
             if let Some(rest) = line.strip_prefix("# corpus:") {
                 e.corpus_tag = rest.trim().to_string();
+                continue;
+            }
+            if let Some(rest) = line.strip_prefix("# issue #") {
+                let (n, title) = rest.split_once(": ").ok_or_else(|| {
+                    format!("line {}: malformed `# issue #N: title`", (n_idx + 1))
+                })?;
+                let n: u64 = n
+                    .parse()
+                    .map_err(|_| format!("line {}: bad issue number", (n_idx + 1)))?;
+                e.issue_titles.insert(n, title.to_string());
                 continue;
             }
             if line.trim().is_empty() || line.starts_with('#') {
@@ -132,6 +177,16 @@ impl Expected {
                 return Err(format!("line {}: duplicate id {id}", n + 1));
             }
         }
+        for (id, ent) in &e.entries {
+            for one in ent.issue.split(',').filter(|i| *i != "-") {
+                let num: u64 = one.trim_start_matches('#').parse().unwrap_or(0);
+                if !e.issue_titles.contains_key(&num) {
+                    return Err(format!(
+                        "{id}: issue {one} has no `# issue #N: title` header line"
+                    ));
+                }
+            }
+        }
         Ok(e)
     }
 
@@ -153,6 +208,9 @@ impl Expected {
              # an entry without an issue. Regenerate only to RECORD a reviewed change (see expected.rs).\n",
         );
         s.push_str(&format!("# corpus: {}\n", self.corpus_tag));
+        for (n, title) in &self.issue_titles {
+            s.push_str(&format!("# issue #{n}: {title}\n"));
+        }
         // Class = the observed result without its digest.
         let class_of = |obs: &str| obs.split(" #").next().unwrap_or(obs).to_string();
         let mut by_class: BTreeMap<String, Vec<(&String, &Entry)>> = BTreeMap::new();
@@ -257,6 +315,19 @@ pub fn issue_for(id: &str, observed: &str) -> Result<Option<String>, String> {
     }
     issues.sort();
     Ok(Some(issues.join(",")))
+}
+
+/// The entry to record for a vector's verdict, or `None` for a plain match. `Err`
+/// when a result fits no issue (regeneration then fails; it never invents one).
+pub fn entry_for(id: &str, verdict: &Verdict) -> Result<Option<Entry>, String> {
+    match verdict {
+        Verdict::Match => Ok(None),
+        Verdict::HarnessError(e) => Err(format!("{id}: harness error: {e}")),
+        Verdict::AgreedReject(o) | Verdict::Diverges(o) => Ok(Some(Entry {
+            observed: o.clone(),
+            issue: issue_for(id, o)?.unwrap_or_else(|| "-".into()),
+        })),
+    }
 }
 
 /// `Rule/test_N` sorted by rule, then N numerically.

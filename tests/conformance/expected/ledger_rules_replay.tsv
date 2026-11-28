@@ -3,6 +3,17 @@
 # on an entry that now matches (delete it), on a changed observed result, on a stale id and on
 # an entry without an issue. Regenerate only to RECORD a reviewed change (see expected.rs).
 # corpus: conformance-corpus-v20261128-084556
+# issue #1132: ledger: Haskell snapshot import drops cgsDRepPulsingState, so nothing ratifies at the first Conway boundary after import
+# issue #1133: ledger: Haskell snapshot import drops cgsFuturePParams
+# issue #1134: ledger: Haskell snapshot import ignores cgsCommittee = SNothing (no-confidence)
+# issue #1190: ledger: validator accepts a committee cold-key resignation (cert 15) that Haskell rejects
+# issue #1191: ledger: validator accepts a DRep unregistration whose refund differs from the deposit
+# issue #1192: ledger: validator accepts a proposal whose deposit differs from ppGovActionDeposit
+# issue #1194: ledger: instant_stake keeps zero-stake entries (Haskell invariant: never zero)
+# issue #1195: ledger: DRep unregistration keeps the DRep's votes on proposals
+# issue #1196: ledger: non-myopic pool likelihoods differ from Haskell at NEWEPOCH
+# issue #1197: ledger: mark snapshot keeps delegations of zero-stake credentials
+# issue #1198: ledger: dormant_epochs differs from Haskell at NEWEPOCH
 
 # 2805 vector(s), issue #1194: STATE_MISMATCH post=instant_stake:* pre=none
 LEDGER/test_8	STATE_MISMATCH post=instant_stake:* pre=none #c5f22e54fa6e	#1194
@@ -2939,30 +2950,30 @@ NEWEPOCH/test_6898	STATE_MISMATCH post=snapshots:mark/deleg/* pre=inputs:drep_pu
 NEWEPOCH/test_6900	STATE_MISMATCH post=snapshots:mark/deleg/* pre=inputs:drep_pulsing_state,inputs:nes_ru #fc0fc1778c66	#1197
 NEWEPOCH/test_7778	STATE_MISMATCH post=snapshots:mark/deleg/* pre=inputs:drep_pulsing_state,inputs:nes_ru #3f835bbde2ba	#1197
 
-# 23 vector(s), issue -: AGREED_REJECT validator=Phase2CollectError
-LEDGER/test_7853	AGREED_REJECT validator=Phase2CollectError	-
-LEDGER/test_7880	AGREED_REJECT validator=Phase2CollectError	-
-LEDGER/test_7885	AGREED_REJECT validator=Phase2CollectError	-
-LEDGER/test_7892	AGREED_REJECT validator=Phase2CollectError	-
-LEDGER/test_7899	AGREED_REJECT validator=Phase2CollectError	-
-LEDGER/test_7903	AGREED_REJECT validator=Phase2CollectError	-
-LEDGER/test_7907	AGREED_REJECT validator=Phase2CollectError	-
-LEDGER/test_7910	AGREED_REJECT validator=Phase2CollectError	-
-LEDGER/test_7913	AGREED_REJECT validator=Phase2CollectError	-
-LEDGER/test_7939	AGREED_REJECT validator=Phase2CollectError	-
-LEDGER/test_7945	AGREED_REJECT validator=Phase2CollectError	-
-LEDGER/test_7951	AGREED_REJECT validator=Phase2CollectError	-
-LEDGER/test_7957	AGREED_REJECT validator=Phase2CollectError	-
-LEDGER/test_7960	AGREED_REJECT validator=Phase2CollectError	-
-LEDGER/test_7963	AGREED_REJECT validator=Phase2CollectError	-
-LEDGER/test_7966	AGREED_REJECT validator=Phase2CollectError	-
-LEDGER/test_7969	AGREED_REJECT validator=Phase2CollectError	-
-LEDGER/test_7972	AGREED_REJECT validator=Phase2CollectError	-
-LEDGER/test_7975	AGREED_REJECT validator=Phase2CollectError	-
-LEDGER/test_7981	AGREED_REJECT validator=Phase2CollectError	-
-LEDGER/test_7987	AGREED_REJECT validator=Phase2CollectError	-
-LEDGER/test_7993	AGREED_REJECT validator=Phase2CollectError	-
-LEDGER/test_7999	AGREED_REJECT validator=Phase2CollectError	-
+# 23 vector(s), issue -: AGREED_REJECT validator=Phase2CollectError pre=none
+LEDGER/test_7853	AGREED_REJECT validator=Phase2CollectError pre=none #a9f58e4427db	-
+LEDGER/test_7880	AGREED_REJECT validator=Phase2CollectError pre=none #aa12d0520432	-
+LEDGER/test_7885	AGREED_REJECT validator=Phase2CollectError pre=none #aa12d0520432	-
+LEDGER/test_7892	AGREED_REJECT validator=Phase2CollectError pre=none #1e15e83dc1fe	-
+LEDGER/test_7899	AGREED_REJECT validator=Phase2CollectError pre=none #1e15e83dc1fe	-
+LEDGER/test_7903	AGREED_REJECT validator=Phase2CollectError pre=none #ba441afa9048	-
+LEDGER/test_7907	AGREED_REJECT validator=Phase2CollectError pre=none #ba441afa9048	-
+LEDGER/test_7910	AGREED_REJECT validator=Phase2CollectError pre=none #e0a35880f83f	-
+LEDGER/test_7913	AGREED_REJECT validator=Phase2CollectError pre=none #e0a35880f83f	-
+LEDGER/test_7939	AGREED_REJECT validator=Phase2CollectError pre=none #2f25583e10e2	-
+LEDGER/test_7945	AGREED_REJECT validator=Phase2CollectError pre=none #2f25583e10e2	-
+LEDGER/test_7951	AGREED_REJECT validator=Phase2CollectError pre=none #b8c6943afc34	-
+LEDGER/test_7957	AGREED_REJECT validator=Phase2CollectError pre=none #b8c6943afc34	-
+LEDGER/test_7960	AGREED_REJECT validator=Phase2CollectError pre=none #da25a3b1f1a8	-
+LEDGER/test_7963	AGREED_REJECT validator=Phase2CollectError pre=none #da25a3b1f1a8	-
+LEDGER/test_7966	AGREED_REJECT validator=Phase2CollectError pre=none #0ed2ecf7c6ae	-
+LEDGER/test_7969	AGREED_REJECT validator=Phase2CollectError pre=none #0ed2ecf7c6ae	-
+LEDGER/test_7972	AGREED_REJECT validator=Phase2CollectError pre=none #70aac6324438	-
+LEDGER/test_7975	AGREED_REJECT validator=Phase2CollectError pre=none #70aac6324438	-
+LEDGER/test_7981	AGREED_REJECT validator=Phase2CollectError pre=none #3f6ccef8137f	-
+LEDGER/test_7987	AGREED_REJECT validator=Phase2CollectError pre=none #3f6ccef8137f	-
+LEDGER/test_7993	AGREED_REJECT validator=Phase2CollectError pre=none #5803dc9b072a	-
+LEDGER/test_7999	AGREED_REJECT validator=Phase2CollectError pre=none #5803dc9b072a	-
 
 # 19 vector(s), issue #1132,#1198: STATE_MISMATCH post=dstate:acct/*,gov:committee/member/*,gov:committee/threshold,gov:proposal/*,gov:proposal/order/*,gov:root/committee,gov:vote/*/drep/*,gov:vote/*/pool/*,vstate:dormant_epochs pre=inputs:drep_pulsing_state,inputs:nes_ru
 NEWEPOCH/test_5159	STATE_MISMATCH post=dstate:acct/*,gov:committee/member/*,gov:committee/threshold,gov:proposal/*,gov:proposal/order/*,gov:root/committee,gov:vote/*/drep/*,gov:vote/*/pool/*,vstate:dormant_epochs pre=inputs:drep_pulsing_state,inputs:nes_ru #57b83e256fbf	#1132,#1198
@@ -2985,18 +2996,18 @@ NEWEPOCH/test_7437	STATE_MISMATCH post=dstate:acct/*,gov:committee/member/*,gov:
 NEWEPOCH/test_7678	STATE_MISMATCH post=dstate:acct/*,gov:committee/member/*,gov:committee/threshold,gov:proposal/*,gov:proposal/order/*,gov:root/committee,gov:vote/*/drep/*,gov:vote/*/pool/*,vstate:dormant_epochs pre=inputs:drep_pulsing_state,inputs:nes_ru #a14b6af483f2	#1132,#1198
 NEWEPOCH/test_7726	STATE_MISMATCH post=dstate:acct/*,gov:committee/member/*,gov:committee/threshold,gov:proposal/*,gov:proposal/order/*,gov:root/committee,gov:vote/*/drep/*,gov:vote/*/pool/*,vstate:dormant_epochs pre=inputs:drep_pulsing_state,inputs:nes_ru #a14b6af483f2	#1132,#1198
 
-# 11 vector(s), issue -: AGREED_REJECT validator=MalformedProposal
-LEDGER/test_6011	AGREED_REJECT validator=MalformedProposal	-
-LEDGER/test_6014	AGREED_REJECT validator=MalformedProposal	-
-LEDGER/test_6017	AGREED_REJECT validator=MalformedProposal	-
-LEDGER/test_6020	AGREED_REJECT validator=MalformedProposal	-
-LEDGER/test_6023	AGREED_REJECT validator=MalformedProposal	-
-LEDGER/test_6026	AGREED_REJECT validator=MalformedProposal	-
-LEDGER/test_6029	AGREED_REJECT validator=MalformedProposal	-
-LEDGER/test_6032	AGREED_REJECT validator=MalformedProposal	-
-LEDGER/test_6035	AGREED_REJECT validator=MalformedProposal	-
-LEDGER/test_6038	AGREED_REJECT validator=MalformedProposal	-
-LEDGER/test_6041	AGREED_REJECT validator=MalformedProposal	-
+# 11 vector(s), issue -: AGREED_REJECT validator=MalformedProposal pre=none
+LEDGER/test_6011	AGREED_REJECT validator=MalformedProposal pre=none #614ffb0c3a62	-
+LEDGER/test_6014	AGREED_REJECT validator=MalformedProposal pre=none #db74198f78d4	-
+LEDGER/test_6017	AGREED_REJECT validator=MalformedProposal pre=none #1e507d47e991	-
+LEDGER/test_6020	AGREED_REJECT validator=MalformedProposal pre=none #84a70f913790	-
+LEDGER/test_6023	AGREED_REJECT validator=MalformedProposal pre=none #b18d950ec7a0	-
+LEDGER/test_6026	AGREED_REJECT validator=MalformedProposal pre=none #9748c6554592	-
+LEDGER/test_6029	AGREED_REJECT validator=MalformedProposal pre=none #6b162b883676	-
+LEDGER/test_6032	AGREED_REJECT validator=MalformedProposal pre=none #03d5e2546cc2	-
+LEDGER/test_6035	AGREED_REJECT validator=MalformedProposal pre=none #c37fced19f67	-
+LEDGER/test_6038	AGREED_REJECT validator=MalformedProposal pre=none #e2b29ee0f297	-
+LEDGER/test_6041	AGREED_REJECT validator=MalformedProposal pre=none #ade76d1b0914	-
 
 # 11 vector(s), issue #1132,#1198: STATE_MISMATCH post=dstate:acct/*,gov:constitution,gov:proposal/*,gov:proposal/order/*,gov:root/constitution,gov:vote/*/cc/*,gov:vote/*/drep/*,vstate:dormant_epochs pre=inputs:drep_pulsing_state,inputs:nes_ru
 NEWEPOCH/test_5385	STATE_MISMATCH post=dstate:acct/*,gov:constitution,gov:proposal/*,gov:proposal/order/*,gov:root/constitution,gov:vote/*/cc/*,gov:vote/*/drep/*,vstate:dormant_epochs pre=inputs:drep_pulsing_state,inputs:nes_ru #64afec336eb5	#1132,#1198
@@ -3069,26 +3080,26 @@ NEWEPOCH/test_5754	STATE_MISMATCH post=dstate:acct/*,gov:proposal/*,gov:proposal
 NEWEPOCH/test_5767	STATE_MISMATCH post=dstate:acct/*,gov:proposal/*,gov:proposal/order/* pre=inputs:drep_pulsing_state,inputs:nes_ru #84037845160e	#1132
 NEWEPOCH/test_5768	STATE_MISMATCH post=dstate:acct/*,gov:proposal/*,gov:proposal/order/* pre=inputs:drep_pulsing_state,inputs:nes_ru #62c35efe052c	#1132
 
-# 4 vector(s), issue -: AGREED_REJECT validator=ProposalCantFollow
-LEDGER/test_5990	AGREED_REJECT validator=ProposalCantFollow	-
-LEDGER/test_6002	AGREED_REJECT validator=ProposalCantFollow	-
-LEDGER/test_6004	AGREED_REJECT validator=ProposalCantFollow	-
-LEDGER/test_6008	AGREED_REJECT validator=ProposalCantFollow	-
+# 4 vector(s), issue -: AGREED_REJECT validator=ProposalCantFollow pre=none
+LEDGER/test_5990	AGREED_REJECT validator=ProposalCantFollow pre=none #3c6228790dd6	-
+LEDGER/test_6002	AGREED_REJECT validator=ProposalCantFollow pre=none #7771aa8bbb9c	-
+LEDGER/test_6004	AGREED_REJECT validator=ProposalCantFollow pre=none #5f717f320533	-
+LEDGER/test_6008	AGREED_REJECT validator=ProposalCantFollow pre=none #5f717f320533	-
 
-# 3 vector(s), issue -: AGREED_REJECT validator=DisallowedVoters
-LEDGER/test_5899	AGREED_REJECT validator=DisallowedVoters	-
-LEDGER/test_5903	AGREED_REJECT validator=DisallowedVoters	-
-LEDGER/test_5911	AGREED_REJECT validator=DisallowedVoters	-
+# 3 vector(s), issue -: AGREED_REJECT validator=DisallowedVoters pre=none
+LEDGER/test_5899	AGREED_REJECT validator=DisallowedVoters pre=none #21d666e94abb	-
+LEDGER/test_5903	AGREED_REJECT validator=DisallowedVoters pre=none #a5b9db81cf20	-
+LEDGER/test_5911	AGREED_REJECT validator=DisallowedVoters pre=none #78f4f67b7ffe	-
 
-# 3 vector(s), issue -: AGREED_REJECT validator=InvalidPrevGovActionId
-LEDGER/test_5660	AGREED_REJECT validator=InvalidPrevGovActionId	-
-LEDGER/test_5666	AGREED_REJECT validator=InvalidPrevGovActionId	-
-LEDGER/test_5681	AGREED_REJECT validator=InvalidPrevGovActionId	-
+# 3 vector(s), issue -: AGREED_REJECT validator=InvalidPrevGovActionId pre=none
+LEDGER/test_5660	AGREED_REJECT validator=InvalidPrevGovActionId pre=none #e719ef52b3e9	-
+LEDGER/test_5666	AGREED_REJECT validator=InvalidPrevGovActionId pre=none #e719ef52b3e9	-
+LEDGER/test_5681	AGREED_REJECT validator=InvalidPrevGovActionId pre=none #e6a3e3de339c	-
 
-# 3 vector(s), issue -: AGREED_REJECT validator=ZeroTreasuryWithdrawals
-LEDGER/test_5973	AGREED_REJECT validator=ZeroTreasuryWithdrawals	-
-LEDGER/test_5977	AGREED_REJECT validator=ZeroTreasuryWithdrawals	-
-LEDGER/test_5981	AGREED_REJECT validator=ZeroTreasuryWithdrawals	-
+# 3 vector(s), issue -: AGREED_REJECT validator=ZeroTreasuryWithdrawals pre=none
+LEDGER/test_5973	AGREED_REJECT validator=ZeroTreasuryWithdrawals pre=none #a397c8ffbc8a	-
+LEDGER/test_5977	AGREED_REJECT validator=ZeroTreasuryWithdrawals pre=none #43cc1e4e82d3	-
+LEDGER/test_5981	AGREED_REJECT validator=ZeroTreasuryWithdrawals pre=none #8d3206dfdc38	-
 
 # 3 vector(s), issue #1132,#1196,#1198: STATE_MISMATCH post=dstate:acct/*,gov:committee/member/*,gov:committee/threshold,gov:proposal/*,gov:proposal/order/*,gov:root/committee,gov:vote/*/pool/*,non_myopic:likelihood/*,vstate:dormant_epochs pre=inputs:drep_pulsing_state,inputs:nes_ru
 NEWEPOCH/test_6815	STATE_MISMATCH post=dstate:acct/*,gov:committee/member/*,gov:committee/threshold,gov:proposal/*,gov:proposal/order/*,gov:root/committee,gov:vote/*/pool/*,non_myopic:likelihood/*,vstate:dormant_epochs pre=inputs:drep_pulsing_state,inputs:nes_ru #64e61ac9bc13	#1132,#1196,#1198
@@ -3100,41 +3111,41 @@ NEWEPOCH/test_5374	STATE_MISMATCH post=dstate:acct/*,gov:future_pparams/future/a
 NEWEPOCH/test_6969	STATE_MISMATCH post=dstate:acct/*,gov:future_pparams/future/a0,gov:future_pparams/future/active_slots_coeff,gov:future_pparams/future/ada_per_utxo_byte,gov:future_pparams/future/coins_per_utxo_word,gov:future_pparams/future/collateral_percentage,gov:future_pparams/future/committee_max_term_length,gov:future_pparams/future/committee_min_size,gov:future_pparams/future/cost_models,gov:future_pparams/future/d,gov:future_pparams/future/drep_activity,gov:future_pparams/future/drep_deposit,gov:future_pparams/future/dvt_committee_no_confidence,gov:future_pparams/future/dvt_committee_normal,gov:future_pparams/future/dvt_constitution,gov:future_pparams/future/dvt_hard_fork,gov:future_pparams/future/dvt_no_confidence,gov:future_pparams/future/dvt_pp_economic_group,gov:future_pparams/future/dvt_pp_gov_group,gov:future_pparams/future/dvt_pp_network_group,gov:future_pparams/future/dvt_pp_technical_group,gov:future_pparams/future/dvt_treasury_withdrawal,gov:future_pparams/future/e_max,gov:future_pparams/future/execution_costs,gov:future_pparams/future/gov_action_deposit,gov:future_pparams/future/gov_action_lifetime,gov:future_pparams/future/key_deposit,gov:future_pparams/future/max_block_body_size,gov:future_pparams/future/max_block_ex_units,gov:future_pparams/future/max_block_header_size,gov:future_pparams/future/max_collateral_inputs,gov:future_pparams/future/max_ref_script_size_per_block,gov:future_pparams/future/max_ref_script_size_per_tx,gov:future_pparams/future/max_tx_ex_units,gov:future_pparams/future/max_tx_size,gov:future_pparams/future/max_val_size,gov:future_pparams/future/min_fee_a,gov:future_pparams/future/min_fee_b,gov:future_pparams/future/min_fee_ref_script_cost_per_byte,gov:future_pparams/future/min_pool_cost,gov:future_pparams/future/min_utxo_value,gov:future_pparams/future/n_opt,gov:future_pparams/future/pool_deposit,gov:future_pparams/future/protocol_version_major,gov:future_pparams/future/protocol_version_minor,gov:future_pparams/future/pvt_committee_no_confidence,gov:future_pparams/future/pvt_committee_normal,gov:future_pparams/future/pvt_hard_fork,gov:future_pparams/future/pvt_motion_no_confidence,gov:future_pparams/future/pvt_pp_security_group,gov:future_pparams/future/ref_script_cost_multiplier,gov:future_pparams/future/ref_script_cost_stride,gov:future_pparams/future/rho,gov:future_pparams/future/tau,gov:proposal/*,gov:proposal/order/*,gov:root/hard_fork,gov:vote/*/cc/*,gov:vote/*/drep/*,gov:vote/*/pool/*,non_myopic:likelihood/*,pparams:cur/protocol_version_major,vstate:dormant_epochs pre=gov:future_pparams/future/a0,gov:future_pparams/future/active_slots_coeff,gov:future_pparams/future/ada_per_utxo_byte,gov:future_pparams/future/coins_per_utxo_word,gov:future_pparams/future/collateral_percentage,gov:future_pparams/future/committee_max_term_length,gov:future_pparams/future/committee_min_size,gov:future_pparams/future/cost_models,gov:future_pparams/future/d,gov:future_pparams/future/drep_activity,gov:future_pparams/future/drep_deposit,gov:future_pparams/future/dvt_committee_no_confidence,gov:future_pparams/future/dvt_committee_normal,gov:future_pparams/future/dvt_constitution,gov:future_pparams/future/dvt_hard_fork,gov:future_pparams/future/dvt_no_confidence,gov:future_pparams/future/dvt_pp_economic_group,gov:future_pparams/future/dvt_pp_gov_group,gov:future_pparams/future/dvt_pp_network_group,gov:future_pparams/future/dvt_pp_technical_group,gov:future_pparams/future/dvt_treasury_withdrawal,gov:future_pparams/future/e_max,gov:future_pparams/future/execution_costs,gov:future_pparams/future/gov_action_deposit,gov:future_pparams/future/gov_action_lifetime,gov:future_pparams/future/key_deposit,gov:future_pparams/future/max_block_body_size,gov:future_pparams/future/max_block_ex_units,gov:future_pparams/future/max_block_header_size,gov:future_pparams/future/max_collateral_inputs,gov:future_pparams/future/max_ref_script_size_per_block,gov:future_pparams/future/max_ref_script_size_per_tx,gov:future_pparams/future/max_tx_ex_units,gov:future_pparams/future/max_tx_size,gov:future_pparams/future/max_val_size,gov:future_pparams/future/min_fee_a,gov:future_pparams/future/min_fee_b,gov:future_pparams/future/min_fee_ref_script_cost_per_byte,gov:future_pparams/future/min_pool_cost,gov:future_pparams/future/min_utxo_value,gov:future_pparams/future/n_opt,gov:future_pparams/future/pool_deposit,gov:future_pparams/future/protocol_version_major,gov:future_pparams/future/protocol_version_minor,gov:future_pparams/future/pvt_committee_no_confidence,gov:future_pparams/future/pvt_committee_normal,gov:future_pparams/future/pvt_hard_fork,gov:future_pparams/future/pvt_motion_no_confidence,gov:future_pparams/future/pvt_pp_security_group,gov:future_pparams/future/ref_script_cost_multiplier,gov:future_pparams/future/ref_script_cost_stride,gov:future_pparams/future/rho,gov:future_pparams/future/tau,gov:future_pparams/tag,inputs:drep_pulsing_state,inputs:nes_ru #89e22ecb7b37	#1132,#1133,#1196,#1198
 NEWEPOCH/test_7034	STATE_MISMATCH post=dstate:acct/*,gov:future_pparams/future/a0,gov:future_pparams/future/active_slots_coeff,gov:future_pparams/future/ada_per_utxo_byte,gov:future_pparams/future/coins_per_utxo_word,gov:future_pparams/future/collateral_percentage,gov:future_pparams/future/committee_max_term_length,gov:future_pparams/future/committee_min_size,gov:future_pparams/future/cost_models,gov:future_pparams/future/d,gov:future_pparams/future/drep_activity,gov:future_pparams/future/drep_deposit,gov:future_pparams/future/dvt_committee_no_confidence,gov:future_pparams/future/dvt_committee_normal,gov:future_pparams/future/dvt_constitution,gov:future_pparams/future/dvt_hard_fork,gov:future_pparams/future/dvt_no_confidence,gov:future_pparams/future/dvt_pp_economic_group,gov:future_pparams/future/dvt_pp_gov_group,gov:future_pparams/future/dvt_pp_network_group,gov:future_pparams/future/dvt_pp_technical_group,gov:future_pparams/future/dvt_treasury_withdrawal,gov:future_pparams/future/e_max,gov:future_pparams/future/execution_costs,gov:future_pparams/future/gov_action_deposit,gov:future_pparams/future/gov_action_lifetime,gov:future_pparams/future/key_deposit,gov:future_pparams/future/max_block_body_size,gov:future_pparams/future/max_block_ex_units,gov:future_pparams/future/max_block_header_size,gov:future_pparams/future/max_collateral_inputs,gov:future_pparams/future/max_ref_script_size_per_block,gov:future_pparams/future/max_ref_script_size_per_tx,gov:future_pparams/future/max_tx_ex_units,gov:future_pparams/future/max_tx_size,gov:future_pparams/future/max_val_size,gov:future_pparams/future/min_fee_a,gov:future_pparams/future/min_fee_b,gov:future_pparams/future/min_fee_ref_script_cost_per_byte,gov:future_pparams/future/min_pool_cost,gov:future_pparams/future/min_utxo_value,gov:future_pparams/future/n_opt,gov:future_pparams/future/pool_deposit,gov:future_pparams/future/protocol_version_major,gov:future_pparams/future/protocol_version_minor,gov:future_pparams/future/pvt_committee_no_confidence,gov:future_pparams/future/pvt_committee_normal,gov:future_pparams/future/pvt_hard_fork,gov:future_pparams/future/pvt_motion_no_confidence,gov:future_pparams/future/pvt_pp_security_group,gov:future_pparams/future/ref_script_cost_multiplier,gov:future_pparams/future/ref_script_cost_stride,gov:future_pparams/future/rho,gov:future_pparams/future/tau,gov:proposal/*,gov:proposal/order/*,gov:root/hard_fork,gov:vote/*/cc/*,gov:vote/*/drep/*,gov:vote/*/pool/*,non_myopic:likelihood/*,pparams:cur/protocol_version_major,vstate:dormant_epochs pre=gov:future_pparams/future/a0,gov:future_pparams/future/active_slots_coeff,gov:future_pparams/future/ada_per_utxo_byte,gov:future_pparams/future/coins_per_utxo_word,gov:future_pparams/future/collateral_percentage,gov:future_pparams/future/committee_max_term_length,gov:future_pparams/future/committee_min_size,gov:future_pparams/future/cost_models,gov:future_pparams/future/d,gov:future_pparams/future/drep_activity,gov:future_pparams/future/drep_deposit,gov:future_pparams/future/dvt_committee_no_confidence,gov:future_pparams/future/dvt_committee_normal,gov:future_pparams/future/dvt_constitution,gov:future_pparams/future/dvt_hard_fork,gov:future_pparams/future/dvt_no_confidence,gov:future_pparams/future/dvt_pp_economic_group,gov:future_pparams/future/dvt_pp_gov_group,gov:future_pparams/future/dvt_pp_network_group,gov:future_pparams/future/dvt_pp_technical_group,gov:future_pparams/future/dvt_treasury_withdrawal,gov:future_pparams/future/e_max,gov:future_pparams/future/execution_costs,gov:future_pparams/future/gov_action_deposit,gov:future_pparams/future/gov_action_lifetime,gov:future_pparams/future/key_deposit,gov:future_pparams/future/max_block_body_size,gov:future_pparams/future/max_block_ex_units,gov:future_pparams/future/max_block_header_size,gov:future_pparams/future/max_collateral_inputs,gov:future_pparams/future/max_ref_script_size_per_block,gov:future_pparams/future/max_ref_script_size_per_tx,gov:future_pparams/future/max_tx_ex_units,gov:future_pparams/future/max_tx_size,gov:future_pparams/future/max_val_size,gov:future_pparams/future/min_fee_a,gov:future_pparams/future/min_fee_b,gov:future_pparams/future/min_fee_ref_script_cost_per_byte,gov:future_pparams/future/min_pool_cost,gov:future_pparams/future/min_utxo_value,gov:future_pparams/future/n_opt,gov:future_pparams/future/pool_deposit,gov:future_pparams/future/protocol_version_major,gov:future_pparams/future/protocol_version_minor,gov:future_pparams/future/pvt_committee_no_confidence,gov:future_pparams/future/pvt_committee_normal,gov:future_pparams/future/pvt_hard_fork,gov:future_pparams/future/pvt_motion_no_confidence,gov:future_pparams/future/pvt_pp_security_group,gov:future_pparams/future/ref_script_cost_multiplier,gov:future_pparams/future/ref_script_cost_stride,gov:future_pparams/future/rho,gov:future_pparams/future/tau,gov:future_pparams/tag,inputs:drep_pulsing_state,inputs:nes_ru #fe3ebb363ecb	#1132,#1133,#1196,#1198
 
-# 2 vector(s), issue -: AGREED_REJECT validator=CommitteeHasPreviouslyResigned
-LEDGER/test_6128	AGREED_REJECT validator=CommitteeHasPreviouslyResigned	-
-LEDGER/test_6131	AGREED_REJECT validator=CommitteeHasPreviouslyResigned	-
+# 2 vector(s), issue -: AGREED_REJECT validator=CommitteeHasPreviouslyResigned pre=none
+LEDGER/test_6128	AGREED_REJECT validator=CommitteeHasPreviouslyResigned pre=none #7d5c2212de35	-
+LEDGER/test_6131	AGREED_REJECT validator=CommitteeHasPreviouslyResigned pre=none #3c3e995a44a7	-
 
-# 2 vector(s), issue -: AGREED_REJECT validator=ConwayIncompleteWithdrawals
-LEDGER/test_5017	AGREED_REJECT validator=ConwayIncompleteWithdrawals	-
-LEDGER/test_5018	AGREED_REJECT validator=ConwayIncompleteWithdrawals	-
+# 2 vector(s), issue -: AGREED_REJECT validator=ConwayIncompleteWithdrawals pre=none
+LEDGER/test_5017	AGREED_REJECT validator=ConwayIncompleteWithdrawals pre=none #4f1fbb3a1f24	-
+LEDGER/test_5018	AGREED_REJECT validator=ConwayIncompleteWithdrawals pre=none #d012d755bff9	-
 
-# 2 vector(s), issue -: AGREED_REJECT validator=ConwayWithdrawalsMissingAccounts+WdrlNotDelegatedToDRep
-LEDGER/test_4994	AGREED_REJECT validator=ConwayWithdrawalsMissingAccounts+WdrlNotDelegatedToDRep	-
-LEDGER/test_5002	AGREED_REJECT validator=ConwayWithdrawalsMissingAccounts+WdrlNotDelegatedToDRep	-
+# 2 vector(s), issue -: AGREED_REJECT validator=ConwayWithdrawalsMissingAccounts+WdrlNotDelegatedToDRep pre=none
+LEDGER/test_4994	AGREED_REJECT validator=ConwayWithdrawalsMissingAccounts+WdrlNotDelegatedToDRep pre=none #7f3886e9049a	-
+LEDGER/test_5002	AGREED_REJECT validator=ConwayWithdrawalsMissingAccounts+WdrlNotDelegatedToDRep pre=none #181322ed3f71	-
 
-# 2 vector(s), issue -: AGREED_REJECT validator=InvalidGuardrailsScriptHash
-LEDGER/test_5938	AGREED_REJECT validator=InvalidGuardrailsScriptHash	-
-LEDGER/test_5941	AGREED_REJECT validator=InvalidGuardrailsScriptHash	-
+# 2 vector(s), issue -: AGREED_REJECT validator=InvalidGuardrailsScriptHash pre=none
+LEDGER/test_5938	AGREED_REJECT validator=InvalidGuardrailsScriptHash pre=none #7f2f45cda52d	-
+LEDGER/test_5941	AGREED_REJECT validator=InvalidGuardrailsScriptHash pre=none #7f2f45cda52d	-
 
-# 2 vector(s), issue -: AGREED_REJECT validator=UnelectedCommitteeVoters
-LEDGER/test_6145	AGREED_REJECT validator=UnelectedCommitteeVoters	-
-LEDGER/test_6573	AGREED_REJECT validator=UnelectedCommitteeVoters	-
+# 2 vector(s), issue -: AGREED_REJECT validator=UnelectedCommitteeVoters pre=none
+LEDGER/test_6145	AGREED_REJECT validator=UnelectedCommitteeVoters pre=none #14743a65fe25	-
+LEDGER/test_6573	AGREED_REJECT validator=UnelectedCommitteeVoters pre=none #92aefad5cfc4	-
 
-# 2 vector(s), issue -: AGREED_REJECT validator=UnelectedCommitteeVoters+VotersDoNotExist
-LEDGER/test_5882	AGREED_REJECT validator=UnelectedCommitteeVoters+VotersDoNotExist	-
-LEDGER/test_6147	AGREED_REJECT validator=UnelectedCommitteeVoters+VotersDoNotExist	-
+# 2 vector(s), issue -: AGREED_REJECT validator=UnelectedCommitteeVoters+VotersDoNotExist pre=none
+LEDGER/test_5882	AGREED_REJECT validator=UnelectedCommitteeVoters+VotersDoNotExist pre=none #cc14239275ab	-
+LEDGER/test_6147	AGREED_REJECT validator=UnelectedCommitteeVoters+VotersDoNotExist pre=none #a2ad6876ab72	-
 
-# 2 vector(s), issue -: AGREED_REJECT validator=UnspendableUTxONoDatumHash
-LEDGER/test_8002	AGREED_REJECT validator=UnspendableUTxONoDatumHash	-
-LEDGER/test_8005	AGREED_REJECT validator=UnspendableUTxONoDatumHash	-
+# 2 vector(s), issue -: AGREED_REJECT validator=UnspendableUTxONoDatumHash pre=none
+LEDGER/test_8002	AGREED_REJECT validator=UnspendableUTxONoDatumHash pre=none #f416b70ddae2	-
+LEDGER/test_8005	AGREED_REJECT validator=UnspendableUTxONoDatumHash pre=none #720a6d5d1bd1	-
 
-# 2 vector(s), issue -: AGREED_REJECT validator=VotersDoNotExist
-LEDGER/test_5883	AGREED_REJECT validator=VotersDoNotExist	-
-LEDGER/test_5884	AGREED_REJECT validator=VotersDoNotExist	-
+# 2 vector(s), issue -: AGREED_REJECT validator=VotersDoNotExist pre=none
+LEDGER/test_5883	AGREED_REJECT validator=VotersDoNotExist pre=none #4f833bd503c0	-
+LEDGER/test_5884	AGREED_REJECT validator=VotersDoNotExist pre=none #05bd0bb29ca1	-
 
-# 2 vector(s), issue -: AGREED_REJECT validator=WdrlNotDelegatedToDRep
-LEDGER/test_6508	AGREED_REJECT validator=WdrlNotDelegatedToDRep	-
-LEDGER/test_6521	AGREED_REJECT validator=WdrlNotDelegatedToDRep	-
+# 2 vector(s), issue -: AGREED_REJECT validator=WdrlNotDelegatedToDRep pre=none
+LEDGER/test_6508	AGREED_REJECT validator=WdrlNotDelegatedToDRep pre=none #366d20e3947c	-
+LEDGER/test_6521	AGREED_REJECT validator=WdrlNotDelegatedToDRep pre=none #366d20e3947c	-
 
 # 2 vector(s), issue #1132,#1134,#1196,#1198: STATE_MISMATCH post=dstate:acct/*,gov:committee/member/*,gov:committee/present,gov:committee/threshold,gov:proposal/*,gov:proposal/order/*,gov:root/committee,gov:vote/*/drep/*,gov:vote/*/pool/*,non_myopic:likelihood/*,vstate:cc/*,vstate:dormant_epochs pre=inputs:drep_pulsing_state,inputs:nes_ru
 NEWEPOCH/test_6743	STATE_MISMATCH post=dstate:acct/*,gov:committee/member/*,gov:committee/present,gov:committee/threshold,gov:proposal/*,gov:proposal/order/*,gov:root/committee,gov:vote/*/drep/*,gov:vote/*/pool/*,non_myopic:likelihood/*,vstate:cc/*,vstate:dormant_epochs pre=inputs:drep_pulsing_state,inputs:nes_ru #4bcfcb0f541d	#1132,#1134,#1196,#1198
@@ -3224,71 +3235,71 @@ NEWEPOCH/test_6852	STATE_MISMATCH post=non_myopic:likelihood/*,snapshots:mark/de
 NEWEPOCH/test_5060	STATE_MISMATCH post=snapshots:mark/deleg/*,vstate:dormant_epochs pre=inputs:drep_pulsing_state,inputs:nes_ru #111f8db7f130	#1197,#1198
 NEWEPOCH/test_6842	STATE_MISMATCH post=snapshots:mark/deleg/*,vstate:dormant_epochs pre=inputs:drep_pulsing_state,inputs:nes_ru #a0585611a11e	#1197,#1198
 
-# 1 vector(s), issue -: AGREED_REJECT validator=ConflictingCommitteeUpdate
-LEDGER/test_5951	AGREED_REJECT validator=ConflictingCommitteeUpdate	-
+# 1 vector(s), issue -: AGREED_REJECT validator=ConflictingCommitteeUpdate pre=none
+LEDGER/test_5951	AGREED_REJECT validator=ConflictingCommitteeUpdate pre=none #70b4dd8babf8	-
 
-# 1 vector(s), issue -: AGREED_REJECT validator=DRepAlreadyRegistered
-LEDGER/test_6123	AGREED_REJECT validator=DRepAlreadyRegistered	-
+# 1 vector(s), issue -: AGREED_REJECT validator=DRepAlreadyRegistered pre=none
+LEDGER/test_6123	AGREED_REJECT validator=DRepAlreadyRegistered pre=none #6b55ea60aeb5	-
 
-# 1 vector(s), issue -: AGREED_REJECT validator=DRepIncorrectDeposit+ValueNotConserved
-LEDGER/test_6119	AGREED_REJECT validator=DRepIncorrectDeposit+ValueNotConserved	-
+# 1 vector(s), issue -: AGREED_REJECT validator=DRepIncorrectDeposit+ValueNotConserved pre=none
+LEDGER/test_6119	AGREED_REJECT validator=DRepIncorrectDeposit+ValueNotConserved pre=none #59ad3de8556b	-
 
-# 1 vector(s), issue -: AGREED_REJECT validator=DRepNotRegistered
-LEDGER/test_6124	AGREED_REJECT validator=DRepNotRegistered	-
+# 1 vector(s), issue -: AGREED_REJECT validator=DRepNotRegistered pre=none
+LEDGER/test_6124	AGREED_REJECT validator=DRepNotRegistered pre=none #c145b384de1c	-
 
-# 1 vector(s), issue -: AGREED_REJECT validator=DRepNotRegistered+ValueNotConserved
-LEDGER/test_7780	AGREED_REJECT validator=DRepNotRegistered+ValueNotConserved	-
+# 1 vector(s), issue -: AGREED_REJECT validator=DRepNotRegistered+ValueNotConserved pre=none
+LEDGER/test_7780	AGREED_REJECT validator=DRepNotRegistered+ValueNotConserved pre=none #2508e65cb688	-
 
-# 1 vector(s), issue -: AGREED_REJECT validator=DelegateeDRepNotRegistered
-LEDGER/test_5074	AGREED_REJECT validator=DelegateeDRepNotRegistered	-
+# 1 vector(s), issue -: AGREED_REJECT validator=DelegateeDRepNotRegistered pre=none
+LEDGER/test_5074	AGREED_REJECT validator=DelegateeDRepNotRegistered pre=none #2a6309606f58	-
 
-# 1 vector(s), issue -: AGREED_REJECT validator=DelegateePoolNotRegistered
-LEDGER/test_5064	AGREED_REJECT validator=DelegateePoolNotRegistered	-
+# 1 vector(s), issue -: AGREED_REJECT validator=DelegateePoolNotRegistered pre=none
+LEDGER/test_5064	AGREED_REJECT validator=DelegateePoolNotRegistered pre=none #dc93c5225439	-
 
-# 1 vector(s), issue -: AGREED_REJECT validator=ExpirationEpochTooSmall
-LEDGER/test_5947	AGREED_REJECT validator=ExpirationEpochTooSmall	-
+# 1 vector(s), issue -: AGREED_REJECT validator=ExpirationEpochTooSmall pre=none
+LEDGER/test_5947	AGREED_REJECT validator=ExpirationEpochTooSmall pre=none #4fe4f23ed2aa	-
 
-# 1 vector(s), issue -: AGREED_REJECT validator=GovActionsDoNotExist
-LEDGER/test_5895	AGREED_REJECT validator=GovActionsDoNotExist	-
+# 1 vector(s), issue -: AGREED_REJECT validator=GovActionsDoNotExist pre=none
+LEDGER/test_5895	AGREED_REJECT validator=GovActionsDoNotExist pre=none #0e3da85f0306	-
 
-# 1 vector(s), issue -: AGREED_REJECT validator=MissingCertificateWitness
-LEDGER/test_7795	AGREED_REJECT validator=MissingCertificateWitness	-
+# 1 vector(s), issue -: AGREED_REJECT validator=MissingCertificateWitness pre=none
+LEDGER/test_7795	AGREED_REJECT validator=MissingCertificateWitness pre=none #b04162314352	-
 
-# 1 vector(s), issue -: AGREED_REJECT validator=ProposalDepositIncorrect
-LEDGER/test_5949	AGREED_REJECT validator=ProposalDepositIncorrect	-
+# 1 vector(s), issue -: AGREED_REJECT validator=ProposalDepositIncorrect pre=none
+LEDGER/test_5949	AGREED_REJECT validator=ProposalDepositIncorrect pre=none #e83e5908115a	-
 
-# 1 vector(s), issue -: AGREED_REJECT validator=ProposalProcedureNetworkIdMismatch+ProposalReturnAccountDoesNotExist
-LEDGER/test_6042	AGREED_REJECT validator=ProposalProcedureNetworkIdMismatch+ProposalReturnAccountDoesNotExist	-
+# 1 vector(s), issue -: AGREED_REJECT validator=ProposalProcedureNetworkIdMismatch+ProposalReturnAccountDoesNotExist pre=none
+LEDGER/test_6042	AGREED_REJECT validator=ProposalProcedureNetworkIdMismatch+ProposalReturnAccountDoesNotExist pre=none #eaa7261e0512	-
 
-# 1 vector(s), issue -: AGREED_REJECT validator=ProposalReturnAccountDoesNotExist
-LEDGER/test_5944	AGREED_REJECT validator=ProposalReturnAccountDoesNotExist	-
+# 1 vector(s), issue -: AGREED_REJECT validator=ProposalReturnAccountDoesNotExist pre=none
+LEDGER/test_5944	AGREED_REJECT validator=ProposalReturnAccountDoesNotExist pre=none #0924c300d17b	-
 
-# 1 vector(s), issue -: AGREED_REJECT validator=RefScriptsSizeTooBig
-LEDGER/test_6501	AGREED_REJECT validator=RefScriptsSizeTooBig	-
+# 1 vector(s), issue -: AGREED_REJECT validator=RefScriptsSizeTooBig pre=none
+LEDGER/test_6501	AGREED_REJECT validator=RefScriptsSizeTooBig pre=none #b1f1c59ec4d5	-
 
-# 1 vector(s), issue -: AGREED_REJECT validator=ReferenceInputsNotDisjointFromInputs
-LEDGER/test_7872	AGREED_REJECT validator=ReferenceInputsNotDisjointFromInputs	-
+# 1 vector(s), issue -: AGREED_REJECT validator=ReferenceInputsNotDisjointFromInputs pre=none
+LEDGER/test_7872	AGREED_REJECT validator=ReferenceInputsNotDisjointFromInputs pre=none #bd0b865df9ca	-
 
-# 1 vector(s), issue -: AGREED_REJECT validator=ScriptDataHashMismatch
-LEDGER/test_7843	AGREED_REJECT validator=ScriptDataHashMismatch	-
+# 1 vector(s), issue -: AGREED_REJECT validator=ScriptDataHashMismatch pre=none
+LEDGER/test_7843	AGREED_REJECT validator=ScriptDataHashMismatch pre=none #b1838e99a9d8	-
 
-# 1 vector(s), issue -: AGREED_REJECT validator=StakeDeregistrationRefundMismatch+ValueNotConserved
-LEDGER/test_5025	AGREED_REJECT validator=StakeDeregistrationRefundMismatch+ValueNotConserved	-
+# 1 vector(s), issue -: AGREED_REJECT validator=StakeDeregistrationRefundMismatch+ValueNotConserved pre=none
+LEDGER/test_5025	AGREED_REJECT validator=StakeDeregistrationRefundMismatch+ValueNotConserved pre=none #69759260af9a	-
 
-# 1 vector(s), issue -: AGREED_REJECT validator=StakeKeyNotRegisteredForDelegation
-LEDGER/test_5076	AGREED_REJECT validator=StakeKeyNotRegisteredForDelegation	-
+# 1 vector(s), issue -: AGREED_REJECT validator=StakeKeyNotRegisteredForDelegation pre=none
+LEDGER/test_5076	AGREED_REJECT validator=StakeKeyNotRegisteredForDelegation pre=none #a8b8ad40cdda	-
 
-# 1 vector(s), issue -: AGREED_REJECT validator=StakeRegistrationDepositMismatch+ValueNotConserved
-LEDGER/test_5021	AGREED_REJECT validator=StakeRegistrationDepositMismatch+ValueNotConserved	-
+# 1 vector(s), issue -: AGREED_REJECT validator=StakeRegistrationDepositMismatch+ValueNotConserved pre=none
+LEDGER/test_5021	AGREED_REJECT validator=StakeRegistrationDepositMismatch+ValueNotConserved pre=none #5c7f76a13545	-
 
-# 1 vector(s), issue -: AGREED_REJECT validator=TreasuryWithdrawalReturnAccountsDoNotExist
-LEDGER/test_5967	AGREED_REJECT validator=TreasuryWithdrawalReturnAccountsDoNotExist	-
+# 1 vector(s), issue -: AGREED_REJECT validator=TreasuryWithdrawalReturnAccountsDoNotExist pre=none
+LEDGER/test_5967	AGREED_REJECT validator=TreasuryWithdrawalReturnAccountsDoNotExist pre=none #5f07677b6e60	-
 
-# 1 vector(s), issue -: AGREED_REJECT validator=TreasuryWithdrawalReturnAccountsDoNotExist+TreasuryWithdrawalsNetworkIdMismatch
-LEDGER/test_5970	AGREED_REJECT validator=TreasuryWithdrawalReturnAccountsDoNotExist+TreasuryWithdrawalsNetworkIdMismatch	-
+# 1 vector(s), issue -: AGREED_REJECT validator=TreasuryWithdrawalReturnAccountsDoNotExist+TreasuryWithdrawalsNetworkIdMismatch pre=none
+LEDGER/test_5970	AGREED_REJECT validator=TreasuryWithdrawalReturnAccountsDoNotExist+TreasuryWithdrawalsNetworkIdMismatch pre=none #346ea99b4324	-
 
-# 1 vector(s), issue -: AGREED_REJECT validator=UnelectedCommitteeMember
-LEDGER/test_6134	AGREED_REJECT validator=UnelectedCommitteeMember	-
+# 1 vector(s), issue -: AGREED_REJECT validator=UnelectedCommitteeMember pre=none
+LEDGER/test_6134	AGREED_REJECT validator=UnelectedCommitteeMember pre=none #245f91bec364	-
 
 # 1 vector(s), issue #1132,#1134,#1198: STATE_MISMATCH post=dstate:acct/*,gov:committee/member/*,gov:committee/present,gov:committee/threshold,gov:proposal/*,gov:proposal/order/*,gov:root/committee,gov:vote/*/drep/*,gov:vote/*/pool/*,vstate:dormant_epochs pre=inputs:drep_pulsing_state,inputs:nes_ru
 NEWEPOCH/test_5406	STATE_MISMATCH post=dstate:acct/*,gov:committee/member/*,gov:committee/present,gov:committee/threshold,gov:proposal/*,gov:proposal/order/*,gov:root/committee,gov:vote/*/drep/*,gov:vote/*/pool/*,vstate:dormant_epochs pre=inputs:drep_pulsing_state,inputs:nes_ru #3b1255466b6e	#1132,#1134,#1198

@@ -7,13 +7,17 @@
 //! be bound to the manifest's corpus tag, and contain no harness-error entry.
 
 use dugite_conformance::upstream::ledger_rules_replay::expected::{
-    gate, issue_for, manifest_tag, Entry, Expected, Gate,
+    entry_for, gate, issue_for, manifest_tag, pinned_counts, Entry, Expected, Gate, ISSUE_TITLES,
 };
 use dugite_conformance::upstream::ledger_rules_replay::replay::Verdict;
 
 fn exp(entries: &[(&str, &str, &str)]) -> Expected {
     Expected {
         corpus_tag: "t".into(),
+        issue_titles: [(1, "t1"), (7, "t7")]
+            .into_iter()
+            .map(|(n, t)| (n, t.to_string()))
+            .collect(),
         entries: entries
             .iter()
             .map(|(id, o, i)| {
@@ -139,18 +143,21 @@ fn render_parse_round_trips_and_groups_by_class() {
 
 #[test]
 fn every_divergence_must_link_an_issue() {
+    let h = "# issue #12: t12\n# issue #13: t13\n";
     // missing column
     assert!(Expected::parse("A/test_1\tX\n").is_err());
     // not an issue reference
     assert!(Expected::parse("A/test_1\tX\tTBD\n").is_err());
     assert!(Expected::parse("A/test_1\tX\t-\n").is_err());
     assert!(Expected::parse("A/test_1\tX\t#\n").is_err());
-    assert!(Expected::parse("A/test_1\tX\t#12\n").is_ok());
-    assert!(Expected::parse("A/test_1\tX\t#12,#13\n").is_ok());
-    assert!(Expected::parse("A/test_1\tX\t#12,\n").is_err());
+    assert!(Expected::parse(&format!("{h}A/test_1\tX\t#12\n")).is_ok());
+    assert!(Expected::parse(&format!("{h}A/test_1\tX\t#12,#13\n")).is_ok());
+    assert!(Expected::parse(&format!("{h}A/test_1\tX\t#12,\n")).is_err());
+    // an issue with no pinned title cannot be checked against GitHub
+    assert!(Expected::parse("A/test_1\tX\t#12\n").is_err());
     // an agreed rejection has no issue, and a divergence cannot hide as one
     assert!(Expected::parse("A/test_1\tAGREED_REJECT x\t-\n").is_ok());
-    assert!(Expected::parse("A/test_1\tAGREED_REJECT x\t#12\n").is_err());
+    assert!(Expected::parse(&format!("{h}A/test_1\tAGREED_REJECT x\t#12\n")).is_err());
 }
 
 #[test]
@@ -162,6 +169,16 @@ fn duplicate_ids_are_rejected() {
 fn issue_assignment_follows_the_class() {
     let i = |id: &str, o: &str| issue_for(id, o).unwrap();
     assert_eq!(i("LEDGER/test_1", "AGREED_REJECT validator=X"), None);
+    // every issue issue_for returns has a pinned title (checked against GitHub by
+    // scripts/node-diversity/check-expected-issues.sh)
+    for n in [
+        1132u64, 1133, 1134, 1190, 1191, 1192, 1194, 1195, 1196, 1197, 1198,
+    ] {
+        assert!(
+            ISSUE_TITLES.iter().any(|(m, _)| *m == n),
+            "no title for #{n}"
+        );
+    }
     assert_eq!(
         i("NEWEPOCH/test_1", "STATE_MISMATCH post=gov:proposal/*,vstate:dormant_epochs pre=inputs:drep_pulsing_state #a").as_deref(),
         Some("#1132,#1198")
@@ -210,4 +227,46 @@ fn committed_file_is_bound_to_the_pinned_corpus() {
         manifest_tag().unwrap(),
         "the expected-results file is for a different corpus than manifest.toml pins"
     );
+}
+
+// ── red proofs: a result that fits no issue never gets one ────────────────────
+
+#[test]
+fn an_unrecognised_class_fails_instead_of_getting_an_issue() {
+    let unknown = "STATE_MISMATCH post=pots:fees pre=none #a";
+    assert!(issue_for("LEDGER/test_1", unknown).is_err());
+    // ...and so does the entry regeneration would write
+    assert!(entry_for("LEDGER/test_1", &Verdict::Diverges(unknown.into())).is_err());
+    // a harness error is never an entry
+    assert!(entry_for("LEDGER/test_1", &Verdict::HarnessError("x".into())).is_err());
+    // a plain match has none; a known class has the right one
+    assert_eq!(entry_for("LEDGER/test_1", &Verdict::Match), Ok(None));
+    let e = entry_for(
+        "LEDGER/test_1",
+        &Verdict::Diverges("STATE_MISMATCH post=instant_stake:* pre=none #a".into()),
+    )
+    .unwrap()
+    .unwrap();
+    assert_eq!(e.issue, "#1194");
+}
+
+#[test]
+fn the_committed_titles_are_the_pinned_ones() {
+    let e = Expected::load().unwrap();
+    for (n, t) in ISSUE_TITLES {
+        if let Some(committed) = e.issue_titles.get(n) {
+            assert_eq!(committed, t, "#{n}");
+        }
+    }
+    // every issue the entries use is titled (parse enforces it), and nothing else is
+    for n in e.issue_titles.keys() {
+        assert!(ISSUE_TITLES.iter().any(|(m, _)| m == n), "stray title #{n}");
+    }
+}
+
+#[test]
+fn a_corpus_count_is_pinned_for_the_manifest_tag() {
+    let (ledger, newepoch) = pinned_counts(&manifest_tag().unwrap())
+        .expect("vector counts must be pinned for the corpus manifest.toml names");
+    assert!(ledger > 0 && newepoch > 0);
 }

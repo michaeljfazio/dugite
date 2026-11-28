@@ -21,7 +21,7 @@
 //!   * Each vector is gated by its own generated test; the umbrella
 //!     `ledger_rules_apply_and_compare` checks the contract as a whole, and the
 //!     ignored `ledger_rules_replay_report` (`just ledger-rules-replay-report`)
-//!     replays everything in cold child processes for the summary and for
+//!     replays everything (one fresh thread per vector) for the summary and for
 //!     regenerating the file (local only; refuses under CI).
 //! * **The other rules are DECODE-ONLY**: POOL, CERT, CERTS, DELEG, GOVCERT, GOV,
 //!   ENACT and RATIFY (ExecSpecRule states, which are not a `NewEpochState`) get a
@@ -79,9 +79,7 @@ pub mod vector;
 use std::path::Path;
 use std::sync::OnceLock;
 
-use crate::upstream::ledger_rules_replay::expected::{
-    gate, issue_for, Entry, Expected, UPDATE_ENV,
-};
+use crate::upstream::ledger_rules_replay::expected::{gate, Entry, Expected, UPDATE_ENV};
 use crate::upstream::ledger_rules_replay::replay::{
     replay_vector, replay_vector_with, PostHook, Replay, Verdict,
 };
@@ -303,95 +301,20 @@ enum Outcome {
     Skipped,
 }
 
-/// Environment variable naming the vector directory a CHILD process replays.
-pub const ONE_ENV: &str = "DUGITE_REPLAY_ONE";
-
-/// The child half of [`replay_in_child`]: replay one vector and print its verdict
-/// as `@@`-prefixed lines on stdout.
-pub fn replay_one_for_child(test_dir: &Path) {
-    let verdict_line = |tag: &str, text: &str| println!("@@VERDICT\t{tag}\t{text}");
-    let vec = match vector::decode_vector(test_dir) {
-        Ok(v) => v,
-        Err(e) => return verdict_line("H", &format!("decode: {e}")),
-    };
-    let Some(r) = replay_vector(&vec) else {
-        return verdict_line("H", "not a replayed rule");
-    };
-    println!("@@COMPARED\t{}", r.pre.compared.join(","));
-    println!("@@PRE\t{}", r.pre.groups().join(","));
-    match &r.verdict {
-        Verdict::Match => verdict_line("M", ""),
-        Verdict::AgreedReject(o) => verdict_line("A", o),
-        Verdict::Diverges(o) => verdict_line("D", o),
-        Verdict::HarnessError(o) => verdict_line("H", o),
-    }
-}
-
-/// Replay one vector in a COLD child process (this test binary, running the
-/// ignored `ledger_rules_replay_one` test), exactly as the generated per-vector
-/// tests see it. In-process replay is not equivalent: the same vectors gave
-/// different Phase-2 verdicts depending on which others the process had already
-/// evaluated, so the report that regenerates the contract must not share a
-/// process between vectors.
-fn replay_in_child(
-    test_dir: &Path,
-) -> Result<(Verdict, Vec<&'static str>, Vec<&'static str>), String> {
-    let exe = std::env::current_exe().map_err(|e| format!("current_exe: {e}"))?;
-    let out = std::process::Command::new(exe)
-        .args([
-            "--ignored",
-            "--exact",
-            "ledger_rules_replay_one",
-            "--nocapture",
-        ])
-        .env(ONE_ENV, test_dir)
-        .output()
-        .map_err(|e| format!("spawn child: {e}"))?;
-    let text = String::from_utf8_lossy(&out.stdout);
-    let groups = |s: &str| -> Vec<&'static str> {
-        project::GROUPS
-            .iter()
-            .copied()
-            .filter(|g| s.split(',').any(|x| x == *g))
-            .collect()
-    };
-    let (mut verdict, mut compared, mut pre) = (None, Vec::new(), Vec::new());
-    for line in text.lines().filter_map(|l| l.strip_prefix("@@")) {
-        let mut f = line.splitn(3, '\t');
-        match (f.next(), f.next(), f.next()) {
-            (Some("VERDICT"), Some(tag), Some(t)) => {
-                verdict = Some(match tag {
-                    "M" => Verdict::Match,
-                    "A" => Verdict::AgreedReject(t.to_string()),
-                    "D" => Verdict::Diverges(t.to_string()),
-                    _ => Verdict::HarnessError(t.to_string()),
-                })
-            }
-            (Some("COMPARED"), Some(g), _) => compared = groups(g),
-            (Some("PRE"), Some(g), _) => pre = groups(g),
-            _ => {}
-        }
-    }
-    verdict
-        .map(|v| (v, compared, pre))
-        .ok_or_else(|| format!("child produced no verdict (exit {:?})", out.status.code()))
-}
-
 fn run_one(test_dir: &Path) -> Outcome {
     let id = vector_id(test_dir);
     let vec = match vector::decode_vector(test_dir) {
         Ok(v) => v,
         Err(e) => return Outcome::Failed(format!("{id}: decode: {e}")),
     };
-    if replay::rule_kind(&vec.rule).is_some() {
-        return match replay_in_child(test_dir) {
-            Ok((verdict, compared, pre_groups)) => Outcome::Replayed {
-                rule: vec.rule.clone(),
-                verdict,
-                compared,
-                pre_groups,
-            },
-            Err(e) => Outcome::Failed(format!("{id}: {e}")),
+    // `replay_vector` runs each replay on a fresh thread (see its doc), so the
+    // verdict does not depend on what this worker thread replayed before.
+    if let Some(replay) = replay_vector(&vec) {
+        return Outcome::Replayed {
+            rule: vec.rule.clone(),
+            verdict: replay.verdict.clone(),
+            compared: replay.pre.compared.clone(),
+            pre_groups: replay.pre.groups(),
         };
     }
     if let Some(issue) = is_skipped(&vec.rule) {
@@ -462,6 +385,22 @@ pub fn run_apply_checks(dir: &Path) {
         }
     }
     let mut failures = Vec::new();
+    match expected::pinned_counts(&expected.corpus_tag) {
+        None => failures.push(format!(
+            "no vector counts are pinned for corpus `{}` (expected.rs CORPUS_COUNTS)",
+            expected.corpus_tag
+        )),
+        Some((ledger, newepoch)) => {
+            for (rule, want) in [("LEDGER", ledger), ("NEWEPOCH", newepoch)] {
+                let got = per_rule.get(rule).copied().unwrap_or(0);
+                if got != want {
+                    failures.push(format!(
+                        "{rule}: the corpus holds {got} vectors but {want} are pinned — a short or changed corpus"
+                    ));
+                }
+            }
+        }
+    }
     for id in expected.entries.keys() {
         if !ids.contains(id) {
             failures.push(format!(
@@ -594,7 +533,6 @@ fn run_checks(dir: &Path, selection: Selection) {
     let mut observed: std::collections::BTreeMap<String, Entry> = Default::default();
     let mut classes: std::collections::BTreeMap<String, usize> = Default::default();
     let mut seen_ids: std::collections::BTreeSet<String> = Default::default();
-    let mut compared_groups: std::collections::BTreeSet<&'static str> = Default::default();
     let mut pre_lossy: std::collections::BTreeMap<&'static str, usize> = Default::default();
 
     for (i, outcome) in results {
@@ -613,7 +551,7 @@ fn run_checks(dir: &Path, selection: Selection) {
                 pre_groups,
             } => {
                 seen_ids.insert(id.clone());
-                compared_groups.extend(compared);
+                let _ = compared;
                 for g in pre_groups {
                     *pre_lossy.entry(g).or_default() += 1;
                 }
@@ -621,42 +559,23 @@ fn run_checks(dir: &Path, selection: Selection) {
                 t.applied += 1;
                 match &verdict {
                     Verdict::Match => t.matched += 1,
-                    Verdict::AgreedReject(o) => {
-                        t.agreed_reject += 1;
-                        observed.insert(
-                            id.clone(),
-                            Entry {
-                                observed: o.clone(),
-                                issue: "-".into(),
-                            },
-                        );
-                    }
+                    Verdict::AgreedReject(_) => t.agreed_reject += 1,
                     Verdict::Diverges(o) => {
                         t.diverged += 1;
-                        observed.insert(
-                            id.clone(),
-                            Entry {
-                                observed: o.clone(),
-                                issue: match issue_for(&id, o) {
-                                    Ok(Some(i)) => i,
-                                    Ok(None) => "-".into(),
-                                    Err(e) => {
-                                        failures.push(e);
-                                        "-".into()
-                                    }
-                                },
-                            },
-                        );
                         *classes
                             .entry(format!("{rule} :: {}", class_of(o)))
                             .or_default() += 1;
                     }
-                    Verdict::HarnessError(e) => {
-                        t.harness_errors += 1;
-                        if expected.is_none() {
-                            failures.push(format!("{id}: harness error: {e}"));
-                        }
+                    Verdict::HarnessError(_) => t.harness_errors += 1,
+                }
+                // The entry to record; a harness error or a result that fits no
+                // issue is a failure (and blocks regeneration), never a placeholder.
+                match expected::entry_for(&id, &verdict) {
+                    Ok(Some(e)) => {
+                        observed.insert(id.clone(), e);
                     }
+                    Ok(None) => {}
+                    Err(e) => failures.push(e),
                 }
                 if let Some(exp) = &expected {
                     if let Some(msg) = gate(exp, &id, &verdict).describe(&id) {
@@ -667,6 +586,13 @@ fn run_checks(dir: &Path, selection: Selection) {
         }
     }
 
+    if update && !failures.is_empty() {
+        panic!(
+            "[ledger-rules] refusing to regenerate: {} vector(s) failed or fit no issue, nothing written:\n{}",
+            failures.len(),
+            failures.iter().take(20).cloned().collect::<Vec<_>>().join("\n")
+        );
+    }
     if update {
         let summary = committed_expected()
             .as_ref()
@@ -676,6 +602,10 @@ fn run_checks(dir: &Path, selection: Selection) {
         let new = Expected {
             corpus_tag: expected::manifest_tag().expect("manifest tag"),
             entries: observed.clone(),
+            issue_titles: expected::ISSUE_TITLES
+                .iter()
+                .map(|(n, t)| (*n, t.to_string()))
+                .collect(),
         };
         let path = expected::expected_path();
         std::fs::create_dir_all(path.parent().expect("parent")).expect("mkdir expected");
@@ -710,9 +640,19 @@ fn run_checks(dir: &Path, selection: Selection) {
             eprintln!("[ledger-rules]   diverged  {n:>5}  {class}");
         }
         eprintln!(
-            "[ledger-rules] groups compared on at least one vector: {}",
-            compared_groups
+            "[ledger-rules] groups compared, post-state: {}",
+            project::GROUPS
                 .iter()
+                .filter(|g| **g != "inputs")
+                .copied()
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        eprintln!(
+            "[ledger-rules] groups compared, import (pre=): {} (NEWEPOCH adds inputs)",
+            project::GROUPS
+                .iter()
+                .filter(|g| !matches!(**g, "utxo" | "inputs"))
                 .copied()
                 .collect::<Vec<_>>()
                 .join(", ")

@@ -413,7 +413,7 @@ test-conformance-ledger-rules-decode:
 test-conformance-ledger-rules-apply-compare:
     DUGITE_REQUIRE_UPSTREAM=1 cargo nextest run -p dugite-conformance --features upstream-conformance --test upstream_tests -E 'test(/^upstream_ledger_rules_apply_compare_/) + test(ledger_rules_apply_and_compare) + test(/^ledger_rules_bites::/) + test(/^ledger_rules_contract::/)'
 
-# ledger-rules: the whole LEDGER/NEWEPOCH replay in one process with a summary; DUGITE_UPDATE_EXPECTED_RESULTS=1 rewrites the expected-results file (local only; refuses under CI).
+# ledger-rules: the whole LEDGER/NEWEPOCH replay (parallel threads, one fresh thread per vector) with a summary; DUGITE_UPDATE_EXPECTED_RESULTS=1 rewrites the expected-results file (local only; refuses under CI).
 ledger-rules-replay-report:
     cargo nextest run -p dugite-conformance --features upstream-conformance --test upstream_tests --run-ignored only -E 'test(ledger_rules_replay_report)' --no-capture
 

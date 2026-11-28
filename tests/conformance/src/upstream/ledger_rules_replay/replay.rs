@@ -97,18 +97,16 @@ pub fn replay_vector(vec: &ImpVector) -> Option<Replay> {
 
 /// [`replay_vector`] with an optional post-state hook.
 ///
-/// Keep the fresh-thread isolation below: verdicts that depend on what the thread
-/// or process evaluated before are tracked as #1193.
-///
-/// Every replay runs on a FRESH thread (so no per-thread cache is shared with an
-/// earlier replay on the caller's thread). That is NOT enough to make the verdict
-/// independent of what the PROCESS replayed before: in one process the same
-/// vectors gave different Phase-2 verdicts depending on which others had been
-/// evaluated (observed on `LEDGER/test_7892`, `7945`, `7975` among others, with
-/// one thread and with twelve). The reference is therefore a cold process per
-/// vector: the generated per-vector tests are exactly that, and the report that
-/// regenerates the contract (`mod.rs`, `replay_in_child`) runs each vector in its
-/// own child process.
+/// Every replay runs on a FRESH thread, and that is what makes the verdict
+/// independent of what was replayed before it. `LedgerState::apply_block` sets the
+/// thread-local `SKIP_PHASE2_EVAL` flag (`apply.rs`, `suppress_phase2_eval`) and
+/// restores it only on the success path; an early `return Err` / `?` leaves it set
+/// on that thread, so the NEXT transaction validated on the same thread skips
+/// Phase-2 evaluation and gets a different verdict. A vector replayed after one
+/// that failed inside `apply_block` therefore saw a different validator verdict
+/// than it does cold (observed on `LEDGER/test_7892`, `7945`, `7975`, ...). A fresh
+/// thread starts with the flag clear, so no child process is needed. The defect
+/// itself is #1193; keep this isolation until it is fixed.
 pub fn replay_vector_with(vec: &ImpVector, hook: Option<PostHook<'_>>) -> Option<Replay> {
     let kind = rule_kind(&vec.rule)?;
     let replay = std::thread::scope(|scope| {
@@ -217,8 +215,19 @@ fn replay_inner(vec: &ImpVector, kind: RuleKind, hook: Option<PostHook<'_>>) -> 
         (None, applied) => {
             if v_rejects {
                 // Haskell's predicate is not in the dump: record dugite's reason.
+                // The digest covers every validator error WITH its values and the
+                // import diff, so a swap between reasons that share a class name
+                // (e.g. the several Phase2CollectError messages) changes the entry.
+                let mut parts = vec![v_class.clone()];
+                parts.extend(v_details.clone());
+                parts.push("--pre--".into());
+                parts.extend(pre.digest_lines());
                 mk(
-                    Verdict::AgreedReject(format!("AGREED_REJECT validator={v_class}")),
+                    Verdict::AgreedReject(format!(
+                        "AGREED_REJECT validator={v_class} pre={} #{}",
+                        kinds_or(&pre, "none"),
+                        digest_of(&parts)
+                    )),
                     None,
                     None,
                     None,

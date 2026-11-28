@@ -11,7 +11,8 @@
 //!   * `cardano-base/`         → one test per `vrf*.txt` vector file
 //!   * `mithril/`              → one test per `.json` certificate fixture
 //!   * `ledger-rules/`         → one test per `<RULE>/test_N/` directory
-//!     (5,603 vectors at the v20260524 corpus tag)
+//!     (about 8,000 vectors; the count is pinned per corpus tag in
+//!     `ledger_rules_replay/expected.rs`)
 //!
 //! The runtime harness lives in `tests/upstream_tests.rs`; this script only
 //! generates the entries it `include!`s.
