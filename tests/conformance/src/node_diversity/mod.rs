@@ -21,6 +21,7 @@
 //! that writes a schema-valid report marked [`report::ReportStatus::Stub`]: it carries no result.
 //! [`ledger_rules`] (Phase 2b, #1125) is the first real one.
 
+pub mod cbor_decoding;
 pub mod ledger_rules;
 pub mod pins;
 pub mod report;

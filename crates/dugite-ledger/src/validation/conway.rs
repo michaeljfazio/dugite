@@ -18,6 +18,151 @@ use dugite_primitives::value::Lovelace;
 
 use super::{ValidationContext, ValidationError};
 
+/// The ledger registries as they are AFTER the transaction's certificates, for
+/// the GOV predicates.
+///
+/// Haskell runs CERTS first and hands the resulting `CertState` to GOV:
+///
+/// ```haskell
+/// -- cardano-ledger f649f9751074d2ab3de033fc3912f29c9862c1f5
+/// -- eras/conway/impl/src/Cardano/Ledger/Conway/Rules/Ledger.hs L394-421
+///           certStateAfterCERTS <-
+///             trans @(EraRule "CERTS" era) $ TRC ( CertsEnv tx pp curEpochNo committee committeeProposals
+///                   , certState', StrictSeq.fromStrict $ txBody ^. certsTxBodyL )
+///           ...
+///           proposalsState <-
+///             trans @(EraRule "GOV" era) $
+///               TRC ( GovEnv (txIdTxBody txBody) curEpochNo pp
+///                       (govState ^. constitutionGovStateL . constitutionGuardrailsScriptHashL)
+///                       certStateAfterCERTS
+///                       (govState ^. committeeGovStateL)
+///                   , proposals, govSignal )
+/// ```
+///
+/// and GOV reads `knownDReps = vsDReps certVState`, `knownStakePools =
+/// psStakePools certPState`, `knownCommitteeMembers =
+/// authorizedHotCommitteeCredentials committeeState` and `certDState ^.
+/// accountsL` from it (Conway/Rules/Gov.hs L467-474, L504-519, L593-604,
+/// L478-481). So a registry change made by a certificate of the same
+/// transaction is visible to the vote and proposal predicates, and a removal is
+/// visible too.
+///
+/// The certificates are folded left to right (Conway/Rules/Certs.hs L242-246),
+/// each effect being the one Haskell's DELEG / POOL / GOVCERT rule has on the
+/// field GOV reads:
+///
+/// * `accountsL`: `ConwayRegCert`-like certificates add the account, `UnRegCert`
+///   removes it.
+/// * `psStakePools`: `RegPool` adds the pool (Shelley Rules/Pool.hs L272-275);
+///   `RetirePool` only touches `psRetiring`, so a retiring pool still votes.
+/// * `vsDReps`: `RegDRep` adds, `UnRegDRep` removes (GovCert.hs L210-242).
+/// * `csCommitteeCreds`: `AuthCommitteeHotKey` sets the cold key's hot
+///   credential (replacing the previous one), `ResignCommitteeColdKey` replaces
+///   it with `CommitteeMemberResigned` (GovCert.hs L190-208, L273-276), which
+///   `authorizedHotCommitteeCredentials` skips.
+///
+/// Returns `None` when the transaction has no certificates, or has neither
+/// votes nor proposals (no GOV predicate would read the result), so the common
+/// payment transaction pays nothing.
+///
+/// A field that is `None` in `ctx` (registry not supplied) stays `None`: the
+/// predicate reading it is skipped, as before.
+pub(super) fn post_certs_context(
+    body: &TransactionBody,
+    ctx: &ValidationContext,
+) -> Option<ValidationContext> {
+    if body.certificates.is_empty()
+        || (body.voting_procedures.is_empty() && body.proposal_procedures.is_empty())
+    {
+        return None;
+    }
+    let mut out = ctx.clone();
+
+    // Copy-on-write the large registries only when a certificate touches them.
+    let mut dreps = ctx.registered_dreps.clone();
+    let mut pools = ctx.registered_pools.clone();
+    let mut accounts = ctx.reward_accounts.clone();
+    // Committee: evolve the cold -> hot map when it is known; otherwise the
+    // value set can only grow.
+    let mut hot_by_cold = ctx.committee_hot_key_by_cold.as_deref().cloned();
+    let mut authorized = ctx.committee_authorized_hot_keys.clone();
+
+    for cert in &body.certificates {
+        match cert {
+            Certificate::StakeRegistration(credential)
+            | Certificate::ConwayStakeRegistration { credential, .. }
+            | Certificate::RegStakeDeleg { credential, .. }
+            | Certificate::RegStakeVoteDeleg { credential, .. }
+            | Certificate::VoteRegDeleg { credential, .. } => {
+                if let Some(accounts) = accounts.as_mut() {
+                    accounts
+                        .entry(credential.to_typed_hash32())
+                        .or_insert(Lovelace(0));
+                }
+            }
+            Certificate::StakeDeregistration(credential)
+            | Certificate::ConwayStakeDeregistration { credential, .. } => {
+                if let Some(accounts) = accounts.as_mut() {
+                    accounts.remove(&credential.to_typed_hash32());
+                }
+            }
+            Certificate::PoolRegistration(params) => {
+                if let Some(pools) = pools.as_mut() {
+                    std::sync::Arc::make_mut(pools).insert(params.operator);
+                }
+            }
+            Certificate::RegDRep { credential, .. } => {
+                if let Some(dreps) = dreps.as_mut() {
+                    std::sync::Arc::make_mut(dreps).insert(credential.to_typed_hash32());
+                }
+            }
+            Certificate::UnregDRep { credential, .. } => {
+                if let Some(dreps) = dreps.as_mut() {
+                    std::sync::Arc::make_mut(dreps).remove(&credential.to_typed_hash32());
+                }
+            }
+            Certificate::CommitteeHotAuth {
+                cold_credential,
+                hot_credential,
+            } => {
+                let hot = hot_credential.to_typed_hash32();
+                if let Some(map) = hot_by_cold.as_mut() {
+                    map.insert(cold_credential.to_typed_hash32(), hot);
+                } else if let Some(set) = authorized.as_mut() {
+                    std::sync::Arc::make_mut(set).insert(hot);
+                }
+            }
+            Certificate::CommitteeColdResign {
+                cold_credential, ..
+            } => {
+                if let Some(map) = hot_by_cold.as_mut() {
+                    map.remove(&cold_credential.to_typed_hash32());
+                }
+            }
+            _ => {}
+        }
+    }
+
+    out.registered_dreps = dreps;
+    out.registered_pools = pools;
+    out.reward_accounts = accounts;
+    if let Some(map) = hot_by_cold {
+        out.committee_authorized_hot_keys =
+            Some(std::sync::Arc::new(map.values().copied().collect()));
+        if let Some(enacted) = ctx.committee_enacted_cold.as_deref() {
+            out.committee_authorized_elected_hot_keys = Some(std::sync::Arc::new(
+                map.iter()
+                    .filter(|(cold, _)| enacted.contains(*cold))
+                    .map(|(_, hot)| *hot)
+                    .collect(),
+            ));
+        }
+    } else {
+        out.committee_authorized_hot_keys = authorized;
+    }
+    Some(out)
+}
+
 /// Return the human-readable certificate type name when the certificate is
 /// Conway-only (requires protocol version >= 9). Returns `None` for
 /// pre-Conway certificates that are valid in all post-Shelley eras.
@@ -241,47 +386,24 @@ pub(super) fn check_pparam_update_well_formed(
                 reasons.push("nOpt=0");
             }
 
-            // Strict CostModels structural validation — PV >= 11.
+            // No cost-model clause: Haskell's `ppuWellFormed` does not inspect
+            // `ppuCostModelsL`. A too-short cost-model vector is accepted at
+            // proposal time and only matters when a script is evaluated
+            // (missing parameters cost `maxBound`).
             //
-            // Mirrors Haskell `validateCostModelsParamsUpdate` (cardano-ledger
-            // 10.7 / cardano-ledger validate PR #755): under PV >= 11 every present
-            // language's cost vector must have at least the language's
-            // minimum parameter count. Pre-PV11 behaviour is unchanged so
-            // historical mainnet/preview blocks replay cleanly.
-            //
-            // Per-language minimums (per Plutus core builtinCostModel.json
-            // and `Plutus.Core.CostModelInterface`):
-            //   PlutusV1: 166
-            //   PlutusV2: 175
-            //   PlutusV3: 251  (mainnet PV11 currently ships 297 — the
-            //                  strict rule is a *minimum*, not equality, so
-            //                  future builtin extensions remain accepted.)
-            //
-            // Plutus cost-model entries are encoded as `i64` in our
-            // primitives, so the "all entries must be Int" Haskell check is
-            // intrinsic to the type system here; only length is enforced.
-            if params.protocol_version_major >= 11 {
-                if let Some(ref cm) = ppu.cost_models {
-                    const V1_MIN: usize = 166;
-                    const V2_MIN: usize = 175;
-                    const V3_MIN: usize = 251;
-                    if let Some(v1) = &cm.plutus_v1 {
-                        if v1.len() < V1_MIN {
-                            reasons.push("cost_models[PlutusV1] too short");
-                        }
-                    }
-                    if let Some(v2) = &cm.plutus_v2 {
-                        if v2.len() < V2_MIN {
-                            reasons.push("cost_models[PlutusV2] too short");
-                        }
-                    }
-                    if let Some(v3) = &cm.plutus_v3 {
-                        if v3.len() < V3_MIN {
-                            reasons.push("cost_models[PlutusV3] too short");
-                        }
-                    }
-                }
-            }
+            // cardano-ledger f649f9751074d2ab3de033fc3912f29c9862c1f5,
+            // eras/conway/impl/src/Cardano/Ledger/Conway/PParams.hs L934-962
+            // (`instance ConwayEraPParams ConwayEra`, `ppuWellFormed`): the
+            // list holds only maxBBSize, maxTxSize, maxBHSize, maxValSize,
+            // collateralPercentage, committeeMaxTermLength, govActionLifetime,
+            // poolDeposit, govActionDeposit, dRepDeposit, coinsPerUTxOByte
+            // (post-bootstrap), `ppu /= emptyPParamsUpdate`, and nOpt (PV >= 11).
+            // `MalformedProposal` has a single producer, `actionWellFormed`
+            // (Conway/Rules/Gov.hs L393-399), which calls `ppuWellFormed` only.
+            // The identifier a former comment cited does not occur anywhere
+            // in that tree, and the Conway cost-model decoder is lenient
+            // (`decodeCostModelsLenient`, cardano-ledger-core
+            // Plutus/CostModels.hs L311-316 and L426-440).
 
             // Empty update check — all Option fields are None
             let is_empty = ppu.min_fee_a.is_none()
@@ -1685,8 +1807,9 @@ mod tests {
     }
 
     // ---------------------------------------------------------------------------
-    // check_pparam_update_well_formed — strict CostModels validation (PV >= 11,
-    // issue #464 / Haskell `validateCostModelsParamsUpdate`).
+    // check_pparam_update_well_formed — cost models are NOT inspected.
+    // Haskell `ppuWellFormed` (cardano-ledger f649f975, Conway/PParams.hs
+    // L934-962) has no cost-model clause, at any protocol version.
     // ---------------------------------------------------------------------------
 
     fn cost_models_proposal_body(
@@ -1739,7 +1862,7 @@ mod tests {
     }
 
     #[test]
-    fn test_cost_models_pv11_rejects_short_v1() {
+    fn test_cost_models_pv11_accepts_short_v1() {
         let mut params = ProtocolParameters::mainnet_defaults();
         params.protocol_version_major = 11;
         let body = cost_models_proposal_body(dugite_primitives::transaction::CostModels {
@@ -1751,16 +1874,14 @@ mod tests {
         });
         let mut errors = Vec::new();
         check_pparam_update_well_formed(&params, &body, &mut errors);
-        assert_eq!(errors.len(), 1);
         assert!(
-            matches!(&errors[0], ValidationError::MalformedProposal { reason, .. }
-                if reason.contains("cost_models[PlutusV1] too short")),
-            "PV11 must reject short V1 vector, got: {errors:?}",
+            errors.is_empty(),
+            "PV11 must accept a short PlutusV1 cost model (no ppuWellFormed clause), got: {errors:?}",
         );
     }
 
     #[test]
-    fn test_cost_models_pv11_rejects_short_v2() {
+    fn test_cost_models_pv11_accepts_short_v2() {
         let mut params = ProtocolParameters::mainnet_defaults();
         params.protocol_version_major = 11;
         let body = cost_models_proposal_body(dugite_primitives::transaction::CostModels {
@@ -1772,16 +1893,14 @@ mod tests {
         });
         let mut errors = Vec::new();
         check_pparam_update_well_formed(&params, &body, &mut errors);
-        assert_eq!(errors.len(), 1);
         assert!(
-            matches!(&errors[0], ValidationError::MalformedProposal { reason, .. }
-                if reason.contains("cost_models[PlutusV2] too short")),
-            "PV11 must reject short V2 vector, got: {errors:?}",
+            errors.is_empty(),
+            "PV11 must accept a short PlutusV2 cost model (no ppuWellFormed clause), got: {errors:?}",
         );
     }
 
     #[test]
-    fn test_cost_models_pv11_rejects_short_v3() {
+    fn test_cost_models_pv11_accepts_short_v3() {
         let mut params = ProtocolParameters::mainnet_defaults();
         params.protocol_version_major = 11;
         let body = cost_models_proposal_body(dugite_primitives::transaction::CostModels {
@@ -1793,11 +1912,9 @@ mod tests {
         });
         let mut errors = Vec::new();
         check_pparam_update_well_formed(&params, &body, &mut errors);
-        assert_eq!(errors.len(), 1);
         assert!(
-            matches!(&errors[0], ValidationError::MalformedProposal { reason, .. }
-                if reason.contains("cost_models[PlutusV3] too short")),
-            "PV11 must reject short V3 vector, got: {errors:?}",
+            errors.is_empty(),
+            "PV11 must accept a short PlutusV3 cost model (no ppuWellFormed clause), got: {errors:?}",
         );
     }
 

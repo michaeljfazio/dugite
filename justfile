@@ -520,10 +520,10 @@ ndc-report scenario:
 ndc-turbo-quick:
     DUGITE_NDC_TURBO_SAMPLE=40 DUGITE_NDC_REPORTS_DIR=target/node-diversity/reports-quick just ndc-report uplc-turbo
 
-# The whole ndc_reports test binary against NDC's real schema.json files, with the corpus REQUIRED
+# The ndc_reports and ndc_cbor_decoding test binaries against NDC's real schema.json files and the cbor dataset, with the corpus REQUIRED
 # (a missing corpus fails instead of skipping): the red-proofs of the schema validation run here.
 ndc-harness-test: ndc-fetch
-    DUGITE_NDC_REQUIRE=1 cargo nextest run -p dugite-conformance --test ndc_reports --no-tests=fail
+    DUGITE_NDC_REQUIRE=1 cargo nextest run -p dugite-conformance --test ndc_reports --test ndc_cbor_decoding --no-tests=fail
 
 # Write all four reports, schema-validated (cbor-decoding once per era), and run the harness tests
 # with the corpus required.  Every step runs; the recipe fails if any step failed.

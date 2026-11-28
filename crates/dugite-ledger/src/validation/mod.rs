@@ -441,6 +441,24 @@ pub struct ValidationContext {
     /// Reference: Haskell `authorizedElectedHotCommitteeCredentials` in
     /// `eras/conway/impl/src/Cardano/Ledger/CertState.hs`.
     pub committee_authorized_elected_hot_keys: Option<Arc<HashSet<Hash32>>>,
+    /// Cold credential -> hot credential for every committee member that has
+    /// authorised a hot key (Haskell `csCommitteeCreds` entries that are
+    /// `CommitteeHotCredential`), keys and values in the typed-hash form.
+    ///
+    /// [`Self::committee_authorized_hot_keys`] is the value set of this map.
+    /// The map itself is needed to evolve the committee state through a
+    /// transaction's own `CommitteeHotAuth` / `CommitteeColdResign`
+    /// certificates before the GOV predicates read it (see
+    /// [`conway::post_certs_context`]): a re-authorisation or a resignation
+    /// must remove the cold key's PREVIOUS hot key, which the value set alone
+    /// cannot say. When `None`, the evolution can only add hot keys.
+    pub committee_hot_key_by_cold: Option<Arc<HashMap<Hash32, Hash32>>>,
+    /// Cold credentials of the ENACTED committee (`committeeMembers
+    /// electedCommittee`), the filter of
+    /// `authorizedElectedHotCommitteeCredentials` (Governance.hs L581-591).
+    /// Together with [`Self::committee_hot_key_by_cold`] it lets the post-CERTS
+    /// context recompute [`Self::committee_authorized_elected_hot_keys`].
+    pub committee_enacted_cold: Option<Arc<HashSet<Hash32>>>,
     // ---------------------------------------------------------------------
     // MIR (Move Instantaneous Rewards) — Shelley–Babbage only.
     //
@@ -740,6 +758,19 @@ impl ValidationContext {
         hot_keys: Arc<HashSet<Hash32>>,
     ) -> Self {
         self.committee_authorized_elected_hot_keys = Some(hot_keys);
+        self
+    }
+
+    /// Supply the committee's cold -> hot credential map and the enacted
+    /// committee's cold credentials, so the GOV predicates can read the
+    /// committee state AFTER the transaction's own certificates.
+    pub fn with_committee_hot_key_registry(
+        mut self,
+        hot_by_cold: HashMap<Hash32, Hash32>,
+        enacted_cold: HashSet<Hash32>,
+    ) -> Self {
+        self.committee_hot_key_by_cold = Some(Arc::new(hot_by_cold));
+        self.committee_enacted_cold = Some(Arc::new(enacted_cold));
         self
     }
 
@@ -2842,6 +2873,21 @@ pub fn validate_transaction_with_context(
     // unknown voters first into a `HashSet` and skipping them when the
     // `DisallowedVoters` loop iterates.
     let mut extra_errors: Vec<ValidationError> = Vec::new();
+
+    // The GOV predicates below read the registries AFTER the transaction's own
+    // certificates, not before. Haskell's LEDGER rule runs CERTS first and
+    // passes `certStateAfterCERTS` to GOV (cardano-ledger
+    // f649f9751074d2ab3de033fc3912f29c9862c1f5,
+    // eras/conway/impl/src/Cardano/Ledger/Conway/Rules/Ledger.hs L394-421), and
+    // GOV takes `knownDReps`, `knownStakePools`, `knownCommitteeMembers` and the
+    // accounts from that state (Rules/Gov.hs L467-474). So a `RegDRep` /
+    // `RegPool` / `CommitteeHotAuth` / stake registration earlier in the tx makes
+    // a vote or a return account valid, and an `UnRegDRep` / stake
+    // deregistration / `CommitteeColdResign` makes it invalid.
+    // `conway::post_certs_context` folds the certificates over a clone of
+    // `context`; `None` means no certificate can matter and `context` is used.
+    let post_certs_ctx = conway::post_certs_context(&tx.body, &context);
+    let gov_ctx: &ValidationContext = post_certs_ctx.as_ref().unwrap_or(&context);
     if params.protocol_version_major >= 9 && !tx.body.voting_procedures.is_empty() {
         // -------------------------------------------------------------------
         // UnelectedCommitteeVoters (PV >= 11): every CC vote whose hot
@@ -2854,7 +2900,7 @@ pub fn validate_transaction_with_context(
         // `eras/conway/impl/src/Cardano/Ledger/Conway/Rules/Gov.hs`.
         // -------------------------------------------------------------------
         if params.protocol_version_major >= 11 {
-            if let Some(elected) = context.committee_authorized_elected_hot_keys.as_ref() {
+            if let Some(elected) = gov_ctx.committee_authorized_elected_hot_keys.as_ref() {
                 let mut unelected_hot: Vec<Hash32> = Vec::new();
                 let mut seen: HashSet<Hash32> = HashSet::new();
                 for (voter, vp_map) in tx.body.voting_procedures.iter() {
@@ -2896,7 +2942,7 @@ pub fn validate_transaction_with_context(
         let mut unknown_voters: Vec<Voter> = Vec::new();
         let mut unknown_voter_set: HashSet<Voter> = HashSet::new();
         for (voter, vp_map) in tx.body.voting_procedures.iter() {
-            if !vp_map.is_empty() && conway::is_voter_unknown(voter, &context) {
+            if !vp_map.is_empty() && conway::is_voter_unknown(voter, gov_ctx) {
                 unknown_voters.push(voter.clone());
                 unknown_voter_set.insert(voter.clone());
             }
@@ -3288,7 +3334,7 @@ pub fn validate_transaction_with_context(
     if params.protocol_version_major >= 9 && !tx.body.proposal_procedures.is_empty() {
         let mut bad_addrs: Vec<String> = Vec::new();
         for proposal in &tx.body.proposal_procedures {
-            if conway::is_proposal_return_account_unregistered(proposal, params, &context) {
+            if conway::is_proposal_return_account_unregistered(proposal, params, gov_ctx) {
                 // Hex-encode the raw return_addr bytes for the diagnostic.
                 // Matches the fold-based encoding used for withdrawal account
                 // hex strings above so error formatting stays consistent
@@ -3350,7 +3396,7 @@ pub fn validate_transaction_with_context(
         // rejected at PV9 by `DisallowedProposalDuringBootstrap`, Gov.hs
         // L440-442, which dugite raises above.)
         // -------------------------------------------------------------------
-        if let Some(reward_accounts) = context
+        if let Some(reward_accounts) = gov_ctx
             .reward_accounts
             .as_ref()
             .filter(|_| params.protocol_version_major != 9)
