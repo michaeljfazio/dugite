@@ -90,18 +90,14 @@ fn generate(
 fn generate_uplc_conformance(run: &RunInfo) -> Result<(ReportStatus, String, Value), String> {
     use dugite_conformance::node_diversity::uplc_conformance::run_all;
     let result = run_all(&corpora_dir())?;
-    let note = format!(
-        "{} vectors evaluated through the production gated path; {} evaluator panics, {} internal errors",
-        result.cases.len(),
-        result.panics.len(),
-        result.internal.len()
-    );
-    for line in result.panics.iter().chain(result.internal.iter()) {
-        eprintln!("uplc-conformance: {line}");
+    // A panic, an internal error or a decoder arm that is not wired is a dugite defect the report
+    // must not carry as a result: it makes the generator fail, so an error report is written.
+    if let Some(fatal) = result.fatal() {
+        return Err(fatal);
     }
     Ok((
         ReportStatus::Ok,
-        note,
+        result.summary(),
         uplc_conformance_report(run, &result.cases),
     ))
 }

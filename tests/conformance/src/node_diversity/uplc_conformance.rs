@@ -43,8 +43,14 @@ pub const MAX_MEM: i64 = 14_000_000;
 pub const EVAL_FAILURE: &str = "evaluation failure";
 pub const OUT_OF_BUDGET: &str = "out of budget";
 pub const PARSE_DECODE_ERROR: &str = "parse/decode error";
-/// Not one of the scenario's classes, on purpose: see the module doc.
+/// The three classes below are NOT the scenario's, on purpose: no expectation names them, so a
+/// vector that lands in one can never score, and a run that produces one FAILS (an error report).
+/// A panic, a dugite-internal or encoder error, and a decoder arm that says it is not yet wired are
+/// dugite defects or gaps, not outcomes of the program; folding them into `evaluation failure` or
+/// `parse/decode error` would let them score as a correct rejection.
 pub const EVALUATOR_PANIC: &str = "evaluator panic";
+pub const EVALUATOR_INTERNAL: &str = "evaluator internal error";
+pub const DECODER_NOT_WIRED: &str = "decoder not yet wired";
 
 /// One vector of the corpus, located from an `expectations.json` entry.
 #[derive(Debug, Clone)]
@@ -272,6 +278,94 @@ pub fn cbor_wrap(flat: &[u8]) -> Vec<u8> {
     out
 }
 
+/// NDC's own comparison of two evaluation texts (its `build.py` `normalize_evaluation`): whitespace
+/// around punctuation is presentation, the contents of a string are not.
+pub fn normalise_evaluation(text: &str) -> String {
+    let chars: Vec<char> = text.chars().collect();
+    let mut tokens: Vec<String> = Vec::new();
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        if c.is_whitespace() {
+            i += 1;
+        } else if c == '"' {
+            let start = i;
+            i += 1;
+            while i < chars.len() && chars[i] != '"' {
+                i += if chars[i] == '\\' { 2 } else { 1 };
+            }
+            i = (i + 1).min(chars.len());
+            tokens.push(chars[start..i].iter().collect());
+        } else if "()[],{}".contains(c) {
+            tokens.push(c.to_string());
+            i += 1;
+        } else {
+            let start = i;
+            while i < chars.len() && !chars[i].is_whitespace() && !"()[],{}\"".contains(chars[i]) {
+                i += 1;
+            }
+            tokens.push(chars[start..i].iter().collect());
+        }
+    }
+    let mut out = String::new();
+    for token in tokens {
+        let glue_left = matches!(token.as_str(), ")" | "]" | "}" | ",");
+        let after_open = out.ends_with(['(', '[', '{', ',']);
+        if !out.is_empty() && !glue_left && !after_open {
+            out.push(' ');
+        }
+        out.push_str(&token);
+    }
+    out
+}
+
+/// One NDC expectation: the observable result only.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Expectation {
+    pub evaluation: String,
+    pub budget: Option<(i64, i64)>,
+}
+
+/// Would NDC's scorer pass this report entry against this expectation?  (Evaluation text equal
+/// after normalisation, and the budget equal wherever one is expected.)
+pub fn scores(case: &UplcCase, expected: &Expectation) -> bool {
+    normalise_evaluation(&case.evaluation) == normalise_evaluation(&expected.evaluation)
+        && (expected.budget.is_none() || case.budget.map(|b| (b.cpu, b.mem)) == expected.budget)
+}
+
+/// `expectations.json`, keyed by `(id, protocol_version, plutus_version)`.  For CHECKING a run;
+/// the runner itself never reads an expected result.
+pub fn load_expectations(
+    corpora: &Path,
+) -> Result<BTreeMap<(String, String, String), Expectation>, String> {
+    let path = corpora.join("ndc/scenarios/uplc-conformance/expectations.json");
+    let text = std::fs::read_to_string(&path)
+        .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+    let doc: Value = serde_json::from_str(&text).map_err(|e| format!("{e}"))?;
+    let mut out = BTreeMap::new();
+    for e in doc["scenarios"].as_array().ok_or("no scenarios array")? {
+        let key = (
+            str_field(e, "id")?.to_string(),
+            str_field(e, "protocol_version")?.to_string(),
+            str_field(e, "plutus_version")?.to_string(),
+        );
+        let budget = e["budget"].as_object().map(|b| {
+            (
+                b["cpu"].as_i64().unwrap_or(-1),
+                b["mem"].as_i64().unwrap_or(-1),
+            )
+        });
+        out.insert(
+            key,
+            Expectation {
+                evaluation: str_field(e, "evaluation")?.to_string(),
+                budget,
+            },
+        );
+    }
+    Ok(out)
+}
+
 /// What running one vector produced, before it becomes a report entry.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Observed {
@@ -291,13 +385,33 @@ impl Observed {
     }
 }
 
+/// Whether `class` is one of the scenario's three, i.e. can score.
+pub fn is_scenario_class(class: &str) -> bool {
+    matches!(class, EVAL_FAILURE | OUT_OF_BUDGET | PARSE_DECODE_ERROR)
+}
+
+/// The class of an error raised BEFORE the machine started (decode, availability rules).
+fn classify_decode(error: &UplcError) -> &'static str {
+    match error {
+        // The decoder's own wording for an arm it does not implement.
+        UplcError::FlatDecode(m) | UplcError::CborDecode(m) if m.contains("not yet wired") => {
+            DECODER_NOT_WIRED
+        }
+        UplcError::FlatDecode(_) | UplcError::CborDecode(_) => PARSE_DECODE_ERROR,
+        UplcError::Internal(_) | UplcError::Encode(_) => EVALUATOR_INTERNAL,
+        _ => EVAL_FAILURE,
+    }
+}
+
+/// The class of an error raised by the machine.
 fn classify(error: &UplcError) -> &'static str {
     match error {
         UplcError::BudgetExhausted { .. } => OUT_OF_BUDGET,
-        UplcError::FlatDecode(_) | UplcError::CborDecode(_) => PARSE_DECODE_ERROR,
+        UplcError::FlatDecode(_) | UplcError::CborDecode(_) => classify_decode(error),
+        // dugite bugs, never an outcome of the program.
+        UplcError::Internal(_) | UplcError::Encode(_) => EVALUATOR_INTERNAL,
         // A script error, builtin type error or failure, machine error, free variable...: the
-        // program was runnable and did not produce a value.  `Internal` and `Encode` are dugite
-        // bugs; they land here too, with their message in `error`, and are counted separately.
+        // program was runnable and did not produce a value.
         _ => EVAL_FAILURE,
     }
 }
@@ -359,8 +473,8 @@ pub fn run_vector(
             "{}: the corpus cost model for PV{} {} could not be applied",
             v.id, v.major_pv, v.plutus_version
         )),
-        Err(ProgramEvalError::Decode(e)) => Ok(Observed::failure(PARSE_DECODE_ERROR, e)),
-        Err(ProgramEvalError::Scope(e)) => Ok(Observed::failure(EVAL_FAILURE, e)),
+        Err(ProgramEvalError::Decode(e)) => Ok(Observed::failure(classify_decode(&e), e)),
+        Err(ProgramEvalError::Scope(e)) => Ok(Observed::failure(classify(&e), e)),
         Err(ProgramEvalError::Eval { error, .. }) => Ok(Observed::failure(classify(&error), error)),
         Ok(done) => {
             let program = input_program.ok_or_else(|| {
@@ -385,9 +499,49 @@ pub fn run_vector(
 #[derive(Debug, Default)]
 pub struct Run {
     pub cases: Vec<UplcCase>,
-    pub panics: Vec<String>,
-    /// Failures whose message says dugite itself broke (`UplcError::Internal`).
-    pub internal: Vec<String>,
+    /// Vectors that produced one of the non-scoring classes (panic, internal error, decoder not
+    /// yet wired), with the evaluator's message.  A non-empty list fails the run.
+    pub unscorable: Vec<String>,
+    /// Vectors run from `.flat` through the production decoder.
+    pub from_flat: usize,
+    /// Vectors with no `.flat`, run from `.uplc` through the TEXT parser (`dugite_uplc::syn`),
+    /// which is not the production decoder.
+    pub from_text: usize,
+}
+
+impl Run {
+    /// The run's failure, if any: an unscorable outcome is a dugite defect the report must not hide.
+    pub fn fatal(&self) -> Option<String> {
+        if self.unscorable.is_empty() {
+            None
+        } else {
+            Some(format!(
+                "{} vectors hit a non-scoring outcome (panic, internal error or decoder not yet wired): {}",
+                self.unscorable.len(),
+                self.unscorable.join("; ")
+            ))
+        }
+    }
+
+    /// One line for the status note: how many results of each kind, and by which input path.
+    pub fn summary(&self) -> String {
+        let mut counts: BTreeMap<&str, usize> = BTreeMap::new();
+        for c in &self.cases {
+            let kind = if c.evaluation.starts_with('(') {
+                "result"
+            } else {
+                c.evaluation.as_str()
+            };
+            *counts.entry(kind).or_default() += 1;
+        }
+        format!(
+            "{} vectors through the production gated path; observed {counts:?}; {} run from .flat \
+             (production decoder), {} run from .uplc (text parser, not the production decoder)",
+            self.cases.len(),
+            self.from_flat,
+            self.from_text
+        )
+    }
 }
 
 /// Run the whole scenario on a thread with a large stack: the textual parser and some corpus
@@ -410,18 +564,20 @@ pub fn run_all(corpora: &Path) -> Result<Run, String> {
                             .map(|s| s.to_string())
                             .or_else(|| payload.downcast_ref::<String>().cloned())
                             .unwrap_or_else(|| "non-string panic payload".into());
-                        run.panics.push(format!("{}: {message}", v.id));
                         Observed::failure(EVALUATOR_PANIC, message)
                     }
                 };
-                if observed
-                    .error
-                    .as_deref()
-                    .is_some_and(|e| e.starts_with("internal:"))
+                if v.file("flat").is_file() {
+                    run.from_flat += 1;
+                } else {
+                    run.from_text += 1;
+                }
+                if !is_scenario_class(&observed.evaluation) && !observed.evaluation.starts_with('(')
                 {
-                    run.internal.push(format!(
-                        "{}: {}",
+                    run.unscorable.push(format!(
+                        "{}: {} ({})",
                         v.id,
+                        observed.evaluation,
                         observed.error.clone().unwrap_or_default()
                     ));
                 }
@@ -486,5 +642,32 @@ mod tests {
             PARSE_DECODE_ERROR
         );
         assert_eq!(classify(&UplcError::FreeVariable(1)), EVAL_FAILURE);
+    }
+
+    #[test]
+    fn internal_encode_and_not_wired_errors_never_become_a_scenario_class() {
+        assert_eq!(
+            classify(&UplcError::Internal("x".into())),
+            EVALUATOR_INTERNAL
+        );
+        assert_eq!(classify(&UplcError::Encode("x".into())), EVALUATOR_INTERNAL);
+        assert_eq!(
+            classify_decode(&UplcError::Internal("x".into())),
+            EVALUATOR_INTERNAL
+        );
+        assert_eq!(
+            classify_decode(&UplcError::FlatDecode(
+                "Array / Value flat encoding not yet wired".into()
+            )),
+            DECODER_NOT_WIRED
+        );
+        // An ordinary rejection of bad bytes is still a decode error.
+        assert_eq!(
+            classify_decode(&UplcError::FlatDecode("unknown term tag 0b1011".into())),
+            PARSE_DECODE_ERROR
+        );
+        for class in [EVALUATOR_INTERNAL, DECODER_NOT_WIRED, EVALUATOR_PANIC] {
+            assert!(!is_scenario_class(class));
+        }
     }
 }
