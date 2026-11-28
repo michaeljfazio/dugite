@@ -552,49 +552,58 @@ fn delegating_to_a_drep_unregistered_earlier_in_the_tx_is_still_rejected() {
 }
 
 /// The refund of an UnRegDRep that follows an in-tx RegDRep is compared with
-/// the deposit that RegDRep declared (GovCert.hs L234-242). The deposit map is
-/// not part of `mempool_validation_context`, so supply it explicitly.
+/// the deposit that RegDRep declared (GovCert.hs L234-242). The deposit is
+/// known from the transaction itself, so the comparison must not depend on
+/// `drep_deposits`, which the production contexts do not carry.
+fn wrong_refund_tx(x: &Signer, tag: u8, refund: u64) -> Transaction {
+    tx_with(
+        tag,
+        seed_input(),
+        10_000_000,
+        vec![reg(x), unreg(x, refund)],
+        DREP_DEPOSIT as i64 - refund as i64,
+        &[x],
+    )
+}
+
 #[test]
-fn refund_of_an_in_tx_registration_is_checked_against_its_own_deposit() {
+fn wrong_refund_on_an_in_tx_registered_drep_is_rejected_by_the_mempool_validator() {
     let x = Signer::new(0x5B);
     let (ledger, utxo) = ledger_at(10);
-    let ctx = || {
-        ledger
-            .mempool_validation_context()
-            .with_drep_deposits(std::collections::HashMap::new())
-    };
-    let run = |tag: u8, refund: u64| {
-        let tx = tx_with(
-            tag,
-            seed_input(),
-            10_000_000,
-            vec![reg(&x), unreg(&x, refund)],
-            DREP_DEPOSIT as i64 - refund as i64,
-            &[&x],
-        );
-        validate_transaction_with_context(
-            &tx,
-            &utxo,
-            &ledger.epochs.protocol_params,
-            100,
-            300,
-            None,
-            ctx(),
-        )
-        .err()
-        .unwrap_or_default()
-    };
-    let right = run(0x2A, DREP_DEPOSIT);
+    // Production context: `drep_deposits` is None.
+    assert!(ledger.mempool_validation_context().drep_deposits.is_none());
+    let right = mempool_errors(&ledger, &utxo, &wrong_refund_tx(&x, 0x2A, DREP_DEPOSIT));
     assert!(
         right.is_empty(),
         "matching refund must be accepted; got {right:?}"
     );
-    let wrong = run(0x2B, DREP_DEPOSIT + 1);
+    let wrong = mempool_errors(&ledger, &utxo, &wrong_refund_tx(&x, 0x2B, DREP_DEPOSIT + 1));
     assert!(
         has(&wrong, |e| matches!(
             e,
-            ValidationError::DRepIncorrectRefund { .. }
+            ValidationError::DRepIncorrectRefund { declared, expected, .. }
+                if *declared == DREP_DEPOSIT + 1 && *expected == DREP_DEPOSIT
         )),
         "a refund that differs from the in-tx deposit must raise DRepIncorrectRefund; got {wrong:?}"
+    );
+}
+
+#[test]
+fn wrong_refund_on_an_in_tx_registered_drep_is_flagged_by_apply_block() {
+    let x = Signer::new(0x5C);
+    let (mut ledger, _) = ledger_at(10);
+    let (result, warns) = apply_single_tx_block(
+        &mut ledger,
+        wrong_refund_tx(&x, 0x2C, DREP_DEPOSIT + 1),
+        1,
+        Hash32::ZERO,
+    );
+    let flagged = result.is_err()
+        || warns
+            .iter()
+            .any(|l| l.contains("DRepIncorrectRefund") || l.contains("IncorrectRefund"));
+    assert!(
+        flagged,
+        "ValidateAll must flag the wrong refund; result {result:?}, warns {warns:?}"
     );
 }

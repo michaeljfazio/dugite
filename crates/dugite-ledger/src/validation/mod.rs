@@ -2791,13 +2791,14 @@ pub fn validate_transaction_with_context(
     // `cardano-ledger-conway:Cardano.Ledger.Conway.Rules.GovCert`.
     // ------------------------------------------------------------------
     let mut extra_errors_pre: Vec<ValidationError> = Vec::new();
-    if let (Some(dreps), Some(deposits)) = (
-        context.registered_dreps.as_deref(),
-        context.drep_deposits.as_deref(),
-    ) {
+    if let Some(dreps) = context.registered_dreps.as_deref() {
         // Left-to-right over the EVOLVING registry (Conway/Rules/Certs.hs
         // L242-246): a `RegDRep` earlier in this tx stores ITS deposit, which
-        // a later `UnregDRep` of the same credential must refund.
+        // a later `UnregDRep` of the same credential must refund. That
+        // in-tx deposit is known from the transaction itself, so it is
+        // compared whether or not `drep_deposits` (the stored deposits of
+        // DReps registered BEFORE this tx) was supplied.
+        let deposits = context.drep_deposits.as_deref();
         let mut overlay = conway::DRepRegistryOverlay::new(dreps);
         for cert in &tx.body.certificates {
             match cert {
@@ -2815,7 +2816,7 @@ pub fn validate_transaction_with_context(
                     }
                     let expected = overlay
                         .in_tx_deposit(&key)
-                        .or_else(|| deposits.get(&key).copied());
+                        .or_else(|| deposits.and_then(|d| d.get(&key).copied()));
                     if let Some(stored_deposit) = expected {
                         if refund.0 != stored_deposit {
                             extra_errors_pre.push(ValidationError::DRepIncorrectRefund {
