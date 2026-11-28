@@ -787,6 +787,10 @@ pub struct Node {
     /// Receiver for peer failure reports from protocol tasks (e.g. fetch timeout).
     /// The main run loop drains this to call `peer_failed()` for reputation scoring.
     peer_failure_rx: Option<mpsc::Receiver<(SocketAddr, PeerFailureKind)>>,
+    /// Sending half of the same channel, so the block-apply path can report
+    /// the peer that served an invalid block (Haskell `InvalidBlockPunishment`).
+    /// Set in `run` alongside `peer_failure_rx`.
+    peer_failure_tx: Option<mpsc::Sender<(SocketAddr, PeerFailureKind)>>,
     /// Receiver for KeepAlive RTT measurements from connected peers.
     /// The main run loop uses these to update PeerManager EWMA and RTT gauges.
     keepalive_rtt_rx: Option<mpsc::Receiver<(SocketAddr, f64)>>,
@@ -2891,6 +2895,7 @@ impl Node {
                 .unwrap_or(256),
             shutdown_rx_for_flush: None,
             peer_failure_rx: None,
+            peer_failure_tx: None,
             keepalive_rtt_rx: None,
             query_handler,
             peer_manager: Arc::new(RwLock::new({
@@ -5119,6 +5124,7 @@ impl Node {
         let (fetched_blocks_tx, fetched_blocks_rx) =
             mpsc::channel::<FetchedBlock>(fetched_blocks_cap);
         let (peer_failure_tx, peer_failure_rx) = mpsc::channel::<(SocketAddr, PeerFailureKind)>(64);
+        self.peer_failure_tx = Some(peer_failure_tx.clone());
         let (keepalive_rtt_tx, keepalive_rtt_rx) = mpsc::channel::<(SocketAddr, f64)>(256);
         let candidate_chains: Arc<RwLock<HashMap<SocketAddr, CandidateChainState>>> =
             Arc::new(RwLock::new(HashMap::new()));
@@ -6566,6 +6572,44 @@ impl Node {
 
     // ─── apply_fetched_block() ──────────────────────────────────────────────
 
+    /// Reject a block a peer served that failed validation when it was
+    /// applied — its Praos header, or its body in the ledger.
+    ///
+    /// Haskell `ChainSel.validateCandidate` (ouroboros-consensus
+    /// `136122cc66`), on `ValidateLedgerError`, does three things: records the
+    /// block in the invalid-block set (`addInvalidBlock varInvalid e pt`),
+    /// keeps the chain at the last valid block (`Diff.truncate
+    /// (castPoint lastValid) chainDiff`), and punishes the peer that sent it
+    /// (`InvalidBlockPunishment.enact punishment … BlockItself`, which throws
+    /// `PeerSentAnInvalidBlockException` to that peer's client thread and so
+    /// tears its connection down). The first two are
+    /// [`Self::abandon_failed_fork`] with the parent as the intersection; the
+    /// third is a `ProtocolFault` report for `peer`.
+    ///
+    /// The ledger must already be at `parent` — for a ledger failure, the
+    /// caller has run [`undo_failed_block_apply`] first.
+    async fn reject_invalid_peer_block(
+        &self,
+        peer: SocketAddr,
+        bad_hash: dugite_primitives::hash::Hash32,
+        reason: &str,
+        parent: &dugite_primitives::block::Point,
+    ) {
+        self.abandon_failed_fork(bad_hash, reason, parent).await;
+        if let Some(ref tx) = self.peer_failure_tx {
+            // `try_send`: this runs on the run loop, which is also the
+            // channel's only reader, so waiting for room could never end.
+            if let Err(e) = tx.try_send((peer, PeerFailureKind::ProtocolFault)) {
+                warn!(
+                    %peer,
+                    bad = %bad_hash.to_hex(),
+                    error = %e,
+                    "Could not report the peer that served an invalid block"
+                );
+            }
+        }
+    }
+
     /// Abandon a fork whose replay failed (a body-hash mismatch or a ledger
     /// apply error on a fork-replayed block).
     ///
@@ -7607,7 +7651,8 @@ impl Node {
                 let ls = self.ledger_state.read().await;
                 ls.tip.point.clone()
             };
-            self.abandon_failed_fork(
+            self.reject_invalid_peer_block(
+                fetched.peer,
                 block_hash,
                 "apply-time Praos header validation failed",
                 &parent_point,
@@ -7861,31 +7906,32 @@ impl Node {
                     (delta, items)
                 }
                 Err(e) => {
-                    // Issue #669 — surface this as a hard operator-actionable
-                    // signal.  The earlier `warn! + return` was indistinguishable
-                    // from a silent network gap: the chain stops advancing but
-                    // there's no metric increment and no error-level entry, so
-                    // monitoring sees only the absence of further "Chain extended"
-                    // lines.  An apply failure on a fetched block is always one
-                    // of:
-                    //   (a) a dugite bug (the network accepts the block; we
-                    //       mis-validate).  Loud ERROR + metric so the operator
-                    //       files an issue instead of mistaking it for upstream
-                    //       silence.  See #668 for the canonical case.
-                    //   (b) a peer feeding bad data.  Same loud signal; the peer
-                    //       is implicitly throttled by the existing fetch-rate
-                    //       controls and follow-up work (#669) will add explicit
-                    //       per-peer disqualification on apply failure.
+                    // The block reached here as `AddedAsTip`: ChainDB's selected
+                    // chain already ends in it, one block ahead of the ledger.
+                    // Haskell handles a ledger failure here exactly like the
+                    // header failure above — the block goes into the invalid-
+                    // block set, the chain stays at its parent, the peer that
+                    // sent it is punished (`ChainSel.validateCandidate`,
+                    // `ValidateLedgerError`). Merely returning left the invalid
+                    // block as the ChainDB tip: re-fetched and re-rejected
+                    // forever, never cached as invalid, and adopted without
+                    // validation by the next restart's replay.
                     //
-                    // Undo the partial apply under the lock the apply held, so
-                    // nothing ever sees it.
+                    // First undo the partial apply, under the lock the apply
+                    // held, so nothing ever sees it.
                     {
                         let seq = self.ledger_seq.read().await;
                         undo_failed_block_apply(&mut ls, &seq, block_slot, &block_hash);
                     }
+                    let parent_point = ls.tip.point.clone();
+                    drop(ls);
                     self.metrics
                         .block_apply_failures
                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    // ERROR, not WARN: on a network cardano-node accepts this
+                    // block, so this is either a peer serving an invalid block
+                    // or a dugite validation bug — the operator must be able to
+                    // tell from the error which one.
                     error!(
                         peer = %fetched.peer,
                         slot = block_slot.0,
@@ -7893,13 +7939,16 @@ impl Node {
                         hash = %block_hash.to_hex(),
                         prev = %block.prev_hash().to_hex(),
                         txs = block.transactions.len(),
-                        "Fetched block failed ledger apply: {e} \
-                         — chain advance halted at this block. \
-                         Investigate the validation error above; the same \
-                         block will be re-fetched from this and other peers \
-                         and will keep failing until the underlying issue is \
-                         resolved."
+                        "Fetched block failed ledger apply: {e} — block marked \
+                         invalid, chain kept at its parent, peer reported"
                     );
+                    self.reject_invalid_peer_block(
+                        fetched.peer,
+                        block_hash,
+                        "ledger apply failed",
+                        &parent_point,
+                    )
+                    .await;
                     return;
                 }
             }

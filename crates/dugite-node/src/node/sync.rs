@@ -3039,6 +3039,18 @@ impl Node {
             );
         }
 
+        // Blocks above the immutable tip have not been validated by THIS start
+        // of the process: they may be ones a previous run rejected (an invalid
+        // block is stored before it is applied, as the selected-chain tip), or
+        // ones it stored and never applied (a crash between the two). Haskell
+        // re-runs chain selection over the VolatileDB at startup with full
+        // validation (`ChainSel.initialChainSelection` → `chainSelection'` →
+        // `validateCandidate`, ouroboros-consensus `136122cc66`), recording
+        // invalid blocks and keeping the chain at the last valid one. Replay
+        // does the same: once it reaches the VolatileDB it applies every block
+        // with `ValidateAll`, pushing a delta per block so a rejected block can
+        // be undone, and stops at the first rejected one.
+        let mut validating_volatile = false;
         let mut current_slot = start_slot;
         // Point cursor: steps through same-slot Byron EBB/main pairs that a
         // slot-only walk skips.  Origin/unknown hashes fall back to the
@@ -3069,12 +3081,17 @@ impl Node {
                 break;
             }
 
-            let block_data = {
+            let (block_data, next_is_volatile) = {
                 let db = self.chain_db.read().await;
-                db.get_next_block_after_point(
+                let next = db.get_next_block_after_point(
                     dugite_primitives::time::SlotNo(current_slot),
                     &current_hash,
-                )
+                );
+                let volatile = matches!(
+                    &next,
+                    Ok(Some((_, h, _))) if db.get_volatile_block_meta(h).is_some()
+                );
+                (next, volatile)
             };
 
             match block_data {
@@ -3084,22 +3101,87 @@ impl Node {
                         break;
                     }
 
-                    // Minimal decode: LSM replay always uses ApplyOnly mode;
-                    // witness-set fields are never accessed.
-                    match dugite_serialization::decode_block_minimal_with_byron_epoch_length(
-                        &cbor,
-                        self.byron_epoch_length,
-                    ) {
+                    if next_is_volatile && !validating_volatile {
+                        validating_volatile = true;
+                        // The window has to start at the state the volatile
+                        // blocks are applied to, so a rejected one can be undone
+                        // from it. In the delta regime it already does (every
+                        // block so far was pushed); otherwise the seq is still
+                        // anchored where `Node::new` left it.
+                        if !delta_replay {
+                            self.reanchor_ledger_seq("startup replay reached the VolatileDB")
+                                .await;
+                        }
+                        info!(
+                            slot = next_slot.0,
+                            "Replay reached the VolatileDB: validating its blocks in full, \
+                             as cardano-node's initial chain selection does"
+                        );
+                    }
+                    let validate = validating_volatile;
+
+                    // ApplyOnly never reads the witness set, so it decodes
+                    // minimally; ValidateAll needs the full block (#738).
+                    let decoded = if validate {
+                        dugite_serialization::decode_block_with_byron_epoch_length(
+                            &cbor,
+                            self.byron_epoch_length,
+                        )
+                    } else {
+                        dugite_serialization::decode_block_minimal_with_byron_epoch_length(
+                            &cbor,
+                            self.byron_epoch_length,
+                        )
+                    };
+                    match decoded {
                         Ok(block) => {
                             let mut ls = self.ledger_state.write().await;
                             let block_no = ls.tip.block_number.0 + 1;
-                            // #1057: in the delta regime every replayed block must also
-                            // land in the LedgerSeq, so the anchor stays where it is
-                            // (Origin) and the chain remains rollback-able. Identical
-                            // validation mode either way — ApplyOnly — so this changes
-                            // what is RECORDED about the replay, never its result.
                             let mut delta_opt = None;
-                            if delta_replay {
+                            if validate {
+                                ls.phase2_apply_horizon =
+                                    if block.era >= dugite_primitives::era::Era::Babbage {
+                                        let pre_tip = ls.tip.point.slot().map(|s| s.0).unwrap_or(0);
+                                        self.era_history.read().await.phase2_apply_horizon_slot(
+                                            dugite_primitives::time::SlotNo(pre_tip),
+                                        )
+                                    } else {
+                                        None
+                                    };
+                                match tokio::task::block_in_place(|| {
+                                    ls.apply_block_with_delta(&block, BlockValidationMode::ValidateAll)
+                                }) {
+                                    Ok(delta) => delta_opt = Some(delta),
+                                    Err(e) => {
+                                        {
+                                            let seq = self.ledger_seq.read().await;
+                                            crate::node::undo_failed_block_apply(
+                                                &mut ls, &seq, next_slot, &next_hash,
+                                            );
+                                        }
+                                        let parent_point = ls.tip.point.clone();
+                                        drop(ls);
+                                        error!(
+                                            slot = next_slot.0,
+                                            hash = %next_hash.to_hex(),
+                                            "Replay: VolatileDB block failed ledger validation: \
+                                             {e} — block marked invalid, chain kept at its parent"
+                                        );
+                                        self.abandon_failed_fork(
+                                            next_hash,
+                                            "startup replay: ledger apply failed",
+                                            &parent_point,
+                                        )
+                                        .await;
+                                        break;
+                                    }
+                                }
+                            } else if delta_replay {
+                                // #1057: in the delta regime every replayed block must
+                                // also land in the LedgerSeq, so the anchor stays where
+                                // it is (Origin) and the chain remains rollback-able.
+                                // Same mode — ApplyOnly — so this changes what is
+                                // RECORDED about the replay, never its result.
                                 match ls
                                     .apply_block_with_delta(&block, BlockValidationMode::ApplyOnly)
                                 {
@@ -3156,7 +3238,13 @@ impl Node {
                             if let Some(delta) = delta_opt {
                                 let mut seq = self.ledger_seq.write().await;
                                 seq.push(delta);
-                                pushed_deltas = true;
+                                // Outside the #1057 delta regime these deltas exist
+                                // only so a rejected volatile block can be undone;
+                                // the caller still re-anchors after the post-replay
+                                // stake rebuild below, which they do not record.
+                                if delta_replay {
+                                    pushed_deltas = true;
+                                }
                             }
                         }
                         Err(e) => {
