@@ -971,7 +971,7 @@ pub(crate) fn read_relay(r: &mut Reader<'_>) -> Result<Relay, SerializationError
     }
 }
 
-fn read_opt_port(r: &mut Reader<'_>) -> Result<Option<u16>, SerializationError> {
+pub(crate) fn read_opt_port(r: &mut Reader<'_>) -> Result<Option<u16>, SerializationError> {
     if r.peek_major()? == Type::Null {
         r.read_null()?;
         return Ok(None);
@@ -980,7 +980,7 @@ fn read_opt_port(r: &mut Reader<'_>) -> Result<Option<u16>, SerializationError> 
     Ok(Some(v as u16))
 }
 
-fn read_opt_ipv4(r: &mut Reader<'_>) -> Result<Option<[u8; 4]>, SerializationError> {
+pub(crate) fn read_opt_ipv4(r: &mut Reader<'_>) -> Result<Option<[u8; 4]>, SerializationError> {
     if r.peek_major()? == Type::Null {
         r.read_null()?;
         return Ok(None);
@@ -997,7 +997,7 @@ fn read_opt_ipv4(r: &mut Reader<'_>) -> Result<Option<[u8; 4]>, SerializationErr
     Ok(Some(a))
 }
 
-fn read_opt_ipv6(r: &mut Reader<'_>) -> Result<Option<[u8; 16]>, SerializationError> {
+pub(crate) fn read_opt_ipv6(r: &mut Reader<'_>) -> Result<Option<[u8; 16]>, SerializationError> {
     if r.peek_major()? == Type::Null {
         r.read_null()?;
         return Ok(None);
@@ -1014,7 +1014,9 @@ fn read_opt_ipv6(r: &mut Reader<'_>) -> Result<Option<[u8; 16]>, SerializationEr
     Ok(Some(a))
 }
 
-fn read_pool_metadata(r: &mut Reader<'_>) -> Result<Option<PoolMetadata>, SerializationError> {
+pub(crate) fn read_pool_metadata(
+    r: &mut Reader<'_>,
+) -> Result<Option<PoolMetadata>, SerializationError> {
     let ty = r.peek_major()?;
     if ty == Type::Null {
         r.read_null()?;

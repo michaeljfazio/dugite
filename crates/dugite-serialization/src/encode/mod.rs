@@ -15,6 +15,7 @@ mod block;
 mod certificate;
 mod governance;
 mod protocol_params;
+pub mod rules;
 mod script;
 pub(crate) mod transaction;
 mod value;

@@ -41,6 +41,9 @@ pub(crate) mod raw;
 #[allow(dead_code)]
 pub(crate) mod reader;
 
+/// Rule-level entry points for the node-diversity conformance harness.
+pub mod rules;
+
 // In-house era decoders — all 8 Cardano eras.
 //
 // M4a: Byron (era tags 0/1), Shelley (2).
