@@ -253,28 +253,34 @@ type PlcVersionsIntroduced = (u32, &'static [(u8, u8, u8)]);
 /// The Plutus Core program versions each ledger language gains at each
 /// protocol major version — Haskell `plcVersionsIntroducedIn`.
 ///
-/// `IntersectMBO/plutus` @ `1.71.0.0` (the version cardano-node 11.2.1 ships;
-/// the table is identical at `1.72.0.0`),
-/// `plutus-ledger-api/src/PlutusLedgerApi/Common/Versions.hs` L362-385:
+/// `IntersectMBO/plutus` @ `1.70.0.0` (the version the current mainnet release,
+/// cardano-node 11.1.3, ships),
+/// `plutus-ledger-api/src/PlutusLedgerApi/Common/Versions.hs` L362-382:
 ///
 /// ```haskell
-/// PlutusV1 -> [ (alonzoPV, [plcVersion100]), (vanRossemPV, [plcVersion110]), (dijkstraPV, [plcVersion120]) ]
-/// PlutusV2 -> [ (vasilPV,  [plcVersion100]), (vanRossemPV, [plcVersion110]), (dijkstraPV, [plcVersion120]) ]
-/// PlutusV3 -> [ (changPV,  [plcVersion100, plcVersion110]), (dijkstraPV, [plcVersion120]) ]
-/// PlutusV4 -> [ (dijkstraPV, [plcVersion100, plcVersion110, plcVersion120]) ]
+/// PlutusV1 -> [ (alonzoPV, [plcVersion100]), (vanRossemPV, [plcVersion110]) ]
+/// PlutusV2 -> [ (vasilPV,  [plcVersion100]), (vanRossemPV, [plcVersion110]) ]
+/// PlutusV3 -> [ (changPV,  [plcVersion100, plcVersion110]) ]
+/// PlutusV4 -> [ (dijkstraPV, [plcVersion100, plcVersion110]) ]
 /// ```
 ///
 /// with alonzo = 5, vasil = 7, chang = 9, vanRossem = 11, dijkstra = 12
 /// (`ProtocolVersions.hs`).
+///
+/// Not yet followed: plutus `1.71.0.0` (pre-release cardano-node 11.2.x) adds
+/// `(dijkstraPV, [plcVersion120])` to every language, together with a change
+/// to `case` on builtin values that depends on the program version
+/// (`Eval.hs` `defaultCaserBuiltinFor pv plcVersion`: `caseBuiltin` only for
+/// `plcVersion >= plcVersion120` at `dijkstraPV`). dugite's machine does not
+/// implement that semantics, so 1.2.0 stays unavailable until it does.
 const fn plc_versions_introduced_in(language: ScriptLanguage) -> &'static [PlcVersionsIntroduced] {
     const V100: (u8, u8, u8) = (1, 0, 0);
     const V110: (u8, u8, u8) = (1, 1, 0);
-    const V120: (u8, u8, u8) = (1, 2, 0);
     match language {
-        ScriptLanguage::PlutusV1 => &[(5, &[V100]), (11, &[V110]), (12, &[V120])],
-        ScriptLanguage::PlutusV2 => &[(7, &[V100]), (11, &[V110]), (12, &[V120])],
-        ScriptLanguage::PlutusV3 => &[(9, &[V100, V110]), (12, &[V120])],
-        ScriptLanguage::PlutusV4 => &[(12, &[V100, V110, V120])],
+        ScriptLanguage::PlutusV1 => &[(5, &[V100]), (11, &[V110])],
+        ScriptLanguage::PlutusV2 => &[(7, &[V100]), (11, &[V110])],
+        ScriptLanguage::PlutusV3 => &[(9, &[V100, V110])],
+        ScriptLanguage::PlutusV4 => &[(12, &[V100, V110])],
     }
 }
 
@@ -306,9 +312,9 @@ pub fn plc_version_available_in(
 /// Reject a program whose declared Plutus Core version is not available for
 /// its ledger language at `major_pv`.
 ///
-/// `IntersectMBO/plutus` @ `1.71.0.0`,
-/// `plutus-ledger-api/src/PlutusLedgerApi/Common/Eval.hs` L124-128
-/// (`mkTermToEvaluate`, identical at `1.72.0.0` and `1.63.0.0`):
+/// `IntersectMBO/plutus` @ `1.70.0.0` (cardano-node 11.1.3),
+/// `plutus-ledger-api/src/PlutusLedgerApi/Common/Eval.hs` L123-127
+/// (`mkTermToEvaluate`; the same check at `1.63.0.0`, `1.71.0.0`, `1.72.0.0`):
 ///
 /// ```haskell
 /// -- check that the Plutus Core language version is available
@@ -1874,7 +1880,7 @@ mod tests {
         }
     }
 
-    /// The whole (language, PV) table from PV5 to PV13, written out
+    /// The whole (language, PV) table from PV5 to PV13 (plutus 1.70.0.0), written out
     /// independently of `plc_versions_introduced_in`, so a wrong entry there
     /// fails here. Candidate versions include near misses (1.0.1, 0.x, 2.0.0).
     #[test]
@@ -1894,9 +1900,8 @@ mod tests {
             if pv >= v110 {
                 out.push((1, 1, 0));
             }
-            if pv >= 12 {
-                out.push((1, 2, 0));
-            }
+            // 1.2.0 is never available: plutus 1.70.0.0 (node 11.1.3) has no
+            // `plcVersion120` entry for any language.
             out
         };
         let candidates = [
