@@ -18,6 +18,151 @@ use dugite_primitives::value::Lovelace;
 
 use super::{ValidationContext, ValidationError};
 
+/// The ledger registries as they are AFTER the transaction's certificates, for
+/// the GOV predicates.
+///
+/// Haskell runs CERTS first and hands the resulting `CertState` to GOV:
+///
+/// ```haskell
+/// -- cardano-ledger f649f9751074d2ab3de033fc3912f29c9862c1f5
+/// -- eras/conway/impl/src/Cardano/Ledger/Conway/Rules/Ledger.hs L394-421
+///           certStateAfterCERTS <-
+///             trans @(EraRule "CERTS" era) $ TRC ( CertsEnv tx pp curEpochNo committee committeeProposals
+///                   , certState', StrictSeq.fromStrict $ txBody ^. certsTxBodyL )
+///           ...
+///           proposalsState <-
+///             trans @(EraRule "GOV" era) $
+///               TRC ( GovEnv (txIdTxBody txBody) curEpochNo pp
+///                       (govState ^. constitutionGovStateL . constitutionGuardrailsScriptHashL)
+///                       certStateAfterCERTS
+///                       (govState ^. committeeGovStateL)
+///                   , proposals, govSignal )
+/// ```
+///
+/// and GOV reads `knownDReps = vsDReps certVState`, `knownStakePools =
+/// psStakePools certPState`, `knownCommitteeMembers =
+/// authorizedHotCommitteeCredentials committeeState` and `certDState ^.
+/// accountsL` from it (Conway/Rules/Gov.hs L467-474, L504-519, L593-604,
+/// L478-481). So a registry change made by a certificate of the same
+/// transaction is visible to the vote and proposal predicates, and a removal is
+/// visible too.
+///
+/// The certificates are folded left to right (Conway/Rules/Certs.hs L242-246),
+/// each effect being the one Haskell's DELEG / POOL / GOVCERT rule has on the
+/// field GOV reads:
+///
+/// * `accountsL`: `ConwayRegCert`-like certificates add the account, `UnRegCert`
+///   removes it.
+/// * `psStakePools`: `RegPool` adds the pool (Shelley Rules/Pool.hs L272-275);
+///   `RetirePool` only touches `psRetiring`, so a retiring pool still votes.
+/// * `vsDReps`: `RegDRep` adds, `UnRegDRep` removes (GovCert.hs L210-242).
+/// * `csCommitteeCreds`: `AuthCommitteeHotKey` sets the cold key's hot
+///   credential (replacing the previous one), `ResignCommitteeColdKey` replaces
+///   it with `CommitteeMemberResigned` (GovCert.hs L190-208, L273-276), which
+///   `authorizedHotCommitteeCredentials` skips.
+///
+/// Returns `None` when the transaction has no certificates, or has neither
+/// votes nor proposals (no GOV predicate would read the result), so the common
+/// payment transaction pays nothing.
+///
+/// A field that is `None` in `ctx` (registry not supplied) stays `None`: the
+/// predicate reading it is skipped, as before.
+pub(super) fn post_certs_context(
+    body: &TransactionBody,
+    ctx: &ValidationContext,
+) -> Option<ValidationContext> {
+    if body.certificates.is_empty()
+        || (body.voting_procedures.is_empty() && body.proposal_procedures.is_empty())
+    {
+        return None;
+    }
+    let mut out = ctx.clone();
+
+    // Copy-on-write the large registries only when a certificate touches them.
+    let mut dreps = ctx.registered_dreps.clone();
+    let mut pools = ctx.registered_pools.clone();
+    let mut accounts = ctx.reward_accounts.clone();
+    // Committee: evolve the cold -> hot map when it is known; otherwise the
+    // value set can only grow.
+    let mut hot_by_cold = ctx.committee_hot_key_by_cold.as_deref().cloned();
+    let mut authorized = ctx.committee_authorized_hot_keys.clone();
+
+    for cert in &body.certificates {
+        match cert {
+            Certificate::StakeRegistration(credential)
+            | Certificate::ConwayStakeRegistration { credential, .. }
+            | Certificate::RegStakeDeleg { credential, .. }
+            | Certificate::RegStakeVoteDeleg { credential, .. }
+            | Certificate::VoteRegDeleg { credential, .. } => {
+                if let Some(accounts) = accounts.as_mut() {
+                    accounts
+                        .entry(credential.to_typed_hash32())
+                        .or_insert(Lovelace(0));
+                }
+            }
+            Certificate::StakeDeregistration(credential)
+            | Certificate::ConwayStakeDeregistration { credential, .. } => {
+                if let Some(accounts) = accounts.as_mut() {
+                    accounts.remove(&credential.to_typed_hash32());
+                }
+            }
+            Certificate::PoolRegistration(params) => {
+                if let Some(pools) = pools.as_mut() {
+                    std::sync::Arc::make_mut(pools).insert(params.operator);
+                }
+            }
+            Certificate::RegDRep { credential, .. } => {
+                if let Some(dreps) = dreps.as_mut() {
+                    std::sync::Arc::make_mut(dreps).insert(credential.to_typed_hash32());
+                }
+            }
+            Certificate::UnregDRep { credential, .. } => {
+                if let Some(dreps) = dreps.as_mut() {
+                    std::sync::Arc::make_mut(dreps).remove(&credential.to_typed_hash32());
+                }
+            }
+            Certificate::CommitteeHotAuth {
+                cold_credential,
+                hot_credential,
+            } => {
+                let hot = hot_credential.to_typed_hash32();
+                if let Some(map) = hot_by_cold.as_mut() {
+                    map.insert(cold_credential.to_typed_hash32(), hot);
+                } else if let Some(set) = authorized.as_mut() {
+                    std::sync::Arc::make_mut(set).insert(hot);
+                }
+            }
+            Certificate::CommitteeColdResign {
+                cold_credential, ..
+            } => {
+                if let Some(map) = hot_by_cold.as_mut() {
+                    map.remove(&cold_credential.to_typed_hash32());
+                }
+            }
+            _ => {}
+        }
+    }
+
+    out.registered_dreps = dreps;
+    out.registered_pools = pools;
+    out.reward_accounts = accounts;
+    if let Some(map) = hot_by_cold {
+        out.committee_authorized_hot_keys =
+            Some(std::sync::Arc::new(map.values().copied().collect()));
+        if let Some(enacted) = ctx.committee_enacted_cold.as_deref() {
+            out.committee_authorized_elected_hot_keys = Some(std::sync::Arc::new(
+                map.iter()
+                    .filter(|(cold, _)| enacted.contains(*cold))
+                    .map(|(_, hot)| *hot)
+                    .collect(),
+            ));
+        }
+    } else {
+        out.committee_authorized_hot_keys = authorized;
+    }
+    Some(out)
+}
+
 /// Return the human-readable certificate type name when the certificate is
 /// Conway-only (requires protocol version >= 9). Returns `None` for
 /// pre-Conway certificates that are valid in all post-Shelley eras.
