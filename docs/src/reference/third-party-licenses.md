@@ -3,9 +3,9 @@
 Dugite depends on a number of open-source Rust crates. This page documents
 all third-party dependencies and their license terms.
 
-**Total dependencies:** 560
+**Total dependencies:** 580
 
-_Generated from `Cargo.lock` on 2026-07-31 at commit `3cbe3986c8`. Regenerate with `just licenses` after any dependency change — nothing in CI does it for you._
+_Generated from `Cargo.lock` on 2026-11-28 at commit `d21b289a3c`. Regenerate with `just licenses` after any dependency change — nothing in CI does it for you._
 
 Dugite itself is licensed under **Apache-2.0**. Counts below are per unique crate name (the highest version, where a crate appears at several versions) across all target platforms, so they include target-gated dependencies such as the `windows-*` family that are not built on Linux or macOS.
 
@@ -13,10 +13,10 @@ Dugite itself is licensed under **Apache-2.0**. Counts below are per unique crat
 
 | License | Count |
 |---------|-------|
-| MIT OR Apache-2.0 | 285 |
-| MIT | 119 |
-| Apache-2.0 OR MIT | 44 |
-| Apache-2.0 | 22 |
+| MIT OR Apache-2.0 | 293 |
+| MIT | 128 |
+| Apache-2.0 OR MIT | 45 |
+| Apache-2.0 | 23 |
 | Unicode-3.0 | 18 |
 | Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT | 14 |
 | Unlicense OR MIT | 6 |
@@ -35,6 +35,7 @@ Dugite itself is licensed under **Apache-2.0**. Counts below are per unique crat
 | BSD-2-Clause | 1 |
 | ISC AND (Apache-2.0 OR ISC) | 1 |
 | ISC AND (Apache-2.0 OR ISC) AND Apache-2.0 AND MIT AND BSD-3-Clause AND (Apache-2.0 OR ISC OR MIT) AND (Apache-2.0 OR ISC OR MIT-0) | 1 |
+| MIT-0 | 1 |
 | (Apache-2.0 OR MIT) AND BSD-3-Clause | 1 |
 | MIT OR Apache-2.0 OR CC0-1.0 | 1 |
 | MIT OR Apache-2.0 OR BSD-1-Clause | 1 |
@@ -99,7 +100,7 @@ including SHA-224,... |
 ... |
 | [kes-summed-ed25519](https://github.com/input-output-hk/kes) | 0.2.1 | Apache-2.0 | Key Evolving Signature |
 | vrf_dalek | 0.1.0 | Unknown |  |
-| [num-bigint](https://github.com/rust-num/num-bigint) | 0.4.6 | MIT OR Apache-2.0 | Big integer implementation for Rust |
+| [num-bigint](https://github.com/rust-num/num-bigint) | 0.4.8 | MIT OR Apache-2.0 | Big integer implementation for Rust |
 | [num-rational](https://github.com/rust-num/num-rational) | 0.4.2 | MIT OR Apache-2.0 | Rational numbers implementation for Rust |
 | [dashu-int](https://github.com/cmpute/dashu) | 0.4.2 | MIT OR Apache-2.0 | A big integer library with good performance |
 | [memmap2](https://github.com/RazrFalcon/memmap2-rs) | 0.9.11 | MIT OR Apache-2.0 | Cross-platform Rust API for memory-mapped file IO |
@@ -125,7 +126,7 @@ including SHA-224,... |
 | [arc-swap](https://github.com/vorner/arc-swap) | 1.9.2 | MIT OR Apache-2.0 | Atomically swappable Arc |
 | [rayon](https://github.com/rayon-rs/rayon) | 1.12.0 | MIT OR Apache-2.0 | Simple work-stealing parallelism for Rust |
 | [rand](https://github.com/rust-random/rand) | 0.9.4 | MIT OR Apache-2.0 | Random number generators and other randomness functionality. |
-| [chrono](https://github.com/chronotope/chrono) | 0.4.44 | MIT OR Apache-2.0 | Date and time library for Rust |
+| [chrono](https://github.com/chronotope/chrono) | 0.4.45 | MIT OR Apache-2.0 | Date and time library for Rust |
 
 ## All Dependencies
 
@@ -134,6 +135,7 @@ Complete list of all third-party crates used by Dugite, sorted alphabetically.
 | Crate | Version | License |
 |-------|---------|---------|
 | [adler2](https://github.com/oyvindln/adler2) | 2.0.1 | 0BSD OR MIT OR Apache-2.0 |
+| [ahash](https://github.com/tkaitchuck/ahash) | 0.8.15 | MIT OR Apache-2.0 |
 | [aho-corasick](https://github.com/BurntSushi/aho-corasick) | 1.1.4 | Unlicense OR MIT |
 | [alloca](https://github.com/playXE/alloca-rs) | 0.4.0 | MIT |
 | [allocator-api2](https://github.com/zakarumych/allocator-api2) | 0.2.21 | MIT OR Apache-2.0 |
@@ -144,7 +146,7 @@ Complete list of all third-party crates used by Dugite, sorted alphabetically.
 | [anstyle-parse](https://github.com/rust-cli/anstyle.git) | 1.0.0 | MIT OR Apache-2.0 |
 | [anstyle-query](https://github.com/rust-cli/anstyle.git) | 1.1.5 | MIT OR Apache-2.0 |
 | [anstyle-wincon](https://github.com/rust-cli/anstyle.git) | 3.0.11 | MIT OR Apache-2.0 |
-| [anyhow](https://github.com/dtolnay/anyhow) | 1.0.102 | MIT OR Apache-2.0 |
+| [anyhow](https://github.com/dtolnay/anyhow) | 1.0.105 | MIT OR Apache-2.0 |
 | [approx](https://github.com/brendanzab/approx) | 0.5.1 | Apache-2.0 |
 | [ar_archive_writer](https://github.com/rust-lang/ar_archive_writer) | 0.5.1 | Apache-2.0 WITH LLVM-exception |
 | [arc-swap](https://github.com/vorner/arc-swap) | 1.9.2 | MIT OR Apache-2.0 |
@@ -176,12 +178,14 @@ Complete list of all third-party crates used by Dugite, sorted alphabetically.
 | [blake2b_simd](https://github.com/oconnor663/blake2_simd) | 1.0.4 | MIT |
 | [block-buffer](https://github.com/RustCrypto/utils) | 0.9.0 | MIT OR Apache-2.0 |
 | [blst](https://github.com/supranational/blst) | 0.3.16 | Apache-2.0 |
+| [borrow-or-share](https://github.com/yescallop/borrow-or-share) | 0.2.4 | MIT-0 |
 | [bs58](https://github.com/Nullus157/bs58-rs) | 0.5.1 | MIT/Apache-2.0 |
 | [bumpalo](https://github.com/fitzgen/bumpalo) | 3.20.2 | MIT OR Apache-2.0 |
 | [by_address](https://github.com/mbrubeck/by_address) | 1.2.1 | MIT OR Apache-2.0 |
+| [bytecount](https://github.com/llogiq/bytecount) | 0.6.9 | Apache-2.0/MIT |
 | [bytemuck](https://github.com/Lokathor/bytemuck) | 1.25.0 | Zlib OR Apache-2.0 OR MIT |
 | [byteorder](https://github.com/BurntSushi/byteorder) | 1.5.0 | Unlicense OR MIT |
-| [bytes](https://github.com/tokio-rs/bytes) | 1.12.0 | MIT |
+| [bytes](https://github.com/tokio-rs/bytes) | 1.12.2 | MIT |
 | [cast](https://github.com/japaric/cast.rs) | 0.3.0 | MIT OR Apache-2.0 |
 | [castaway](https://github.com/sagebind/castaway) | 0.2.4 | MIT |
 | [cc](https://github.com/rust-lang/cc-rs) | 1.2.60 | MIT OR Apache-2.0 |
@@ -189,7 +193,7 @@ Complete list of all third-party crates used by Dugite, sorted alphabetically.
 | [cfg-if](https://github.com/rust-lang/cfg-if) | 1.0.4 | MIT OR Apache-2.0 |
 | [cfg_aliases](https://github.com/katharostech/cfg_aliases) | 0.2.1 | MIT |
 | [chacha20](https://github.com/RustCrypto/stream-ciphers) | 0.10.0 | MIT OR Apache-2.0 |
-| [chrono](https://github.com/chronotope/chrono) | 0.4.44 | MIT OR Apache-2.0 |
+| [chrono](https://github.com/chronotope/chrono) | 0.4.45 | MIT OR Apache-2.0 |
 | [ciborium](https://github.com/enarx/ciborium) | 0.2.2 | Apache-2.0 |
 | [ciborium-io](https://github.com/enarx/ciborium) | 0.2.2 | Apache-2.0 |
 | [ciborium-ll](https://github.com/enarx/ciborium) | 0.2.2 | Apache-2.0 |
@@ -249,13 +253,14 @@ Complete list of all third-party crates used by Dugite, sorted alphabetically.
 | [ed25519-dalek](https://github.com/dalek-cryptography/curve25519-dalek/tree/main/ed25519-dalek) | 2.2.0 | BSD-3-Clause |
 | [either](https://github.com/rayon-rs/either) | 1.15.0 | MIT OR Apache-2.0 |
 | [elliptic-curve](https://github.com/RustCrypto/traits/tree/master/elliptic-curve) | 0.13.8 | Apache-2.0 OR MIT |
+| [email_address](https://github.com/johnstonskj/rust-email_address.git) | 0.2.10 | MIT OR Apache-2.0 |
 | [encode_unicode](https://github.com/tormol/encode_unicode) | 1.0.0 | Apache-2.0 OR MIT |
 | [encoding_rs](https://github.com/hsivonen/encoding_rs) | 0.8.35 | (Apache-2.0 OR MIT) AND BSD-3-Clause |
 | [equivalent](https://github.com/indexmap-rs/equivalent) | 1.0.2 | Apache-2.0 OR MIT |
 | [erased-serde](https://github.com/dtolnay/erased-serde) | 0.4.10 | MIT OR Apache-2.0 |
 | [errno](https://github.com/lambda-fairy/rust-errno) | 0.3.14 | MIT OR Apache-2.0 |
 | [euclid](https://github.com/servo/euclid) | 0.22.14 | MIT OR Apache-2.0 |
-| [fancy-regex](https://github.com/fancy-regex/fancy-regex) | 0.11.0 | MIT |
+| [fancy-regex](https://github.com/fancy-regex/fancy-regex) | 0.20.2 | MIT |
 | [fast-srgb8](https://github.com/thomcc/fast-srgb8) | 1.0.0 | MIT OR Apache-2.0 OR CC0-1.0 |
 | [fastrand](https://github.com/smol-rs/fastrand) | 2.4.1 | Apache-2.0 OR MIT |
 | [ff](https://github.com/zkcrypto/ff) | 0.13.1 | MIT/Apache-2.0 |
@@ -267,10 +272,12 @@ Complete list of all third-party crates used by Dugite, sorted alphabetically.
 | [fixed](https://gitlab.com/tspiteri/fixed) | 1.31.0 | MIT/Apache-2.0 |
 | [fixedbitset](https://github.com/petgraph/fixedbitset) | 0.5.7 | MIT OR Apache-2.0 |
 | [flate2](https://github.com/rust-lang/flate2-rs) | 1.1.9 | MIT OR Apache-2.0 |
+| [fluent-uri](https://github.com/yescallop/fluent-uri-rs) | 0.4.1 | MIT |
 | [flume](https://github.com/zesterer/flume) | 0.12.0 | Apache-2.0/MIT |
 | [fnv](https://github.com/servo/rust-fnv) | 1.0.7 | Apache-2.0 / MIT |
 | [foldhash](https://github.com/orlp/foldhash) | 0.2.0 | Zlib |
 | [form_urlencoded](https://github.com/servo/rust-url) | 1.2.2 | MIT OR Apache-2.0 |
+| [fraction](https://github.com/dnsl48/fraction.git) | 0.17.0 | MIT OR Apache-2.0 |
 | [fs2](https://github.com/danburkert/fs2-rs) | 0.4.3 | MIT/Apache-2.0 |
 | [fs_extra](https://github.com/webdesus/fs_extra) | 1.3.0 | MIT |
 | [futures](https://github.com/rust-lang/futures-rs) | 0.3.32 | MIT OR Apache-2.0 |
@@ -339,6 +346,9 @@ Complete list of all third-party crates used by Dugite, sorted alphabetically.
 | [jni-sys-macros](https://github.com/jni-rs/jni-sys) | 0.4.1 | MIT OR Apache-2.0 |
 | [jobserver](https://github.com/rust-lang/jobserver-rs) | 0.1.34 | MIT OR Apache-2.0 |
 | [js-sys](https://github.com/wasm-bindgen/wasm-bindgen/tree/master/crates/js-sys) | 0.3.95 | MIT OR Apache-2.0 |
+| [jsonschema](https://github.com/Stranger6667/jsonschema) | 0.63.2 | MIT |
+| [jsonschema-regex](https://github.com/Stranger6667/jsonschema) | 0.63.2 | MIT |
+| [jsonschema-value](https://github.com/Stranger6667/jsonschema) | 0.63.2 | MIT |
 | [k256](https://github.com/RustCrypto/elliptic-curves/tree/master/k256) | 0.13.4 | Apache-2.0 OR MIT |
 | [kasuari](https://github.com/ratatui/kasuari) | 0.4.12 | MIT OR Apache-2.0 |
 | [keccak](https://github.com/RustCrypto/sponges) | 0.2.0 | Apache-2.0 OR MIT |
@@ -365,6 +375,7 @@ Complete list of all third-party crates used by Dugite, sorted alphabetically.
 | [memmap2](https://github.com/RazrFalcon/memmap2-rs) | 0.9.11 | MIT OR Apache-2.0 |
 | [memmem](http://github.com/jneem/memmem) | 0.1.1 | MIT/Apache-2.0 |
 | [memoffset](https://github.com/Gilnaa/memoffset) | 0.9.1 | MIT |
+| [micromap](https://github.com/yegor256/micromap) | 0.3.0 | MIT |
 | [mime](https://github.com/hyperium/mime) | 0.3.17 | MIT OR Apache-2.0 |
 | [minicbor](https://github.com/twittner/minicbor) | 0.26.5 | BlueOak-1.0.0 |
 | [minicbor-derive](https://github.com/twittner/minicbor) | 0.16.2 | BlueOak-1.0.0 |
@@ -390,10 +401,14 @@ Complete list of all third-party crates used by Dugite, sorted alphabetically.
 | [nom](https://github.com/rust-bakery/nom) | 8.0.0 | MIT |
 | [ntapi](https://github.com/MSxDOS/ntapi) | 0.4.3 | Apache-2.0 OR MIT |
 | [nu-ansi-term](https://github.com/nushell/nu-ansi-term) | 0.50.3 | MIT |
-| [num-bigint](https://github.com/rust-num/num-bigint) | 0.4.6 | MIT OR Apache-2.0 |
+| [num](https://github.com/rust-num/num) | 0.4.3 | MIT OR Apache-2.0 |
+| [num-bigint](https://github.com/rust-num/num-bigint) | 0.4.8 | MIT OR Apache-2.0 |
+| [num-cmp](https://github.com/lifthrasiir/num-cmp) | 0.1.0 | MIT/Apache-2.0 |
+| [num-complex](https://github.com/rust-num/num-complex) | 0.4.6 | MIT OR Apache-2.0 |
 | [num-conv](https://github.com/jhpratt/num-conv) | 0.2.1 | MIT OR Apache-2.0 |
 | [num-derive](https://github.com/rust-num/num-derive) | 0.4.2 | MIT OR Apache-2.0 |
 | [num-integer](https://github.com/rust-num/num-integer) | 0.1.46 | MIT OR Apache-2.0 |
+| [num-iter](https://github.com/rust-num/num-iter) | 0.1.45 | MIT OR Apache-2.0 |
 | [num-modular](https://github.com/cmpute/num-modular) | 0.6.1 | Apache-2.0 |
 | [num-order](https://github.com/cmpute/num-order) | 1.2.0 | Apache-2.0 |
 | [num-rational](https://github.com/rust-num/num-rational) | 0.4.2 | MIT OR Apache-2.0 |
@@ -409,6 +424,7 @@ Complete list of all third-party crates used by Dugite, sorted alphabetically.
 | [opaque-debug](https://github.com/RustCrypto/utils) | 0.3.1 | MIT OR Apache-2.0 |
 | [openssl-probe](https://github.com/rustls/openssl-probe) | 0.2.1 | MIT OR Apache-2.0 |
 | [ordered-float](https://github.com/reem/rust-ordered-float) | 5.3.0 | MIT |
+| [outref](https://github.com/Nugine/outref) | 0.5.2 | MIT |
 | [page_size](https://github.com/Elzair/page_size_rs) | 0.6.0 | MIT/Apache-2.0 |
 | [palette](https://github.com/Ogeon/palette) | 0.7.6 | MIT OR Apache-2.0 |
 | [palette_derive](https://github.com/Ogeon/palette) | 0.7.6 | MIT OR Apache-2.0 |
@@ -446,6 +462,7 @@ Complete list of all third-party crates used by Dugite, sorted alphabetically.
 | [prost](https://github.com/tokio-rs/prost) | 0.14.4 | Apache-2.0 |
 | [prost-build](https://github.com/tokio-rs/prost) | 0.14.4 | Apache-2.0 |
 | [prost-derive](https://github.com/tokio-rs/prost) | 0.14.4 | Apache-2.0 |
+| [prost-reflect](https://github.com/andrewhickman/prost-reflect) | 0.16.5 | MIT OR Apache-2.0 |
 | [prost-types](https://github.com/tokio-rs/prost) | 0.14.4 | Apache-2.0 |
 | [psm](https://github.com/rust-lang/stacker/) | 0.1.31 | MIT OR Apache-2.0 |
 | [pulldown-cmark](https://github.com/raphlinus/pulldown-cmark) | 0.13.4 | MIT |
@@ -474,9 +491,10 @@ Complete list of all third-party crates used by Dugite, sorted alphabetically.
 | [redox_syscall](https://gitlab.redox-os.org/redox-os/syscall) | 0.7.4 | MIT |
 | [ref-cast](https://github.com/dtolnay/ref-cast) | 1.0.25 | MIT OR Apache-2.0 |
 | [ref-cast-impl](https://github.com/dtolnay/ref-cast) | 1.0.25 | MIT OR Apache-2.0 |
-| [regex](https://github.com/rust-lang/regex) | 1.12.3 | MIT OR Apache-2.0 |
-| [regex-automata](https://github.com/rust-lang/regex) | 0.4.14 | MIT OR Apache-2.0 |
-| [regex-syntax](https://github.com/rust-lang/regex) | 0.8.10 | MIT OR Apache-2.0 |
+| [referencing](https://github.com/Stranger6667/jsonschema) | 0.63.2 | MIT |
+| [regex](https://github.com/rust-lang/regex) | 1.13.2 | MIT OR Apache-2.0 |
+| [regex-automata](https://github.com/rust-lang/regex) | 0.4.19 | MIT OR Apache-2.0 |
+| [regex-syntax](https://github.com/rust-lang/regex) | 0.8.12 | MIT OR Apache-2.0 |
 | [reqwest](https://github.com/seanmonstar/reqwest) | 0.13.3 | MIT OR Apache-2.0 |
 | [resolv-conf](https://github.com/hickory-dns/resolv-conf) | 0.7.6 | MIT OR Apache-2.0 |
 | [rfc6979](https://github.com/RustCrypto/signatures/tree/master/rfc6979) | 0.4.0 | Apache-2.0 OR MIT |
@@ -544,7 +562,7 @@ Complete list of all third-party crates used by Dugite, sorted alphabetically.
 | [syn](https://github.com/dtolnay/syn) | 2.0.117 | MIT OR Apache-2.0 |
 | [sync_wrapper](https://github.com/Actyx/sync_wrapper) | 1.0.2 | Apache-2.0 |
 | [synstructure](https://github.com/mystor/synstructure) | 0.13.2 | MIT |
-| [sysinfo](https://github.com/GuillaumeGomez/sysinfo) | 0.39.3 | MIT |
+| [sysinfo](https://github.com/GuillaumeGomez/sysinfo) | 0.39.6 | MIT |
 | [system-configuration](https://github.com/mullvad/system-configuration-rs) | 0.7.0 | MIT OR Apache-2.0 |
 | [system-configuration-sys](https://github.com/mullvad/system-configuration-rs) | 0.6.0 | MIT OR Apache-2.0 |
 | [tagptr](https://github.com/oliver-giersch/tagptr.git) | 0.2.0 | MIT/Apache-2.0 |
@@ -599,6 +617,7 @@ Complete list of all third-party crates used by Dugite, sorted alphabetically.
 | [ucd-trie](https://github.com/BurntSushi/ucd-generate) | 0.1.7 | MIT OR Apache-2.0 |
 | [unarray](https://github.com/cameron1024/unarray) | 0.1.4 | MIT OR Apache-2.0 |
 | [unicase](https://github.com/seanmonstar/unicase) | 2.9.0 | MIT OR Apache-2.0 |
+| [unicode-general-category](https://github.com/yeslogic/unicode-general-category) | 1.1.0 | Apache-2.0 |
 | [unicode-ident](https://github.com/dtolnay/unicode-ident) | 1.0.24 | (MIT OR Apache-2.0) AND Unicode-3.0 |
 | [unicode-segmentation](https://github.com/unicode-rs/unicode-segmentation) | 1.13.2 | MIT OR Apache-2.0 |
 | [unicode-truncate](https://github.com/Aetf/unicode-truncate) | 2.0.1 | MIT OR Apache-2.0 |
@@ -611,10 +630,12 @@ Complete list of all third-party crates used by Dugite, sorted alphabetically.
 | [utf8_iter](https://github.com/hsivonen/utf8_iter) | 1.0.4 | Apache-2.0 OR MIT |
 | [utf8parse](https://github.com/alacritty/vte) | 0.2.2 | Apache-2.0 OR MIT |
 | [uuid](https://github.com/uuid-rs/uuid) | 1.23.1 | Apache-2.0 OR MIT |
+| [uuid-simd](https://github.com/Nugine/simd) | 0.8.0 | MIT |
 | [valuable](https://github.com/tokio-rs/valuable) | 0.1.1 | MIT |
 | [version_check](https://github.com/SergioBenitez/version_check) | 0.9.5 | MIT/Apache-2.0 |
 | [virtue](https://github.com/bincode-org/virtue) | 0.0.18 | MIT |
 | vrf_dalek | 0.1.0 | Unknown |
+| [vsimd](https://github.com/Nugine/simd) | 0.8.0 | MIT |
 | [vtparse](https://github.com/wez/wezterm) | 0.6.2 | MIT |
 | [wait-timeout](https://github.com/alexcrichton/wait-timeout) | 0.2.1 | MIT/Apache-2.0 |
 | [walkdir](https://github.com/BurntSushi/walkdir) | 2.5.0 | Unlicense/MIT |
@@ -689,7 +710,7 @@ Complete list of all third-party crates used by Dugite, sorted alphabetically.
 | [zerotrie](https://github.com/unicode-org/icu4x) | 0.2.4 | Unicode-3.0 |
 | [zerovec](https://github.com/unicode-org/icu4x) | 0.11.6 | Unicode-3.0 |
 | [zerovec-derive](https://github.com/unicode-org/icu4x) | 0.11.3 | Unicode-3.0 |
-| [zmij](https://github.com/dtolnay/zmij) | 1.0.21 | MIT |
+| [zmij](https://github.com/dtolnay/zmij) | 1.0.23 | MIT |
 | [zstd](https://github.com/gyscos/zstd-rs) | 0.13.3 | MIT |
 | [zstd-safe](https://github.com/gyscos/zstd-rs) | 7.2.4 | MIT OR Apache-2.0 |
 | [zstd-sys](https://github.com/gyscos/zstd-rs) | 2.0.16+zstd.1.5.7 | MIT/Apache-2.0 |
