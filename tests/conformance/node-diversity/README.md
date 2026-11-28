@@ -63,35 +63,63 @@ The report's per-sample value is only `true`, so the harness guards itself, and 
 numbers next to the report as `<report>.guards.json` (and in the status sidecar's note):
 
 * **No input-byte reuse.** `scrub.rs` clears every preserved-bytes field between decode and encode
-  and panics (a harness failure, never a sample failure) if one is left. A source scan of
-  `dugite-primitives` fails the tests when a new field that could hold preserved bytes is neither
-  scrubbed nor audited as harmless, and every decoded type a codec does not scrub must be declared
-  `NoPreservedBytes`. `reuse_of_preserved_bytes_would_make_a_wrong_encoding_look_right` shows the
-  encoder echoing an input from preserved bytes and the harness path not doing so.
-* **Byte-carrying fields are audited in both serialization crates.** The scan covers
-  `dugite-primitives` and `dugite-serialization` and every field whose type carries bytes
-  (`Vec<u8>`, `Bytes`, `Arc<[u8]>`, `Box<[u8]>`, `KeepRaw<..>`, also inside `Option`), whatever its
-  name. Each is either scrubbed or exempted by owner type AND field with a reason. After a scrub the
-  value is also formatted with `Debug` and checked for a populated byte `Option` or a
-  `raw_*`/`original_*` field, independently of the scrub's own list, so a traversal gap is caught.
-  Not covered by this: `TransactionOutput.is_legacy`, a decoded form hint (array or map output) the
-  encoder honours; it is not input bytes, but it is input information that survives the re-encoding.
-  A Byron address keeps its payload as opaque input and writes it back, so an echo and a rebuild are
-  the same thing for it: those samples are still scored, but are left out of the discriminating
-  counts and published as `samples_with_opaque_reemitted_input`.
-* **Entries use the reader production uses for the field, or the rule is unregistered.** Keys and
-  signatures (`vkey`, `vrf_vkey`, `kes_vkey`, `signature`) are read with `read_bytes_owned`, which
-  checks no length; `big_int`, `bounded_bytes` and `%constr<plutus_data>` have no decoder at that
-  granularity and fail as "no decoder registered"; `data` and `network_id` read exactly what the
-  inline-datum arm and the transaction body read. Those readers accept some samples the dataset says
-  must be refused (an inline datum followed by a trailing byte: #1181; a `network_id` other than 0
-  or 1 decoded as `None`: #1182); they show up in the invalid-samples-accepted counts, not as
-  harness exceptions.
+  and panics (a harness failure, never a sample failure) if one is left. Every decoded type a codec
+  does not scrub must be declared `NoPreservedBytes`.
+  `reuse_of_preserved_bytes_would_make_a_wrong_encoding_look_right` shows the encoder echoing an
+  input from preserved bytes and the harness path not doing so.
+* **What the audit covers.** A scan PARSES (with `syn`) every non-`#[cfg(test)]` item of
+  `dugite-primitives` and `dugite-serialization` and finds every struct field, tuple-struct field and
+  enum-variant field (named or positional, the type on any line) whose type carries bytes
+  (`Vec<u8>`, `Bytes`, any `[u8]` slice such as `Arc<[u8]>`, `Box<[u8]>`, `Cow<'_, [u8]>`, fixed
+  `[u8; N]`, `KeepRaw<..>`; also inside `Option`, tuples and maps, and through type aliases), or whose
+  name looks like preserved bytes (`raw_*`, `*_raw`, `original_*`), whatever its type. Each is either
+  scrubbed or exempted by owner type AND field with a reason (`the_scan_sees_every_field_shape`
+  proves the shapes). It does not look at bytes held behind a generic parameter or a type from
+  another crate. After a scrub, and for every `plain` codec, the value is also formatted with `Debug`
+  and checked for a populated byte `Option` or a `raw_*`/`original_*` field, independently of the
+  scrub's own list, so a traversal gap is caught; a handful of content fields (`ipv4`, `ipv6`, cost
+  vectors, `tx_fee_policy`) are allowed by name.
+* **Opaque input that is re-emitted.** A Byron address keeps its payload as the bytes it was read
+  from and writes them back, so an echo and a rebuild are the same thing for it. The harness
+  recognises that for the `address` rule only (`samples_with_opaque_reemitted_input`; those samples
+  are scored, but left out of the discriminating counts). No other rule is checked for it. The
+  encoder also honours a decoded form hint, `TransactionOutput.is_legacy` (array or map output): not
+  input bytes, but input information that survives the re-encoding. It is listed in the guards
+  (`decoded_form_hints_the_encoder_honours`) and in the status note.
+* **Entries use the reader production uses for the field, or the rule is unregistered, with these
+  exceptions, which are adapters written for the harness:**
+  * `script` is read through the `#6.24(bytes .cbor script)` wrapper the production script-reference
+    decoder expects, by wrapping the item;
+  * `pool_metadata` refuses `null` (the production reader accepts it for the optional field): that
+    refusal is a harness check;
+  * `account_balance_interval` and `account_balance_intervals` call the production interval readers
+    directly, not through the sub-transaction body;
+  * `alonzo_transaction_output` calls `read_legacy_tx_output` directly and skips the production
+    array-or-map dispatch; `babbage_transaction_output` and `transaction_output` use the union
+    reader (`read_babbage_tx_output`), which dispatches on array or map, so neither rule is checked
+    for refusing the other form;
+  * `redeemer` is read as the one element of the array form of `redeemers` (Conway's
+    `read_redeemers_raw`, with `read_redeemer_tag`);
+  * `unit_interval` and `nonnegative_interval` use `read_rational` (dugite checks no bounds there);
+  * the `credential` family, `kes_period`, `epoch`, `slot`, `block_number` and
+    `major_protocol_version` use one reader each for what are several rules.
+
+  Keys and signatures (`vkey`, `vrf_vkey`, `kes_vkey`, `signature`) are read with
+  `read_bytes_owned`, which checks no length; `big_int`, `bounded_bytes` and `%constr<plutus_data>`
+  have no decoder at that granularity and fail as "no decoder registered"; `data` and `network_id`
+  read exactly what the inline-datum arm and the transaction body read. Those readers accept some
+  samples the dataset says must be refused (an inline datum followed by a trailing byte: #1181; a
+  `network_id` other than 0 or 1 decoded as `None`: #1182); they show up in the
+  invalid-samples-accepted counts, not as harness exceptions. `native_script`, `plutus_data`,
+  `block`, `header` and `transaction` have no whole-input check of their own: they call the
+  production entry point as it is.
 * **"Refused" is any `Err`.** The reason of every refusal is written to `<report>.refusals.json`,
   summarised in `refusal_reasons`, and the `manual-invalid` refusals whose reason does not mention a
   defect their name states (`indefinite`, `trailing`, `duplicate`) are counted.
 * **The rule-level entry points** (`dugite_serialization::decode::rules` / `encode::rules`) are
-  behind the `conformance-rules` feature and hidden from the docs. They are not all production
+  behind the `conformance-rules` feature and hidden from the docs. The feature is not enabled by the
+  node, but `tests/conformance` enables it and is a default workspace member, so a workspace-wide
+  build turns it on. They are not all production
   encoders: `vote`, `ex_units`, `ex_unit_prices`, `constitution`, `account_balance_interval(s)`,
   `data`, `bytes` and `network_id` are written from CBOR primitives.
 * **Discriminating samples.** `discriminating_valid_samples` counts valid samples whose input
