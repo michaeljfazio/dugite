@@ -21,6 +21,9 @@
 //!   (`normalize(input) != expected`), which only a real decode-and-rebuild gets right.
 //! * **A rule's invalid samples count only if its valid samples decode.**  A decoder that
 //!   rejects everything would otherwise score every invalid sample.
+//! * **"Refused" is any `Err`**, so the reason is recorded for every refused invalid sample
+//!   (`<report>.refusals.json`), the reasons are summarised in the guards, and the refusals whose
+//!   reason does not mention a defect the sample's name states are counted.
 //! * **A rule with no registered decoder FAILS**, valid and invalid samples alike.
 //! * **The protocol version is stated** in each report.
 
@@ -90,6 +93,9 @@ pub struct RuleStats {
     /// re-encoder that rebuilt the value from it gets them right.  A subset of the above.
     pub echo_proof_total: usize,
     pub echo_proof_pass: usize,
+    /// Valid samples whose decoded value re-emits opaque input bytes (a Byron address payload):
+    /// still scored, but left out of the discriminating and echo-proof counts.
+    pub opaque_reemitted: usize,
     pub invalid_total: usize,
     /// Invalid samples the decoder refused, whether or not they were counted.
     pub invalid_refused: usize,
@@ -111,6 +117,8 @@ pub struct EraRun {
     pub results: BTreeMap<String, CborOutcome>,
     pub rules: BTreeMap<String, RuleStats>,
     pub missing_decoders: Vec<String>,
+    /// Sample key -> the reason the decoder gave for refusing it (refused invalid samples only).
+    pub refusals: BTreeMap<String, String>,
 }
 
 fn panic_text(payload: &Box<dyn std::any::Any + Send>) -> String {
@@ -211,17 +219,41 @@ fn echo_passes(sample: &Sample, byte_exact: bool) -> bool {
     }
 }
 
-fn run_invalid(sample: &Sample, codec: &Codec) -> Raw {
+/// The result of an invalid sample and, when the decoder refused it, the reason it gave.  "Refused"
+/// is any `Err`, so the reason is recorded: it is the only evidence that a refusal is for the
+/// defect the sample is about.
+fn run_invalid(sample: &Sample, codec: &Codec) -> (Raw, Option<String>) {
     match guarded(|| (codec.decode)(&sample.input)) {
-        Err(panic) => Raw::Fail(format!("decode: {panic}")),
-        Ok(Err(_)) => Raw::Pass,
-        Ok(Ok(())) => Raw::Fail("decode: succeeded when expected to fail".into()),
+        Err(panic) => (Raw::Fail(format!("decode: {panic}")), None),
+        Ok(Err(reason)) => (Raw::Pass, Some(reason)),
+        Ok(Ok(())) => (
+            Raw::Fail("decode: succeeded when expected to fail".into()),
+            None,
+        ),
     }
+}
+
+/// Defects the dataset names in a `manual-invalid` sample's file name, with a word the refusal
+/// reason must then contain.  Only these three are named reliably enough to check; for every other
+/// sample the reasons are published (`refusal_reasons`) and not judged.
+const NAMED_DEFECTS: [(&str, &str); 3] = [
+    ("indefinite", "indefinite"),
+    ("trailing", "trailing"),
+    ("duplicate", "duplicate"),
+];
+
+/// Samples whose file name names a defect that the refusal reason does not mention.
+fn reason_mismatch(sample: &Sample, reason: &str) -> bool {
+    sample.category == "manual-invalid"
+        && NAMED_DEFECTS
+            .iter()
+            .any(|(name, word)| sample.file.contains(name) && !reason.contains(word))
 }
 
 /// Run every sample of `corpus` through `registry`.
 pub fn run_corpus(corpus: &Corpus, registry: &BTreeMap<&'static str, Codec>) -> EraRun {
     let mut results = BTreeMap::new();
+    let mut refusals: BTreeMap<String, String> = BTreeMap::new();
     let mut rules = BTreeMap::new();
     let mut missing = Vec::new();
     for (rule, samples) in &corpus.rules {
@@ -235,7 +267,7 @@ pub fn run_corpus(corpus: &Corpus, registry: &BTreeMap<&'static str, Codec>) -> 
             missing.push(rule.clone());
         }
         // Valid samples first: they decide whether the invalid ones are counted.
-        let mut invalid: Vec<(&Sample, Raw)> = Vec::new();
+        let mut invalid: Vec<(&Sample, Raw, Option<String>)> = Vec::new();
         for sample in samples {
             match (sample.expectation, codec) {
                 (Expectation::Decodes, None) => {
@@ -253,12 +285,16 @@ pub fn run_corpus(corpus: &Corpus, registry: &BTreeMap<&'static str, Codec>) -> 
                 }
                 (Expectation::Decodes, Some(codec)) => {
                     stats.valid_total += 1;
+                    let opaque = registry::reemits_opaque_input(rule, &sample.input);
+                    if opaque {
+                        stats.opaque_reemitted += 1;
+                    }
                     let discriminating =
-                        sample.expected.as_deref() != Some(sample.input.as_slice());
+                        !opaque && sample.expected.as_deref() != Some(sample.input.as_slice());
                     if discriminating {
                         stats.discriminating_total += 1;
                     }
-                    let echo_proof = !echo_passes(sample, byte_exact);
+                    let echo_proof = !opaque && !echo_passes(sample, byte_exact);
                     if echo_proof {
                         stats.echo_proof_total += 1;
                     }
@@ -292,11 +328,15 @@ pub fn run_corpus(corpus: &Corpus, registry: &BTreeMap<&'static str, Codec>) -> 
                 }
                 (Expectation::Refused, Some(codec)) => {
                     stats.invalid_total += 1;
-                    invalid.push((sample, run_invalid(sample, codec)));
+                    let (raw, reason) = run_invalid(sample, codec);
+                    invalid.push((sample, raw, reason));
                 }
             }
         }
-        for (sample, raw) in invalid {
+        for (sample, raw, reason) in invalid {
+            if let Some(reason) = reason {
+                refusals.insert(sample.key(), reason);
+            }
             let outcome = match raw {
                 Raw::Fail(m) => CborOutcome::Fail(m),
                 Raw::Pass => {
@@ -320,6 +360,7 @@ pub fn run_corpus(corpus: &Corpus, registry: &BTreeMap<&'static str, Codec>) -> 
         results,
         rules,
         missing_decoders: missing,
+        refusals,
     }
 }
 
@@ -434,6 +475,7 @@ pub fn guards_json(era: CborEra, corpus: &Corpus, run: &EraRun) -> Value {
         totals.discriminating_pass += s.discriminating_pass;
         totals.echo_proof_total += s.echo_proof_total;
         totals.echo_proof_pass += s.echo_proof_pass;
+        totals.opaque_reemitted += s.opaque_reemitted;
         totals.invalid_total += s.invalid_total;
         totals.invalid_refused += s.invalid_refused;
         totals.invalid_pass += s.invalid_pass;
@@ -455,6 +497,25 @@ pub fn guards_json(era: CborEra, corpus: &Corpus, run: &EraRun) -> Value {
             }),
         );
     }
+    let mut classes: BTreeMap<String, usize> = BTreeMap::new();
+    for reason in run.refusals.values() {
+        let class: String = reason
+            .chars()
+            .map(|c| if c.is_ascii_digit() { 'N' } else { c })
+            .take(90)
+            .collect();
+        *classes.entry(class).or_default() += 1;
+    }
+    let mut mismatched: Vec<String> = Vec::new();
+    for (rule, samples) in &corpus.rules {
+        for sample in samples {
+            if let Some(reason) = run.refusals.get(&sample.key()) {
+                if reason_mismatch(sample, reason) {
+                    mismatched.push(format!("{rule}/{}/{}", sample.category, sample.file));
+                }
+            }
+        }
+    }
     let passed = run
         .results
         .values()
@@ -473,12 +534,17 @@ pub fn guards_json(era: CborEra, corpus: &Corpus, run: &EraRun) -> Value {
         "valid_samples_passed": totals.valid_pass,
         "discriminating_valid_samples": totals.discriminating_total,
         "discriminating_valid_samples_passed": totals.discriminating_pass,
+        "samples_with_opaque_reemitted_input": totals.opaque_reemitted,
         "echo_proof_valid_samples": totals.echo_proof_total,
         "echo_proof_valid_samples_passed": totals.echo_proof_pass,
         "invalid_samples": totals.invalid_total,
         "invalid_samples_refused_by_decoder": totals.invalid_refused,
         "invalid_samples_counted_in_report": totals.invalid_pass,
         "byte_exact_rules": BYTE_EXACT_RULES,
+        "refusal_reasons": classes,
+        "manual_invalid_refused_for_a_reason_not_matching_the_name": mismatched.len(),
+        "manual_invalid_refused_for_a_reason_not_matching_the_name_samples": mismatched,
+        "refusals_sidecar": "<report>.refusals.json (sample key -> reason, every refused invalid sample)",
         "rules": per_rule,
     })
 }
@@ -515,7 +581,7 @@ pub fn generate(
     era: CborEra,
     pins: &Pins,
     run_info: &RunInfo,
-) -> Result<(Value, Value), String> {
+) -> Result<(Value, Value, BTreeMap<String, String>), String> {
     let corpus = Corpus::load(corpora, era)?;
     let consistency = check_dataset_self_consistency(&corpus)?;
     let registry = registry(era);
@@ -531,7 +597,12 @@ pub fn generate(
             unknown.join(", ")
         ));
     }
-    let result = run_corpus(&corpus, &registry);
+    // A harness defect unwinds out of the run; say what it was instead of "non-string payload".
+    let result = std::panic::catch_unwind(AssertUnwindSafe(|| run_corpus(&corpus, &registry)))
+        .map_err(|payload| match payload.downcast_ref::<HarnessDefect>() {
+            Some(defect) => format!("harness defect: {}", defect.0),
+            None => format!("generator panicked: {}", panic_text(&payload)),
+        })?;
     let report = cbor_decoding_report(pins, run_info, protocol_version(era), &result.results);
     let mut guards = guards_json(era, &corpus, &result);
     guards["dataset_self_check"] = json!({
@@ -542,7 +613,7 @@ pub fn generate(
         "valid_samples_equal_only_up_to_ordering": consistency.up_to_ordering.values().sum::<usize>(),
         "rules_whose_reference_reorders_sets": consistency.up_to_ordering,
     });
-    Ok((report, guards))
+    Ok((report, guards, result.refusals))
 }
 
 /// The body of the `cbor-decoding` runner: build the era's report, write the guard summary next
@@ -554,7 +625,7 @@ pub fn generate_for_runner(
     pins: &Pins,
     run_info: &RunInfo,
 ) -> Result<(crate::node_diversity::report::ReportStatus, String, Value), String> {
-    let (report, guards) = generate(corpora, era, pins, run_info)?;
+    let (report, guards, refusals) = generate(corpora, era, pins, run_info)?;
     let note = summary(&guards);
     if let Some(path) = std::env::var_os(crate::node_diversity::report::REPORT_ENV) {
         let mut name = std::path::PathBuf::from(path).into_os_string();
@@ -567,6 +638,13 @@ pub fn generate_for_runner(
                 std::path::Path::new(&name).display()
             )
         })?;
+    }
+    if let Some(path) = std::env::var_os(crate::node_diversity::report::REPORT_ENV) {
+        let mut name = std::path::PathBuf::from(path).into_os_string();
+        name.push(".refusals.json");
+        let mut text = serde_json::to_string_pretty(&refusals).map_err(|e| e.to_string())?;
+        text.push('\n');
+        std::fs::write(&name, text).map_err(|e| format!("cannot write refusals: {e}"))?;
     }
     eprintln!("cbor-decoding: {note}");
     Ok((
@@ -857,6 +935,65 @@ mod tests {
         }));
         let payload = caught.expect_err("a harness defect must unwind out of the run");
         assert!(payload.downcast_ref::<HarnessDefect>().is_some());
+    }
+
+    /// "Refused" is any `Err`: the reason is recorded for every refused invalid sample, and a
+    /// refusal whose reason does not mention the defect the sample's name states is counted.
+    #[test]
+    fn refusal_reasons_are_recorded_and_checked_against_named_defects() {
+        let corpus = corpus_of(
+            "r",
+            vec![
+                sample("r", "valid", "v1", &[0x01], Some(&[0x01])),
+                sample(
+                    "r",
+                    "manual-invalid",
+                    "trailing-byte-after",
+                    &[0x01, 0x00],
+                    None,
+                ),
+                sample("r", "manual-invalid", "plain", &[0xf6], None),
+            ],
+        );
+        let reasons = Codec {
+            decode: Box::new(|b| {
+                if b == [0x01] {
+                    Ok(())
+                } else if b.len() == 2 {
+                    Err("bytes too long".into())
+                } else {
+                    Err("expected uint".into())
+                }
+            }),
+            reencode: Box::new(|b| Ok(b.to_vec())),
+        };
+        let run = run_corpus(&corpus, &registry_of("r", reasons));
+        assert_eq!(run.refusals.len(), 2);
+        assert_eq!(
+            run.refusals["r/manual-invalid/plain.input.cbor"],
+            "expected uint"
+        );
+        let guards = guards_json(CborEra::Conway, &corpus, &run);
+        // The sample named "trailing" was refused for another reason; "plain" names no defect.
+        assert_eq!(
+            guards["manual_invalid_refused_for_a_reason_not_matching_the_name"],
+            1
+        );
+        assert_eq!(guards["refusal_reasons"]["bytes too long"], 1);
+    }
+
+    /// A Byron address re-emits opaque input bytes, so it is left out of the discriminating
+    /// counts (and counted on its own); a Shelley address is not.
+    #[test]
+    fn opaque_reemission_is_recognised_for_byron_addresses_only() {
+        let mut byron = vec![0x58, 0x02, 0x82, 0x00];
+        assert!(registry::reemits_opaque_input("address", &byron));
+        byron[2] = 0x61;
+        assert!(!registry::reemits_opaque_input("address", &byron));
+        assert!(!registry::reemits_opaque_input(
+            "coin",
+            &[0x58, 0x02, 0x82, 0x00]
+        ));
     }
 
     /// An unknown category directory is a harness failure (the site stops on it).

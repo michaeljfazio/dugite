@@ -12,6 +12,7 @@
 //! | non-minimal integer, tag or length head | the minimal head |
 //! | bignum (tag 2 / 3) whose value fits a native head | the native uint / nint |
 //! | bignum that does not fit | kept, leading zero bytes of the magnitude dropped |
+//! | tag-30 rational `[n, d]`, `d != 0` | lowest terms; a negative denominator flips sign into the numerator (bignum components included) |
 //!
 //! Map key order, duplicate keys, tags, float widths and every integer value survive.  The
 //! normaliser is checked two ways: against the 20 hand-verified pairs under

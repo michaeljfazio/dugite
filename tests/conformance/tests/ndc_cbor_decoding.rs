@@ -359,6 +359,7 @@ fn reuse_of_preserved_bytes_would_make_a_wrong_encoding_look_right() {
 /// sample result.
 #[test]
 fn a_populated_field_after_scrubbing_is_a_harness_defect() {
+    #[derive(Debug)]
     struct Leaky;
     impl Scrub for Leaky {
         fn scrub(&mut self) -> Vec<&'static str> {

@@ -23,9 +23,10 @@ use dugite_primitives::transaction::{
 use super::HarnessDefect;
 
 /// Every field of `dugite-primitives` that holds the original bytes of an item, as
-/// `(type, field)`.  The audit test scans for `Option<Vec<u8>>` fields and for any field named
-/// like `raw_*` / `original_*`, and requires each to be here (or to be listed in
-/// [`NOT_PRESERVED_BYTES`] with the reason it is not).
+/// `(type, field)`.  The audit test scans both crates for every field whose type carries bytes
+/// (`Vec<u8>`, `Bytes`, `Arc<[u8]>`, `Box<[u8]>`, `KeepRaw<..>`, also inside `Option`) and for any
+/// field named like `raw_*` / `original_*`, and requires each to be here or to be listed in
+/// [`NOT_PRESERVED_BYTES`] with the reason it is not.
 pub const PRESERVED_BYTES_FIELDS: &[(&str, &str)] = &[
     ("TransactionOutput", "raw_cbor"),
     ("OutputDatum::InlineDatum", "raw_cbor"),
@@ -41,23 +42,73 @@ pub const PRESERVED_BYTES_FIELDS: &[(&str, &str)] = &[
     ("Block", "raw_cbor"),
 ];
 
-/// Fields the audit scan finds that are NOT preserved input bytes, with the reason.
+/// Byte-carrying fields (of `dugite-primitives` and `dugite-serialization`) that are NOT preserved
+/// input, keyed by owner type AND field, each with the reason.  The audit scan requires every
+/// byte-carrying field to be on one of the two lists.
 pub const NOT_PRESERVED_BYTES: &[(&str, &str, &str)] = &[
-    (
-        "Byron",
-        "tx_fee_policy",
-        "Byron-only update parameter, captured raw and never applied; no Conway or Dijkstra item holds it",
-    ),
-    (
-        "ByronDlgCert",
-        "epoch_raw",
-        "Byron delegation certificate field; Byron blocks are outside both datasets",
-    ),
-    (
-        "ByronUpdVote",
-        "proposal_id_raw",
-        "Byron update vote field; Byron blocks are outside both datasets",
-    ),
+    ("Addr28Decoded", "address", "an address or reward account: the item's own value"),
+    ("AssetName", "0", "the asset name: the item's own value"),
+    ("AuxiliaryData", "plutus_v1_scripts", "a Plutus script: a byte string that is the item's value; the CBOR wrapper around it is not kept"),
+    ("AuxiliaryData", "plutus_v2_scripts", "a Plutus script: a byte string that is the item's value; the CBOR wrapper around it is not kept"),
+    ("AuxiliaryData", "plutus_v3_scripts", "a Plutus script: a byte string that is the item's value; the CBOR wrapper around it is not kept"),
+    ("TransactionWitnessSet", "plutus_v1_scripts", "a Plutus script: a byte string that is the item's value; the CBOR wrapper around it is not kept"),
+    ("TransactionWitnessSet", "plutus_v2_scripts", "a Plutus script: a byte string that is the item's value; the CBOR wrapper around it is not kept"),
+    ("TransactionWitnessSet", "plutus_v3_scripts", "a Plutus script: a byte string that is the item's value; the CBOR wrapper around it is not kept"),
+    ("BlockHeader", "issuer_vkey", "the item's own value (a key, signature, hash, VRF output): decoded content, not a copy of its encoding"),
+    ("BlockHeader", "kes_signature", "the item's own value (a key, signature, hash, VRF output): decoded content, not a copy of its encoding"),
+    ("BlockHeader", "nonce_vrf_output", "the item's own value (a key, signature, hash, VRF output): decoded content, not a copy of its encoding (derived)"),
+    ("BlockHeader", "nonce_vrf_proof", "the item's own value (a key, signature, hash, VRF output): decoded content, not a copy of its encoding"),
+    ("BlockHeader", "vrf_vkey", "the item's own value (a key, signature, hash, VRF output): decoded content, not a copy of its encoding"),
+    ("BootstrapWitness", "attributes", "the Byron address attributes of a bootstrap witness: the witness's own value"),
+    ("BootstrapWitness", "chain_code", "the item's own value (a key, signature, hash, VRF output): decoded content, not a copy of its encoding"),
+    ("BootstrapWitness", "signature", "the item's own value (a key, signature, hash, VRF output): decoded content, not a copy of its encoding"),
+    ("BootstrapWitness", "vkey", "the item's own value (a key, signature, hash, VRF output): decoded content, not a copy of its encoding"),
+    ("VKeyWitness", "signature", "the item's own value (a key, signature, hash, VRF output): decoded content, not a copy of its encoding"),
+    ("VKeyWitness", "vkey", "the item's own value (a key, signature, hash, VRF output): decoded content, not a copy of its encoding"),
+    ("OperationalCert", "hot_vkey", "the item's own value (a key, signature, hash, VRF output): decoded content, not a copy of its encoding"),
+    ("OperationalCert", "sigma", "the item's own value (a key, signature, hash, VRF output): decoded content, not a copy of its encoding"),
+    ("VrfOutput", "output", "the item's own value (a key, signature, hash, VRF output): decoded content, not a copy of its encoding"),
+    ("VrfOutput", "proof", "the item's own value (a key, signature, hash, VRF output): decoded content, not a copy of its encoding"),
+    ("ByronAddress", "payload", "opaque input re-emitted verbatim by the address encoder: `Address` is NOT `NoPreservedBytes`; Byron address samples are counted apart (`samples_with_opaque_reemitted_input`)"),
+    ("ByronAddressPayload", "attributes", "opaque input re-emitted verbatim by the address encoder: `Address` is NOT `NoPreservedBytes`; Byron address samples are counted apart (`samples_with_opaque_reemitted_input`)"),
+    ("ByronBlockAux", "block_signature", "Byron-only; Byron blocks are outside both datasets"),
+    ("ByronBlockAux", "block_signed_bytes", "Byron-only; Byron blocks are outside both datasets"),
+    ("ByronBlockAux", "delegate_pubkey", "Byron-only; Byron blocks are outside both datasets"),
+    ("ByronBlockAux", "issuer_pubkey", "Byron-only; Byron blocks are outside both datasets"),
+    ("ByronDlgCert", "delegate_vk", "Byron-only; Byron blocks are outside both datasets"),
+    ("ByronDlgCert", "issuer_vk", "Byron-only; Byron blocks are outside both datasets"),
+    ("ByronDlgCert", "signature", "Byron-only; Byron blocks are outside both datasets"),
+    ("ByronDlgCert", "epoch_raw", "Byron-only; Byron blocks are outside both datasets"),
+    ("ByronParamsUpdate", "tx_fee_policy", "Byron-only; Byron blocks are outside both datasets (captured raw and never applied)"),
+    ("ByronUpdProposal", "body_span", "Byron-only; Byron blocks are outside both datasets"),
+    ("ByronUpdProposal", "proposer_vk", "Byron-only; Byron blocks are outside both datasets"),
+    ("ByronUpdProposal", "signature", "Byron-only; Byron blocks are outside both datasets"),
+    ("ByronUpdVote", "signature", "Byron-only; Byron blocks are outside both datasets"),
+    ("ByronUpdVote", "voter_vk", "Byron-only; Byron blocks are outside both datasets"),
+    ("ByronUpdVote", "proposal_id_raw", "Byron-only; Byron blocks are outside both datasets"),
+    ("CompactValueDecoded", "multi_asset_raw", "ledger-state / MemPack snapshot import type: not decoded by any rule of the dataset"),
+    ("DatumOption", "datum", "ledger-state / MemPack snapshot import type: not decoded by any rule of the dataset"),
+    ("HaskellGovState", "committee_raw", "ledger-state / MemPack snapshot import type: not decoded by any rule of the dataset"),
+    ("HaskellGovState", "drep_pulsing_raw", "ledger-state / MemPack snapshot import type: not decoded by any rule of the dataset"),
+    ("HaskellGovState", "proposals_raw", "ledger-state / MemPack snapshot import type: not decoded by any rule of the dataset"),
+    ("HaskellSnapShotPool", "reward_account", "ledger-state / MemPack snapshot import type: not decoded by any rule of the dataset"),
+    ("HaskellStakePoolState", "reward_account", "ledger-state / MemPack snapshot import type: not decoded by any rule of the dataset"),
+    ("MemPackTxOut", "address", "ledger-state / MemPack snapshot import type: not decoded by any rule of the dataset"),
+    ("MemPackTxOut", "datum", "ledger-state / MemPack snapshot import type: not decoded by any rule of the dataset"),
+    ("MemPackTxOut", "multi_asset", "ledger-state / MemPack snapshot import type: not decoded by any rule of the dataset"),
+    ("MemPackTxOut", "opaque_tail", "ledger-state / MemPack snapshot import type: not decoded by any rule of the dataset"),
+    ("MemPackTxOut", "script_ref", "ledger-state / MemPack snapshot import type: not decoded by any rule of the dataset"),
+    ("KeepRaw", "raw", "decode helper, never part of a decoded value"),
+    ("KeepRawOwned", "raw", "decode helper, never part of a decoded value"),
+    ("Reader", "origin", "decode helper, never part of a decoded value"),
+    ("PoolParams", "reward_account", "an address or reward account: the item's own value"),
+    ("ProposalProcedure", "return_addr", "an address or reward account: the item's own value"),
+    ("Withdrawal", "reward_account", "an address or reward account: the item's own value"),
+    ("GovAction", "withdrawals", "reward-account keys of a map: the item's own value"),
+    ("SubTransaction", "direct_deposits", "reward-account keys of a map: the item's own value"),
+    ("SubTransaction", "withdrawals", "reward-account keys of a map: the item's own value"),
+    ("TransactionBody", "direct_deposits", "reward-account keys of a map: the item's own value"),
+    ("TransactionBody", "withdrawals", "reward-account keys of a map: the item's own value"),
 ];
 
 /// A decoded type that is KNOWN to hold no preserved input bytes, anywhere inside it.
@@ -103,13 +154,13 @@ no_preserved_bytes!(
     dugite_primitives::transaction::ScriptRef,
     dugite_primitives::transaction::AccountBalanceInterval,
     dugite_primitives::credentials::Credential,
-    dugite_primitives::address::Address,
     dugite_primitives::block::ProtocolVersion,
     dugite_primitives::block::OperationalCert,
     dugite_primitives::value::AssetName,
 );
 
 impl<T: NoPreservedBytes> NoPreservedBytes for Vec<T> {}
+impl<T: NoPreservedBytes> NoPreservedBytes for Option<T> {}
 impl<A: NoPreservedBytes, B: NoPreservedBytes> NoPreservedBytes for (A, B) {}
 impl<K: NoPreservedBytes, V: NoPreservedBytes> NoPreservedBytes
     for std::collections::BTreeMap<K, V>
@@ -349,11 +400,45 @@ impl Scrub for Block {
     }
 }
 
+/// Field names that hold byte content, not preserved input, and may be populated in a decoded
+/// value (an empty `Option<Vec<u8>>` is never a hit; these are populated ones).
+const CONTENT_OPTION_BYTES: &[&str] = &["tx_fee_policy", "ipv4", "ipv6"];
+
+/// Look at the `Debug` rendering of a value for a populated preserved-bytes field, without
+/// consulting [`Scrub`]: any field named `raw_*` / `*_raw` / `original_*` holding `Some(..)`, and
+/// any `Option` of bytes (`Some([..` rendering) that is not a known content field.  `Debug` prints
+/// every field, including ones a serde `skip` hides, so a traversal gap in the hand-written
+/// scrub is caught here.
+pub fn independent_preserved_bytes(debug: &str) -> Vec<String> {
+    let mut hits = Vec::new();
+    let bytes = debug.as_bytes();
+    let mut i = 0;
+    while let Some(pos) = debug[i..].find(": Some(") {
+        let at = i + pos;
+        let name_start = debug[..at]
+            .rfind(|c: char| !(c.is_alphanumeric() || c == '_'))
+            .map_or(0, |p| p + 1);
+        let name = &debug[name_start..at];
+        let after = at + ": Some(".len();
+        let looks_like_bytes = bytes.get(after) == Some(&b'[');
+        let named =
+            name.starts_with("raw_") || name.ends_with("_raw") || name.starts_with("original_");
+        if (named || looks_like_bytes) && !CONTENT_OPTION_BYTES.contains(&name) {
+            hits.push(name.to_string());
+        }
+        i = after;
+    }
+    hits.sort();
+    hits.dedup();
+    hits
+}
+
 /// Clear every preserved-bytes field of `value`, then verify none remains.  A remaining field is
 /// a harness defect: the encoder could reuse input bytes, so the result would prove nothing.
-pub fn checked_scrub<T: Scrub>(value: &mut T) -> Vec<&'static str> {
+pub fn checked_scrub<T: Scrub + std::fmt::Debug>(value: &mut T) -> Vec<&'static str> {
     let cleared = value.scrub();
-    let left = value.populated();
+    let mut left: Vec<String> = value.populated().iter().map(|s| (*s).to_string()).collect();
+    left.extend(independent_preserved_bytes(&format!("{value:?}")));
     if !left.is_empty() {
         std::panic::panic_any(HarnessDefect(format!(
             "preserved input bytes remain after scrubbing: {}",
@@ -368,13 +453,28 @@ mod tests {
     use super::*;
     use crate::node_diversity::pins::repo_root;
 
-    /// Every `(owner, field, type)` of a field in `dugite-primitives` (outside `#[cfg(test)]`
-    /// modules) that could hold preserved input bytes: an `Option<Vec<u8>>`, or a field named
-    /// like `raw_*`, `*_raw`, `original_*`.
+    /// The type spellings that carry bytes: a plain or optional byte vector, shared or boxed byte
+    /// slices, `Bytes`, and the raw-capturing wrappers.
+    const BYTE_TYPES: [&str; 7] = [
+        "Vec<u8>",
+        "Bytes",
+        "Arc<[u8]>",
+        "Box<[u8]>",
+        "KeepRaw<",
+        "KeepRawOwned<",
+        "&'b [u8]",
+    ];
+
+    /// Every `(owner, field, type)` of a struct or enum-variant field in `dugite-primitives` and
+    /// `dugite-serialization` (outside `#[cfg(test)]` code) whose type carries bytes
+    /// ([`BYTE_TYPES`], also inside `Option`), or whose name looks like preserved bytes
+    /// (`raw_*`, `*_raw`, `original_*`), whatever its type.
     fn candidate_fields() -> Vec<(String, String, String)> {
-        let dir = repo_root().join("crates/dugite-primitives/src");
         let mut files = Vec::new();
-        let mut stack = vec![dir];
+        let mut stack = vec![
+            repo_root().join("crates/dugite-primitives/src"),
+            repo_root().join("crates/dugite-serialization/src"),
+        ];
         while let Some(d) = stack.pop() {
             for entry in std::fs::read_dir(&d).unwrap() {
                 let path = entry.unwrap().path();
@@ -390,26 +490,53 @@ mod tests {
         for file in files {
             let text = std::fs::read_to_string(&file).unwrap();
             let mut owner = String::new();
+            // Brace depth inside the current struct or enum; fields are only read inside one, so
+            // function parameters and match arms are not mistaken for fields.
+            let mut depth: i32 = 0;
             for line in text.lines() {
                 let t = line.trim();
                 if t.starts_with("#[cfg(test)]") {
                     break;
                 }
-                for kw in ["struct ", "enum "] {
-                    if let Some(rest) = t
-                        .strip_prefix(&format!("pub {kw}"))
-                        .or_else(|| t.strip_prefix(kw))
-                    {
+                if t.starts_with("//") {
+                    continue;
+                }
+                let opens = t.matches('{').count() as i32;
+                let closes = t.matches('}').count() as i32;
+                if depth <= 0 {
+                    let decl = [
+                        "pub struct ",
+                        "pub(crate) struct ",
+                        "struct ",
+                        "pub enum ",
+                        "pub(crate) enum ",
+                        "enum ",
+                    ]
+                    .iter()
+                    .find_map(|kw| t.strip_prefix(kw));
+                    if let Some(rest) = decl {
                         owner = rest
                             .split(|c: char| !c.is_alphanumeric() && c != '_')
                             .next()
                             .unwrap_or("")
                             .to_string();
+                        if rest.contains('(') && !rest.contains('{') {
+                            // tuple struct: `struct X(pub Vec<u8>);`
+                            if BYTE_TYPES.iter().any(|b| rest.contains(b)) {
+                                found.push((owner.clone(), "0".to_string(), rest.to_string()));
+                            }
+                        }
+                        depth = opens - closes;
+                        continue;
                     }
-                }
-                if t.starts_with("//") {
                     continue;
                 }
+                let inside = depth;
+                depth += opens - closes;
+                if inside <= 0 || t.contains("=>") || t.contains("fn ") {
+                    continue;
+                }
+                let t = t.strip_prefix("pub(crate) ").unwrap_or(t);
                 let t = t.strip_prefix("pub ").unwrap_or(t);
                 let Some((name, ty)) = t.split_once(':') else {
                     continue;
@@ -422,44 +549,45 @@ mod tests {
                 let by_name = name.starts_with("raw_")
                     || name.ends_with("_raw")
                     || name.starts_with("original_");
-                // `raw_cbor: None,` in a struct literal is an initialiser, not a field.
-                if ty == "None" || ty.starts_with("Some(") {
-                    continue;
-                }
-                if ty.contains("Option<Vec<u8>>") || by_name {
+                if BYTE_TYPES.iter().any(|b| ty.contains(b)) || by_name {
                     found.push((owner.clone(), name.to_string(), ty.to_string()));
                 }
             }
         }
+        found.sort();
+        found.dedup();
         found
     }
 
-    /// Every field of `dugite-primitives` that could hold preserved input bytes is either on the
-    /// audited list (and scrubbed) or on the list of fields that are not (with the reason).  A
-    /// field added tomorrow fails here until someone decides which it is.
+    fn owner_matches(audited: &str, owner: &str) -> bool {
+        audited == owner || audited.split("::").next() == Some(owner)
+    }
+
+    /// Every byte-carrying field of the two crates is either preserved input (scrubbed) or on the
+    /// exemption list keyed by owner AND field with a reason.  A field added tomorrow fails here
+    /// until someone decides which it is.
     #[test]
     fn every_preserved_bytes_field_is_covered() {
         let candidates = candidate_fields();
-        let owner_matches = |audited: &str, owner: &str| {
-            audited == owner || audited.split("::").next() == Some(owner)
-        };
         let mut unaccounted = Vec::new();
         for (owner, field, ty) in &candidates {
             let preserved = PRESERVED_BYTES_FIELDS
                 .iter()
                 .any(|(o, f)| f == field && owner_matches(o, owner));
-            let not_preserved = NOT_PRESERVED_BYTES.iter().any(|(_, f, _)| f == field);
-            if !preserved && !not_preserved {
-                unaccounted.push(format!("{owner}.{field}: {ty}"));
+            let exempt = NOT_PRESERVED_BYTES
+                .iter()
+                .any(|(o, f, _)| f == field && o == owner);
+            if !preserved && !exempt {
+                unaccounted.push(format!("(\"{owner}\", \"{field}\"): {ty}"));
             }
         }
         assert!(
             unaccounted.is_empty(),
-            "fields that may hold preserved input bytes are neither scrubbed nor audited as \
-             harmless: {unaccounted:?}\nadd them to PRESERVED_BYTES_FIELDS (and implement Scrub) or \
-             to NOT_PRESERVED_BYTES (with the reason)"
+            "byte-carrying fields neither scrubbed nor exempted with a reason:\n{}\nadd them to \
+             PRESERVED_BYTES_FIELDS (and implement Scrub) or to NOT_PRESERVED_BYTES (owner, field, reason)",
+            unaccounted.join("\n")
         );
-        // And the other direction: every audited field still exists, so the list cannot rot.
+        // The other direction: neither list may rot.
         for (owner, field) in PRESERVED_BYTES_FIELDS {
             assert!(
                 candidates
@@ -468,5 +596,33 @@ mod tests {
                 "audited field {owner}.{field} no longer exists: update PRESERVED_BYTES_FIELDS"
             );
         }
+        for (owner, field, reason) in NOT_PRESERVED_BYTES {
+            assert!(!reason.is_empty());
+            assert!(
+                candidates.iter().any(|(o, f, _)| f == field && o == owner),
+                "exempted field {owner}.{field} no longer exists: update NOT_PRESERVED_BYTES"
+            );
+        }
+    }
+
+    /// The verification after a scrub does not trust the scrub's own enumeration: it formats the
+    /// whole value with `Debug` (which prints every field, `serde(skip)` or not) and looks for a
+    /// populated `Option` of bytes or a populated field named like preserved bytes.
+    #[test]
+    fn the_independent_check_sees_a_field_the_scrub_does_not_know() {
+        #[derive(Debug)]
+        #[allow(dead_code)]
+        struct Unknown {
+            raw_extra: Option<Vec<u8>>,
+        }
+        let leaky = Unknown {
+            raw_extra: Some(vec![1, 2]),
+        };
+        assert_eq!(
+            super::independent_preserved_bytes(&format!("{leaky:?}")),
+            vec!["raw_extra".to_string()]
+        );
+        let clean = Unknown { raw_extra: None };
+        assert!(super::independent_preserved_bytes(&format!("{clean:?}")).is_empty());
     }
 }

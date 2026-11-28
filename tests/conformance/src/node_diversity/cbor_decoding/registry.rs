@@ -18,8 +18,7 @@
 use std::collections::BTreeMap;
 
 use dugite_primitives::era::Era;
-use dugite_primitives::transaction::PlutusData;
-use dugite_serialization::cbor::{encode_bytes, encode_uint};
+use dugite_serialization::cbor::encode_uint;
 use dugite_serialization::decode::rules as dec;
 use dugite_serialization::encode::rules as enc;
 use dugite_serialization::SerializationError;
@@ -81,7 +80,7 @@ fn plain<T: NoPreservedBytes + 'static>(
 
 /// A codec for a value that can carry preserved input bytes: they are cleared (and verified
 /// cleared) between decode and encode.
-fn scrubbed<T: Scrub + 'static>(
+fn scrubbed<T: Scrub + std::fmt::Debug + 'static>(
     decode: impl Fn(&[u8]) -> Result<T, SerializationError> + Clone + 'static,
     encode: impl Fn(&T) -> Vec<u8> + 'static,
 ) -> Codec {
@@ -96,24 +95,30 @@ fn scrubbed<T: Scrub + 'static>(
     }
 }
 
-fn fixed<const N: usize>() -> Codec {
-    plain(dec::fixed_bytes::<N>, |h| encode_bytes(h.as_ref()))
+/// Whether decoding `input` as `rule` yields a value that re-emits opaque input bytes: a Byron
+/// address keeps its payload as the bytes it was read from and writes them back, so an echo of
+/// the input and a rebuild are indistinguishable for it.  Such samples are still scored; they are
+/// excluded from the discriminating and echo-proof counts and counted on their own.
+pub fn reemits_opaque_input(rule: &str, input: &[u8]) -> bool {
+    use super::normalize::{parse, Item};
+    rule == "address"
+        && matches!(parse(input), Ok(Item::Bytes(b)) if b.first().is_some_and(|h| h >> 4 == 0b1000))
 }
 
-/// A leaf rule that dugite decodes by reading a PlutusData item (`big_int`, `bounded_bytes`,
-/// constructor alternatives): the decoded value must be of the kind the rule names.
-fn plutus_kind(accept: fn(&PlutusData) -> bool) -> Codec {
-    let check = move |b: &[u8]| -> Result<PlutusData, SerializationError> {
-        let d = dec::plutus_data(b)?;
-        if accept(&d) {
-            Ok(d)
-        } else {
-            Err(SerializationError::CborDecode(
-                "decoded as PlutusData of another kind than the rule names".into(),
-            ))
-        }
-    };
-    plain(check, enc::plutus_data)
+/// A codec for a value without the `NoPreservedBytes` statement: only for `address`, whose Byron
+/// variant carries opaque input bytes (see [`reemits_opaque_input`]).
+fn opaque<T: 'static>(
+    decode: impl Fn(&[u8]) -> Result<T, SerializationError> + Clone + 'static,
+    encode: impl Fn(&T) -> Vec<u8> + 'static,
+) -> Codec {
+    let d = decode.clone();
+    Codec {
+        decode: Box::new(move |b| d(b).map(|_| ()).map_err(|e| e.to_string())),
+        reencode: Box::new(move |b| {
+            let value = decode(b).map_err(|e| Failure::Decode(e.to_string()))?;
+            encoded(|| encode(&value))
+        }),
+    }
 }
 
 /// The registry of one era.
@@ -144,10 +149,12 @@ pub fn registry(era: CborEra) -> BTreeMap<&'static str, Codec> {
     ] {
         m.insert(rule, plain(dec::hash32, enc::hash32));
     }
-    for rule in ["vkey", "vrf_vkey", "kes_vkey"] {
-        m.insert(rule, fixed::<32>());
+    // Keys and signatures are read by the production header, operational-certificate and witness
+    // readers with `read_bytes_owned`, which checks no length (`read_hash::<32>` / `<64>` are
+    // length-checked but are not what production uses for these fields).
+    for rule in ["vkey", "vrf_vkey", "kes_vkey", "signature"] {
+        m.insert(rule, plain(dec::bytes_owned, |b| enc::bytes(b)));
     }
-    m.insert("signature", fixed::<64>());
     m.insert("coin", plain(dec::lovelace, enc::lovelace));
     for rule in [
         "epoch",
@@ -158,10 +165,7 @@ pub fn registry(era: CborEra) -> BTreeMap<&'static str, Codec> {
     ] {
         m.insert(rule, plain(dec::uint, |v| encode_uint(*v)));
     }
-    m.insert(
-        "network_id",
-        plain(dec::network_id, |v| encode_uint(u64::from(*v))),
-    );
+    m.insert("network_id", plain(dec::network_id, enc::network_id));
     for rule in ["unit_interval", "nonnegative_interval"] {
         m.insert(rule, plain(dec::rational, enc::rational));
     }
@@ -179,18 +183,9 @@ pub fn registry(era: CborEra) -> BTreeMap<&'static str, Codec> {
         "operational_cert",
         plain(dec::operational_cert, enc::operational_cert),
     );
-    m.insert(
-        "big_int",
-        plutus_kind(|d| matches!(d, PlutusData::Integer(_))),
-    );
-    m.insert(
-        "bounded_bytes",
-        plutus_kind(|d| matches!(d, PlutusData::Bytes(_))),
-    );
-    m.insert(
-        "%constr<plutus_data>",
-        plutus_kind(|d| matches!(d, PlutusData::Constr(..))),
-    );
+    // `big_int`, `bounded_bytes` and `%constr<plutus_data>` are NOT registered: dugite has one
+    // plutus-data decoder, none per kind, and a kind filter written for the harness would be the
+    // decoder under test.  They fail as "no decoder registered".
 
     // ── blocks, transactions ────────────────────────────────────────────────────────────────
     m.insert("block", scrubbed(move |b| dec::block(b, e), enc::block));
@@ -240,7 +235,7 @@ pub fn registry(era: CborEra) -> BTreeMap<&'static str, Codec> {
         scrubbed(dec::datum_option, enc::datum_option),
     );
     m.insert("script", plain(dec::script, enc::script));
-    m.insert("address", plain(dec::address, enc::address));
+    m.insert("address", opaque(dec::address, enc::address));
 
     // ── certificates and governance ─────────────────────────────────────────────────────────
     m.insert("certificate", plain(dec::certificate, enc::certificate));
