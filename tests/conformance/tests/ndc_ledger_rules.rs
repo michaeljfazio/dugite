@@ -351,8 +351,8 @@ fn context_none_set_is_the_documented_one() {
         );
         checked += 1;
     }
-    // Not vacuous: every fixture that reached validation is checked (258 at the pinned corpus;
-    // the rest are refused at decode, #1138).
+    // Not vacuous: every fixture that reached validation is checked (366 at the pinned corpus;
+    // the two that expect a decoding failure are refused at decode).
     assert!(
         checked >= 250,
         "only {checked} scored fixtures had a context to check"
@@ -363,18 +363,11 @@ fn context_none_set_is_the_documented_one() {
 /// today and does not once the section is gone), or the section is one no scored fixture's result
 /// depends on.  Those are listed with the reason and the list is exact: a section that starts to
 /// matter must leave it.  The shadow run is a diagnostic and never counts here.
-const SECTIONS_NOT_OBSERVABLE_ON_SCORED_RESULTS: &[(&str, &str)] = &[
-    (
-        "proposals_roots",
-        "every fixture that carries it is refused at decode today (#1138), so no scored result \
-         reads it; this entry must go when #1138 is fixed",
-    ),
-    (
-        "governance_activity",
-        "the dormant-epoch counter only feeds a DRep's expiry when a DRep is registered, updated or \
+const SECTIONS_NOT_OBSERVABLE_ON_SCORED_RESULTS: &[(&str, &str)] = &[(
+    "governance_activity",
+    "the dormant-epoch counter only feeds a DRep's expiry when a DRep is registered, updated or \
          votes (the apply path); no phase-one rule on the admission path reads it",
-    ),
-];
+)];
 
 #[test]
 fn dropping_each_initial_state_section_is_observable() {
@@ -605,10 +598,9 @@ fn the_report_is_complete_and_schema_valid() {
     }
 }
 
-/// 00362 and 00363 expect a decoding failure and match today only because outputs with an
-/// indefinite map fail to decode (#1138).  They must keep failing for the reason the fixture
-/// names once that is fixed: with the outer output maps made definite they still fail, with the
-/// decoder's own reason about the reference script, never about the map.
+/// 00362 and 00363 expect a decoding failure.  They must fail for the reason the fixture names
+/// (the decoder's own reason about the reference script), never because an output map is
+/// indefinite (#1138, fixed): with the outer output maps made definite they fail the same way.
 #[test]
 fn decoding_failure_fixtures_fail_for_their_own_reason() {
     if !have_corpus("decoding_failure_fixtures_fail_for_their_own_reason") {
@@ -633,7 +625,7 @@ fn decoding_failure_fixtures_fail_for_their_own_reason() {
 
 const PINNED_DECODING_REASONS: &[(&str, &str)] = &[
     ("00362", "script_ref: unknown script type 99"),
-    ("00363", "script_ref: expected array(2), got Some(3)"),
+    ("00363", "script_ref: expected array(2), got array(3)"),
 ];
 
 /// Two different failures that both fall back to `ConwayMempoolFailure` must not read as the same

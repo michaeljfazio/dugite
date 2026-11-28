@@ -499,8 +499,8 @@ fn decode_babbage_tx_body(r: &mut Reader<'_>) -> Result<TransactionBody, Seriali
                 })?;
             }
             15 => {
-                let id = r.read_uint()?;
-                network_id = Some(id as u8);
+                // Haskell `Network` DecCBOR: `decodeWord8` + `word8ToNetwork` (0 or 1 only).
+                network_id = Some(crate::decode::helpers::read_network_id(r)?);
             }
             16 => {
                 // collateral_return: a post-Alonzo output (map or legacy array).
@@ -643,13 +643,17 @@ fn read_babbage_mint_map(
 ///
 /// The discriminator is the CBOR major type: Array = legacy, Map = post-Alonzo.
 fn read_babbage_tx_output(r: &mut Reader<'_>) -> Result<TransactionOutput, SerializationError> {
+    // Haskell `decodeBabbageTxOut` (`Babbage/TxOut.hs`) peeks the token type:
+    // `TypeMapLenIndef | TypeMapLen -> decodeTxOut` (SparseKeyed), anything else
+    // `oldTxOut` (`decodeListLenOrIndef`). cborg reports a `0xbb` (8-byte length) map
+    // head as `TypeMapLen64`, which is not matched, so it fails in `oldTxOut`.
     let ty = r.peek_major()?;
     match ty {
-        Type::Array => {
+        Type::Array | Type::ArrayIndef => {
             // Legacy Shelley-style: [address, value] or [address, value, datum_hash]
             read_babbage_legacy_output(r)
         }
-        Type::Map => {
+        Type::Map | Type::MapIndef if r.peek_byte() != Some(0xbb) => {
             // Post-Alonzo map: {0: address, 1: value, 2: datum_option, 3: script_ref}
             read_babbage_map_output(r)
         }
@@ -677,15 +681,14 @@ fn read_babbage_tx_output_with_raw(
 }
 
 fn read_babbage_legacy_output(r: &mut Reader<'_>) -> Result<TransactionOutput, SerializationError> {
+    // Haskell `oldTxOut`: `decodeListLenOrIndef`; definite 2 or 3, or an indefinite
+    // array of 2 or 3 elements closed by a break.
     let arr_len = r.read_array_header()?;
-    let n = match arr_len {
-        Some(2) | Some(3) => arr_len.unwrap(),
-        _ => {
-            return Err(SerializationError::CborDecode(format!(
-                "babbage legacy tx_out: expected array(2) or array(3), got {arr_len:?}"
-            )));
-        }
-    };
+    if !matches!(arr_len, Some(2) | Some(3) | None) {
+        return Err(SerializationError::CborDecode(format!(
+            "babbage legacy tx_out: expected array(2) or array(3), got {arr_len:?}"
+        )));
+    }
 
     let addr_bytes = r.read_bytes_owned()?;
     let address = Address::from_bytes(&addr_bytes)
@@ -693,12 +696,17 @@ fn read_babbage_legacy_output(r: &mut Reader<'_>) -> Result<TransactionOutput, S
 
     let value = read_value(r)?;
 
-    let datum = if n == 3 {
+    let has_datum_hash = match arr_len {
+        Some(n) => n == 3,
+        None => r.peek_major()? != Type::Break,
+    };
+    let datum = if has_datum_hash {
         let dh = read_hash32(r)?;
         OutputDatum::DatumHash(dh)
     } else {
         OutputDatum::None
     };
+    r.close_record(arr_len.is_none())?;
 
     Ok(TransactionOutput {
         address,
@@ -797,18 +805,13 @@ fn read_babbage_map_output(r: &mut Reader<'_>) -> Result<TransactionOutput, Seri
 
 /// Read a datum option: `[0, hash32] | [1, tag(24) bytes]`.
 fn read_datum_option(r: &mut Reader<'_>) -> Result<OutputDatum, SerializationError> {
-    let arr_len = r.read_array_header()?;
-    if !matches!(arr_len, Some(2)) {
-        return Err(SerializationError::CborDecode(format!(
-            "datum_option: expected array(2), got {arr_len:?}"
-        )));
-    }
+    // Haskell `Datum` is `Summands "Datum"` (`decodeRecordSum`): definite or indefinite.
+    let indef = r.read_record_header("datum_option", 2)?;
     let disc = r.read_uint()?;
-    match disc {
+    let out = match disc {
         0 => {
             // DatumHash: bytes(32)
-            let hash = read_hash32(r)?;
-            Ok(OutputDatum::DatumHash(hash))
+            OutputDatum::DatumHash(read_hash32(r)?)
         }
         1 => {
             // InlineDatum: tag(24) bytes containing PlutusData CBOR
@@ -816,15 +819,21 @@ fn read_datum_option(r: &mut Reader<'_>) -> Result<OutputDatum, SerializationErr
             // Parse the PlutusData from the inner bytes
             let mut inner_r = Reader::new(&inner_bytes);
             let data = read_plutus_data(&mut inner_r)?;
-            Ok(OutputDatum::InlineDatum {
+            // Haskell `decodeBinaryData` -> `decodeFull'`: exactly one PlutusData value.
+            inner_r.expect_end("inline datum")?;
+            OutputDatum::InlineDatum {
                 data,
                 raw_cbor: Some(inner_bytes),
-            })
+            }
         }
-        other => Err(SerializationError::CborDecode(format!(
-            "datum_option: unknown discriminator {other}"
-        ))),
-    }
+        other => {
+            return Err(SerializationError::CborDecode(format!(
+                "datum_option: unknown discriminator {other}"
+            )));
+        }
+    };
+    r.close_record(indef)?;
+    Ok(out)
 }
 
 /// Read a script reference: `tag(24) bytes([type, script_bytes])`.
@@ -837,42 +846,29 @@ fn read_datum_option(r: &mut Reader<'_>) -> Result<OutputDatum, SerializationErr
 fn read_script_ref(r: &mut Reader<'_>) -> Result<ScriptRef, SerializationError> {
     let inner_bytes = r.read_embedded_cbor_bytes()?.to_vec();
     let mut inner_r = Reader::new(&inner_bytes);
-    let arr_len = inner_r.read_array_header()?;
-    if !matches!(arr_len, Some(2)) {
-        return Err(SerializationError::CborDecode(format!(
-            "script_ref: expected array(2), got {arr_len:?}"
-        )));
-    }
+    // Haskell `Script` is `Summands "AlonzoScript"` (`decodeRecordSum`): the inner
+    // `[type, script]` array may be definite or indefinite.
+    let indef = inner_r.read_record_header("script_ref", 2)?;
     let script_type = inner_r.read_uint()?;
-    match script_type {
+    let out = match script_type {
+        // NativeScript — the value is the native script CBOR itself, read in place.
         0 => {
-            // NativeScript — the value is the native script CBOR bytes.
-            // We already consumed the script_type (0). Re-parse from inner_bytes
-            // with a fresh reader since we can't "un-read" the already-consumed bytes.
-            let _ = inner_r; // drop to avoid unused-variable warning
-            let mut fresh = Reader::new(&inner_bytes);
-            let _arr = fresh.read_array_header()?; // [2]
-            let _type = fresh.read_uint()?; // 0 — script type discriminator
-                                            // The remaining value is the native script CBOR.
-            let ns = crate::decode::era_alonzo::read_native_script_from_cbor(&mut fresh)?;
-            Ok(ScriptRef::NativeScript(ns))
+            let ns = crate::decode::era_alonzo::read_native_script_from_cbor(&mut inner_r)?;
+            ScriptRef::NativeScript(ns)
         }
-        1 => {
-            let script_bytes = inner_r.read_bytes_owned()?;
-            Ok(ScriptRef::PlutusV1(script_bytes))
+        1 => ScriptRef::PlutusV1(inner_r.read_bytes_owned()?),
+        2 => ScriptRef::PlutusV2(inner_r.read_bytes_owned()?),
+        3 => ScriptRef::PlutusV3(inner_r.read_bytes_owned()?),
+        other => {
+            return Err(SerializationError::CborDecode(format!(
+                "script_ref: unknown type {other}"
+            )));
         }
-        2 => {
-            let script_bytes = inner_r.read_bytes_owned()?;
-            Ok(ScriptRef::PlutusV2(script_bytes))
-        }
-        3 => {
-            let script_bytes = inner_r.read_bytes_owned()?;
-            Ok(ScriptRef::PlutusV3(script_bytes))
-        }
-        other => Err(SerializationError::CborDecode(format!(
-            "script_ref: unknown type {other}"
-        ))),
-    }
+    };
+    inner_r.close_record(indef)?;
+    // Haskell `decodeCIC` -> `decodeFullAnnotator`: no bytes may follow the script.
+    inner_r.expect_end("script_ref")?;
+    Ok(out)
 }
 
 // ============================================================================
