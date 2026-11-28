@@ -1,0 +1,122 @@
+{
+ "comment": "Vectors of the pinned uplc-conformance corpus that dugite currently fails, with the outcome the runner observes and the issue that tracks each. ndc_uplc_conformance.rs fails on a new failure, on a listed vector that now passes, and on a changed outcome; edit this file in the same change as the fix or the pin that moves it.",
+ "failures": [
+  {
+   "id": "builtin_semantics_rotatebytestring_negative_rotate_beyond_int64_pv10_v3",
+   "protocol_version": "10.0",
+   "plutus_version": "V3",
+   "issue": 1129,
+   "observed_evaluation": "evaluation failure",
+   "observed_budget": null
+  },
+  {
+   "id": "builtin_semantics_rotatebytestring_rotate_beyond_int64_pv10_v3",
+   "protocol_version": "10.0",
+   "plutus_version": "V3",
+   "issue": 1129,
+   "observed_evaluation": "evaluation failure",
+   "observed_budget": null
+  },
+  {
+   "id": "builtin_semantics_shiftbytestring_negative_shift_beyond_int64_pv10_v3",
+   "protocol_version": "10.0",
+   "plutus_version": "V3",
+   "issue": 1129,
+   "observed_evaluation": "evaluation failure",
+   "observed_budget": null
+  },
+  {
+   "id": "builtin_semantics_shiftbytestring_shift_beyond_int64_pv10_v3",
+   "protocol_version": "10.0",
+   "plutus_version": "V3",
+   "issue": 1129,
+   "observed_evaluation": "evaluation failure",
+   "observed_budget": null
+  },
+  {
+   "id": "program_version_1_0_1_v3",
+   "protocol_version": "11.0",
+   "plutus_version": "V3",
+   "issue": 1128,
+   "observed_evaluation": "(program 1.0.1 (con unit ()))",
+   "observed_budget": {
+    "cpu": 16100,
+    "mem": 200
+   }
+  },
+  {
+   "id": "program_version_1_1_0_before_pv11_v1",
+   "protocol_version": "10.0",
+   "plutus_version": "V1",
+   "issue": 1128,
+   "observed_evaluation": "(program 1.1.0 (con unit ()))",
+   "observed_budget": {
+    "cpu": 16100,
+    "mem": 200
+   }
+  },
+  {
+   "id": "program_version_1_1_0_before_pv11_v2",
+   "protocol_version": "10.0",
+   "plutus_version": "V2",
+   "issue": 1128,
+   "observed_evaluation": "(program 1.1.0 (con unit ()))",
+   "observed_budget": {
+    "cpu": 16100,
+    "mem": 200
+   }
+  },
+  {
+   "id": "program_version_1_2_0_v3",
+   "protocol_version": "11.0",
+   "plutus_version": "V3",
+   "issue": 1128,
+   "observed_evaluation": "(program 1.2.0 (con unit ()))",
+   "observed_budget": {
+    "cpu": 16100,
+    "mem": 200
+   }
+  },
+  {
+   "id": "program_version_2_0_0_v1",
+   "protocol_version": "11.0",
+   "plutus_version": "V1",
+   "issue": 1128,
+   "observed_evaluation": "(program 2.0.0 (con unit ()))",
+   "observed_budget": {
+    "cpu": 16100,
+    "mem": 200
+   }
+  },
+  {
+   "id": "program_version_2_0_0_v3",
+   "protocol_version": "10.0",
+   "plutus_version": "V3",
+   "issue": 1128,
+   "observed_evaluation": "(program 2.0.0 (con unit ()))",
+   "observed_budget": {
+    "cpu": 16100,
+    "mem": 200
+   }
+  },
+  {
+   "id": "program_version_2_0_0_v3",
+   "protocol_version": "11.0",
+   "plutus_version": "V3",
+   "issue": 1128,
+   "observed_evaluation": "(program 2.0.0 (con unit ()))",
+   "observed_budget": {
+    "cpu": 16100,
+    "mem": 200
+   }
+  },
+  {
+   "id": "term_constr_constr_07_v3",
+   "protocol_version": "11.0",
+   "plutus_version": "V3",
+   "issue": 1130,
+   "observed_evaluation": "evaluation failure",
+   "observed_budget": null
+  }
+ ]
+}
