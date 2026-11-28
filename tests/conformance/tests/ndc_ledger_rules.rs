@@ -336,18 +336,14 @@ fn context_none_set_is_the_documented_one() {
     }
     let (_, runs, _) = live();
     let expected: BTreeSet<&str> = CONTEXT_NONE_EXPECTED.iter().map(|(n, _)| *n).collect();
+    // SCORED results only: a fixture refused at decode builds no context in the scored run, and
+    // the diagnostic shadow run is not a result the gate or the report counts.
     let mut checked = 0;
-    for r in &runs {
-        // A fixture refused at decode builds its context only in the shadow run.
-        let probe = if matches!(r.verdict, Verdict::DecodingFailure(_)) {
-            match &r.shadow {
-                Some(s) => s,
-                None => continue,
-            }
-        } else {
-            r
-        };
-        let got: BTreeSet<&str> = probe.context_none.iter().copied().collect();
+    for r in runs
+        .iter()
+        .filter(|r| !matches!(r.verdict, Verdict::DecodingFailure(_)))
+    {
+        let got: BTreeSet<&str> = r.context_none.iter().copied().collect();
         assert_eq!(
             got, expected,
             "fixture {}: the context's `None` fields are not the documented set",
@@ -355,22 +351,30 @@ fn context_none_set_is_the_documented_one() {
         );
         checked += 1;
     }
-    // Not vacuous: nearly every fixture is checked.
+    // Not vacuous: every fixture that reached validation is checked (258 at the pinned corpus;
+    // the rest are refused at decode, #1138).
     assert!(
-        checked >= 360,
-        "only {checked} fixtures had a context to check"
+        checked >= 250,
+        "only {checked} scored fixtures had a context to check"
     );
 }
 
-/// Dropping an `initial_state` section must change the outcome of at least one fixture that
-/// contains it, or the section is one nothing reads.  Those are listed, with the reason, and the
-/// list is exact: a section that starts to matter must leave it.
-const SECTIONS_NO_RULE_READS: &[(&str, &str)] = &[(
-    "governance_activity",
-    "the dormant-epoch counter only feeds a DRep's expiry when a DRep is registered, updated or votes \
-     (the apply path); no phase-one rule on the admission path reads it, so none of the 7 fixtures that \
-     carry it can depend on it",
-)];
+/// Dropping an `initial_state` section must turn at least one SCORED fixture red (one that matches
+/// today and does not once the section is gone), or the section is one no scored fixture's result
+/// depends on.  Those are listed with the reason and the list is exact: a section that starts to
+/// matter must leave it.  The shadow run is a diagnostic and never counts here.
+const SECTIONS_NOT_OBSERVABLE_ON_SCORED_RESULTS: &[(&str, &str)] = &[
+    (
+        "proposals_roots",
+        "every fixture that carries it is refused at decode today (#1138), so no scored result \
+         reads it; this entry must go when #1138 is fixed",
+    ),
+    (
+        "governance_activity",
+        "the dormant-epoch counter only feeds a DRep's expiry when a DRep is registered, updated or \
+         votes (the apply path); no phase-one rule on the admission path reads it",
+    ),
+];
 
 #[test]
 fn dropping_each_initial_state_section_is_observable() {
@@ -384,39 +388,43 @@ fn dropping_each_initial_state_section_is_observable() {
     for section in Section::ALL {
         let mut red = Vec::new();
         let mut changed = Vec::new();
+        let mut scored = 0;
         for f in fixtures
             .iter()
             .filter(|f| f.initial_state.contains_key(section.key()))
         {
             let before = base[f.id.as_str()];
-            // A fixture refused at decode never reads state; its shadow does.
+            // SCORED results only: a fixture refused at decode has no scored result to change.
+            if matches!(before.verdict, Verdict::DecodingFailure(_)) {
+                continue;
+            }
+            scored += 1;
             let after = run_fixture(f, &vocab, Some(section)).expect("run");
-            let (b, a) = match (&before.shadow, &after.shadow) {
-                (Some(bs), Some(as_)) => (bs.as_ref(), as_.as_ref()),
-                _ => (before, &after),
-            };
-            if b.observed() != a.observed() {
+            if before.observed() != after.observed() {
                 changed.push(f.id.clone());
-                if b.matched() && !a.matched() {
+                if before.matched() && !after.matched() {
                     red.push(f.id.clone());
                 }
             }
         }
         eprintln!(
-            "section {:>20}: {} fixtures change, {} turn red {:?}",
+            "section {:>20}: {scored} scored fixtures, {} change, {} turn red {:?}",
             section.key(),
             changed.len(),
             red.len(),
             &red[..red.len().min(4)]
         );
-        if changed.is_empty() {
+        if red.is_empty() {
             unobservable.push(section.key());
         }
     }
-    let allowed: Vec<&str> = SECTIONS_NO_RULE_READS.iter().map(|(s, _)| *s).collect();
+    let allowed: Vec<&str> = SECTIONS_NOT_OBSERVABLE_ON_SCORED_RESULTS
+        .iter()
+        .map(|(s, _)| *s)
+        .collect();
     assert_eq!(
         unobservable, allowed,
-        "the sections no fixture's outcome depends on changed; update SECTIONS_NO_RULE_READS with the reason"
+        "the sections no scored fixture turns red on changed; update SECTIONS_NOT_OBSERVABLE_ON_SCORED_RESULTS with the reason"
     );
 }
 
@@ -594,5 +602,67 @@ fn the_report_is_complete_and_schema_valid() {
     let vocab: Vocabulary = vocabulary().unwrap();
     for c in cases {
         assert!(vocab.contains(c["result"].as_str().unwrap()));
+    }
+}
+
+/// 00362 and 00363 expect a decoding failure and match today only because outputs with an
+/// indefinite map fail to decode (#1138).  They must keep failing for the reason the fixture
+/// names once that is fixed: with the outer output maps made definite they still fail, with the
+/// decoder's own reason about the reference script, never about the map.
+#[test]
+fn decoding_failure_fixtures_fail_for_their_own_reason() {
+    if !have_corpus("decoding_failure_fixtures_fail_for_their_own_reason") {
+        return;
+    }
+    let (_, runs, _) = live();
+    for (id, needle) in PINNED_DECODING_REASONS {
+        let r = runs.iter().find(|r| r.id == *id).unwrap();
+        assert!(r.matched(), "{id}");
+        let why = r
+            .shadow_decode_error
+            .as_deref()
+            .unwrap_or_else(|| panic!("{id}: decodes once its outputs are made definite"));
+        eprintln!("{id}: {why}");
+        assert!(
+            !why.contains("indefinite map"),
+            "{id} still fails only because of #1138: {why}"
+        );
+        assert!(why.contains(needle), "{id}: unexpected reason: {why}");
+    }
+}
+
+const PINNED_DECODING_REASONS: &[(&str, &str)] = &[
+    ("00362", "script_ref: unknown script type 99"),
+    ("00363", "script_ref: expected array(2), got Some(3)"),
+];
+
+/// Two different failures that both fall back to `ConwayMempoolFailure` must not read as the same
+/// result: the fallback's text and the ledger failures behind it are part of the observed result
+/// and of the snapshot.
+#[test]
+fn a_different_generic_failure_changes_observed_and_snapshot() {
+    if !have_corpus("a_different_generic_failure_changes_observed_and_snapshot") {
+        return;
+    }
+    let (_, runs, _) = live();
+    let a = runs.iter().find(|r| r.id == "00076").unwrap();
+    assert!(a
+        .observed()
+        .contains("text: \"transaction validation failed\""));
+    assert!(a.observed().contains("ledger: InvalidWitnessSignature"));
+    let mut b = a.clone();
+    b.ledger_errors = vec!["MissingRequiredSigner(\"x\")".into()];
+    assert_ne!(a.observed(), b.observed());
+    assert_ne!(a.raised_lines(), b.raised_lines());
+    // Every generic-fallback entry of the contract records the text and the ledger failure.
+    for e in entries()
+        .iter()
+        .filter(|e| e.observed.contains("generic fallback"))
+    {
+        assert!(
+            e.observed.contains("text: ") && e.observed.contains("ledger: "),
+            "{}",
+            e.id
+        );
     }
 }

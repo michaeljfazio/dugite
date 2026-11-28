@@ -24,9 +24,17 @@
 // Rows the harness deliberately does NOT carry, because each would turn a wire-level divergence
 // into a match (the scenario scores names; the point of the harness is the bytes):
 //
-//  * `ConwayMempoolFailure` -> `BadInputsUTxO` / `InputSetEmptyUTxO` ([scarab] only): that is
-//    dugite's own generic fallback text.  A failure dugite could not encode typed must count as a
-//    failure, never as the name of whatever it was a fallback for.
+//  * `ConwayMempoolFailure` -> `BadInputsUTxO` / `InputSetEmptyUTxO` ([scarab] and the checker).
+//    Haskell DOES send `ConwayMempoolFailure "All inputs are spent. Transaction has probably
+//    already been included"` (`Conway/Rules/Mempool.hs`, raised when none of a transaction's inputs
+//    is in the UTxO), and the reference checker (`Run.hs`, `normalizeLedgerFailure`) maps that text
+//    to `InputSetEmptyUTxO` for an empty input set and `BadInputsUTxO` otherwise.  dugite's
+//    `ConwayMempoolFailure` is something else: its generic fallback, with the text
+//    "transaction validation failed", for a failure it has no typed encoding for.  A row keyed on
+//    the constructor alone would score every fallback as the failure it stood in for, so the
+//    constructor has no name here.  The cost is stated, not hidden: dugite sends the typed
+//    `BadInputsUTxO` where a real node sends the mempool text (fixtures 00050, 00074, decided by
+//    #1138 today; their shadow runs match by name).
 //  * `OutputTooSmallUTxO` (UTXO tag 9) -> `BabbageOutputTooSmallUTxO` ([scarab] only): Conway's
 //    check raises `BabbageOutputTooSmallUTxO` (tag 21); a node that sends tag 9 sends different
 //    bytes from cardano-node.

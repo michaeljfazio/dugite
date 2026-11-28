@@ -27,22 +27,35 @@ with open(sys.argv[1], "rb") as f:
 bad = [e for e in entries if not isinstance(e.get("issue"), int) or e["issue"] <= 0]
 if bad:
     sys.exit("entries without an issue number: " + ", ".join(e.get("id", "?") for e in bad))
-for n in sorted({e["issue"] for e in entries}):
-    print(n)
+classes = {}
+for e in entries:
+    classes.setdefault(e["issue"], set()).add(e.get("class", ""))
+for n in sorted(classes):
+    if len(classes[n]) != 1:
+        sys.exit(f"issue {n} is used with different classes: {sorted(classes[n])}")
+    print(n, next(iter(classes[n])), sep="\t")
 PY
 ) || exit 1
 
 status=0
 count=0
-for n in $issues; do
+while IFS=$'\t' read -r n class; do
     count=$((count + 1))
-    if ! state=$(gh issue view "$n" --repo "$REPO" --json state --jq .state 2>&1); then
-        echo "check-expected-issues: cannot read $REPO#$n: $state" >&2
+    if ! info=$(gh issue view "$n" --repo "$REPO" --json state,title --jq '[.state, .title] | @tsv' 2>&1); then
+        echo "check-expected-issues: cannot read $REPO#$n: $info" >&2
         status=1
-    elif [[ "$state" != "OPEN" ]]; then
+        continue
+    fi
+    state=${info%%$'\t'*}
+    title=${info#*$'\t'}
+    if [[ "$state" != "OPEN" ]]; then
         echo "check-expected-issues: $REPO#$n is $state; an expected-results entry needs an OPEN issue" >&2
         status=1
     fi
-done
-[[ $status -eq 0 ]] && echo "check-expected-issues: $count issues, all open"
+    if [[ "$title" != "$class" ]]; then
+        echo "check-expected-issues: $REPO#$n is titled '$title', its entries say class '$class'" >&2
+        status=1
+    fi
+done <<<"$issues"
+[[ $status -eq 0 ]] && echo "check-expected-issues: $count issues, all open and titled as their entries say"
 exit $status

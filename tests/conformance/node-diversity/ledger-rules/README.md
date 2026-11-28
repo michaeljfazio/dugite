@@ -32,6 +32,25 @@ has no name: it is a failure and can never be a match. A rejection whose failure
 is reported with a placeholder that is not the fixture's expectation (the schema can only carry the
 scenario's 81 names); the gate compares the true value, `unmapped:<constructor>`.
 
+## What the oracle is, and what a match proves
+
+A match proves that the failure dugite's encoder would send NAMES the scenario's expected failure. It does
+not prove that cardano-cli would be sent the same bytes by cardano-node, because the scenario's own oracle is
+not "the bytes cardano-node sends". It is the Haskell `applyTx` (the MEMPOOL rule, which wraps LEDGER) plus
+the reference checker's normalisation (`Amaru validation-rules/.../Run.hs`, `normalizeApplyTxError`):
+
+* the PV<11 mempool-only failure `ConwayMempoolFailure "Unelected committee members are not allowed to cast
+  votes: .."` is DROPPED (`Run.hs:387-401`). Fixture 00154 (PV10, vote by an unelected member) therefore
+  expects `Pass`; cardano-node's mempool would refuse it (`Conway/Rules/Mempool.hs:122-134`) and dugite has no
+  such check, so dugite agrees with the scenario and differs from the node it models.
+* `ConwayMempoolFailure "All inputs are spent. .."` is mapped to `InputSetEmptyUTxO` (empty input set) or
+  `BadInputsUTxO`. A real node sends the mempool text there; dugite sends the typed `BadInputsUTxO`. Fixtures
+  00050 and 00074 expect those names and are decided by #1138 today, so the question is open until it is fixed.
+* when the fixture names an expected predicate and ANY raised failure renders to a string containing it, the
+  checker reports the expected name alone. Comparison is therefore unordered and payload-free, and so is
+  ours: 00290 matches with `[ValueNotConservedUTxO, StakeKeyNotRegisteredDELEG]` raised, where the oracle
+  would have reported only the expected name.
+
 ## The tag table (`tag_table.rs`) and the name table (`ndc_names.rs`)
 
 `tag_table.rs` is transcribed from cardano-ledger, never from dugite's encoder. Every constructor quotes
@@ -70,13 +89,21 @@ roots, pots, constitution guardrail). Interpretations the fixtures force, each s
 * `guardrail_script` absent or null still enacts a constitution (with no guardrail).
 * a fixture's output with an indefinite outer map is made definite **in state only**; the transaction is never
   touched (see below).
-* `PREPROD_SYSTEM_START_MS`, `k = 2160`, magic 1; the fixture's era history supplies the epoch size and the
-  per-transaction safe-zone horizon.
+* the committee is built as the reference checker builds it (`InitialState.hs`, `electedCommitteeMembers`,
+  `committeeAuthorizations`, `orphanAuthorizations`): `valid_until` elects a member, `status` is its authorisation
+  entry, and every member WITHOUT `valid_until` is added through one synthetic `UpdateCommittee` proposal's
+  `members_to_add`. `ConstitutionalCommittee` proposals are `NoConfidence`, other stand-ins follow `toGovAction`,
+  every initial proposal is proposed in the current epoch, and the system start is POSIX 0 (`Run.hs`).
+* `k = 2160`, magic 1; the fixture's era history (one open era from slot 0, asserted) supplies the epoch size and
+  the per-transaction safe-zone horizon.
 
-Tests: `context_none_set_is_the_documented_one` (exactly the documented context fields are `None`:
+Both tests below count SCORED results only (a fixture refused at decode has none; the shadow run is a diagnostic).
+`context_none_set_is_the_documented_one` (exactly the documented context fields are `None`:
 the Shelley-Babbage MIR fields, and `drep_deposits`, which the node's own context builder leaves unset, see
 the `drep-incorrect-refund` class) and `dropping_each_initial_state_section_is_observable` (the negative
-control: dropping a section turns fixtures red; `governance_activity` is the one section no rule reads).
+control: dropping a section turns a scored fixture red; `proposals_roots` is unobservable on scored results because
+every fixture that carries it is behind #1138, and `governance_activity` is read by no admission-path rule; both
+are listed and asserted, so `proposals_roots` flips when #1138 is fixed).
 
 ## The contract
 
@@ -102,3 +129,9 @@ appears in the snapshot and in #1160, never in the contract.
 * Names are read from the bytes, but the bytes' payloads are not compared (the scenario scores names only), except
   the `ValidationTagMismatch` narrowing.
 * One `ApplyTxErr` golden path (see above).
+
+`DecodingFailure` is the one scenario name not read from bytes: an undecodable transaction has no `ApplyTxErr`.
+Haskell fails it at the codec layer (a `DeserialiseFailure`, connection dropped); dugite answers a
+`ConwayMempoolFailure` with the text "transaction decode failed: ..." (`encode.rs`). The two fixtures that
+expect it and match (00362, 00363) are pinned to fail for their own reason, not for #1138
+(`decoding_failure_fixtures_fail_for_their_own_reason`).

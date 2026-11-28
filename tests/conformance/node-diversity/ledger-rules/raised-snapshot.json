@@ -83,8 +83,9 @@
   ],
   "00019": [
     "decoding-failure: CBOR decoding error: tx_output: expected array or map, got indefinite map",
-    "shadow (outputs made definite): unmapped:ConwayMempoolFailure (generic fallback) [MISMATCH]",
-    "  shadow: ConwayMempoolFailure [7] -> GENERIC-FALLBACK"
+    "shadow (outputs made definite): unmapped:ConwayMempoolFailure (generic fallback, text: \"transaction validation failed\"; ledger: Phase2CollectError) [MISMATCH]",
+    "  shadow: ConwayMempoolFailure [7] -> GENERIC-FALLBACK (text: \"transaction validation failed\")",
+    "  shadow: ledger failures: Phase2CollectError"
   ],
   "00020": [
     "decoding-failure: CBOR decoding error: tx_output: expected array or map, got indefinite map",
@@ -211,8 +212,9 @@
   ],
   "00051": [
     "decoding-failure: CBOR decoding error: tx_output: expected array or map, got indefinite map",
-    "shadow (outputs made definite): unmapped:ConwayMempoolFailure (generic fallback) [MISMATCH]",
-    "  shadow: ConwayMempoolFailure [7] -> GENERIC-FALLBACK"
+    "shadow (outputs made definite): unmapped:ConwayMempoolFailure (generic fallback, text: \"transaction validation failed\"; ledger: ReferenceInputNotFound) [MISMATCH]",
+    "  shadow: ConwayMempoolFailure [7] -> GENERIC-FALLBACK (text: \"transaction validation failed\")",
+    "  shadow: ledger failures: ReferenceInputNotFound"
   ],
   "00052": [
     "decoding-failure: CBOR decoding error: tx_output: expected array or map, got indefinite map",
@@ -229,23 +231,27 @@
   ],
   "00055": [
     "decoding-failure: CBOR decoding error: tx_output: expected array or map, got indefinite map",
-    "shadow (outputs made definite): unmapped:ConwayMempoolFailure (generic fallback) [MISMATCH]",
-    "  shadow: ConwayMempoolFailure [7] -> GENERIC-FALLBACK"
+    "shadow (outputs made definite): unmapped:ConwayMempoolFailure (generic fallback, text: \"transaction validation failed\"; ledger: RefScriptsSizeTooBig) [MISMATCH]",
+    "  shadow: ConwayMempoolFailure [7] -> GENERIC-FALLBACK (text: \"transaction validation failed\")",
+    "  shadow: ledger failures: RefScriptsSizeTooBig"
   ],
   "00056": [
     "decoding-failure: CBOR decoding error: tx_output: expected array or map, got indefinite map",
-    "shadow (outputs made definite): unmapped:ConwayMempoolFailure (generic fallback) [MISMATCH]",
-    "  shadow: ConwayMempoolFailure [7] -> GENERIC-FALLBACK"
+    "shadow (outputs made definite): unmapped:ConwayMempoolFailure (generic fallback, text: \"transaction validation failed\"; ledger: RefScriptsSizeTooBig) [MISMATCH]",
+    "  shadow: ConwayMempoolFailure [7] -> GENERIC-FALLBACK (text: \"transaction validation failed\")",
+    "  shadow: ledger failures: RefScriptsSizeTooBig"
   ],
   "00057": [
     "decoding-failure: CBOR decoding error: tx_output: expected array or map, got indefinite map",
-    "shadow (outputs made definite): unmapped:ConwayMempoolFailure (generic fallback) [MISMATCH]",
-    "  shadow: ConwayMempoolFailure [7] -> GENERIC-FALLBACK"
+    "shadow (outputs made definite): unmapped:ConwayMempoolFailure (generic fallback, text: \"transaction validation failed\"; ledger: RefScriptsSizeTooBig) [MISMATCH]",
+    "  shadow: ConwayMempoolFailure [7] -> GENERIC-FALLBACK (text: \"transaction validation failed\")",
+    "  shadow: ledger failures: RefScriptsSizeTooBig"
   ],
   "00058": [
     "decoding-failure: CBOR decoding error: tx_output: expected array or map, got indefinite map",
-    "shadow (outputs made definite): unmapped:ConwayMempoolFailure (generic fallback) [MISMATCH]",
-    "  shadow: ConwayMempoolFailure [7] -> GENERIC-FALLBACK"
+    "shadow (outputs made definite): unmapped:ConwayMempoolFailure (generic fallback, text: \"transaction validation failed\"; ledger: WdrlNotDelegatedToDRep) [MISMATCH]",
+    "  shadow: ConwayMempoolFailure [7] -> GENERIC-FALLBACK (text: \"transaction validation failed\")",
+    "  shadow: ledger failures: WdrlNotDelegatedToDRep"
   ],
   "00059": [
     "decoding-failure: CBOR decoding error: tx_output: expected array or map, got indefinite map",
@@ -329,20 +335,25 @@
     "ConwayUtxowFailure/UtxoFailure/InsufficientCollateral [1, 0, 12] -> InsufficientCollateral"
   ],
   "00076": [
-    "ConwayMempoolFailure [7] -> GENERIC-FALLBACK"
+    "ConwayMempoolFailure [7] -> GENERIC-FALLBACK (text: \"transaction validation failed\")",
+    "ledger failures: InvalidWitnessSignature"
   ],
   "00077": [
-    "ConwayMempoolFailure [7] -> GENERIC-FALLBACK"
+    "ConwayMempoolFailure [7] -> GENERIC-FALLBACK (text: \"transaction validation failed\")",
+    "ledger failures: InvalidWitnessSignature"
   ],
   "00078": [
-    "ConwayMempoolFailure [7] -> GENERIC-FALLBACK"
+    "ConwayMempoolFailure [7] -> GENERIC-FALLBACK (text: \"transaction validation failed\")",
+    "ledger failures: InvalidWitnessSignature"
   ],
   "00079": [
-    "ConwayMempoolFailure [7] -> GENERIC-FALLBACK"
+    "ConwayMempoolFailure [7] -> GENERIC-FALLBACK (text: \"transaction validation failed\")",
+    "ledger failures: InvalidWitnessSignature"
   ],
   "00080": [
-    "ConwayMempoolFailure [7] -> GENERIC-FALLBACK",
-    "ConwayUtxowFailure/MissingVKeyWitnessesUTXOW [1, 2] -> MissingVerificationKeyWitnessesUTXOW"
+    "ConwayMempoolFailure [7] -> GENERIC-FALLBACK (text: \"transaction validation failed\")",
+    "ConwayUtxowFailure/MissingVKeyWitnessesUTXOW [1, 2] -> MissingVerificationKeyWitnessesUTXOW",
+    "ledger failures: InvalidWitnessSignature, MissingInputWitness"
   ],
   "00081": [
     "decoding-failure: CBOR decoding error: tx_output: expected array or map, got indefinite map",
@@ -351,13 +362,15 @@
   ],
   "00082": [
     "decoding-failure: CBOR decoding error: tx_output: expected array or map, got indefinite map",
-    "shadow (outputs made definite): unmapped:ConwayMempoolFailure (generic fallback) [MISMATCH]",
-    "  shadow: ConwayMempoolFailure [7] -> GENERIC-FALLBACK"
+    "shadow (outputs made definite): unmapped:ConwayMempoolFailure (generic fallback, text: \"AuxiliaryDataWithoutHash: auxiliary data present but no hash in tx body\"; ledger: AuxiliaryDataWithoutHash) [MISMATCH]",
+    "  shadow: ConwayMempoolFailure [7] -> GENERIC-FALLBACK (text: \"AuxiliaryDataWithoutHash: auxiliary data present but no hash in tx body\")",
+    "  shadow: ledger failures: AuxiliaryDataWithoutHash"
   ],
   "00083": [
     "decoding-failure: CBOR decoding error: tx_output: expected array or map, got indefinite map",
-    "shadow (outputs made definite): unmapped:ConwayMempoolFailure (generic fallback) [MISMATCH]",
-    "  shadow: ConwayMempoolFailure [7] -> GENERIC-FALLBACK"
+    "shadow (outputs made definite): unmapped:ConwayMempoolFailure (generic fallback, text: \"AuxiliaryDataHashWithoutData: metadata hash declared but no auxiliary data\"; ledger: AuxiliaryDataHashWithoutData) [MISMATCH]",
+    "  shadow: ConwayMempoolFailure [7] -> GENERIC-FALLBACK (text: \"AuxiliaryDataHashWithoutData: metadata hash declared but no auxiliary data\")",
+    "  shadow: ledger failures: AuxiliaryDataHashWithoutData"
   ],
   "00084": [
     "decoding-failure: CBOR decoding error: tx_output: expected array or map, got indefinite map",
@@ -365,7 +378,8 @@
     "  shadow: ConwayUtxowFailure/MissingVKeyWitnessesUTXOW [1, 2] -> MissingVerificationKeyWitnessesUTXOW"
   ],
   "00085": [
-    "ConwayMempoolFailure [7] -> GENERIC-FALLBACK"
+    "ConwayMempoolFailure [7] -> GENERIC-FALLBACK (text: \"transaction validation failed\")",
+    "ledger failures: MissingRequiredSigner"
   ],
   "00086": [
     "ConwayUtxowFailure/MissingVKeyWitnessesUTXOW [1, 2] -> MissingVerificationKeyWitnessesUTXOW"
@@ -375,8 +389,9 @@
   ],
   "00088": [
     "decoding-failure: CBOR decoding error: tx_output: expected array or map, got indefinite map",
-    "shadow (outputs made definite): unmapped:ConwayMempoolFailure (generic fallback) [MISMATCH]",
-    "  shadow: ConwayMempoolFailure [7] -> GENERIC-FALLBACK"
+    "shadow (outputs made definite): unmapped:ConwayMempoolFailure (generic fallback, text: \"transaction validation failed\"; ledger: Phase2CollectError) [MISMATCH]",
+    "  shadow: ConwayMempoolFailure [7] -> GENERIC-FALLBACK (text: \"transaction validation failed\")",
+    "  shadow: ledger failures: Phase2CollectError"
   ],
   "00089": [
     "decoding-failure: CBOR decoding error: tx_output: expected array or map, got indefinite map",
@@ -521,7 +536,8 @@
     "ConwayUtxowFailure/UtxoFailure/ValueNotConservedUTxO [1, 0, 6] -> ValueNotConservedUTxO"
   ],
   "00121": [
-    "ConwayMempoolFailure [7] -> GENERIC-FALLBACK"
+    "ConwayMempoolFailure [7] -> GENERIC-FALLBACK (text: \"transaction validation failed\")",
+    "ledger failures: MultiAssetNotConserved"
   ],
   "00122": [
     "ConwayUtxowFailure/UtxoFailure/ValueNotConservedUTxO [1, 0, 6] -> ValueNotConservedUTxO"
@@ -539,7 +555,8 @@
     "decoding-failure: CBOR decoding error: tx_output: expected array or map, got indefinite map",
     "shadow (outputs made definite): WithdrawalsNotInRewardsCERTS [match]",
     "  shadow: ConwayCertsFailure/WithdrawalsNotInRewardsCERTS [2, 0] -> WithdrawalsNotInRewardsCERTS",
-    "  shadow: ConwayMempoolFailure [7] -> GENERIC-FALLBACK"
+    "  shadow: ConwayMempoolFailure [7] -> GENERIC-FALLBACK (text: \"transaction validation failed\")",
+    "  shadow: ledger failures: WithdrawalsNotInRewardsCERTS, WdrlNotDelegatedToDRep"
   ],
   "00126": [
     "decoding-failure: CBOR decoding error: tx_output: expected array or map, got indefinite map",
@@ -548,12 +565,14 @@
   ],
   "00127": [
     "decoding-failure: CBOR decoding error: tx_output: expected array or map, got indefinite map",
-    "shadow (outputs made definite): unmapped:ConwayMempoolFailure (generic fallback) [MISMATCH]",
-    "  shadow: ConwayMempoolFailure [7] -> GENERIC-FALLBACK"
+    "shadow (outputs made definite): unmapped:ConwayMempoolFailure (generic fallback, text: \"transaction validation failed\"; ledger: NetworkMismatch) [MISMATCH]",
+    "  shadow: ConwayMempoolFailure [7] -> GENERIC-FALLBACK (text: \"transaction validation failed\")",
+    "  shadow: ledger failures: NetworkMismatch"
   ],
   "00128": [
-    "ConwayMempoolFailure [7] -> GENERIC-FALLBACK",
-    "ConwayUtxowFailure/UtxoFailure/WrongNetwork [1, 0, 7] -> WrongNetworkInTxOutput"
+    "ConwayMempoolFailure [7] -> GENERIC-FALLBACK (text: \"transaction validation failed\")",
+    "ConwayUtxowFailure/UtxoFailure/WrongNetwork [1, 0, 7] -> WrongNetworkInTxOutput",
+    "ledger failures: NetworkMismatch, WrongNetworkInOutput"
   ],
   "00129": [
     "decoding-failure: CBOR decoding error: tx_output: expected array or map, got indefinite map",
@@ -821,13 +840,15 @@
   ],
   "00202": [
     "decoding-failure: CBOR decoding error: tx_output: expected array or map, got indefinite map",
-    "shadow (outputs made definite): unmapped:ConwayMempoolFailure (generic fallback) [MISMATCH]",
-    "  shadow: ConwayMempoolFailure [7] -> GENERIC-FALLBACK"
+    "shadow (outputs made definite): unmapped:ConwayMempoolFailure (generic fallback, text: \"transaction validation failed\"; ledger: ProposalCantFollow) [MISMATCH]",
+    "  shadow: ConwayMempoolFailure [7] -> GENERIC-FALLBACK (text: \"transaction validation failed\")",
+    "  shadow: ledger failures: ProposalCantFollow"
   ],
   "00203": [
     "decoding-failure: CBOR decoding error: tx_output: expected array or map, got indefinite map",
-    "shadow (outputs made definite): unmapped:ConwayMempoolFailure (generic fallback) [MISMATCH]",
-    "  shadow: ConwayMempoolFailure [7] -> GENERIC-FALLBACK"
+    "shadow (outputs made definite): unmapped:ConwayMempoolFailure (generic fallback, text: \"transaction validation failed\"; ledger: ProposalCantFollow) [MISMATCH]",
+    "  shadow: ConwayMempoolFailure [7] -> GENERIC-FALLBACK (text: \"transaction validation failed\")",
+    "  shadow: ledger failures: ProposalCantFollow"
   ],
   "00204": [
     "ConwayCertsFailure/CertFailure/GovCertFailure/ConwayCommitteeIsUnknown [2, 1, 3, 5] -> CommitteeIsUnknown"
@@ -848,7 +869,6 @@
     "pass"
   ],
   "00210": [
-    "ConwayCertsFailure/CertFailure/GovCertFailure/ConwayCommitteeIsUnknown [2, 1, 3, 5] -> CommitteeIsUnknown",
     "ConwayCertsFailure/CertFailure/GovCertFailure/ConwayCommitteeHasPreviouslyResigned [2, 1, 3, 3] -> CommitteeHasPreviouslyResigned"
   ],
   "00211": [
@@ -1057,11 +1077,13 @@
     "  shadow: ConwayUtxowFailure/MalformedReferenceScripts [1, 17] -> MalformedReferenceScripts"
   ],
   "00284": [
-    "ConwayMempoolFailure [7] -> GENERIC-FALLBACK"
+    "ConwayMempoolFailure [7] -> GENERIC-FALLBACK (text: \"transaction validation failed\")",
+    "ledger failures: ExUnitsExceeded"
   ],
   "00285": [
     "ConwayUtxowFailure/UtxoFailure/FeeTooSmallUTxO [1, 0, 5] -> FeeTooSmallUTxO",
-    "ConwayMempoolFailure [7] -> GENERIC-FALLBACK"
+    "ConwayMempoolFailure [7] -> GENERIC-FALLBACK (text: \"transaction validation failed\")",
+    "ledger failures: FeeTooSmall, ExUnitsExceeded"
   ],
   "00286": [
     "ConwayCertsFailure/CertFailure/DelegFailure/StakeKeyNotRegisteredDELEG [2, 1, 1, 3] -> StakeCredentialInvalidPoolDelegation"
@@ -1085,7 +1107,8 @@
   ],
   "00292": [
     "ConwayUtxowFailure/UtxoFailure/ValueNotConservedUTxO [1, 0, 6] -> ValueNotConservedUTxO",
-    "ConwayMempoolFailure [7] -> GENERIC-FALLBACK"
+    "ConwayMempoolFailure [7] -> GENERIC-FALLBACK (text: \"transaction validation failed\")",
+    "ledger failures: ValueNotConserved, DRepNotRegistered"
   ],
   "00293": [
     "ConwayUtxowFailure/MissingVKeyWitnessesUTXOW [1, 2] -> MissingVerificationKeyWitnessesUTXOW"
@@ -1115,43 +1138,55 @@
     "ConwayUtxowFailure/UtxoFailure/ValueNotConservedUTxO [1, 0, 6] -> ValueNotConservedUTxO"
   ],
   "00302": [
-    "ConwayMempoolFailure [7] -> GENERIC-FALLBACK"
+    "ConwayMempoolFailure [7] -> GENERIC-FALLBACK (text: \"transaction validation failed\")",
+    "ledger failures: MultiAssetNotConserved"
   ],
   "00303": [
-    "ConwayMempoolFailure [7] -> GENERIC-FALLBACK"
+    "ConwayMempoolFailure [7] -> GENERIC-FALLBACK (text: \"transaction validation failed\")",
+    "ledger failures: InvalidWitnessSignature"
   ],
   "00304": [
-    "ConwayMempoolFailure [7] -> GENERIC-FALLBACK"
+    "ConwayMempoolFailure [7] -> GENERIC-FALLBACK (text: \"transaction validation failed\")",
+    "ledger failures: InvalidWitnessSignature"
   ],
   "00305": [
     "ConwayUtxowFailure/UtxoFailure/ValueNotConservedUTxO [1, 0, 6] -> ValueNotConservedUTxO"
   ],
   "00306": [
-    "ConwayMempoolFailure [7] -> GENERIC-FALLBACK"
+    "ConwayMempoolFailure [7] -> GENERIC-FALLBACK (text: \"transaction validation failed\")",
+    "ledger failures: Phase2CollectError"
   ],
   "00307": [
-    "ConwayMempoolFailure [7] -> GENERIC-FALLBACK"
+    "ConwayMempoolFailure [7] -> GENERIC-FALLBACK (text: \"transaction validation failed\")",
+    "ledger failures: Phase2CollectError"
   ],
   "00308": [
-    "ConwayMempoolFailure [7] -> GENERIC-FALLBACK"
+    "ConwayMempoolFailure [7] -> GENERIC-FALLBACK (text: \"transaction validation failed\")",
+    "ledger failures: Phase2CollectError"
   ],
   "00309": [
-    "ConwayMempoolFailure [7] -> GENERIC-FALLBACK"
+    "ConwayMempoolFailure [7] -> GENERIC-FALLBACK (text: \"transaction validation failed\")",
+    "ledger failures: Phase2CollectError"
   ],
   "00310": [
-    "ConwayMempoolFailure [7] -> GENERIC-FALLBACK"
+    "ConwayMempoolFailure [7] -> GENERIC-FALLBACK (text: \"transaction validation failed\")",
+    "ledger failures: Phase2CollectError"
   ],
   "00311": [
-    "ConwayMempoolFailure [7] -> GENERIC-FALLBACK"
+    "ConwayMempoolFailure [7] -> GENERIC-FALLBACK (text: \"transaction validation failed\")",
+    "ledger failures: Phase2CollectError"
   ],
   "00312": [
-    "ConwayMempoolFailure [7] -> GENERIC-FALLBACK"
+    "ConwayMempoolFailure [7] -> GENERIC-FALLBACK (text: \"transaction validation failed\")",
+    "ledger failures: Phase2CollectError"
   ],
   "00313": [
-    "ConwayMempoolFailure [7] -> GENERIC-FALLBACK"
+    "ConwayMempoolFailure [7] -> GENERIC-FALLBACK (text: \"transaction validation failed\")",
+    "ledger failures: Phase2CollectError"
   ],
   "00314": [
-    "ConwayMempoolFailure [7] -> GENERIC-FALLBACK"
+    "ConwayMempoolFailure [7] -> GENERIC-FALLBACK (text: \"transaction validation failed\")",
+    "ledger failures: Phase2CollectError"
   ],
   "00315": [
     "ConwayUtxowFailure/PPViewHashesDontMatch [1, 13] -> PPViewHashesDontMatch"
@@ -1166,18 +1201,21 @@
     "ConwayUtxowFailure/MissingVKeyWitnessesUTXOW [1, 2] -> MissingVerificationKeyWitnessesUTXOW"
   ],
   "00319": [
-    "ConwayMempoolFailure [7] -> GENERIC-FALLBACK"
+    "ConwayMempoolFailure [7] -> GENERIC-FALLBACK (text: \"transaction validation failed\")",
+    "ledger failures: MissingSpendRedeemer"
   ],
   "00320": [
-    "ConwayMempoolFailure [7] -> GENERIC-FALLBACK"
+    "ConwayMempoolFailure [7] -> GENERIC-FALLBACK (text: \"transaction validation failed\")",
+    "ledger failures: MissingDatumWitness"
   ],
   "00321": [
     "ConwayUtxowFailure/NotAllowedSupplementalDatums [1, 12] -> NotAllowedSupplementalDatums"
   ],
   "00322": [
-    "ConwayMempoolFailure [7] -> GENERIC-FALLBACK",
-    "ConwayMempoolFailure [7] -> GENERIC-FALLBACK",
-    "ConwayUtxowFailure/ExtraRedeemers [1, 15] -> ExtraRedeemers"
+    "ConwayMempoolFailure [7] -> GENERIC-FALLBACK (text: \"transaction validation failed\")",
+    "ConwayMempoolFailure [7] -> GENERIC-FALLBACK (text: \"transaction validation failed\")",
+    "ConwayUtxowFailure/ExtraRedeemers [1, 15] -> ExtraRedeemers",
+    "ledger failures: RedeemerIndexOutOfRange, MissingSpendRedeemer, ExtraRedeemer"
   ],
   "00323": [
     "ConwayUtxowFailure/UnspendableUTxONoDatumHash [1, 14] -> UnspendableUTxONoDatumHash"
@@ -1195,11 +1233,13 @@
     "ConwayCertsFailure/WithdrawalsNotInRewardsCERTS [2, 0] -> WithdrawalsNotInRewardsCERTS"
   ],
   "00328": [
-    "ConwayMempoolFailure [7] -> GENERIC-FALLBACK"
+    "ConwayMempoolFailure [7] -> GENERIC-FALLBACK (text: \"transaction validation failed\")",
+    "ledger failures: NativeScriptFailed"
   ],
   "00329": [
-    "ConwayMempoolFailure [7] -> GENERIC-FALLBACK",
-    "ConwayUtxowFailure/ExtraRedeemers [1, 15] -> ExtraRedeemers"
+    "ConwayMempoolFailure [7] -> GENERIC-FALLBACK (text: \"transaction validation failed\")",
+    "ConwayUtxowFailure/ExtraRedeemers [1, 15] -> ExtraRedeemers",
+    "ledger failures: RedeemerIndexOutOfRange, ExtraRedeemer"
   ],
   "00330": [
     "ConwayUtxowFailure/PPViewHashesDontMatch [1, 13] -> PPViewHashesDontMatch"
@@ -1241,8 +1281,9 @@
   ],
   "00350": [
     "decoding-failure: CBOR decoding error: tx_output: expected array or map, got indefinite map",
-    "shadow (outputs made definite): unmapped:ConwayMempoolFailure (generic fallback) [MISMATCH]",
-    "  shadow: ConwayMempoolFailure [7] -> GENERIC-FALLBACK"
+    "shadow (outputs made definite): unmapped:ConwayMempoolFailure (generic fallback, text: \"transaction validation failed\"; ledger: ExUnitsExceeded) [MISMATCH]",
+    "  shadow: ConwayMempoolFailure [7] -> GENERIC-FALLBACK (text: \"transaction validation failed\")",
+    "  shadow: ledger failures: ExUnitsExceeded"
   ],
   "00351": [
     "ConwayGovFailure/ConflictingCommitteeUpdate [3, 6] -> ConflictingCommitteeUpdate"
@@ -1251,10 +1292,12 @@
     "ConwayGovFailure/ProposalDepositIncorrect [3, 4] -> ProposalDepositIncorrect"
   ],
   "00353": [
-    "ConwayMempoolFailure [7] -> GENERIC-FALLBACK"
+    "ConwayMempoolFailure [7] -> GENERIC-FALLBACK (text: \"transaction validation failed\")",
+    "ledger failures: Phase2CollectError"
   ],
   "00354": [
-    "ConwayMempoolFailure [7] -> GENERIC-FALLBACK"
+    "ConwayMempoolFailure [7] -> GENERIC-FALLBACK (text: \"transaction validation failed\")",
+    "ledger failures: Phase2CollectError"
   ],
   "00355": [
     "ConwayGovFailure/MalformedProposal [3, 1] -> MalformedProposal"
@@ -1271,7 +1314,8 @@
   ],
   "00359": [
     "ConwayCertsFailure/WithdrawalsNotInRewardsCERTS [2, 0] -> WithdrawalsNotInRewardsCERTS",
-    "ConwayMempoolFailure [7] -> GENERIC-FALLBACK"
+    "ConwayMempoolFailure [7] -> GENERIC-FALLBACK (text: \"transaction validation failed\")",
+    "ledger failures: WithdrawalsNotInRewardsCERTS, WdrlNotDelegatedToDRep"
   ],
   "00360": [
     "pass"
@@ -1294,10 +1338,12 @@
     "pass"
   ],
   "00366": [
-    "ConwayMempoolFailure [7] -> GENERIC-FALLBACK"
+    "ConwayMempoolFailure [7] -> GENERIC-FALLBACK (text: \"transaction validation failed\")",
+    "ledger failures: Phase2CollectError"
   ],
   "00367": [
-    "ConwayMempoolFailure [7] -> GENERIC-FALLBACK"
+    "ConwayMempoolFailure [7] -> GENERIC-FALLBACK (text: \"transaction validation failed\")",
+    "ledger failures: Phase2CollectError"
   ],
   "00368": [
     "ConwayGovFailure/MalformedProposal [3, 1] -> MalformedProposal"
@@ -1336,7 +1382,8 @@
     "ConwayGovFailure/MalformedProposal [3, 1] -> MalformedProposal"
   ],
   "00380": [
-    "ConwayMempoolFailure [7] -> GENERIC-FALLBACK"
+    "ConwayMempoolFailure [7] -> GENERIC-FALLBACK (text: \"transaction validation failed\")",
+    "ledger failures: MissingDatumWitness"
   ],
   "00381": [
     "ConwayUtxowFailure/UtxoFailure/ValueNotConservedUTxO [1, 0, 6] -> ValueNotConservedUTxO",

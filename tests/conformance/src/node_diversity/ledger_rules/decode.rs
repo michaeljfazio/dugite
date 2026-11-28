@@ -1,7 +1,7 @@
 //! Decoding the `ApplyTxErr` bytes `encode_apply_tx_err` emits.
 //!
 //! The harness never reads dugite's own error type to learn what was reported: it reads the BYTES
-//! a cardano-cli would be sent, walks them through [`tag_table`] (transcribed from cardano-ledger)
+//! a cardano-cli would be sent by dugite, walks them through [`tag_table`] (transcribed from cardano-ledger)
 //! and names every failure from its tag path.  A failure whose tag is not in the table is
 //! reported as unknown, never guessed.  The generic `ConwayMempoolFailure` fallback is decoded
 //! like any other constructor; [`Failure::is_generic_fallback`] lets callers refuse to count it.

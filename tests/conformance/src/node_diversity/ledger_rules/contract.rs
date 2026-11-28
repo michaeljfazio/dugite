@@ -31,7 +31,8 @@ pub struct Entry {
     pub expected: String,
     /// What dugite produces today.
     pub observed: String,
-    /// The divergence class, equal to the title of the issue.
+    /// The divergence class, equal to the title of the issue (checked against GitHub by
+    /// `scripts/node-diversity/check-expected-issues.sh`, which needs the network).
     pub class: String,
     /// The open GitHub issue holding the evidence.
     pub issue: u64,

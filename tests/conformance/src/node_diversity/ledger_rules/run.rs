@@ -58,6 +58,9 @@ pub struct Run {
     /// what the rules would say if the decoder accepted what cardano-node accepts, so a divergence
     /// hidden behind the decoder's refusal is still seen.
     pub shadow: Option<Box<Run>>,
+    /// The decoder's reason when the transaction still fails to decode with its outputs made
+    /// definite: the fixture fails for a reason other than #1138.
+    pub shadow_decode_error: Option<String>,
 }
 
 /// How the result is reported when dugite rejected the transaction but nothing it raised has a
@@ -67,7 +70,11 @@ pub const UNREPRESENTABLE_PLACEHOLDERS: [&str; 2] =
     ["ByronTxOutInContext", "ConflictingCommitteeUpdate"];
 
 impl Run {
-    /// The scenario-level result: `pass`, a scenario name, or `unmapped:<why>` when the
+    /// The scenario-level result: `pass`, a scenario name (`DecodingFailure` is the one name NOT
+    /// read from bytes: an undecodable transaction has no `ApplyTxErr`, and Haskell fails it at the codec
+    /// layer (DeserialiseFailure, connection dropped); dugite answers a `ConwayMempoolFailure` with the
+    /// text "transaction decode failed: ..", `encode.rs:822`), or
+    /// `unmapped:<why>` when the
     /// transaction was rejected but nothing raised has a scenario name.  Anything outside the
     /// vocabulary is prefixed so it can never equal an expectation.
     pub fn name(&self) -> String {
@@ -93,9 +100,14 @@ impl Run {
                     return (*first).to_string();
                 }
                 match raised.first() {
-                    Some(n) if n.generic => {
-                        "unmapped:ConwayMempoolFailure (generic fallback)".into()
-                    }
+                    // The text is constant for most fallbacks, so the ledger failures that
+                    // produced it are part of the identity too: a different generic failure
+                    // must read as a different observed result.
+                    Some(n) if n.generic => format!(
+                        "unmapped:ConwayMempoolFailure (generic fallback, {}; ledger: {})",
+                        n.detail.clone().unwrap_or_default(),
+                        self.ledger_variants().join(",")
+                    ),
                     Some(n) => format!("unmapped:{}", n.haskell),
                     None => "unmapped:no failure on the wire".into(),
                 }
@@ -141,6 +153,19 @@ impl Run {
         observed
     }
 
+    /// The names of the ledger's own failures (the variant, not its payload), in raised order.
+    /// Identification only: never used to name a result.
+    pub fn ledger_variants(&self) -> Vec<String> {
+        self.ledger_errors
+            .iter()
+            .map(|e| {
+                e.chars()
+                    .take_while(|c| c.is_alphanumeric() || *c == '_')
+                    .collect()
+            })
+            .collect()
+    }
+
     /// Every raised failure as one line each, for the committed snapshot.
     pub fn raised_lines(&self) -> Vec<String> {
         match &self.verdict {
@@ -161,6 +186,12 @@ impl Run {
                         .unwrap_or_default();
                     format!("{} {:?} -> {names}{detail}", n.path, n.tags)
                 })
+                .chain(
+                    raised
+                        .iter()
+                        .any(|n| n.generic)
+                        .then(|| format!("ledger failures: {}", self.ledger_variants().join(", "))),
+                )
                 .collect(),
             Verdict::Pass => vec!["pass".into()],
             Verdict::DecodingFailure(why) => {
@@ -305,6 +336,7 @@ pub fn run_fixture(
         wire_hex: None,
         ledger_errors: Vec::new(),
         shadow: None,
+        shadow_decode_error: None,
     };
     // 1. decode.  A transaction that does not decode never reaches a rule.
     match dugite_serialization::decode_transaction(CONWAY_ERA, &fixture.transaction) {
@@ -317,7 +349,10 @@ pub fn run_fixture(
             // When the cause is one the harness can undo without touching a signed byte
             // (an indefinite-length output map), run the rules on the transaction as if it had
             // decoded.  The result is a diagnostic, never the fixture's result.
-            if let Some(tx) = shadow_decode(&fixture.transaction) {
+            if let Some(Err(why)) = shadow_decode(&fixture.transaction) {
+                run.shadow_decode_error = Some(why);
+            }
+            if let Some(Ok(tx)) = shadow_decode(&fixture.transaction) {
                 let mut shadow = Run {
                     id: run.id.clone(),
                     expected: run.expected.clone(),
@@ -326,6 +361,7 @@ pub fn run_fixture(
                     wire_hex: None,
                     ledger_errors: Vec::new(),
                     shadow: None,
+                    shadow_decode_error: None,
                 };
                 validate_into(&mut shadow, fixture, &tx, vocab, skip)?;
                 run.shadow = Some(Box::new(shadow));
@@ -337,8 +373,12 @@ pub fn run_fixture(
 
 /// Decode `tx_bytes` with every output's outer indefinite-length map made definite, then restore
 /// the ORIGINAL bytes, hash and body span so that every hash, signature and size is the one the
-/// fixture signed.  `None` when the transaction does not decode even then.
-fn shadow_decode(tx_bytes: &[u8]) -> Option<dugite_primitives::transaction::Transaction> {
+/// fixture signed.  `None` when the bytes cannot be normalised at all; `Some(Err(reason))` when the
+/// normalised transaction still does not decode (the reason is the decoder's, so a fixture that is
+/// MEANT to fail decoding can be pinned to its intended reason).
+pub fn shadow_decode(
+    tx_bytes: &[u8],
+) -> Option<Result<dugite_primitives::transaction::Transaction, String>> {
     use minicbor::Decoder;
     let mut d = Decoder::new(tx_bytes);
     if d.array().ok()? != Some(4) {
@@ -431,12 +471,15 @@ fn shadow_decode(tx_bytes: &[u8]) -> Option<dugite_primitives::transaction::Tran
     rebuilt.extend_from_slice(&out_body);
     rebuilt.extend_from_slice(&tx_bytes[rest_start..]);
 
-    let mut tx = dugite_serialization::decode_transaction(CONWAY_ERA, &rebuilt).ok()?;
+    let mut tx = match dugite_serialization::decode_transaction(CONWAY_ERA, &rebuilt) {
+        Ok(tx) => tx,
+        Err(e) => return Some(Err(e.to_string())),
+    };
     // The signed body is the ORIGINAL one.
     tx.hash = dugite_primitives::hash::blake2b_256(body);
     tx.raw_body_cbor = Some(body.to_vec());
     tx.raw_cbor = Some(tx_bytes.to_vec());
-    Some(tx)
+    Some(Ok(tx))
 }
 
 /// Steps 2-5 of the module doc for an already-decoded transaction; fills `run.verdict`,

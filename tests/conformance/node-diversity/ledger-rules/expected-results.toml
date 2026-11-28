@@ -21,391 +21,391 @@
 id = "00002"
 expected = "pass"
 observed = "DecodingFailure"
-class = "ledger-rules: a transaction whose outputs are indefinite-length CBOR maps fails to decode"
+class = "serialization: indefinite-length transaction outputs fail to decode, in submitted transactions AND in blocks (dugite stalls on a valid block)"
 issue = 1138
 
 [[entry]]
 id = "00003"
 expected = "pass"
 observed = "DecodingFailure"
-class = "ledger-rules: a transaction whose outputs are indefinite-length CBOR maps fails to decode"
+class = "serialization: indefinite-length transaction outputs fail to decode, in submitted transactions AND in blocks (dugite stalls on a valid block)"
 issue = 1138
 
 [[entry]]
 id = "00005"
 expected = "pass"
 observed = "DecodingFailure"
-class = "ledger-rules: a transaction whose outputs are indefinite-length CBOR maps fails to decode"
+class = "serialization: indefinite-length transaction outputs fail to decode, in submitted transactions AND in blocks (dugite stalls on a valid block)"
 issue = 1138
 
 [[entry]]
 id = "00006"
 expected = "pass"
 observed = "DecodingFailure"
-class = "ledger-rules: a transaction whose outputs are indefinite-length CBOR maps fails to decode"
+class = "serialization: indefinite-length transaction outputs fail to decode, in submitted transactions AND in blocks (dugite stalls on a valid block)"
 issue = 1138
 
 [[entry]]
 id = "00007"
 expected = "pass"
 observed = "DecodingFailure"
-class = "ledger-rules: a transaction whose outputs are indefinite-length CBOR maps fails to decode"
+class = "serialization: indefinite-length transaction outputs fail to decode, in submitted transactions AND in blocks (dugite stalls on a valid block)"
 issue = 1138
 
 [[entry]]
 id = "00008"
 expected = "pass"
 observed = "DecodingFailure"
-class = "ledger-rules: a transaction whose outputs are indefinite-length CBOR maps fails to decode"
+class = "serialization: indefinite-length transaction outputs fail to decode, in submitted transactions AND in blocks (dugite stalls on a valid block)"
 issue = 1138
 
 [[entry]]
 id = "00009"
 expected = "pass"
 observed = "DecodingFailure"
-class = "ledger-rules: a transaction whose outputs are indefinite-length CBOR maps fails to decode"
+class = "serialization: indefinite-length transaction outputs fail to decode, in submitted transactions AND in blocks (dugite stalls on a valid block)"
 issue = 1138
 
 [[entry]]
 id = "00010"
 expected = "pass"
 observed = "DecodingFailure"
-class = "ledger-rules: a transaction whose outputs are indefinite-length CBOR maps fails to decode"
+class = "serialization: indefinite-length transaction outputs fail to decode, in submitted transactions AND in blocks (dugite stalls on a valid block)"
 issue = 1138
 
 [[entry]]
 id = "00011"
 expected = "pass"
 observed = "DecodingFailure"
-class = "ledger-rules: a transaction whose outputs are indefinite-length CBOR maps fails to decode"
+class = "serialization: indefinite-length transaction outputs fail to decode, in submitted transactions AND in blocks (dugite stalls on a valid block)"
 issue = 1138
 
 [[entry]]
 id = "00012"
 expected = "pass"
 observed = "DecodingFailure"
-class = "ledger-rules: a transaction whose outputs are indefinite-length CBOR maps fails to decode"
+class = "serialization: indefinite-length transaction outputs fail to decode, in submitted transactions AND in blocks (dugite stalls on a valid block)"
 issue = 1138
 
 [[entry]]
 id = "00013"
 expected = "pass"
 observed = "DecodingFailure"
-class = "ledger-rules: a transaction whose outputs are indefinite-length CBOR maps fails to decode"
+class = "serialization: indefinite-length transaction outputs fail to decode, in submitted transactions AND in blocks (dugite stalls on a valid block)"
 issue = 1138
 
 [[entry]]
 id = "00014"
 expected = "pass"
 observed = "DecodingFailure"
-class = "ledger-rules: a transaction whose outputs are indefinite-length CBOR maps fails to decode"
+class = "serialization: indefinite-length transaction outputs fail to decode, in submitted transactions AND in blocks (dugite stalls on a valid block)"
 issue = 1138
 
 [[entry]]
 id = "00015"
 expected = "pass"
 observed = "DecodingFailure"
-class = "ledger-rules: a transaction whose outputs are indefinite-length CBOR maps fails to decode"
+class = "serialization: indefinite-length transaction outputs fail to decode, in submitted transactions AND in blocks (dugite stalls on a valid block)"
 issue = 1138
 
 [[entry]]
 id = "00018"
 expected = "pass"
 observed = "DecodingFailure"
-class = "ledger-rules: a transaction whose outputs are indefinite-length CBOR maps fails to decode"
+class = "serialization: indefinite-length transaction outputs fail to decode, in submitted transactions AND in blocks (dugite stalls on a valid block)"
 issue = 1138
 
 [[entry]]
 id = "00019"
 expected = "pass"
 observed = "DecodingFailure"
-class = "ledger-rules: a transaction whose outputs are indefinite-length CBOR maps fails to decode"
+class = "serialization: indefinite-length transaction outputs fail to decode, in submitted transactions AND in blocks (dugite stalls on a valid block)"
 issue = 1138
 
 [[entry]]
 id = "00020"
 expected = "pass"
 observed = "DecodingFailure"
-class = "ledger-rules: a transaction whose outputs are indefinite-length CBOR maps fails to decode"
+class = "serialization: indefinite-length transaction outputs fail to decode, in submitted transactions AND in blocks (dugite stalls on a valid block)"
 issue = 1138
 
 [[entry]]
 id = "00022"
 expected = "pass"
 observed = "DecodingFailure"
-class = "ledger-rules: a transaction whose outputs are indefinite-length CBOR maps fails to decode"
+class = "serialization: indefinite-length transaction outputs fail to decode, in submitted transactions AND in blocks (dugite stalls on a valid block)"
 issue = 1138
 
 [[entry]]
 id = "00023"
 expected = "pass"
 observed = "DecodingFailure"
-class = "ledger-rules: a transaction whose outputs are indefinite-length CBOR maps fails to decode"
+class = "serialization: indefinite-length transaction outputs fail to decode, in submitted transactions AND in blocks (dugite stalls on a valid block)"
 issue = 1138
 
 [[entry]]
 id = "00032"
 expected = "pass"
 observed = "DecodingFailure"
-class = "ledger-rules: a transaction whose outputs are indefinite-length CBOR maps fails to decode"
+class = "serialization: indefinite-length transaction outputs fail to decode, in submitted transactions AND in blocks (dugite stalls on a valid block)"
 issue = 1138
 
 [[entry]]
 id = "00033"
 expected = "pass"
 observed = "DecodingFailure"
-class = "ledger-rules: a transaction whose outputs are indefinite-length CBOR maps fails to decode"
+class = "serialization: indefinite-length transaction outputs fail to decode, in submitted transactions AND in blocks (dugite stalls on a valid block)"
 issue = 1138
 
 [[entry]]
 id = "00034"
 expected = "pass"
 observed = "DecodingFailure"
-class = "ledger-rules: a transaction whose outputs are indefinite-length CBOR maps fails to decode"
+class = "serialization: indefinite-length transaction outputs fail to decode, in submitted transactions AND in blocks (dugite stalls on a valid block)"
 issue = 1138
 
 [[entry]]
 id = "00037"
 expected = "pass"
 observed = "DecodingFailure"
-class = "ledger-rules: a transaction whose outputs are indefinite-length CBOR maps fails to decode"
+class = "serialization: indefinite-length transaction outputs fail to decode, in submitted transactions AND in blocks (dugite stalls on a valid block)"
 issue = 1138
 
 [[entry]]
 id = "00041"
 expected = "pass"
 observed = "DecodingFailure"
-class = "ledger-rules: a transaction whose outputs are indefinite-length CBOR maps fails to decode"
+class = "serialization: indefinite-length transaction outputs fail to decode, in submitted transactions AND in blocks (dugite stalls on a valid block)"
 issue = 1138
 
 [[entry]]
 id = "00042"
 expected = "pass"
 observed = "DecodingFailure"
-class = "ledger-rules: a transaction whose outputs are indefinite-length CBOR maps fails to decode"
+class = "serialization: indefinite-length transaction outputs fail to decode, in submitted transactions AND in blocks (dugite stalls on a valid block)"
 issue = 1138
 
 [[entry]]
 id = "00043"
 expected = "pass"
 observed = "DecodingFailure"
-class = "ledger-rules: a transaction whose outputs are indefinite-length CBOR maps fails to decode"
+class = "serialization: indefinite-length transaction outputs fail to decode, in submitted transactions AND in blocks (dugite stalls on a valid block)"
 issue = 1138
 
 [[entry]]
 id = "00045"
 expected = "pass"
 observed = "DecodingFailure"
-class = "ledger-rules: a transaction whose outputs are indefinite-length CBOR maps fails to decode"
+class = "serialization: indefinite-length transaction outputs fail to decode, in submitted transactions AND in blocks (dugite stalls on a valid block)"
 issue = 1138
 
 [[entry]]
 id = "00046"
 expected = "pass"
 observed = "DecodingFailure"
-class = "ledger-rules: a transaction whose outputs are indefinite-length CBOR maps fails to decode"
+class = "serialization: indefinite-length transaction outputs fail to decode, in submitted transactions AND in blocks (dugite stalls on a valid block)"
 issue = 1138
 
 [[entry]]
 id = "00047"
 expected = "pass"
 observed = "DecodingFailure"
-class = "ledger-rules: a transaction whose outputs are indefinite-length CBOR maps fails to decode"
+class = "serialization: indefinite-length transaction outputs fail to decode, in submitted transactions AND in blocks (dugite stalls on a valid block)"
 issue = 1138
 
 [[entry]]
 id = "00048"
 expected = "BabbageNonDisjointRefInputs"
 observed = "DecodingFailure"
-class = "ledger-rules: a transaction whose outputs are indefinite-length CBOR maps fails to decode"
+class = "serialization: indefinite-length transaction outputs fail to decode, in submitted transactions AND in blocks (dugite stalls on a valid block)"
 issue = 1138
 
 [[entry]]
 id = "00050"
 expected = "BadInputsUTxO"
 observed = "DecodingFailure"
-class = "ledger-rules: a transaction whose outputs are indefinite-length CBOR maps fails to decode"
+class = "serialization: indefinite-length transaction outputs fail to decode, in submitted transactions AND in blocks (dugite stalls on a valid block)"
 issue = 1138
 
 [[entry]]
 id = "00051"
 expected = "BadInputsUTxO"
 observed = "DecodingFailure"
-class = "ledger-rules: a transaction whose outputs are indefinite-length CBOR maps fails to decode"
+class = "serialization: indefinite-length transaction outputs fail to decode, in submitted transactions AND in blocks (dugite stalls on a valid block)"
 issue = 1138
 
 [[entry]]
 id = "00052"
 expected = "BadInputsUTxO"
 observed = "DecodingFailure"
-class = "ledger-rules: a transaction whose outputs are indefinite-length CBOR maps fails to decode"
+class = "serialization: indefinite-length transaction outputs fail to decode, in submitted transactions AND in blocks (dugite stalls on a valid block)"
 issue = 1138
 
 [[entry]]
 id = "00053"
 expected = "ConflictingMetadataHash"
 observed = "DecodingFailure"
-class = "ledger-rules: a transaction whose outputs are indefinite-length CBOR maps fails to decode"
+class = "serialization: indefinite-length transaction outputs fail to decode, in submitted transactions AND in blocks (dugite stalls on a valid block)"
 issue = 1138
 
 [[entry]]
 id = "00055"
 expected = "ConwayTxRefScriptsSizeTooBig"
 observed = "DecodingFailure"
-class = "ledger-rules: a transaction whose outputs are indefinite-length CBOR maps fails to decode"
+class = "serialization: indefinite-length transaction outputs fail to decode, in submitted transactions AND in blocks (dugite stalls on a valid block)"
 issue = 1138
 
 [[entry]]
 id = "00056"
 expected = "ConwayTxRefScriptsSizeTooBig"
 observed = "DecodingFailure"
-class = "ledger-rules: a transaction whose outputs are indefinite-length CBOR maps fails to decode"
+class = "serialization: indefinite-length transaction outputs fail to decode, in submitted transactions AND in blocks (dugite stalls on a valid block)"
 issue = 1138
 
 [[entry]]
 id = "00057"
 expected = "ConwayTxRefScriptsSizeTooBig"
 observed = "DecodingFailure"
-class = "ledger-rules: a transaction whose outputs are indefinite-length CBOR maps fails to decode"
+class = "serialization: indefinite-length transaction outputs fail to decode, in submitted transactions AND in blocks (dugite stalls on a valid block)"
 issue = 1138
 
 [[entry]]
 id = "00058"
 expected = "ConwayWdrlNotDelegatedToDRep"
 observed = "DecodingFailure"
-class = "ledger-rules: a transaction whose outputs are indefinite-length CBOR maps fails to decode"
+class = "serialization: indefinite-length transaction outputs fail to decode, in submitted transactions AND in blocks (dugite stalls on a valid block)"
 issue = 1138
 
 [[entry]]
 id = "00059"
 expected = "DRepAlreadyRegistered"
 observed = "DecodingFailure"
-class = "ledger-rules: a transaction whose outputs are indefinite-length CBOR maps fails to decode"
+class = "serialization: indefinite-length transaction outputs fail to decode, in submitted transactions AND in blocks (dugite stalls on a valid block)"
 issue = 1138
 
 [[entry]]
 id = "00060"
 expected = "DRepAlreadyRegistered"
 observed = "DecodingFailure"
-class = "ledger-rules: a transaction whose outputs are indefinite-length CBOR maps fails to decode"
+class = "serialization: indefinite-length transaction outputs fail to decode, in submitted transactions AND in blocks (dugite stalls on a valid block)"
 issue = 1138
 
 [[entry]]
 id = "00061"
 expected = "DelegateeDRepNotRegistered"
 observed = "DecodingFailure"
-class = "ledger-rules: a transaction whose outputs are indefinite-length CBOR maps fails to decode"
+class = "serialization: indefinite-length transaction outputs fail to decode, in submitted transactions AND in blocks (dugite stalls on a valid block)"
 issue = 1138
 
 [[entry]]
 id = "00062"
 expected = "DelegateeDRepNotRegistered"
 observed = "DecodingFailure"
-class = "ledger-rules: a transaction whose outputs are indefinite-length CBOR maps fails to decode"
+class = "serialization: indefinite-length transaction outputs fail to decode, in submitted transactions AND in blocks (dugite stalls on a valid block)"
 issue = 1138
 
 [[entry]]
 id = "00063"
 expected = "DelegateeDRepNotRegistered"
 observed = "DecodingFailure"
-class = "ledger-rules: a transaction whose outputs are indefinite-length CBOR maps fails to decode"
+class = "serialization: indefinite-length transaction outputs fail to decode, in submitted transactions AND in blocks (dugite stalls on a valid block)"
 issue = 1138
 
 [[entry]]
 id = "00064"
 expected = "DelegateeDRepNotRegistered"
 observed = "DecodingFailure"
-class = "ledger-rules: a transaction whose outputs are indefinite-length CBOR maps fails to decode"
+class = "serialization: indefinite-length transaction outputs fail to decode, in submitted transactions AND in blocks (dugite stalls on a valid block)"
 issue = 1138
 
 [[entry]]
 id = "00065"
 expected = "DelegateeStakePoolNotRegistered"
 observed = "DecodingFailure"
-class = "ledger-rules: a transaction whose outputs are indefinite-length CBOR maps fails to decode"
+class = "serialization: indefinite-length transaction outputs fail to decode, in submitted transactions AND in blocks (dugite stalls on a valid block)"
 issue = 1138
 
 [[entry]]
 id = "00066"
 expected = "DelegateeStakePoolNotRegistered"
 observed = "DecodingFailure"
-class = "ledger-rules: a transaction whose outputs are indefinite-length CBOR maps fails to decode"
+class = "serialization: indefinite-length transaction outputs fail to decode, in submitted transactions AND in blocks (dugite stalls on a valid block)"
 issue = 1138
 
 [[entry]]
 id = "00067"
 expected = "DelegateeStakePoolNotRegistered"
 observed = "DecodingFailure"
-class = "ledger-rules: a transaction whose outputs are indefinite-length CBOR maps fails to decode"
+class = "serialization: indefinite-length transaction outputs fail to decode, in submitted transactions AND in blocks (dugite stalls on a valid block)"
 issue = 1138
 
 [[entry]]
 id = "00068"
 expected = "DelegateeStakePoolNotRegistered"
 observed = "DecodingFailure"
-class = "ledger-rules: a transaction whose outputs are indefinite-length CBOR maps fails to decode"
+class = "serialization: indefinite-length transaction outputs fail to decode, in submitted transactions AND in blocks (dugite stalls on a valid block)"
 issue = 1138
 
 [[entry]]
 id = "00069"
 expected = "FeeTooSmallUTxO"
 observed = "DecodingFailure"
-class = "ledger-rules: a transaction whose outputs are indefinite-length CBOR maps fails to decode"
+class = "serialization: indefinite-length transaction outputs fail to decode, in submitted transactions AND in blocks (dugite stalls on a valid block)"
 issue = 1138
 
 [[entry]]
 id = "00070"
 expected = "FeeTooSmallUTxO"
 observed = "DecodingFailure"
-class = "ledger-rules: a transaction whose outputs are indefinite-length CBOR maps fails to decode"
+class = "serialization: indefinite-length transaction outputs fail to decode, in submitted transactions AND in blocks (dugite stalls on a valid block)"
 issue = 1138
 
 [[entry]]
 id = "00071"
 expected = "FeeTooSmallUTxO"
 observed = "DecodingFailure"
-class = "ledger-rules: a transaction whose outputs are indefinite-length CBOR maps fails to decode"
+class = "serialization: indefinite-length transaction outputs fail to decode, in submitted transactions AND in blocks (dugite stalls on a valid block)"
 issue = 1138
 
 [[entry]]
 id = "00072"
 expected = "IncorrectDepositDELEG"
 observed = "DecodingFailure"
-class = "ledger-rules: a transaction whose outputs are indefinite-length CBOR maps fails to decode"
+class = "serialization: indefinite-length transaction outputs fail to decode, in submitted transactions AND in blocks (dugite stalls on a valid block)"
 issue = 1138
 
 [[entry]]
 id = "00074"
 expected = "InputSetEmptyUTxO"
 observed = "DecodingFailure"
-class = "ledger-rules: a transaction whose outputs are indefinite-length CBOR maps fails to decode"
+class = "serialization: indefinite-length transaction outputs fail to decode, in submitted transactions AND in blocks (dugite stalls on a valid block)"
 issue = 1138
 
 [[entry]]
 id = "00076"
 expected = "InvalidWitnessesUTXOW"
-observed = "unmapped:ConwayMempoolFailure (generic fallback)"
+observed = "unmapped:ConwayMempoolFailure (generic fallback, text: \"transaction validation failed\"; ledger: InvalidWitnessSignature)"
 class = "ledger-rules: InvalidWitnessSignature degrades to the generic ConwayMempoolFailure instead of InvalidWitnessesUTXOW"
 issue = 1140
 
 [[entry]]
 id = "00077"
 expected = "DecodingFailure"
-observed = "unmapped:ConwayMempoolFailure (generic fallback)"
+observed = "unmapped:ConwayMempoolFailure (generic fallback, text: \"transaction validation failed\"; ledger: InvalidWitnessSignature)"
 class = "ledger-rules: witness vkey and signature lengths are not enforced at decode"
 issue = 1139
 
 [[entry]]
 id = "00078"
 expected = "DecodingFailure"
-observed = "unmapped:ConwayMempoolFailure (generic fallback)"
+observed = "unmapped:ConwayMempoolFailure (generic fallback, text: \"transaction validation failed\"; ledger: InvalidWitnessSignature)"
 class = "ledger-rules: witness vkey and signature lengths are not enforced at decode"
 issue = 1139
 
 [[entry]]
 id = "00079"
 expected = "InvalidWitnessesUTXOW"
-observed = "unmapped:ConwayMempoolFailure (generic fallback)"
+observed = "unmapped:ConwayMempoolFailure (generic fallback, text: \"transaction validation failed\"; ledger: InvalidWitnessSignature)"
 class = "ledger-rules: InvalidWitnessSignature degrades to the generic ConwayMempoolFailure instead of InvalidWitnessesUTXOW"
 issue = 1140
 
@@ -420,34 +420,34 @@ issue = 1139
 id = "00081"
 expected = "MaxTxSizeUTxO"
 observed = "DecodingFailure"
-class = "ledger-rules: a transaction whose outputs are indefinite-length CBOR maps fails to decode"
+class = "serialization: indefinite-length transaction outputs fail to decode, in submitted transactions AND in blocks (dugite stalls on a valid block)"
 issue = 1138
 
 [[entry]]
 id = "00082"
 expected = "MissingTxBodyMetadataHash"
 observed = "DecodingFailure"
-class = "ledger-rules: a transaction whose outputs are indefinite-length CBOR maps fails to decode"
+class = "serialization: indefinite-length transaction outputs fail to decode, in submitted transactions AND in blocks (dugite stalls on a valid block)"
 issue = 1138
 
 [[entry]]
 id = "00083"
 expected = "MissingTxMetadata"
 observed = "DecodingFailure"
-class = "ledger-rules: a transaction whose outputs are indefinite-length CBOR maps fails to decode"
+class = "serialization: indefinite-length transaction outputs fail to decode, in submitted transactions AND in blocks (dugite stalls on a valid block)"
 issue = 1138
 
 [[entry]]
 id = "00084"
 expected = "MissingVerificationKeyWitnessesUTXOW"
 observed = "DecodingFailure"
-class = "ledger-rules: a transaction whose outputs are indefinite-length CBOR maps fails to decode"
+class = "serialization: indefinite-length transaction outputs fail to decode, in submitted transactions AND in blocks (dugite stalls on a valid block)"
 issue = 1138
 
 [[entry]]
 id = "00085"
 expected = "MissingVerificationKeyWitnessesUTXOW"
-observed = "unmapped:ConwayMempoolFailure (generic fallback)"
+observed = "unmapped:ConwayMempoolFailure (generic fallback, text: \"transaction validation failed\"; ledger: MissingRequiredSigner)"
 class = "ledger-rules: MissingRequiredSigner degrades to the generic ConwayMempoolFailure instead of MissingVKeyWitnessesUTXOW"
 issue = 1141
 
@@ -462,153 +462,153 @@ issue = 1151
 id = "00088"
 expected = "OutsideForecast"
 observed = "DecodingFailure"
-class = "ledger-rules: a transaction whose outputs are indefinite-length CBOR maps fails to decode"
+class = "serialization: indefinite-length transaction outputs fail to decode, in submitted transactions AND in blocks (dugite stalls on a valid block)"
 issue = 1138
 
 [[entry]]
 id = "00089"
 expected = "OutsideValidityIntervalUTxO"
 observed = "DecodingFailure"
-class = "ledger-rules: a transaction whose outputs are indefinite-length CBOR maps fails to decode"
+class = "serialization: indefinite-length transaction outputs fail to decode, in submitted transactions AND in blocks (dugite stalls on a valid block)"
 issue = 1138
 
 [[entry]]
 id = "00090"
 expected = "OutsideValidityIntervalUTxO"
 observed = "DecodingFailure"
-class = "ledger-rules: a transaction whose outputs are indefinite-length CBOR maps fails to decode"
+class = "serialization: indefinite-length transaction outputs fail to decode, in submitted transactions AND in blocks (dugite stalls on a valid block)"
 issue = 1138
 
 [[entry]]
 id = "00091"
 expected = "OutsideValidityIntervalUTxO"
 observed = "DecodingFailure"
-class = "ledger-rules: a transaction whose outputs are indefinite-length CBOR maps fails to decode"
+class = "serialization: indefinite-length transaction outputs fail to decode, in submitted transactions AND in blocks (dugite stalls on a valid block)"
 issue = 1138
 
 [[entry]]
 id = "00100"
 expected = "StakeCredentialInvalidPoolDelegation"
 observed = "DecodingFailure"
-class = "ledger-rules: a transaction whose outputs are indefinite-length CBOR maps fails to decode"
+class = "serialization: indefinite-length transaction outputs fail to decode, in submitted transactions AND in blocks (dugite stalls on a valid block)"
 issue = 1138
 
 [[entry]]
 id = "00101"
 expected = "StakeCredentialInvalidPoolDelegation"
 observed = "DecodingFailure"
-class = "ledger-rules: a transaction whose outputs are indefinite-length CBOR maps fails to decode"
+class = "serialization: indefinite-length transaction outputs fail to decode, in submitted transactions AND in blocks (dugite stalls on a valid block)"
 issue = 1138
 
 [[entry]]
 id = "00102"
 expected = "StakeCredentialInvalidPoolDelegation"
 observed = "DecodingFailure"
-class = "ledger-rules: a transaction whose outputs are indefinite-length CBOR maps fails to decode"
+class = "serialization: indefinite-length transaction outputs fail to decode, in submitted transactions AND in blocks (dugite stalls on a valid block)"
 issue = 1138
 
 [[entry]]
 id = "00103"
 expected = "StakeCredentialInvalidPoolDelegation"
 observed = "DecodingFailure"
-class = "ledger-rules: a transaction whose outputs are indefinite-length CBOR maps fails to decode"
+class = "serialization: indefinite-length transaction outputs fail to decode, in submitted transactions AND in blocks (dugite stalls on a valid block)"
 issue = 1138
 
 [[entry]]
 id = "00104"
 expected = "StakeKeyHasNonZeroAccountBalance"
 observed = "DecodingFailure"
-class = "ledger-rules: a transaction whose outputs are indefinite-length CBOR maps fails to decode"
+class = "serialization: indefinite-length transaction outputs fail to decode, in submitted transactions AND in blocks (dugite stalls on a valid block)"
 issue = 1138
 
 [[entry]]
 id = "00105"
 expected = "StakeKeyHasNonZeroAccountBalance"
 observed = "DecodingFailure"
-class = "ledger-rules: a transaction whose outputs are indefinite-length CBOR maps fails to decode"
+class = "serialization: indefinite-length transaction outputs fail to decode, in submitted transactions AND in blocks (dugite stalls on a valid block)"
 issue = 1138
 
 [[entry]]
 id = "00106"
 expected = "StakeKeyRegistered"
 observed = "DecodingFailure"
-class = "ledger-rules: a transaction whose outputs are indefinite-length CBOR maps fails to decode"
+class = "serialization: indefinite-length transaction outputs fail to decode, in submitted transactions AND in blocks (dugite stalls on a valid block)"
 issue = 1138
 
 [[entry]]
 id = "00107"
 expected = "StakeKeyRegistered"
 observed = "DecodingFailure"
-class = "ledger-rules: a transaction whose outputs are indefinite-length CBOR maps fails to decode"
+class = "serialization: indefinite-length transaction outputs fail to decode, in submitted transactions AND in blocks (dugite stalls on a valid block)"
 issue = 1138
 
 [[entry]]
 id = "00108"
 expected = "StakeKeyRegistered"
 observed = "DecodingFailure"
-class = "ledger-rules: a transaction whose outputs are indefinite-length CBOR maps fails to decode"
+class = "serialization: indefinite-length transaction outputs fail to decode, in submitted transactions AND in blocks (dugite stalls on a valid block)"
 issue = 1138
 
 [[entry]]
 id = "00109"
 expected = "StakeKeyRegistered"
 observed = "DecodingFailure"
-class = "ledger-rules: a transaction whose outputs are indefinite-length CBOR maps fails to decode"
+class = "serialization: indefinite-length transaction outputs fail to decode, in submitted transactions AND in blocks (dugite stalls on a valid block)"
 issue = 1138
 
 [[entry]]
 id = "00110"
 expected = "StakePoolCostTooLowPOOL"
 observed = "DecodingFailure"
-class = "ledger-rules: a transaction whose outputs are indefinite-length CBOR maps fails to decode"
+class = "serialization: indefinite-length transaction outputs fail to decode, in submitted transactions AND in blocks (dugite stalls on a valid block)"
 issue = 1138
 
 [[entry]]
 id = "00111"
 expected = "StakePoolCostTooLowPOOL"
 observed = "DecodingFailure"
-class = "ledger-rules: a transaction whose outputs are indefinite-length CBOR maps fails to decode"
+class = "serialization: indefinite-length transaction outputs fail to decode, in submitted transactions AND in blocks (dugite stalls on a valid block)"
 issue = 1138
 
 [[entry]]
 id = "00114"
 expected = "StakePoolRetirementWrongEpochPOOL"
 observed = "DecodingFailure"
-class = "ledger-rules: a transaction whose outputs are indefinite-length CBOR maps fails to decode"
+class = "serialization: indefinite-length transaction outputs fail to decode, in submitted transactions AND in blocks (dugite stalls on a valid block)"
 issue = 1138
 
 [[entry]]
 id = "00115"
 expected = "StakePoolRetirementWrongEpochPOOL"
 observed = "DecodingFailure"
-class = "ledger-rules: a transaction whose outputs are indefinite-length CBOR maps fails to decode"
+class = "serialization: indefinite-length transaction outputs fail to decode, in submitted transactions AND in blocks (dugite stalls on a valid block)"
 issue = 1138
 
 [[entry]]
 id = "00117"
 expected = "TreasuryWithdrawalReturnAccountsDoNotExist"
 observed = "DecodingFailure"
-class = "ledger-rules: a transaction whose outputs are indefinite-length CBOR maps fails to decode"
+class = "serialization: indefinite-length transaction outputs fail to decode, in submitted transactions AND in blocks (dugite stalls on a valid block)"
 issue = 1138
 
 [[entry]]
 id = "00118"
 expected = "TreasuryWithdrawalReturnAccountsDoNotExist"
 observed = "DecodingFailure"
-class = "ledger-rules: a transaction whose outputs are indefinite-length CBOR maps fails to decode"
+class = "serialization: indefinite-length transaction outputs fail to decode, in submitted transactions AND in blocks (dugite stalls on a valid block)"
 issue = 1138
 
 [[entry]]
 id = "00119"
 expected = "TreasuryWithdrawalReturnAccountsDoNotExist"
 observed = "DecodingFailure"
-class = "ledger-rules: a transaction whose outputs are indefinite-length CBOR maps fails to decode"
+class = "serialization: indefinite-length transaction outputs fail to decode, in submitted transactions AND in blocks (dugite stalls on a valid block)"
 issue = 1138
 
 [[entry]]
 id = "00121"
 expected = "ValueNotConservedUTxO"
-observed = "unmapped:ConwayMempoolFailure (generic fallback)"
+observed = "unmapped:ConwayMempoolFailure (generic fallback, text: \"transaction validation failed\"; ledger: MultiAssetNotConserved)"
 class = "ledger-rules: MultiAssetNotConserved degrades to the generic ConwayMempoolFailure instead of ValueNotConservedUTxO"
 issue = 1142
 
@@ -616,175 +616,175 @@ issue = 1142
 id = "00124"
 expected = "ValueNotConservedUTxO"
 observed = "DecodingFailure"
-class = "ledger-rules: a transaction whose outputs are indefinite-length CBOR maps fails to decode"
+class = "serialization: indefinite-length transaction outputs fail to decode, in submitted transactions AND in blocks (dugite stalls on a valid block)"
 issue = 1138
 
 [[entry]]
 id = "00125"
 expected = "WithdrawalsNotInRewardsCERTS"
 observed = "DecodingFailure"
-class = "ledger-rules: a transaction whose outputs are indefinite-length CBOR maps fails to decode"
+class = "serialization: indefinite-length transaction outputs fail to decode, in submitted transactions AND in blocks (dugite stalls on a valid block)"
 issue = 1138
 
 [[entry]]
 id = "00126"
 expected = "WithdrawalsNotInRewardsCERTS"
 observed = "DecodingFailure"
-class = "ledger-rules: a transaction whose outputs are indefinite-length CBOR maps fails to decode"
+class = "serialization: indefinite-length transaction outputs fail to decode, in submitted transactions AND in blocks (dugite stalls on a valid block)"
 issue = 1138
 
 [[entry]]
 id = "00127"
 expected = "WrongNetworkInTxBody"
 observed = "DecodingFailure"
-class = "ledger-rules: a transaction whose outputs are indefinite-length CBOR maps fails to decode"
+class = "serialization: indefinite-length transaction outputs fail to decode, in submitted transactions AND in blocks (dugite stalls on a valid block)"
 issue = 1138
 
 [[entry]]
 id = "00129"
 expected = "WrongNetworkWithdrawal"
 observed = "DecodingFailure"
-class = "ledger-rules: a transaction whose outputs are indefinite-length CBOR maps fails to decode"
+class = "serialization: indefinite-length transaction outputs fail to decode, in submitted transactions AND in blocks (dugite stalls on a valid block)"
 issue = 1138
 
 [[entry]]
 id = "00132"
 expected = "pass"
 observed = "DecodingFailure"
-class = "ledger-rules: a transaction whose outputs are indefinite-length CBOR maps fails to decode"
+class = "serialization: indefinite-length transaction outputs fail to decode, in submitted transactions AND in blocks (dugite stalls on a valid block)"
 issue = 1138
 
 [[entry]]
 id = "00133"
 expected = "pass"
 observed = "DecodingFailure"
-class = "ledger-rules: a transaction whose outputs are indefinite-length CBOR maps fails to decode"
+class = "serialization: indefinite-length transaction outputs fail to decode, in submitted transactions AND in blocks (dugite stalls on a valid block)"
 issue = 1138
 
 [[entry]]
 id = "00134"
 expected = "pass"
 observed = "DecodingFailure"
-class = "ledger-rules: a transaction whose outputs are indefinite-length CBOR maps fails to decode"
+class = "serialization: indefinite-length transaction outputs fail to decode, in submitted transactions AND in blocks (dugite stalls on a valid block)"
 issue = 1138
 
 [[entry]]
 id = "00135"
 expected = "pass"
 observed = "DecodingFailure"
-class = "ledger-rules: a transaction whose outputs are indefinite-length CBOR maps fails to decode"
+class = "serialization: indefinite-length transaction outputs fail to decode, in submitted transactions AND in blocks (dugite stalls on a valid block)"
 issue = 1138
 
 [[entry]]
 id = "00136"
 expected = "pass"
 observed = "DecodingFailure"
-class = "ledger-rules: a transaction whose outputs are indefinite-length CBOR maps fails to decode"
+class = "serialization: indefinite-length transaction outputs fail to decode, in submitted transactions AND in blocks (dugite stalls on a valid block)"
 issue = 1138
 
 [[entry]]
 id = "00137"
 expected = "pass"
 observed = "DecodingFailure"
-class = "ledger-rules: a transaction whose outputs are indefinite-length CBOR maps fails to decode"
+class = "serialization: indefinite-length transaction outputs fail to decode, in submitted transactions AND in blocks (dugite stalls on a valid block)"
 issue = 1138
 
 [[entry]]
 id = "00138"
 expected = "pass"
 observed = "DecodingFailure"
-class = "ledger-rules: a transaction whose outputs are indefinite-length CBOR maps fails to decode"
+class = "serialization: indefinite-length transaction outputs fail to decode, in submitted transactions AND in blocks (dugite stalls on a valid block)"
 issue = 1138
 
 [[entry]]
 id = "00139"
 expected = "pass"
 observed = "DecodingFailure"
-class = "ledger-rules: a transaction whose outputs are indefinite-length CBOR maps fails to decode"
+class = "serialization: indefinite-length transaction outputs fail to decode, in submitted transactions AND in blocks (dugite stalls on a valid block)"
 issue = 1138
 
 [[entry]]
 id = "00140"
 expected = "pass"
 observed = "DecodingFailure"
-class = "ledger-rules: a transaction whose outputs are indefinite-length CBOR maps fails to decode"
+class = "serialization: indefinite-length transaction outputs fail to decode, in submitted transactions AND in blocks (dugite stalls on a valid block)"
 issue = 1138
 
 [[entry]]
 id = "00141"
 expected = "pass"
 observed = "DecodingFailure"
-class = "ledger-rules: a transaction whose outputs are indefinite-length CBOR maps fails to decode"
+class = "serialization: indefinite-length transaction outputs fail to decode, in submitted transactions AND in blocks (dugite stalls on a valid block)"
 issue = 1138
 
 [[entry]]
 id = "00142"
 expected = "pass"
 observed = "DecodingFailure"
-class = "ledger-rules: a transaction whose outputs are indefinite-length CBOR maps fails to decode"
+class = "serialization: indefinite-length transaction outputs fail to decode, in submitted transactions AND in blocks (dugite stalls on a valid block)"
 issue = 1138
 
 [[entry]]
 id = "00143"
 expected = "pass"
 observed = "DecodingFailure"
-class = "ledger-rules: a transaction whose outputs are indefinite-length CBOR maps fails to decode"
+class = "serialization: indefinite-length transaction outputs fail to decode, in submitted transactions AND in blocks (dugite stalls on a valid block)"
 issue = 1138
 
 [[entry]]
 id = "00144"
 expected = "pass"
 observed = "DecodingFailure"
-class = "ledger-rules: a transaction whose outputs are indefinite-length CBOR maps fails to decode"
+class = "serialization: indefinite-length transaction outputs fail to decode, in submitted transactions AND in blocks (dugite stalls on a valid block)"
 issue = 1138
 
 [[entry]]
 id = "00145"
 expected = "pass"
 observed = "DecodingFailure"
-class = "ledger-rules: a transaction whose outputs are indefinite-length CBOR maps fails to decode"
+class = "serialization: indefinite-length transaction outputs fail to decode, in submitted transactions AND in blocks (dugite stalls on a valid block)"
 issue = 1138
 
 [[entry]]
 id = "00146"
 expected = "pass"
 observed = "DecodingFailure"
-class = "ledger-rules: a transaction whose outputs are indefinite-length CBOR maps fails to decode"
+class = "serialization: indefinite-length transaction outputs fail to decode, in submitted transactions AND in blocks (dugite stalls on a valid block)"
 issue = 1138
 
 [[entry]]
 id = "00147"
 expected = "pass"
 observed = "DecodingFailure"
-class = "ledger-rules: a transaction whose outputs are indefinite-length CBOR maps fails to decode"
+class = "serialization: indefinite-length transaction outputs fail to decode, in submitted transactions AND in blocks (dugite stalls on a valid block)"
 issue = 1138
 
 [[entry]]
 id = "00148"
 expected = "InvalidPrevGovActionId"
 observed = "DecodingFailure"
-class = "ledger-rules: a transaction whose outputs are indefinite-length CBOR maps fails to decode"
+class = "serialization: indefinite-length transaction outputs fail to decode, in submitted transactions AND in blocks (dugite stalls on a valid block)"
 issue = 1138
 
 [[entry]]
 id = "00149"
 expected = "InvalidPrevGovActionId"
 observed = "DecodingFailure"
-class = "ledger-rules: a transaction whose outputs are indefinite-length CBOR maps fails to decode"
+class = "serialization: indefinite-length transaction outputs fail to decode, in submitted transactions AND in blocks (dugite stalls on a valid block)"
 issue = 1138
 
 [[entry]]
 id = "00150"
 expected = "InvalidPrevGovActionId"
 observed = "DecodingFailure"
-class = "ledger-rules: a transaction whose outputs are indefinite-length CBOR maps fails to decode"
+class = "serialization: indefinite-length transaction outputs fail to decode, in submitted transactions AND in blocks (dugite stalls on a valid block)"
 issue = 1138
 
 [[entry]]
 id = "00151"
 expected = "MalformedReferenceScripts"
 observed = "DecodingFailure"
-class = "ledger-rules: a transaction whose outputs are indefinite-length CBOR maps fails to decode"
+class = "serialization: indefinite-length transaction outputs fail to decode, in submitted transactions AND in blocks (dugite stalls on a valid block)"
 issue = 1138
 
 [[entry]]
@@ -826,14 +826,14 @@ issue = 1150
 id = "00202"
 expected = "ProposalCantFollow"
 observed = "DecodingFailure"
-class = "ledger-rules: a transaction whose outputs are indefinite-length CBOR maps fails to decode"
+class = "serialization: indefinite-length transaction outputs fail to decode, in submitted transactions AND in blocks (dugite stalls on a valid block)"
 issue = 1138
 
 [[entry]]
 id = "00203"
 expected = "ProposalCantFollow"
 observed = "DecodingFailure"
-class = "ledger-rules: a transaction whose outputs are indefinite-length CBOR maps fails to decode"
+class = "serialization: indefinite-length transaction outputs fail to decode, in submitted transactions AND in blocks (dugite stalls on a valid block)"
 issue = 1138
 
 [[entry]]
@@ -882,7 +882,7 @@ issue = 1148
 id = "00247"
 expected = "pass"
 observed = "DecodingFailure"
-class = "ledger-rules: a transaction whose outputs are indefinite-length CBOR maps fails to decode"
+class = "serialization: indefinite-length transaction outputs fail to decode, in submitted transactions AND in blocks (dugite stalls on a valid block)"
 issue = 1138
 
 [[entry]]
@@ -917,13 +917,13 @@ issue = 1153
 id = "00283"
 expected = "MalformedReferenceScripts"
 observed = "DecodingFailure"
-class = "ledger-rules: a transaction whose outputs are indefinite-length CBOR maps fails to decode"
+class = "serialization: indefinite-length transaction outputs fail to decode, in submitted transactions AND in blocks (dugite stalls on a valid block)"
 issue = 1138
 
 [[entry]]
 id = "00284"
 expected = "ExUnitsTooBigUTxO"
-observed = "unmapped:ConwayMempoolFailure (generic fallback)"
+observed = "unmapped:ConwayMempoolFailure (generic fallback, text: \"transaction validation failed\"; ledger: ExUnitsExceeded)"
 class = "ledger-rules: ExUnitsExceeded degrades to the generic ConwayMempoolFailure instead of ExUnitsTooBigUTxO"
 issue = 1143
 
@@ -951,21 +951,21 @@ issue = 1157
 [[entry]]
 id = "00302"
 expected = "ValueNotConservedUTxO"
-observed = "unmapped:ConwayMempoolFailure (generic fallback)"
+observed = "unmapped:ConwayMempoolFailure (generic fallback, text: \"transaction validation failed\"; ledger: MultiAssetNotConserved)"
 class = "ledger-rules: MultiAssetNotConserved degrades to the generic ConwayMempoolFailure instead of ValueNotConservedUTxO"
 issue = 1142
 
 [[entry]]
 id = "00303"
 expected = "InvalidWitnessesUTXOW"
-observed = "unmapped:ConwayMempoolFailure (generic fallback)"
+observed = "unmapped:ConwayMempoolFailure (generic fallback, text: \"transaction validation failed\"; ledger: InvalidWitnessSignature)"
 class = "ledger-rules: InvalidWitnessSignature degrades to the generic ConwayMempoolFailure instead of InvalidWitnessesUTXOW"
 issue = 1140
 
 [[entry]]
 id = "00304"
 expected = "InvalidWitnessesUTXOW"
-observed = "unmapped:ConwayMempoolFailure (generic fallback)"
+observed = "unmapped:ConwayMempoolFailure (generic fallback, text: \"transaction validation failed\"; ledger: InvalidWitnessSignature)"
 class = "ledger-rules: InvalidWitnessSignature degrades to the generic ConwayMempoolFailure instead of InvalidWitnessesUTXOW"
 issue = 1140
 
@@ -979,77 +979,77 @@ issue = 1156
 [[entry]]
 id = "00306"
 expected = "ProposalProceduresFieldNotSupported"
-observed = "unmapped:ConwayMempoolFailure (generic fallback)"
+observed = "unmapped:ConwayMempoolFailure (generic fallback, text: \"transaction validation failed\"; ledger: Phase2CollectError)"
 class = "ledger-rules: Phase2CollectError degrades to the generic ConwayMempoolFailure instead of the CollectErrors payload"
 issue = 1144
 
 [[entry]]
 id = "00307"
 expected = "ProposalProceduresFieldNotSupported"
-observed = "unmapped:ConwayMempoolFailure (generic fallback)"
+observed = "unmapped:ConwayMempoolFailure (generic fallback, text: \"transaction validation failed\"; ledger: Phase2CollectError)"
 class = "ledger-rules: Phase2CollectError degrades to the generic ConwayMempoolFailure instead of the CollectErrors payload"
 issue = 1144
 
 [[entry]]
 id = "00308"
 expected = "TreasuryDonationFieldNotSupported"
-observed = "unmapped:ConwayMempoolFailure (generic fallback)"
+observed = "unmapped:ConwayMempoolFailure (generic fallback, text: \"transaction validation failed\"; ledger: Phase2CollectError)"
 class = "ledger-rules: Phase2CollectError degrades to the generic ConwayMempoolFailure instead of the CollectErrors payload"
 issue = 1144
 
 [[entry]]
 id = "00309"
 expected = "TreasuryDonationFieldNotSupported"
-observed = "unmapped:ConwayMempoolFailure (generic fallback)"
+observed = "unmapped:ConwayMempoolFailure (generic fallback, text: \"transaction validation failed\"; ledger: Phase2CollectError)"
 class = "ledger-rules: Phase2CollectError degrades to the generic ConwayMempoolFailure instead of the CollectErrors payload"
 issue = 1144
 
 [[entry]]
 id = "00310"
 expected = "VotingProceduresFieldNotSupported"
-observed = "unmapped:ConwayMempoolFailure (generic fallback)"
+observed = "unmapped:ConwayMempoolFailure (generic fallback, text: \"transaction validation failed\"; ledger: Phase2CollectError)"
 class = "ledger-rules: Phase2CollectError degrades to the generic ConwayMempoolFailure instead of the CollectErrors payload"
 issue = 1144
 
 [[entry]]
 id = "00311"
 expected = "VotingProceduresFieldNotSupported"
-observed = "unmapped:ConwayMempoolFailure (generic fallback)"
+observed = "unmapped:ConwayMempoolFailure (generic fallback, text: \"transaction validation failed\"; ledger: Phase2CollectError)"
 class = "ledger-rules: Phase2CollectError degrades to the generic ConwayMempoolFailure instead of the CollectErrors payload"
 issue = 1144
 
 [[entry]]
 id = "00312"
 expected = "CurrentTreasuryFieldNotSupported"
-observed = "unmapped:ConwayMempoolFailure (generic fallback)"
+observed = "unmapped:ConwayMempoolFailure (generic fallback, text: \"transaction validation failed\"; ledger: Phase2CollectError)"
 class = "ledger-rules: Phase2CollectError degrades to the generic ConwayMempoolFailure instead of the CollectErrors payload"
 issue = 1144
 
 [[entry]]
 id = "00313"
 expected = "CurrentTreasuryFieldNotSupported"
-observed = "unmapped:ConwayMempoolFailure (generic fallback)"
+observed = "unmapped:ConwayMempoolFailure (generic fallback, text: \"transaction validation failed\"; ledger: Phase2CollectError)"
 class = "ledger-rules: Phase2CollectError degrades to the generic ConwayMempoolFailure instead of the CollectErrors payload"
 issue = 1144
 
 [[entry]]
 id = "00314"
 expected = "InlineDatumsNotSupported"
-observed = "unmapped:ConwayMempoolFailure (generic fallback)"
+observed = "unmapped:ConwayMempoolFailure (generic fallback, text: \"transaction validation failed\"; ledger: Phase2CollectError)"
 class = "ledger-rules: Phase2CollectError degrades to the generic ConwayMempoolFailure instead of the CollectErrors payload"
 issue = 1144
 
 [[entry]]
 id = "00319"
 expected = "MissingRedeemers"
-observed = "unmapped:ConwayMempoolFailure (generic fallback)"
+observed = "unmapped:ConwayMempoolFailure (generic fallback, text: \"transaction validation failed\"; ledger: MissingSpendRedeemer)"
 class = "ledger-rules: MissingSpendRedeemer degrades to the generic ConwayMempoolFailure instead of MissingRedeemers"
 issue = 1145
 
 [[entry]]
 id = "00320"
 expected = "MissingRequiredDatums"
-observed = "unmapped:ConwayMempoolFailure (generic fallback)"
+observed = "unmapped:ConwayMempoolFailure (generic fallback, text: \"transaction validation failed\"; ledger: MissingDatumWitness)"
 class = "ledger-rules: MissingDatumWitness degrades to the generic ConwayMempoolFailure instead of MissingRequiredDatums"
 issue = 1146
 
@@ -1063,7 +1063,7 @@ issue = 1145
 [[entry]]
 id = "00328"
 expected = "ScriptWitnessNotValidatingUTXOW"
-observed = "unmapped:ConwayMempoolFailure (generic fallback)"
+observed = "unmapped:ConwayMempoolFailure (generic fallback, text: \"transaction validation failed\"; ledger: NativeScriptFailed)"
 class = "ledger-rules: NativeScriptFailed degrades to the generic ConwayMempoolFailure instead of ScriptWitnessNotValidatingUTXOW"
 issue = 1147
 
@@ -1085,20 +1085,20 @@ issue = 1148
 id = "00350"
 expected = "ExUnitsTooBigUTxO"
 observed = "DecodingFailure"
-class = "ledger-rules: a transaction whose outputs are indefinite-length CBOR maps fails to decode"
+class = "serialization: indefinite-length transaction outputs fail to decode, in submitted transactions AND in blocks (dugite stalls on a valid block)"
 issue = 1138
 
 [[entry]]
 id = "00353"
 expected = "InlineDatumsNotSupported"
-observed = "unmapped:ConwayMempoolFailure (generic fallback)"
+observed = "unmapped:ConwayMempoolFailure (generic fallback, text: \"transaction validation failed\"; ledger: Phase2CollectError)"
 class = "ledger-rules: Phase2CollectError degrades to the generic ConwayMempoolFailure instead of the CollectErrors payload"
 issue = 1144
 
 [[entry]]
 id = "00354"
 expected = "InlineDatumsNotSupported"
-observed = "unmapped:ConwayMempoolFailure (generic fallback)"
+observed = "unmapped:ConwayMempoolFailure (generic fallback, text: \"transaction validation failed\"; ledger: Phase2CollectError)"
 class = "ledger-rules: Phase2CollectError degrades to the generic ConwayMempoolFailure instead of the CollectErrors payload"
 issue = 1144
 
@@ -1120,7 +1120,7 @@ issue = 1150
 id = "00364"
 expected = "pass"
 observed = "DecodingFailure"
-class = "ledger-rules: a transaction whose outputs are indefinite-length CBOR maps fails to decode"
+class = "serialization: indefinite-length transaction outputs fail to decode, in submitted transactions AND in blocks (dugite stalls on a valid block)"
 issue = 1138
 
 [[entry]]
@@ -1133,20 +1133,20 @@ issue = 1159
 [[entry]]
 id = "00366"
 expected = "ByronTxOutInContext"
-observed = "unmapped:ConwayMempoolFailure (generic fallback)"
+observed = "unmapped:ConwayMempoolFailure (generic fallback, text: \"transaction validation failed\"; ledger: Phase2CollectError)"
 class = "ledger-rules: Phase2CollectError degrades to the generic ConwayMempoolFailure instead of the CollectErrors payload"
 issue = 1144
 
 [[entry]]
 id = "00367"
 expected = "ByronTxOutInContext"
-observed = "unmapped:ConwayMempoolFailure (generic fallback)"
+observed = "unmapped:ConwayMempoolFailure (generic fallback, text: \"transaction validation failed\"; ledger: Phase2CollectError)"
 class = "ledger-rules: Phase2CollectError degrades to the generic ConwayMempoolFailure instead of the CollectErrors payload"
 issue = 1144
 
 [[entry]]
 id = "00380"
 expected = "MissingRequiredDatums"
-observed = "unmapped:ConwayMempoolFailure (generic fallback)"
+observed = "unmapped:ConwayMempoolFailure (generic fallback, text: \"transaction validation failed\"; ledger: MissingDatumWitness)"
 class = "ledger-rules: MissingDatumWitness degrades to the generic ConwayMempoolFailure instead of MissingRequiredDatums"
 issue = 1146

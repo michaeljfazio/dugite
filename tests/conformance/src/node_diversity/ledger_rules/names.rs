@@ -11,8 +11,10 @@
 //!   delegation), so the transaction's own certificates decide among the candidates.
 //! * `CollectErrors` carries a list of `CollectError`s; each is a failure of its own and is named
 //!   by its payload (`NoCostModel`, `TimeTranslationPastHorizon`, a context error, ...).
-//! * `ConwayMempoolFailure` is dugite's generic fallback.  It has NO name, by design: a failure the
-//!   encoder could not type must never be scored as the failure it stood in for.
+//! * `ConwayMempoolFailure` is, in dugite, the generic fallback for a failure the encoder has no
+//!   typed arm for (text "transaction validation failed").  It has NO name, by design: it must never
+//!   be scored as the failure it stood in for.  (Haskell uses the same constructor for its own
+//!   mempool-only checks; see the header of `ndc_names.rs` for what that means for this table.)
 
 use std::collections::BTreeSet;
 use std::path::Path;
@@ -93,7 +95,21 @@ pub struct Named {
     pub detail: Option<String>,
 }
 
+/// The free text of `ConwayMempoolFailure` (`[7, text]`).
+fn generic_text(f: &Failure) -> Option<String> {
+    let mut d = Decoder::new(&f.raw);
+    d.array().ok()?;
+    d.u64().ok()?;
+    d.str().ok().map(str::to_string)
+}
+
 fn named(f: &Failure, ndc: Vec<String>, detail: Option<String>) -> Named {
+    // The generic fallback carries its text, so a different generic failure is a different line.
+    let detail = if f.is_generic_fallback() {
+        Some(format!("text: {:?}", generic_text(f).unwrap_or_default()))
+    } else {
+        detail
+    };
     Named {
         path: f.path.join("/"),
         tags: f.tags.clone(),

@@ -30,9 +30,9 @@ use serde_json::Value;
 
 use super::fixture::Fixture;
 
-/// Preprod's system start, POSIX milliseconds (`2022-06-01T00:00:00Z`).  Every fixture is
-/// `network: preprod`; the era history the fixtures carry counts time from this instant.
-pub const PREPROD_SYSTEM_START_MS: u64 = 1_654_041_600_000;
+/// The system start the Haskell reference checker uses for every fixture (`SystemStart
+/// (posixSecondsToUTCTime 0)`, `Run.hs`): the era history counts time from POSIX 0.
+pub const SYSTEM_START_MS: u64 = 0;
 
 /// Preprod's Praos security parameter `k`.
 pub const PREPROD_SECURITY_PARAM: u64 = 2160;
@@ -439,6 +439,11 @@ fn gov_action_id(v: &Value, what: &str) -> Result<GovActionId, String> {
     })
 }
 
+/// Haskell's `def :: RewardAccount`: testnet, key credential of 28 zero bytes.
+fn default_reward_account() -> Vec<u8> {
+    [&[0xe0u8][..], &[0u8; 28][..]].concat()
+}
+
 fn dummy_anchor() -> Anchor {
     Anchor {
         url: "https://example.invalid/fixture".into(),
@@ -459,19 +464,14 @@ fn gov_action(kind: &str) -> Result<GovAction, String> {
         "ProtocolParameters(security-group)" => GovAction::ParameterChange {
             prev_action_id: None,
             protocol_param_update: Box::new(dugite_primitives::transaction::ProtocolParamUpdate {
-                max_block_body_size: Some(90_112),
+                max_block_body_size: Some(1),
                 ..Default::default()
             }),
             policy_hash: None,
         },
-        "ConstitutionalCommittee" => GovAction::UpdateCommittee {
+        // The checker's stand-in for the committee purpose is `NoConfidence SNothing`.
+        "ConstitutionalCommittee" => GovAction::NoConfidence {
             prev_action_id: None,
-            members_to_remove: Vec::new(),
-            members_to_add: Default::default(),
-            threshold: Rational {
-                numerator: 2,
-                denominator: 3,
-            },
         },
         "Constitution" => GovAction::NewConstitution {
             prev_action_id: None,
@@ -480,8 +480,11 @@ fn gov_action(kind: &str) -> Result<GovAction, String> {
                 script_hash: None,
             },
         },
+        // The checker's stand-in: one withdrawal of 1 lovelace to the default reward account.
         "TreasuryWithdrawals" => GovAction::TreasuryWithdrawals {
-            withdrawals: Default::default(),
+            withdrawals: [(default_reward_account(), Lovelace(1))]
+                .into_iter()
+                .collect(),
             policy_hash: None,
         },
         // `Orphan` names a proposal no other action chains onto; its content is irrelevant to
@@ -527,6 +530,62 @@ pub fn definite_outer_map(bytes: &[u8]) -> Result<Vec<u8>, String> {
     Ok(out)
 }
 
+/// The checker's `buildOrphanCommitteeProposal`: one `UpdateCommittee` proposal, id `(zero tx id,
+/// lowest free index)`, whose `members_to_add` holds every member the enacted committee does not,
+/// each with the expiry of the first initial proposal (or the maximum epoch when there is none).
+/// It chains onto the enacted committee root and is proposed in that proposal's epoch (0 when
+/// there is none).
+fn add_orphan_committee_proposal(ledger: &mut LedgerState, orphans: &[Credential]) {
+    let gov = Arc::make_mut(&mut ledger.gov.governance);
+    let first = gov
+        .proposals
+        .values()
+        .min_by_key(|p| p.submission_index)
+        .map(|p| (p.proposed_epoch, p.expires_epoch, p.procedure.clone()));
+    let (proposed, expires, template) = match first {
+        Some((proposed, expires, procedure)) => (proposed, expires, procedure),
+        None => (
+            EpochNo(0),
+            EpochNo(u64::MAX),
+            ProposalProcedure {
+                deposit: Lovelace(0),
+                return_addr: default_reward_account(),
+                gov_action: GovAction::InfoAction,
+                anchor: dummy_anchor(),
+            },
+        ),
+    };
+    let id = (0u32..)
+        .map(|action_index| GovActionId {
+            transaction_id: Hash32::from_bytes([0u8; 32]),
+            action_index,
+        })
+        .find(|id| !gov.proposals.contains_key(id))
+        .expect("a free index");
+    let state = ProposalState {
+        procedure: ProposalProcedure {
+            gov_action: GovAction::UpdateCommittee {
+                prev_action_id: gov.enacted_committee.clone(),
+                members_to_remove: Vec::new(),
+                members_to_add: orphans.iter().map(|c| (c.clone(), expires.0)).collect(),
+                threshold: Rational {
+                    numerator: 1,
+                    denominator: 1,
+                },
+            },
+            ..template
+        },
+        proposed_epoch: proposed,
+        expires_epoch: expires,
+        yes_votes: 0,
+        no_votes: 0,
+        abstain_votes: 0,
+        submission_index: gov.proposal_count,
+    };
+    gov.proposal_count += 1;
+    gov.proposals.insert(id, state);
+}
+
 /// Build the ledger, era history and slot configuration for `fixture`.  `skip` leaves one
 /// `initial_state` section out, for the negative control.
 pub fn build(fixture: &Fixture, skip: Option<Section>) -> Result<Prepared, String> {
@@ -538,6 +597,18 @@ pub fn build(fixture: &Fixture, skip: Option<Section>) -> Result<Prepared, Strin
             "network `{}`: only preprod is wired",
             fixture.network
         ));
+    }
+    // `ledger.epoch = slot / epoch_size` below is only right for ONE era that starts at slot 0,
+    // epoch 0 and never ends (every fixture's history is `preprod-conway.json`).  Anything else
+    // would need the era history's own slot-to-epoch, so refuse it rather than compute a wrong
+    // epoch.
+    match history.entries() {
+        [only] if only.start.slot == 0 && only.start.epoch == 0 && only.end.is_none() => {}
+        _ => {
+            return Err(
+                "era history is not a single open era from slot 0; the epoch would be wrong".into(),
+            )
+        }
     }
     let epoch_size = history
         .entries()
@@ -561,7 +632,7 @@ pub fn build(fixture: &Fixture, skip: Option<Section>) -> Result<Prepared, Strin
         block_number: BlockNo(0),
     };
     let slot_config = SlotConfig {
-        zero_time: PREPROD_SYSTEM_START_MS,
+        zero_time: SYSTEM_START_MS,
         zero_slot: 0,
         slot_length: 1000,
         safe_zone_horizon_slot: None,
@@ -572,6 +643,8 @@ pub fn build(fixture: &Fixture, skip: Option<Section>) -> Result<Prepared, Strin
     // still a constitution (a proposal that carries a policy must then be rejected), so the
     // constitution is always present unless the section is the one being dropped.
     let mut guardrail: Option<dugite_primitives::hash::Hash28> = None;
+    // Committee members the enacted committee does not hold (see `Section::Committee`).
+    let mut orphans: Vec<Credential> = Vec::new();
 
     for (key, value) in &fixture.initial_state {
         let section =
@@ -579,7 +652,17 @@ pub fn build(fixture: &Fixture, skip: Option<Section>) -> Result<Prepared, Strin
         if skip == Some(section) {
             continue;
         }
-        apply_section(&mut ledger, section, value, &mut guardrail, &fixture.id)?;
+        apply_section(
+            &mut ledger,
+            section,
+            value,
+            &mut guardrail,
+            &mut orphans,
+            &fixture.id,
+        )?;
+    }
+    if !orphans.is_empty() {
+        add_orphan_committee_proposal(&mut ledger, &orphans);
     }
     if skip != Some(Section::GuardrailScript) {
         let gov = Arc::make_mut(&mut ledger.gov.governance);
@@ -603,6 +686,7 @@ fn apply_section(
     section: Section,
     value: &Value,
     guardrail: &mut Option<Hash28>,
+    orphans: &mut Vec<Credential>,
     id: &str,
 ) -> Result<(), String> {
     let what = format!("{id}: initial_state.{}", section.key());
@@ -724,8 +808,14 @@ fn apply_section(
             }
         }
         Section::Committee => {
-            let epoch = ledger.epoch;
-            let max_term = ledger.epochs.protocol_params.committee_max_term_length;
+            // The reference checker (Amaru `validation-rules`, `InitialState.hs`, at the pinned
+            // commit) builds the committee like this:
+            //   * a member with `valid_until` is ELECTED (`committeeMembers`: cold -> term);
+            //   * a member with `status` has an authorisation entry (`csCommitteeCreds`: hot
+            //     credential or resigned), elected or not;
+            //   * a member WITHOUT `valid_until` (with or without a status) is not elected; it is
+            //     added through one synthetic `UpdateCommittee` proposal's `members_to_add`
+            //     (`orphanAuthorizations`), see `add_orphan_committee_proposal`.
             let gov = Arc::make_mut(&mut ledger.gov.governance);
             for (i, m) in list(value)?.iter().enumerate() {
                 let w = format!("{what}[{i}]");
@@ -734,24 +824,12 @@ fn apply_section(
                 if let Credential::Script(_) = cold {
                     gov.script_committee_credentials.insert(cold_key);
                 }
-                // `valid_until` is the member's term in the ENACTED committee
-                // (`committeeMembers`: cold credential -> epoch); `status` is its entry in the
-                // committee AUTHORIZATION state (`csCommitteeCreds`: hot credential or resigned).
-                // A member with a `status` and no term is therefore authorised but unelected
-                // (fixtures 00171, 00217).  An entry with NEITHER is a bare committee member the
-                // fixture says may authorise a hot key (00211, expected `Pass`), which GOVCERT
-                // only allows for a current member, so it is seated with the longest term the
-                // parameters allow.
-                match (m.get("valid_until"), m.get("status")) {
-                    (Some(until), _) => {
+                match m.get("valid_until") {
+                    Some(until) => {
                         gov.committee_expiration
                             .insert(cold_key, EpochNo(uint(until, &w)?));
                     }
-                    (None, None) => {
-                        gov.committee_expiration
-                            .insert(cold_key, EpochNo(epoch.0 + max_term));
-                    }
-                    (None, Some(_)) => {}
+                    None => orphans.push(cold.clone()),
                 }
                 match m.get("status") {
                     None => {}
@@ -775,7 +853,7 @@ fn apply_section(
             }
         }
         Section::Proposals => {
-            let lifetime = ledger.epochs.protocol_params.gov_action_lifetime;
+            let epoch = ledger.epoch;
             let deposit = ledger.epochs.protocol_params.gov_action_deposit;
             let gov = Arc::make_mut(&mut ledger.gov.governance);
             for (i, p) in list(value)?.iter().enumerate() {
@@ -790,13 +868,13 @@ fn apply_section(
                 let state = ProposalState {
                     procedure: ProposalProcedure {
                         deposit,
-                        // A reward account on the fixture's network; the fixtures say nothing
-                        // about it.
-                        return_addr: [&[0xe0u8][..], &[0x11u8; 28][..]].concat(),
+                        // Filler, as in the checker (`pProcReturnAddr = def`).
+                        return_addr: default_reward_account(),
                         gov_action: action,
                         anchor: dummy_anchor(),
                     },
-                    proposed_epoch: EpochNo(expires.saturating_sub(lifetime)),
+                    // The checker proposes every initial proposal in the current epoch.
+                    proposed_epoch: epoch,
                     expires_epoch: EpochNo(expires),
                     yes_votes: 0,
                     no_votes: 0,
