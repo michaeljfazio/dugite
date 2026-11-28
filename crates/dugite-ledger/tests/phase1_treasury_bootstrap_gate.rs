@@ -372,15 +372,12 @@ fn pv9_mempool_reports_bootstrap_rejection_without_the_account_failure() {
     let (mut ledger, utxo) = ledger_at(9);
     pre_register_account(&mut ledger, &ret);
     let errors = mempool_errors(&ledger, &utxo, &tx);
-    assert!(
-        errors.iter().any(is_bootstrap_disallowed),
-        "PV9 must still reject a TreasuryWithdrawals proposal; got {:?}",
-        names(&errors)
-    );
-    assert!(
-        !errors.iter().any(is_treasury_dest_missing),
-        "the account check is skipped at PV9 (Gov.hs L504); got {:?}",
-        names(&errors)
+    // Haskell's PV9 failure list for this tx is exactly the bootstrap
+    // rejection (GovSpec.hs L1078-1082).
+    assert_eq!(
+        names(&errors),
+        vec!["DisallowedProposalDuringBootstrap".to_owned()],
+        "the whole PV9 failure list must be the bootstrap rejection"
     );
 }
 
@@ -391,9 +388,16 @@ fn pv9_apply_block_reports_bootstrap_rejection_without_the_account_failure() {
     pre_register_account(&mut ledger, &ret);
     let (_result, warns) = apply_single_tx_block(&mut ledger, tx);
     let text = warns.join("\n");
+    // The apply WARN lists every failure, joined by "; ": exactly one, the
+    // bootstrap rejection.
+    let line = warns
+        .iter()
+        .find(|l| l.contains("Phase-1 validation divergence"))
+        .unwrap_or_else(|| panic!("no Phase-1 divergence logged; got {warns:?}"));
+    let listed = line.split("errors=").nth(1).unwrap_or("");
     assert!(
-        text.contains("DisallowedProposalDuringBootstrap"),
-        "ValidateAll must flag the bootstrap rejection; got {warns:?}"
+        listed.starts_with("DisallowedProposalDuringBootstrap") && !listed.contains("; "),
+        "the whole PV9 failure list must be the bootstrap rejection; got {listed}"
     );
     assert!(
         !text.contains("TreasuryWithdrawalReturnAccountsDoNotExist"),
