@@ -17,7 +17,6 @@ docs/book/
 checkpoints.json
 .monitoring-data/
 .dump/
-.claude/worktrees/
 .DS_Store
 
 # Upstream conformance corpus fixtures — downloaded on demand via
@@ -36,9 +35,13 @@ result-*
 # Direnv
 .direnv*
 
-# Claude
-
-.claude/settings.local.json
+# AI agent files: local only, never tracked (backed up outside the repo)
+.claude/
+CLAUDE.md
+.mcp.json
+.remember/
+docs/superpowers/
+reports/
 logs/
 fuzz/target/
 epoch-snapshots/
@@ -55,9 +58,6 @@ crates/dugite-ledger/tests/fixtures/*.cbor
 reward-dumps-issue-438/
 reward-dumps-issue-481/
 
-# devnet-validate generated artifacts (commit only tagged release reports)
-reports/devnet-validate/report.json
-reports/devnet-validate/report.md
 testnet/local-devnet/evidence/
 # Auto-archived devnet runs (setup.sh moves prior evidence here so a
 # multi-round run stays reportable). The rest of evidence-archive/ is
@@ -74,7 +74,6 @@ dump-snapshot-*/
 .opencode
 *.pid
 epoch-dumps-*
-.claude/scheduled_tasks.lock
 target-replay/
 
 # Python bytecode from the validation scripts

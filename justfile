@@ -7,6 +7,10 @@
 set shell := ["bash", "-cu"]
 set positional-arguments := true
 
+# devnet-validate release-report scripts. They are local tooling and are not
+# tracked in git; point DUGITE_GATE_SCRIPTS at your copy if it lives elsewhere.
+gate_scripts := env_var_or_default("DUGITE_GATE_SCRIPTS", justfile_directory() / ".claude/skills/devnet-validate/scripts")
+
 # Show the recipe list.
 default:
     @just --list --unsorted
@@ -128,7 +132,7 @@ devnet-report TAG="":
     # missing artifact, so this output can never be mistaken for a release
     # gate. For a real gate use the 3-round workflow in
     # .claude/skills/devnet-validate/SKILL.md, which runs strict.
-    "$REPO_ROOT/.claude/skills/devnet-validate/scripts/generate-release-report.sh" \
+    "{{gate_scripts}}/generate-release-report.sh" \
         --preset standard \
         --no-strict \
         $tag_flag \
@@ -166,7 +170,7 @@ devnet-validate-smoke:
     EVIDENCE_DIR="$EVD" ./tx-zoo/run-all.sh 01-bookkeeping 02-native-scripts 08-negative
     EVIDENCE_DIR="$EVD" ./perf/log-level-predicate.sh
     ./stop.sh 2>/dev/null || true
-    "$REPO_ROOT/.claude/skills/devnet-validate/scripts/generate-release-report.sh" \
+    "{{gate_scripts}}/generate-release-report.sh" \
         --preset smoke \
         --output-dir "$REPO_ROOT/reports/devnet-validate" \
         "$EVD"
@@ -179,8 +183,8 @@ devnet-validate-smoke:
 devnet-gate-selftest:
     #!/usr/bin/env bash
     set -euo pipefail
-    .claude/skills/devnet-validate/scripts/test-report-integrity.sh
-    .claude/skills/devnet-validate/scripts/test-denominators.sh
+    "{{gate_scripts}}/test-report-integrity.sh"
+    "{{gate_scripts}}/test-denominators.sh"
 
 # Run extended devnet-validate (~75 min). Used for release tagging.
 devnet-validate-extended:
@@ -254,7 +258,7 @@ devnet-validate-extended:
         cp -R "$EVD" "$KEPT"
         ROUND_DIRS+=("$KEPT")
     done
-    "$REPO_ROOT/.claude/skills/devnet-validate/scripts/generate-release-report.sh" \
+    "{{gate_scripts}}/generate-release-report.sh" \
         --preset extended \
         --output-dir "$REPO_ROOT/reports/devnet-validate" \
         "${ROUND_DIRS[@]}"
