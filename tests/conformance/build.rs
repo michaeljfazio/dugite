@@ -116,11 +116,15 @@ fn main() {
             let rel_str = rel
                 .to_string_lossy()
                 .replace(std::path::MAIN_SEPARATOR, "/");
+            // LEDGER and NEWEPOCH are applied through dugite's ledger and compared
+            // with Haskell's `st_out` (`apply_compare`); every other rule only has
+            // its signal decoded (`decode`).
+            let rule = rel_str.split('/').next().unwrap_or("").to_uppercase();
+            let applied = rule.contains("NEWEPOCH") || rule.ends_with("LEDGER");
+            let kind = if applied { "apply_compare" } else { "decode" };
             let name = unique_name(
                 &mut used_names,
-                // `decode`: the generated test only decodes the vector's
-                // signal; it applies no ledger rule.
-                &format!("upstream_ledger_rules_decode_{}", sanitise(&rel_str)),
+                &format!("upstream_ledger_rules_{kind}_{}", sanitise(&rel_str)),
             );
             let abs = test_dir.display().to_string();
             out.push_str(&format!(
