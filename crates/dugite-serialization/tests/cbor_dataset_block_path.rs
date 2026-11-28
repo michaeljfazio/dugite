@@ -99,13 +99,13 @@ fn mismatches(
 ///   differs from the list in either direction.
 ///
 /// The corpus comes from `just ndc-fetch` (`scripts/node-diversity/fetch-corpora.sh cbor`).
-/// When it is missing the test is skipped, unless `DUGITE_NDC_REQUIRE=1` (set by the CI job
+/// When it is missing the test is skipped, unless `DUGITE_CBOR_DATASET_REQUIRE=1` (set by the CI job
 /// that fetches it, as for the `ndc_reports` tests), where a missing corpus FAILS.
 fn run(rule: &str, known_over_acceptance: &[&str], decode: &dyn Fn(&[u8]) -> Result<(), String>) {
     let Some(root) = dataset_root() else {
         assert!(
-            std::env::var("DUGITE_NDC_REQUIRE").as_deref() != Ok("1"),
-            "{rule}: DUGITE_NDC_REQUIRE=1 but the cbor-dataset corpus is missing; \
+            std::env::var("DUGITE_CBOR_DATASET_REQUIRE").as_deref() != Ok("1"),
+            "{rule}: DUGITE_CBOR_DATASET_REQUIRE=1 but the cbor-dataset corpus is missing; \
              run `scripts/node-diversity/fetch-corpora.sh cbor`"
         );
         eprintln!("SKIP {rule}: cbor-dataset not fetched (run `just ndc-fetch`)");
@@ -214,8 +214,8 @@ fn dataset_block_decode_block_minimal() {
 fn dataset_valid_blocks_pass_body_extraction() {
     let Some(root) = dataset_root() else {
         assert!(
-            std::env::var("DUGITE_NDC_REQUIRE").as_deref() != Ok("1"),
-            "DUGITE_NDC_REQUIRE=1 but the cbor-dataset corpus is missing"
+            std::env::var("DUGITE_CBOR_DATASET_REQUIRE").as_deref() != Ok("1"),
+            "DUGITE_CBOR_DATASET_REQUIRE=1 but the cbor-dataset corpus is missing"
         );
         eprintln!("SKIP: cbor-dataset not fetched (run `just ndc-fetch`)");
         return;
