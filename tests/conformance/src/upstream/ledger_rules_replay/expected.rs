@@ -1,24 +1,43 @@
 //! The expected-results contract for the replayed rules (LEDGER, NEWEPOCH).
 //!
 //! `tests/conformance/expected/ledger_rules_replay.tsv` holds one
-//! `(vector id, observed result)` pair per vector on which dugite is known to
-//! diverge from Haskell. The gate fails on:
+//! `(vector id, observed result, issue)` triple per vector whose result is not a
+//! plain match with Haskell:
+//!
+//! * a **divergence** from Haskell, which names the OPEN GitHub issue that tracks
+//!   it (`#NNNN`); and
+//! * an **agreed rejection** (`AGREED_REJECT ...`): Haskell rejected the signal
+//!   and dugite's validator rejects it too. The dump does not carry Haskell's
+//!   predicate, so the entry pins dugite's reason; its issue column is `-`.
+//!
+//! The gate fails on:
 //!
 //! * an **unknown id** — a divergence with no entry (a new regression, or a new
 //!   vector);
 //! * an entry that now **matches** — it must be removed, so the file only ever
 //!   shrinks as divergences are fixed;
 //! * an observed result that **differs** from the recorded one — the divergence
-//!   changed, which a reviewer must look at;
-//! * a **stale id** — an entry whose vector is not in the corpus.
+//!   changed, which a reviewer must look at (every observed result ends in a
+//!   digest of the evidence, so a changed validator verdict or a changed value
+//!   changes it);
+//! * a **stale id** — an entry whose vector is not in the corpus;
+//! * an entry **without an issue** (or an `AGREED_REJECT` with one).
 //!
 //! This is NOT the `conformance_skip.txt` contract, which only notices a path
 //! that stopped existing. Nothing here skips a vector: every entry is a vector
-//! that is replayed and whose divergence is pinned.
+//! that is replayed and whose result is pinned.
 //!
 //! The file is bound to the corpus: its `# corpus:` header must equal
 //! `manifest.toml`'s release tag, so bumping the pin forces the file to be
 //! regenerated and its diff reviewed.
+//!
+//! ## Regenerating
+//!
+//! Only the ignored `ledger_rules_replay_report` test rewrites the file, and only
+//! with `DUGITE_UPDATE_EXPECTED_RESULTS=1`; it refuses to run when `CI` or
+//! `DUGITE_REQUIRE_UPSTREAM=1` is set and prints an added / changed / removed
+//! summary. The issue column is assigned by [`issue_for`]; a new class without a
+//! rule there fails the regeneration instead of getting a placeholder.
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -26,8 +45,8 @@ use std::path::PathBuf;
 use crate::upstream::fixtures::workspace_root;
 use crate::upstream::ledger_rules_replay::replay::Verdict;
 
-/// Environment variable that makes the umbrella test rewrite the file from what
-/// it observed instead of failing. Never set in CI.
+/// Environment variable that makes the report test rewrite the file from what it
+/// observed instead of failing. Never set in CI.
 pub const UPDATE_ENV: &str = "DUGITE_UPDATE_EXPECTED_RESULTS";
 
 /// Path of the committed file.
@@ -48,11 +67,24 @@ pub fn manifest_tag() -> Result<String, String> {
         .ok_or_else(|| format!("no `tag` in {}", p.display()))
 }
 
+/// One recorded entry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Entry {
+    pub observed: String,
+    /// `#NNNN` or `-` (agreed rejection).
+    pub issue: String,
+}
+
 /// The parsed contract.
 #[derive(Debug, Clone, Default)]
 pub struct Expected {
     pub corpus_tag: String,
-    pub entries: BTreeMap<String, String>,
+    pub entries: BTreeMap<String, Entry>,
+}
+
+fn is_issue_ref(s: &str) -> bool {
+    s.strip_prefix('#')
+        .is_some_and(|d| !d.is_empty() && d.chars().all(|c| c.is_ascii_digit()))
 }
 
 impl Expected {
@@ -67,10 +99,33 @@ impl Expected {
             if line.trim().is_empty() || line.starts_with('#') {
                 continue;
             }
-            let (id, obs) = line
-                .split_once('\t')
-                .ok_or_else(|| format!("line {}: expected `<id>\\t<observed result>`", n + 1))?;
-            if e.entries.insert(id.to_string(), obs.to_string()).is_some() {
+            let mut cols = line.split('\t');
+            let (Some(id), Some(obs), Some(issue), None) =
+                (cols.next(), cols.next(), cols.next(), cols.next())
+            else {
+                return Err(format!(
+                    "line {}: expected `<id>\\t<observed result>\\t<issue>`",
+                    n + 1
+                ));
+            };
+            let agreed = obs.starts_with("AGREED_REJECT");
+            if agreed && issue != "-" {
+                return Err(format!(
+                    "line {}: {id}: an agreed rejection has no issue",
+                    n + 1
+                ));
+            }
+            if !agreed && !is_issue_ref(issue) {
+                return Err(format!(
+                    "line {}: {id}: a divergence must link an open issue as `#NNNN`, got `{issue}`",
+                    n + 1
+                ));
+            }
+            let entry = Entry {
+                observed: obs.to_string(),
+                issue: issue.to_string(),
+            };
+            if e.entries.insert(id.to_string(), entry).is_some() {
                 return Err(format!("line {}: duplicate id {id}", n + 1));
             }
         }
@@ -85,34 +140,86 @@ impl Expected {
         Self::parse(&text)
     }
 
-    /// Render in the committed format (sorted by id).
+    /// Render in the committed format: grouped by class, largest first.
     pub fn render(&self) -> String {
         let mut s = String::new();
         s.push_str(
-            "# Known divergences of dugite from Haskell on the replayed ImpSpec vectors.\n\
-             # One `<vector id><TAB><observed result>` per line. The gate fails on an unknown id,\n\
-             # on an entry that now matches (delete it), and on a changed observed result.\n\
-             # Regenerate only to RECORD a reviewed change: DUGITE_UPDATE_EXPECTED_RESULTS=1.\n",
+            "# Vectors on which dugite does not simply match Haskell, among the replayed ImpSpec rules.\n\
+             # One `<vector id><TAB><observed result><TAB><issue>` per line. The gate fails on an unknown id,\n\
+             # on an entry that now matches (delete it), on a changed observed result, on a stale id and on\n\
+             # an entry without an issue. Regenerate only to RECORD a reviewed change (see expected.rs).\n",
         );
         s.push_str(&format!("# corpus: {}\n", self.corpus_tag));
-        // Grouped by divergence class (the observed result without its digest),
-        // largest class first, so a reviewer reads classes, not 3,000 lines.
+        // Class = the observed result without its digest.
         let class_of = |obs: &str| obs.split(" #").next().unwrap_or(obs).to_string();
-        let mut by_class: BTreeMap<String, Vec<(&String, &String)>> = BTreeMap::new();
-        for (id, obs) in &self.entries {
-            by_class.entry(class_of(obs)).or_default().push((id, obs));
+        let mut by_class: BTreeMap<String, Vec<(&String, &Entry)>> = BTreeMap::new();
+        for (id, e) in &self.entries {
+            by_class
+                .entry(class_of(&e.observed))
+                .or_default()
+                .push((id, e));
         }
         let mut classes: Vec<_> = by_class.into_iter().collect();
         classes.sort_by(|a, b| b.1.len().cmp(&a.1.len()).then_with(|| a.0.cmp(&b.0)));
         for (class, mut members) in classes {
             members.sort_by_key(|(id, _)| natural_key(id));
-            s.push_str(&format!("\n# {} vector(s): {class}\n", members.len()));
-            for (id, obs) in members {
-                s.push_str(&format!("{id}\t{obs}\n"));
+            s.push_str(&format!(
+                "\n# {} vector(s), issue {}: {class}\n",
+                members.len(),
+                members[0].1.issue
+            ));
+            for (id, e) in members {
+                s.push_str(&format!("{id}\t{}\t{}\n", e.observed, e.issue));
             }
         }
         s
     }
+
+    /// What regenerating from `observed` would add, change and remove.
+    pub fn diff_summary(&self, observed: &BTreeMap<String, Entry>) -> String {
+        let added = observed
+            .keys()
+            .filter(|k| !self.entries.contains_key(*k))
+            .count();
+        let removed = self
+            .entries
+            .keys()
+            .filter(|k| !observed.contains_key(*k))
+            .count();
+        let changed = observed
+            .iter()
+            .filter(|(k, v)| self.entries.get(*k).is_some_and(|o| o != *v))
+            .count();
+        format!("added {added}, changed {changed}, removed {removed}")
+    }
+}
+
+/// The open issue that tracks an observed result, by rule.
+///
+/// * `#1132`: the import never maps `cgsDRepPulsingState`, so a NEWEPOCH that
+///   should ratify / enact / expire does not.
+/// * `#1133`: the import drops `cgsFuturePParams`.
+/// * `#1134`: the import ignores `cgsCommittee = SNothing`.
+/// * `#1131`: `apply_block` applies Phase-1-invalid transactions. (No entry maps
+///   here today: those vectors are `AGREED_REJECT`.)
+/// * `#1114`: classes with no issue of their own yet; they are tracked in the
+///   plan until each is split out.
+///
+/// Returns `None` for an `AGREED_REJECT` (no issue).
+pub fn issue_for(observed: &str) -> Option<&'static str> {
+    if observed.starts_with("AGREED_REJECT") {
+        return None;
+    }
+    let has = |needle: &str| observed.contains(needle);
+    Some(if has("gov:future_pparams/") {
+        "#1133"
+    } else if has("gov:committee/present") {
+        "#1134"
+    } else if has("gov:proposal/") && has("inputs:drep_pulsing_state") {
+        "#1132"
+    } else {
+        "#1114"
+    })
 }
 
 /// `Rule/test_N` sorted by rule, then N numerically.
@@ -130,7 +237,7 @@ fn natural_key(id: &str) -> (String, u64) {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Gate {
     Ok,
-    /// Diverges, no entry.
+    /// Diverges (or agreed-rejects), no entry.
     Unknown {
         observed: String,
     },
@@ -152,7 +259,7 @@ impl Gate {
         match self {
             Gate::Ok => None,
             Gate::Unknown { observed } => Some(format!(
-                "{id}: unknown divergence (no entry in the expected-results file): {observed}"
+                "{id}: not in the expected-results file: {observed}"
             )),
             Gate::NowMatches { recorded } => Some(format!(
                 "{id}: now MATCHES Haskell but is still recorded as `{recorded}` — remove the entry"
@@ -167,17 +274,18 @@ impl Gate {
 
 /// Judge one verdict against the contract.
 pub fn gate(expected: &Expected, id: &str, verdict: &Verdict) -> Gate {
-    match (verdict, expected.entries.get(id)) {
+    let recorded = expected.entries.get(id).map(|e| &e.observed);
+    match (verdict, recorded) {
         (Verdict::HarnessError(e), _) => Gate::HarnessError(e.clone()),
         (Verdict::Match, None) => Gate::Ok,
         (Verdict::Match, Some(r)) => Gate::NowMatches {
             recorded: r.clone(),
         },
-        (Verdict::Diverges(o), None) => Gate::Unknown {
+        (Verdict::Diverges(o) | Verdict::AgreedReject(o), None) => Gate::Unknown {
             observed: o.clone(),
         },
-        (Verdict::Diverges(o), Some(r)) if o == r => Gate::Ok,
-        (Verdict::Diverges(o), Some(r)) => Gate::Changed {
+        (Verdict::Diverges(o) | Verdict::AgreedReject(o), Some(r)) if o == r => Gate::Ok,
+        (Verdict::Diverges(o) | Verdict::AgreedReject(o), Some(r)) => Gate::Changed {
             recorded: r.clone(),
             observed: o.clone(),
         },

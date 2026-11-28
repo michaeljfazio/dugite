@@ -67,6 +67,7 @@ pub const GROUPS: &[&str] = &[
     "snapshots",
     "blocks_made",
     "non_myopic",
+    "inputs",
 ];
 
 /// A projected state: the groups it carries, and which of [`GROUPS`] it does
@@ -76,14 +77,36 @@ pub struct Projection {
     pub groups: BTreeMap<&'static str, Group>,
 }
 
+/// Which comparison a projection is for.
+///
+/// * `Pre`: dugite right after the import against Haskell's `st`. It carries the
+///   `inputs` group (what the transition READS that the import must supply) and
+///   leaves out the UTxO, whose conversion is shared by both sides.
+/// * `Post`: dugite after the apply against Haskell's `st_out`. It carries the
+///   UTxO and not `inputs`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Scope {
+    Pre,
+    Post,
+}
+
 impl Projection {
     /// A projection with every group the rule's dump carries pre-declared
     /// (empty), so "carried but empty" and "not carried" stay distinguishable.
-    pub fn new(nes_level: bool) -> Self {
+    ///
+    /// For a LEDGER dump the epoch and the treasury/reserves pots come from
+    /// `env`, which both sides copy, so they are not groups/paths there.
+    pub fn new(nes_level: bool, scope: Scope) -> Self {
         let mut p = Projection::default();
         for g in GROUPS {
-            let nes_only = matches!(*g, "snapshots" | "blocks_made" | "non_myopic");
-            if !nes_only || nes_level {
+            let nes_only = matches!(
+                *g,
+                "snapshots" | "blocks_made" | "non_myopic" | "epoch" | "inputs"
+            );
+            let carried = (!nes_only || nes_level)
+                && !(*g == "inputs" && scope == Scope::Post)
+                && !(*g == "utxo" && scope == Scope::Pre);
+            if carried {
                 p.groups.insert(g, Group::new());
             }
         }
@@ -96,6 +119,41 @@ impl Projection {
 /// The `rules` column limits the entry to the rules it applies to
 /// (`"both"`, `"ledger"`, `"newepoch"`).
 pub const NOT_COMPARED: &[(&str, &str, &str)] = &[
+    (
+        "NEWEPOCH ratification (RATIFY / ENACT / proposal expiry)",
+        "newepoch",
+        "NOT EXERCISED: the import never maps `cgsDRepPulsingState`, so every NEWEPOCH vector \
+         runs with nothing to ratify (#1132; also #1133 futurePParams, #1134 committee SNothing). \
+         The `pre=inputs:*` kinds record it on every vector; there is no positive coverage of \
+         ratification, enactment or expiry until #1132 is fixed",
+    ),
+    (
+        "spsDelegators, dsFutureGenDelegs",
+        "both",
+        "the production decoder skips both; dugite has no field for either on import",
+    ),
+    (
+        "spssStakeRatio, spssSelfDelegatedOwners, spssSelfDelegatedOwnersStake, spssNumDelegators",
+        "newepoch",
+        "StakePoolSnapShot fields the production decoder skips; dugite stores no equivalent",
+    ),
+    (
+        "LEDGER epoch, treasury, reserves",
+        "ledger",
+        "copied from `env` into both sides, so a comparison would test the copy, not the rule",
+    ),
+    (
+        "dsIRewards / dsDeltas (MIR) contents",
+        "both",
+        "dugite's import hard-codes them empty (Conway has no MIR); a count comparison would \
+         compare a constant",
+    ),
+    (
+        "utxosDeposited",
+        "both",
+        "dugite stores no such field; its components are compared individually (stake-key \
+         deposits in total and per account, pool deposits, DRep deposits, proposal deposits)",
+    ),
     (
         "nesRu (PulsingRewUpdate)",
         "newepoch",
@@ -435,14 +493,19 @@ fn likelihood_str(w: &[f32]) -> String {
 }
 
 /// Project what Haskell computed.
-pub fn from_haskell(imp: &ImpState, with_utxo: bool) -> Projection {
+pub fn from_haskell(imp: &ImpState, scope: Scope) -> Projection {
+    let with_utxo = scope == Scope::Post;
     let nes = &imp.nes;
-    let mut p = Projection::new(imp.carried.nes_level);
+    let mut p = Projection::new(imp.carried.nes_level, scope);
     let mut put = |grp: &'static str, k: String, v: String| {
         p.groups.entry(grp).or_default().insert(k, v);
     };
 
-    put("epoch", "epoch".into(), nes.epoch.0.to_string());
+    if imp.carried.nes_level {
+        put("epoch", "epoch".into(), nes.epoch.0.to_string());
+        put("pots", "treasury".into(), nes.treasury.to_string());
+        put("pots", "reserves".into(), nes.reserves.to_string());
+    }
 
     if with_utxo {
         for (i, o) in &imp.utxo {
@@ -454,11 +517,8 @@ pub fn from_haskell(imp: &ImpState, with_utxo: bool) -> Projection {
         }
     }
 
-    put("pots", "treasury".into(), nes.treasury.to_string());
-    put("pots", "reserves".into(), nes.reserves.to_string());
     put("pots", "fees".into(), nes.fees.to_string());
     put("pots", "donation".into(), nes.donation.to_string());
-    put("pots", "deposited".into(), nes.deposited.to_string());
 
     let cs = &nes.cert_state;
     for ((tag, h), a) in &cs.dstate.accounts {
@@ -480,6 +540,16 @@ pub fn from_haskell(imp: &ImpState, with_utxo: bool) -> Projection {
             ),
         );
     }
+    put(
+        "dstate",
+        "total_key_deposits".into(),
+        cs.dstate
+            .accounts
+            .values()
+            .map(|a| a.deposit)
+            .sum::<u64>()
+            .to_string(),
+    );
     for (g, (d, v)) in &cs.dstate.genesis_delegates {
         put(
             "dstate",
@@ -487,17 +557,6 @@ pub fn from_haskell(imp: &ImpState, with_utxo: bool) -> Projection {
             format!("{}/{}", d.to_hex(), v.to_hex()),
         );
     }
-    put(
-        "dstate",
-        "mir/pending".into(),
-        format!(
-            "res={} tre={} dres={} dtre={}",
-            cs.dstate.i_rewards_reserves.len(),
-            cs.dstate.i_rewards_treasury.len(),
-            cs.dstate.delta_reserves,
-            cs.dstate.delta_treasury
-        ),
-    );
 
     for (id, s) in &cs.pstate.stake_pools {
         put("pstate", format!("pool/{}", id.to_hex()), pool_str(s, true));
@@ -706,20 +765,47 @@ pub fn from_haskell(imp: &ImpState, with_utxo: bool) -> Projection {
             nm.insert(format!("likelihood/{}", id.to_hex()), likelihood_str(w));
         }
     }
-    if !with_utxo {
-        p.groups.remove("utxo");
+    if scope == Scope::Pre && imp.carried.nes_level {
+        // What NEWEPOCH reads that the import must supply. dugite's import maps
+        // neither (see `from_haskell_snapshot`), so these differ whenever Haskell
+        // holds them: the transition then runs without them.
+        set_input(
+            &mut p,
+            "drep_pulsing_state",
+            if nes.gov_state.drep_pulsing_raw.is_empty() {
+                "absent"
+            } else {
+                "present"
+            }
+            .into(),
+        );
+        set_input(
+            &mut p,
+            "nes_ru",
+            if imp.reward_update_present {
+                "SJust"
+            } else {
+                "SNothing"
+            }
+            .into(),
+        );
     }
     p
 }
 
 /// Project what dugite holds.
-pub fn from_dugite(st: &LedgerState, kind: RuleKind, with_utxo: bool) -> Projection {
-    let mut p = Projection::new(kind == RuleKind::NewEpoch);
+pub fn from_dugite(st: &LedgerState, kind: RuleKind, scope: Scope) -> Projection {
+    let with_utxo = scope == Scope::Post;
+    let mut p = Projection::new(kind == RuleKind::NewEpoch, scope);
     let mut put = |grp: &'static str, k: String, v: String| {
         p.groups.entry(grp).or_default().insert(k, v);
     };
 
-    put("epoch", "epoch".into(), st.epoch.0.to_string());
+    if kind == RuleKind::NewEpoch {
+        put("epoch", "epoch".into(), st.epoch.0.to_string());
+        put("pots", "treasury".into(), st.epochs.treasury.0.to_string());
+        put("pots", "reserves".into(), st.epochs.reserves.0.to_string());
+    }
 
     if with_utxo {
         for (i, o) in st.utxo.utxo_set.iter() {
@@ -732,25 +818,12 @@ pub fn from_dugite(st: &LedgerState, kind: RuleKind, with_utxo: bool) -> Project
     }
 
     let gov = &*st.gov.governance;
-    put("pots", "treasury".into(), st.epochs.treasury.0.to_string());
-    put("pots", "reserves".into(), st.epochs.reserves.0.to_string());
     put("pots", "fees".into(), st.utxo.epoch_fees.0.to_string());
     put(
         "pots",
         "donation".into(),
         st.utxo.pending_donations.0.to_string(),
     );
-    // `utxosDeposited` has no stored dugite field: it is the sum of the four
-    // deposit books dugite does keep (stake keys, pools, DReps, proposals).
-    let deposited: u64 = st.certs.stake_key_deposits.values().sum::<u64>()
-        + st.certs.pool_deposits.values().sum::<u64>()
-        + gov.dreps.values().map(|d| d.deposit.0).sum::<u64>()
-        + gov
-            .proposals
-            .values()
-            .map(|pr| pr.procedure.deposit.0)
-            .sum::<u64>();
-    put("pots", "deposited".into(), deposited.to_string());
 
     for (c, bal) in st.certs.reward_accounts.iter() {
         put(
@@ -772,6 +845,11 @@ pub fn from_dugite(st: &LedgerState, kind: RuleKind, with_utxo: bool) -> Project
             ),
         );
     }
+    put(
+        "dstate",
+        "total_key_deposits".into(),
+        st.certs.total_stake_key_deposits.to_string(),
+    );
     for (g, (d, v)) in &st.genesis_delegates {
         put(
             "dstate",
@@ -779,17 +857,6 @@ pub fn from_dugite(st: &LedgerState, kind: RuleKind, with_utxo: bool) -> Project
             format!("{}/{}", d.to_hex(), v.to_hex()),
         );
     }
-    put(
-        "dstate",
-        "mir/pending".into(),
-        format!(
-            "res={} tre={} dres={} dtre={}",
-            st.certs.pending_mir_reserves.len(),
-            st.certs.pending_mir_treasury.len(),
-            st.certs.pending_mir_delta_reserves,
-            st.certs.pending_mir_delta_treasury
-        ),
-    );
 
     let relays = |r: &[Relay]| -> String { r.iter().map(canon).collect::<Vec<_>>().join(",") };
     for (id, r) in st.certs.pool_params.iter() {
@@ -1029,10 +1096,36 @@ pub fn from_dugite(st: &LedgerState, kind: RuleKind, with_utxo: bool) -> Project
             nm.insert(format!("likelihood/{}", id.to_hex()), likelihood_str(&l.0));
         }
     }
-    if !with_utxo {
-        p.groups.remove("utxo");
+    if scope == Scope::Pre && kind == RuleKind::NewEpoch {
+        set_input(
+            &mut p,
+            "drep_pulsing_state",
+            if gov.drep_pulsing_state.is_some() {
+                "present"
+            } else {
+                "absent"
+            }
+            .into(),
+        );
+        set_input(
+            &mut p,
+            "nes_ru",
+            if st.epochs.rupd_snapshot.is_some() {
+                "SJust"
+            } else {
+                "SNothing"
+            }
+            .into(),
+        );
     }
     p
+}
+
+fn set_input(p: &mut Projection, k: &str, v: String) {
+    p.groups
+        .entry("inputs")
+        .or_default()
+        .insert(k.to_string(), v);
 }
 
 /// Silence an unused-import lint when a helper is only used on one side.

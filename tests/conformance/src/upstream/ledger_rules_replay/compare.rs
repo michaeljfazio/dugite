@@ -7,8 +7,6 @@
 
 use std::collections::BTreeSet;
 
-use sha2::{Digest, Sha256};
-
 use crate::upstream::ledger_rules_replay::project::{Group, Projection, GROUPS};
 
 /// One differing path.
@@ -54,9 +52,10 @@ impl CompareResult {
         set.into_iter().collect()
     }
 
-    /// A short stable digest of every (group, path, dugite value, haskell
-    /// value): any change in WHAT differs, not only in which group, changes it.
-    pub fn digest(&self) -> String {
+    /// One line per differing path (group, path, dugite value, haskell value),
+    /// sorted: what a digest is taken over, so any change in WHAT differs, not
+    /// only in which group, changes it.
+    pub fn digest_lines(&self) -> Vec<String> {
         let mut lines: Vec<String> = self
             .diffs
             .iter()
@@ -71,8 +70,7 @@ impl CompareResult {
             })
             .collect();
         lines.sort();
-        let h = Sha256::digest(lines.join("\n").as_bytes());
-        h.iter().take(6).map(|b| format!("{b:02x}")).collect()
+        lines
     }
 
     /// Human-readable diff, at most `limit` paths.

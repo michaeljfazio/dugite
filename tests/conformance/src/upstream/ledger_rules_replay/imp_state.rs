@@ -36,9 +36,7 @@ use std::collections::HashMap;
 use dugite_primitives::address::Address;
 use dugite_primitives::hash::{Hash28, Hash32, PolicyId};
 use dugite_primitives::time::{EpochNo, SlotNo};
-use dugite_primitives::transaction::{
-    OutputDatum, PlutusData, ScriptRef, TransactionInput, TransactionOutput,
-};
+use dugite_primitives::transaction::{OutputDatum, ScriptRef, TransactionInput, TransactionOutput};
 use dugite_primitives::value::{AssetName, Value};
 use dugite_serialization::haskell_snapshot::{
     decode_bare_ledger_state, decode_bare_new_epoch_state, HaskellLedgerState,
@@ -118,6 +116,14 @@ pub fn decode_imp_state(kind: RuleKind, bytes: &[u8], vec: &ImpVector) -> Result
             let ls =
                 decode_bare_ledger_state(bytes).map_err(|e| format!("LedgerState decode: {e}"))?;
             let env = decode_ledger_env(&vec.env_cbor)?;
+            // The environment's protocol parameters are the ones in force for this
+            // transition; they must be the ones the state carries, or the replay
+            // would validate against different parameters than Haskell did.
+            if serde_json::to_value(&env.pp).ok()
+                != serde_json::to_value(&ls.gov_state.cur_pparams).ok()
+            {
+                return Err("env.ledgerPp differs from the state's curPParams".into());
+            }
             let empty = || HaskellSnapShot {
                 stake: HashMap::new(),
                 delegations: HashMap::new(),
@@ -165,6 +171,8 @@ struct LedgerEnv {
     epoch: u64,
     treasury: u64,
     reserves: u64,
+    /// `ledgerPp`, decoded with the production `decode_pparams`.
+    pp: dugite_primitives::protocol_params::ProtocolParameters,
 }
 
 fn decode_ledger_env(env_cbor: &[u8]) -> Result<LedgerEnv, String> {
@@ -187,7 +195,12 @@ fn decode_ledger_env(env_cbor: &[u8]) -> Result<LedgerEnv, String> {
         n => return Err(format!("LedgerEnv.epoch: Maybe of length {n}")),
     };
     let _ix = d.u64().map_err(|e| format!("LedgerEnv.ix: {e}"))?;
+    let pp_start = d.position();
     d.skip().map_err(|e| format!("LedgerEnv.pp: {e}"))?;
+    let pp_end = d.position();
+    let (pp, _) =
+        dugite_serialization::haskell_snapshot::decode_pparams(&env_cbor[pp_start..pp_end])
+            .map_err(|e| format!("LedgerEnv.pp decode: {e}"))?;
     let acct = d
         .array()
         .map_err(|e| format!("LedgerEnv.account: {e}"))?
@@ -202,6 +215,7 @@ fn decode_ledger_env(env_cbor: &[u8]) -> Result<LedgerEnv, String> {
         epoch,
         treasury,
         reserves,
+        pp,
     })
 }
 
@@ -281,15 +295,16 @@ fn convert_utxo(
             let datum = if let Some(h) = txout.datum_hash {
                 OutputDatum::DatumHash(Hash32::from_bytes(h))
             } else if let Some(cbor) = &txout.datum {
-                match dugite_serialization::decode_plutus_data_cbor(cbor) {
-                    Ok(data) => OutputDatum::InlineDatum {
-                        data,
-                        raw_cbor: Some(cbor.clone()),
-                    },
-                    Err(_) => OutputDatum::InlineDatum {
-                        data: PlutusData::Bytes(cbor.clone()),
-                        raw_cbor: Some(cbor.clone()),
-                    },
+                let data = dugite_serialization::decode_plutus_data_cbor(cbor).map_err(|er| {
+                    format!(
+                        "inline datum for {}#{} does not decode: {er}",
+                        e.txid.to_hex(),
+                        e.txix
+                    )
+                })?;
+                OutputDatum::InlineDatum {
+                    data,
+                    raw_cbor: Some(cbor.clone()),
                 }
             } else {
                 OutputDatum::None

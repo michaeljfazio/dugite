@@ -77,15 +77,39 @@ fn mithril_certificate_checks() {
 // ── ledger-rules ImpSpec: LEDGER / NEWEPOCH apply-and-compare ────────────────
 //
 // Every LEDGER and NEWEPOCH vector is applied through dugite's ledger and
-// compared with Haskell's `st_out`; known divergences are pinned in
-// `tests/conformance/expected/ledger_rules_replay.tsv`.
-
+// compared with Haskell's `st_out` by its OWN generated test
+// (`upstream_ledger_rules_apply_compare_*`), judged against
+// `tests/conformance/expected/ledger_rules_replay.tsv`. This umbrella is cheap: it
+// checks the contract as a whole (corpus binding, stale ids, an issue per entry).
 #[test]
 fn ledger_rules_apply_and_compare() {
     let Some(dir) = fixtures::check_area("ledger-rules") else {
         return;
     };
     ledger_rules_replay::run_apply_checks(&dir);
+}
+
+// The whole corpus in one process, in parallel, with the run summary — and, with
+// `DUGITE_UPDATE_EXPECTED_RESULTS=1` (never in CI), the regeneration of the
+// expected-results file. ~3 minutes of 12 cores, so it is `#[ignore]`:
+//   just ledger-rules-replay-report
+#[test]
+#[ignore = "full replay (minutes); run with `just ledger-rules-replay-report`"]
+fn ledger_rules_replay_report() {
+    let Some(dir) = fixtures::check_area("ledger-rules") else {
+        return;
+    };
+    ledger_rules_replay::run_apply_report(&dir);
+}
+
+// The child half of `ledger_rules_replay_report`: replays the one vector named by
+// `DUGITE_REPLAY_ONE` and prints its verdict. Not a test of its own.
+#[test]
+#[ignore = "helper process of ledger_rules_replay_report"]
+fn ledger_rules_replay_one() {
+    if let Some(dir) = std::env::var_os(ledger_rules_replay::ONE_ENV) {
+        ledger_rules_replay::replay_one_for_child(std::path::Path::new(&dir));
+    }
 }
 
 // ── ledger-rules ImpSpec: signal decode (ExecSpecRule rules) ─────────────────

@@ -124,26 +124,124 @@ fn block(slot: u64, txs: Vec<dugite_primitives::transaction::Transaction>) -> Bl
 
 /// Outcome of applying a signal.
 pub enum Applied {
-    /// dugite accepted; the post state.
+    /// dugite's `apply_block` accepted; the post state.
     Accepted(Box<LedgerState>),
-    /// dugite rejected (or failed to decode the signal / panicked); the class.
+    /// `apply_block` returned an error; its class. This is dugite refusing the
+    /// block, which is a verdict.
     Rejected(String),
+    /// The harness could not run the signal (decode failure, panic). Never a
+    /// verdict: it is neither a match nor a recordable divergence.
+    Harness(String),
+}
+
+/// dugite's validator verdict for a transaction, with its error list.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ValidatorVerdict {
+    /// `ValidationError` variant names, in the order raised.
+    pub classes: Vec<String>,
+    /// The same errors, `Display`ed (values included), for the evidence trail.
+    pub details: Vec<String>,
+}
+
+impl ValidatorVerdict {
+    pub fn accepts(&self) -> bool {
+        self.classes.is_empty()
+    }
+    /// Sorted, de-duplicated variant names, `+`-joined; `ok` when it accepts.
+    pub fn class_string(&self) -> String {
+        if self.accepts() {
+            return "ok".into();
+        }
+        let mut c = self.classes.clone();
+        c.sort();
+        c.dedup();
+        c.join("+")
+    }
+}
+
+/// What a LEDGER signal did.
+pub struct LedgerRun {
+    /// The validator's verdict on the pre-state (`None` if the harness could not
+    /// obtain one).
+    pub validator: Option<ValidatorVerdict>,
+    pub applied: Applied,
 }
 
 /// Apply a LEDGER signal (a `Tx`) to `state`.
-pub fn apply_ledger(mut state: LedgerState, vec: &ImpVector, env_slot: Option<u64>) -> Applied {
+///
+/// The accept/reject verdict is the VALIDATOR's, run on the imported pre-state
+/// with the ledger's own `mempool_validation_context()` (the single source of
+/// truth the block path and N2C submission share). It is NOT taken from
+/// `apply_block`: for a confirmed block `apply_block(ValidateAll)` logs a
+/// Phase-1 failure and applies the transaction anyway (#1131), so its `Ok` says
+/// nothing about validity. `apply_block` supplies only the post-state.
+pub fn apply_ledger(mut state: LedgerState, vec: &ImpVector, env_slot: Option<u64>) -> LedgerRun {
     // `Tx era` is `array(4) [body, witnesses, isValid, auxiliary_data]`.
     let tx = match dugite_serialization::decode_transaction(6, &vec.sig_cbor) {
         Ok(tx) => tx,
-        Err(e) => return Applied::Rejected(format!("TxDecodeFailed: {e}")),
+        Err(e) => {
+            return LedgerRun {
+                validator: None,
+                applied: Applied::Harness(format!("TxDecodeFailed: {e}")),
+            }
+        }
     };
     let slot = env_slot.unwrap_or(0);
-    run(&mut state, &block(slot, vec![tx]))
+
+    let validator = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let ctx = state.mempool_validation_context();
+        let tx_size = tx.raw_cbor.as_ref().map_or(0, |c| c.len() as u64);
+        dugite_ledger::validation::validate_transaction_with_context(
+            &tx,
+            &state.utxo.utxo_set,
+            &state.epochs.protocol_params,
+            slot,
+            tx_size,
+            Some(&state.slot_config),
+            ctx,
+        )
+    }));
+    let validator = match validator {
+        Ok(Ok(())) => ValidatorVerdict::default(),
+        Ok(Err(errs)) => ValidatorVerdict {
+            classes: errs.iter().map(variant_name).collect(),
+            details: errs.iter().map(|e| e.to_string()).collect(),
+        },
+        Err(p) => {
+            return LedgerRun {
+                validator: None,
+                applied: Applied::Harness(format!("validator panicked: {}", panic_message(&p))),
+            }
+        }
+    };
+
+    let applied = run(&mut state, &block(slot, vec![tx]));
+    LedgerRun {
+        validator: Some(validator),
+        applied,
+    }
+}
+
+/// The leading identifier of a value's `Debug` output: the enum variant name.
+fn variant_name<T: std::fmt::Debug>(v: &T) -> String {
+    format!("{v:?}")
+        .chars()
+        .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+        .collect()
 }
 
 /// Apply a NEWEPOCH signal (an `EpochNo`) to `state`.
 pub fn apply_newepoch(mut state: LedgerState, signal_epoch: u64) -> Applied {
     run(&mut state, &block(signal_epoch * IMP_EPOCH_LENGTH, vec![]))
+}
+
+fn panic_message(p: &Box<dyn std::any::Any + Send>) -> String {
+    let msg = p
+        .downcast_ref::<&str>()
+        .map(|s| s.to_string())
+        .or_else(|| p.downcast_ref::<String>().cloned())
+        .unwrap_or_else(|| "panic".into());
+    msg.lines().next().unwrap_or("").chars().take(120).collect()
 }
 
 fn run(state: &mut LedgerState, b: &Block) -> Applied {
@@ -152,45 +250,8 @@ fn run(state: &mut LedgerState, b: &Block) -> Applied {
     }));
     match r {
         Ok(Ok(())) => Applied::Accepted(Box::new(state.clone())),
-        Ok(Err(e)) => Applied::Rejected(error_class(&e.to_string())),
-        Err(p) => {
-            let msg = p
-                .downcast_ref::<&str>()
-                .map(|s| s.to_string())
-                .or_else(|| p.downcast_ref::<String>().cloned())
-                .unwrap_or_else(|| "panic".into());
-            Applied::Rejected(format!("Panic: {}", first_line(&msg)))
-        }
-    }
-}
-
-fn first_line(s: &str) -> String {
-    s.lines().next().unwrap_or("").chars().take(120).collect()
-}
-
-/// Reduce a `LedgerError` display string to a stable class: the leading
-/// predicate-failure names, with hashes/amounts/slots stripped, so the recorded
-/// observed result does not churn on values that vary per vector.
-pub fn error_class(msg: &str) -> String {
-    // `BlockTxValidationFailed` carries `errors: <list>`; keep the part after
-    // the last "tx <hash>: " prefix.
-    let body = msg.rsplit_once("tx ").map(|(_, r)| r).unwrap_or(msg);
-    let body = body.split_once(": ").map(|(_, r)| r).unwrap_or(body);
-    // Take identifier-like tokens that start a clause.
-    let mut classes: Vec<String> = Vec::new();
-    for clause in body.split(&[';', '\n'][..]) {
-        let tok: String = clause
-            .trim()
-            .chars()
-            .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
-            .collect();
-        if tok.len() > 2 && !classes.contains(&tok) {
-            classes.push(tok);
-        }
-    }
-    if classes.is_empty() {
-        first_line(msg)
-    } else {
-        classes.join("+")
+        // `LedgerError`'s variant name: stable, carries no hashes or amounts.
+        Ok(Err(e)) => Applied::Rejected(variant_name(&e)),
+        Err(p) => Applied::Harness(format!("apply_block panicked: {}", panic_message(&p))),
     }
 }

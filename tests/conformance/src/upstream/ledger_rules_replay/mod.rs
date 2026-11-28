@@ -5,10 +5,24 @@
 //!   `LedgerState::from_haskell_snapshot`, the signal is applied through
 //!   `LedgerState::apply_block` (`ValidateAll`), and the result is compared with
 //!   Haskell's `st_out` over an enumerated field list (`project.rs`, which also
-//!   lists what is NOT compared and why). A vector with no `st_out` (Haskell's
-//!   STS rejected) must be rejected by dugite too. Known divergences are pinned in
-//!   `tests/conformance/expected/ledger_rules_replay.tsv` (`expected.rs`).
-//!   See `imp_state.rs`, `apply.rs`, `replay.rs`, `compare.rs`.
+//!   lists what is NOT compared and why). Known divergences are pinned in
+//!   `tests/conformance/expected/ledger_rules_replay.tsv` (`expected.rs`), each
+//!   linked to an open issue. See `imp_state.rs`, `apply.rs`, `replay.rs`, `compare.rs`.
+//!   * LEDGER accept/reject is dugite's VALIDATOR's verdict, not `apply_block`'s
+//!     (which applies Phase-1-invalid transactions of a confirmed block, #1131). A
+//!     vector with no `st_out` (Haskell rejected; the dump does not say which
+//!     predicate) is an `AGREED_REJECT` carrying dugite's reason when the validator
+//!     rejects, and a divergence when it accepts. A panic or decode failure is a
+//!     harness error.
+//!   * NEWEPOCH has NO positive coverage of ratification, enactment or proposal
+//!     expiry: the import never maps `cgsDRepPulsingState` (#1132; also #1133
+//!     futurePParams, #1134 committee `SNothing`), so every vector runs with
+//!     nothing to ratify. The `pre=inputs:*` kinds in every NEWEPOCH entry record it.
+//!   * Each vector is gated by its own generated test; the umbrella
+//!     `ledger_rules_apply_and_compare` checks the contract as a whole, and the
+//!     ignored `ledger_rules_replay_report` (`just ledger-rules-replay-report`)
+//!     replays everything in cold child processes for the summary and for
+//!     regenerating the file (local only; refuses under CI).
 //! * **The other rules are DECODE-ONLY**: POOL, CERT, CERTS, DELEG, GOVCERT, GOV,
 //!   ENACT and RATIFY (ExecSpecRule states, which are not a `NewEpochState`) get a
 //!   signal-shape check in `runner.rs`; nothing is applied or compared.
@@ -65,8 +79,12 @@ pub mod vector;
 use std::path::Path;
 use std::sync::OnceLock;
 
-use crate::upstream::ledger_rules_replay::expected::{gate, Expected, UPDATE_ENV};
-use crate::upstream::ledger_rules_replay::replay::{replay_vector, Replay, Verdict};
+use crate::upstream::ledger_rules_replay::expected::{
+    gate, issue_for, Entry, Expected, UPDATE_ENV,
+};
+use crate::upstream::ledger_rules_replay::replay::{
+    replay_vector, replay_vector_with, PostHook, Replay, Verdict,
+};
 
 /// Test scenarios known to fail due to unimplemented Dugite features, for the
 /// rules that are only DECODED (the ExecSpecRule rules).
@@ -206,6 +224,14 @@ fn committed_expected() -> &'static Result<Expected, String> {
 /// Haskell's `st_out`; the verdict is then judged against the expected-results
 /// contract. The other rules are decode-only.
 pub fn check_one_test_dir(test_dir: &Path) -> VectorOutcome {
+    check_one_test_dir_with(test_dir, None)
+}
+
+/// [`check_one_test_dir`] with an optional hook that mutates dugite's post-state
+/// before it is compared. Only tests use the hook: they drive a deliberately
+/// perturbed state through this exact path (replay, projection, comparison,
+/// observed result, contract gate) and require it to FAIL.
+pub fn check_one_test_dir_with(test_dir: &Path, hook: Option<PostHook<'_>>) -> VectorOutcome {
     let vec = match vector::decode_vector(test_dir) {
         Ok(v) => v,
         Err(e) => return VectorOutcome::Fail(format!("decode: {e}")),
@@ -213,7 +239,7 @@ pub fn check_one_test_dir(test_dir: &Path) -> VectorOutcome {
     if let Some(issue) = is_skipped(&vec.rule) {
         return VectorOutcome::Skip(format!("rule={} ({issue})", vec.rule));
     }
-    if let Some(replay) = replay_vector(&vec) {
+    if let Some(replay) = replay_vector_with(&vec, hook) {
         if std::env::var(DETAIL_ENV).as_deref() == Ok("1") {
             report_detail(&vector_id(test_dir), &replay);
         }
@@ -245,6 +271,7 @@ struct Tally {
     applied: usize,
     matched: usize,
     diverged: usize,
+    agreed_reject: usize,
     harness_errors: usize,
 }
 
@@ -276,18 +303,95 @@ enum Outcome {
     Skipped,
 }
 
+/// Environment variable naming the vector directory a CHILD process replays.
+pub const ONE_ENV: &str = "DUGITE_REPLAY_ONE";
+
+/// The child half of [`replay_in_child`]: replay one vector and print its verdict
+/// as `@@`-prefixed lines on stdout.
+pub fn replay_one_for_child(test_dir: &Path) {
+    let verdict_line = |tag: &str, text: &str| println!("@@VERDICT\t{tag}\t{text}");
+    let vec = match vector::decode_vector(test_dir) {
+        Ok(v) => v,
+        Err(e) => return verdict_line("H", &format!("decode: {e}")),
+    };
+    let Some(r) = replay_vector(&vec) else {
+        return verdict_line("H", "not a replayed rule");
+    };
+    println!("@@COMPARED\t{}", r.pre.compared.join(","));
+    println!("@@PRE\t{}", r.pre.groups().join(","));
+    match &r.verdict {
+        Verdict::Match => verdict_line("M", ""),
+        Verdict::AgreedReject(o) => verdict_line("A", o),
+        Verdict::Diverges(o) => verdict_line("D", o),
+        Verdict::HarnessError(o) => verdict_line("H", o),
+    }
+}
+
+/// Replay one vector in a COLD child process (this test binary, running the
+/// ignored `ledger_rules_replay_one` test), exactly as the generated per-vector
+/// tests see it. In-process replay is not equivalent: the same vectors gave
+/// different Phase-2 verdicts depending on which others the process had already
+/// evaluated, so the report that regenerates the contract must not share a
+/// process between vectors.
+fn replay_in_child(
+    test_dir: &Path,
+) -> Result<(Verdict, Vec<&'static str>, Vec<&'static str>), String> {
+    let exe = std::env::current_exe().map_err(|e| format!("current_exe: {e}"))?;
+    let out = std::process::Command::new(exe)
+        .args([
+            "--ignored",
+            "--exact",
+            "ledger_rules_replay_one",
+            "--nocapture",
+        ])
+        .env(ONE_ENV, test_dir)
+        .output()
+        .map_err(|e| format!("spawn child: {e}"))?;
+    let text = String::from_utf8_lossy(&out.stdout);
+    let groups = |s: &str| -> Vec<&'static str> {
+        project::GROUPS
+            .iter()
+            .copied()
+            .filter(|g| s.split(',').any(|x| x == *g))
+            .collect()
+    };
+    let (mut verdict, mut compared, mut pre) = (None, Vec::new(), Vec::new());
+    for line in text.lines().filter_map(|l| l.strip_prefix("@@")) {
+        let mut f = line.splitn(3, '\t');
+        match (f.next(), f.next(), f.next()) {
+            (Some("VERDICT"), Some(tag), Some(t)) => {
+                verdict = Some(match tag {
+                    "M" => Verdict::Match,
+                    "A" => Verdict::AgreedReject(t.to_string()),
+                    "D" => Verdict::Diverges(t.to_string()),
+                    _ => Verdict::HarnessError(t.to_string()),
+                })
+            }
+            (Some("COMPARED"), Some(g), _) => compared = groups(g),
+            (Some("PRE"), Some(g), _) => pre = groups(g),
+            _ => {}
+        }
+    }
+    verdict
+        .map(|v| (v, compared, pre))
+        .ok_or_else(|| format!("child produced no verdict (exit {:?})", out.status.code()))
+}
+
 fn run_one(test_dir: &Path) -> Outcome {
     let id = vector_id(test_dir);
     let vec = match vector::decode_vector(test_dir) {
         Ok(v) => v,
         Err(e) => return Outcome::Failed(format!("{id}: decode: {e}")),
     };
-    if let Some(replay) = replay_vector(&vec) {
-        return Outcome::Replayed {
-            rule: vec.rule.clone(),
-            verdict: replay.verdict.clone(),
-            compared: replay.pre.compared.clone(),
-            pre_groups: replay.pre.groups(),
+    if replay::rule_kind(&vec.rule).is_some() {
+        return match replay_in_child(test_dir) {
+            Ok((verdict, compared, pre_groups)) => Outcome::Replayed {
+                rule: vec.rule.clone(),
+                verdict,
+                compared,
+                pre_groups,
+            },
+            Err(e) => Outcome::Failed(format!("{id}: {e}")),
         };
     }
     if let Some(issue) = is_skipped(&vec.rule) {
@@ -333,8 +437,84 @@ fn is_replayed_dir(test_dir: &Path) -> bool {
 /// Apply every LEDGER and NEWEPOCH vector under `dir` through dugite's ledger,
 /// compare with Haskell's `st_out`, and judge each verdict against the
 /// expected-results contract. Replays in parallel (~8,000 vectors).
+///
+/// This is the CHEAP umbrella. Each vector is replayed and gated by its own
+/// per-vector test (so no single test carries the whole corpus and every one
+/// finishes in well under a second or two); this test checks the contract as a
+/// whole — corpus binding, stale ids, an issue on every entry — and prints the
+/// run summary from the recorded entries. The full replay with its summary is
+/// `run_apply_report` (the ignored `ledger_rules_replay_report` test).
 pub fn run_apply_checks(dir: &Path) {
+    let expected = match committed_expected() {
+        Ok(e) => e,
+        Err(e) => panic!("[ledger-rules] {e}"),
+    };
+    let mut per_rule: std::collections::BTreeMap<String, usize> = Default::default();
+    let mut ids = std::collections::BTreeSet::new();
+    for d in collect_test_case_dirs(dir)
+        .into_iter()
+        .filter(|d| is_replayed_dir(d))
+    {
+        let id = vector_id(&d);
+        let rule = id.split('/').next().unwrap_or("").to_string();
+        if ids.insert(id) {
+            *per_rule.entry(rule).or_default() += 1;
+        }
+    }
+    let mut failures = Vec::new();
+    for id in expected.entries.keys() {
+        if !ids.contains(id) {
+            failures.push(format!(
+                "{id}: recorded in the expected-results file but no such vector is in the corpus"
+            ));
+        }
+    }
+    eprintln!("[ledger-rules] ── contract (per-vector tests replay and gate each vector) ──");
+    for (rule, n) in &per_rule {
+        let entries = expected
+            .entries
+            .keys()
+            .filter(|k| k.starts_with(&format!("{rule}/")))
+            .count();
+        eprintln!(
+            "[ledger-rules]   {rule}: {n} vectors, {entries} recorded entries, {} plain matches",
+            n.saturating_sub(entries)
+        );
+    }
+    let mut by_issue: std::collections::BTreeMap<&str, usize> = Default::default();
+    for e in expected.entries.values() {
+        *by_issue.entry(e.issue.as_str()).or_default() += 1;
+    }
+    for (issue, n) in by_issue {
+        eprintln!("[ledger-rules]   {n:>5} entries linked to {issue}");
+    }
+    print_field_lists();
+    if !failures.is_empty() {
+        panic!(
+            "[ledger-rules] {} contract violation(s):\n{}",
+            failures.len(),
+            failures.join("\n")
+        );
+    }
+}
+
+/// The full replay of every LEDGER and NEWEPOCH vector, in parallel, with the
+/// run summary, the contract gate over all of them and — when asked and allowed —
+/// the regeneration of the expected-results file. Run by the ignored
+/// `ledger_rules_replay_report` test; far too long for a gate test.
+pub fn run_apply_report(dir: &Path) {
     run_checks(dir, Selection::Replayed);
+}
+
+fn print_field_lists() {
+    eprintln!(
+        "[ledger-rules] compared groups: {}",
+        project::GROUPS.join(", ")
+    );
+    eprintln!("[ledger-rules] NOT compared (with reason):");
+    for (field, rules, why) in project::NOT_COMPARED {
+        eprintln!("[ledger-rules]   - {field} [{rules}]: {why}");
+    }
 }
 
 /// Decode-only checks for the rules that are not replayed (the ExecSpecRule
@@ -366,6 +546,15 @@ fn run_checks(dir: &Path, selection: Selection) {
 
     let replayed = selection == Selection::Replayed;
     let update = replayed && std::env::var(UPDATE_ENV).as_deref() == Ok("1");
+    if update
+        && (std::env::var_os("CI").is_some()
+            || std::env::var("DUGITE_REQUIRE_UPSTREAM").as_deref() == Ok("1"))
+    {
+        panic!(
+            "[ledger-rules] refusing to rewrite the expected-results file: CI or \
+             DUGITE_REQUIRE_UPSTREAM=1 is set. Regeneration is a local, reviewed act."
+        );
+    }
     // Updating records what was observed instead of judging it; a vector the
     // harness could not run still fails the run (see the `HarnessError` arm).
     let expected = if !replayed || update {
@@ -402,7 +591,7 @@ fn run_checks(dir: &Path, selection: Selection) {
     let mut decode_failed = 0usize;
     let mut failures: Vec<String> = Vec::new();
     let mut tallies: std::collections::BTreeMap<String, Tally> = Default::default();
-    let mut observed: std::collections::BTreeMap<String, String> = Default::default();
+    let mut observed: std::collections::BTreeMap<String, Entry> = Default::default();
     let mut classes: std::collections::BTreeMap<String, usize> = Default::default();
     let mut seen_ids: std::collections::BTreeSet<String> = Default::default();
     let mut compared_groups: std::collections::BTreeSet<&'static str> = Default::default();
@@ -432,9 +621,27 @@ fn run_checks(dir: &Path, selection: Selection) {
                 t.applied += 1;
                 match &verdict {
                     Verdict::Match => t.matched += 1,
+                    Verdict::AgreedReject(o) => {
+                        t.agreed_reject += 1;
+                        observed.insert(
+                            id.clone(),
+                            Entry {
+                                observed: o.clone(),
+                                issue: "-".into(),
+                            },
+                        );
+                    }
                     Verdict::Diverges(o) => {
                         t.diverged += 1;
-                        observed.insert(id.clone(), o.clone());
+                        observed.insert(
+                            id.clone(),
+                            Entry {
+                                observed: o.clone(),
+                                issue: issue_for(o)
+                                    .expect("a divergence always has an issue")
+                                    .to_string(),
+                            },
+                        );
                         *classes
                             .entry(format!("{rule} :: {}", class_of(o)))
                             .or_default() += 1;
@@ -456,6 +663,11 @@ fn run_checks(dir: &Path, selection: Selection) {
     }
 
     if update {
+        let summary = committed_expected()
+            .as_ref()
+            .map(|c| c.diff_summary(&observed))
+            .unwrap_or_else(|_| "no readable committed file".into());
+        eprintln!("[ledger-rules] regenerating: {summary}");
         let new = Expected {
             corpus_tag: expected::manifest_tag().expect("manifest tag"),
             entries: observed.clone(),
@@ -485,15 +697,15 @@ fn run_checks(dir: &Path, selection: Selection) {
         );
         for (rule, t) in &tallies {
             eprintln!(
-                "[ledger-rules]   {rule}: applied {} · matched {} · diverged {} · harness errors {}",
-                t.applied, t.matched, t.diverged, t.harness_errors
+                "[ledger-rules]   {rule}: applied {} · matched {} · agreed-reject {} · diverged {} · harness errors {}",
+                t.applied, t.matched, t.agreed_reject, t.diverged, t.harness_errors
             );
         }
         for (class, n) in &classes {
             eprintln!("[ledger-rules]   diverged  {n:>5}  {class}");
         }
         eprintln!(
-            "[ledger-rules] compared groups: {}",
+            "[ledger-rules] groups compared on at least one vector: {}",
             compared_groups
                 .iter()
                 .copied()
@@ -505,10 +717,7 @@ fn run_checks(dir: &Path, selection: Selection) {
                 "[ledger-rules]   import not faithful for group `{g}` on {n} vector(s) (pre=)"
             );
         }
-        eprintln!("[ledger-rules] NOT compared (with reason):");
-        for (field, rules, why) in project::NOT_COMPARED {
-            eprintln!("[ledger-rules]   - {field} [{rules}]: {why}");
-        }
+        print_field_lists();
     } else {
         eprintln!(
             "[ledger-rules] decode-only rules (nothing applied, nothing compared): \

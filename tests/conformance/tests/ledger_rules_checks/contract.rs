@@ -1,22 +1,30 @@
 //! The expected-results contract for the replayed ImpSpec rules, tested on its
 //! own: no corpus needed.
 //!
-//! The gate must fail on each of the three things the issue names — an unknown
-//! id, an entry that now matches, a changed observed result — and pass when
-//! nothing has changed. The committed file must also parse, be bound to the
-//! manifest's corpus tag, and contain no harness-error entry.
+//! The gate must fail on each of the things the contract names — an unknown id,
+//! an entry that now matches, a changed observed result — and pass when nothing
+//! has changed. The committed file must parse (every divergence linking an issue),
+//! be bound to the manifest's corpus tag, and contain no harness-error entry.
 
 use dugite_conformance::upstream::ledger_rules_replay::expected::{
-    gate, manifest_tag, Expected, Gate,
+    gate, issue_for, manifest_tag, Entry, Expected, Gate,
 };
 use dugite_conformance::upstream::ledger_rules_replay::replay::Verdict;
 
-fn exp(entries: &[(&str, &str)]) -> Expected {
+fn exp(entries: &[(&str, &str, &str)]) -> Expected {
     Expected {
         corpus_tag: "t".into(),
         entries: entries
             .iter()
-            .map(|(a, b)| (a.to_string(), b.to_string()))
+            .map(|(id, o, i)| {
+                (
+                    id.to_string(),
+                    Entry {
+                        observed: o.to_string(),
+                        issue: i.to_string(),
+                    },
+                )
+            })
             .collect(),
     }
 }
@@ -41,7 +49,7 @@ fn divergence_without_entry_is_unknown() {
 fn entry_that_now_matches_must_be_removed() {
     assert_eq!(
         gate(
-            &exp(&[("LEDGER/test_1", "X")]),
+            &exp(&[("LEDGER/test_1", "X", "#1")]),
             "LEDGER/test_1",
             &Verdict::Match
         ),
@@ -55,7 +63,7 @@ fn entry_that_now_matches_must_be_removed() {
 fn changed_observed_result_is_a_failure() {
     let v = Verdict::Diverges("Y".into());
     assert_eq!(
-        gate(&exp(&[("LEDGER/test_1", "X")]), "LEDGER/test_1", &v),
+        gate(&exp(&[("LEDGER/test_1", "X", "#1")]), "LEDGER/test_1", &v),
         Gate::Changed {
             recorded: "X".into(),
             observed: "Y".into()
@@ -67,16 +75,49 @@ fn changed_observed_result_is_a_failure() {
 fn identical_observed_result_is_ok() {
     let v = Verdict::Diverges("X".into());
     assert_eq!(
-        gate(&exp(&[("LEDGER/test_1", "X")]), "LEDGER/test_1", &v),
+        gate(&exp(&[("LEDGER/test_1", "X", "#1")]), "LEDGER/test_1", &v),
         Gate::Ok
     );
+}
+
+#[test]
+fn an_agreed_rejection_is_pinned_like_a_divergence() {
+    let e = exp(&[("LEDGER/test_1", "AGREED_REJECT validator=A", "-")]);
+    assert_eq!(
+        gate(
+            &e,
+            "LEDGER/test_1",
+            &Verdict::AgreedReject("AGREED_REJECT validator=A".into())
+        ),
+        Gate::Ok
+    );
+    assert!(matches!(
+        gate(
+            &e,
+            "LEDGER/test_1",
+            &Verdict::AgreedReject("AGREED_REJECT validator=B".into())
+        ),
+        Gate::Changed { .. }
+    ));
+    assert!(matches!(
+        gate(
+            &exp(&[]),
+            "LEDGER/test_1",
+            &Verdict::AgreedReject("AGREED_REJECT validator=A".into())
+        ),
+        Gate::Unknown { .. }
+    ));
 }
 
 #[test]
 fn harness_error_is_never_recordable() {
     let v = Verdict::HarnessError("boom".into());
     assert!(matches!(
-        gate(&exp(&[("LEDGER/test_1", "boom")]), "LEDGER/test_1", &v),
+        gate(
+            &exp(&[("LEDGER/test_1", "boom", "#1")]),
+            "LEDGER/test_1",
+            &v
+        ),
         Gate::HarnessError(_)
     ));
 }
@@ -84,27 +125,63 @@ fn harness_error_is_never_recordable() {
 #[test]
 fn render_parse_round_trips_and_groups_by_class() {
     let e = exp(&[
-        ("LEDGER/test_10", "A post=x #1"),
-        ("LEDGER/test_2", "A post=x #2"),
-        ("NEWEPOCH/test_5", "B"),
+        ("LEDGER/test_10", "A post=x #1", "#7"),
+        ("LEDGER/test_2", "A post=x #2", "#7"),
+        ("NEWEPOCH/test_5", "AGREED_REJECT y", "-"),
     ]);
     let text = e.render();
-    assert!(text.contains("# 2 vector(s): A post=x"), "{text}");
+    assert!(text.contains("# 2 vector(s), issue #7: A post=x"), "{text}");
     let back = Expected::parse(&text).unwrap();
     assert_eq!(back.entries, e.entries);
     assert_eq!(back.corpus_tag, "t");
-    // natural order inside a class
     assert!(text.find("test_2\t").unwrap() < text.find("test_10\t").unwrap());
 }
 
 #[test]
+fn every_divergence_must_link_an_issue() {
+    // missing column
+    assert!(Expected::parse("A/test_1\tX\n").is_err());
+    // not an issue reference
+    assert!(Expected::parse("A/test_1\tX\tTBD\n").is_err());
+    assert!(Expected::parse("A/test_1\tX\t-\n").is_err());
+    assert!(Expected::parse("A/test_1\tX\t#\n").is_err());
+    assert!(Expected::parse("A/test_1\tX\t#12\n").is_ok());
+    // an agreed rejection has no issue, and a divergence cannot hide as one
+    assert!(Expected::parse("A/test_1\tAGREED_REJECT x\t-\n").is_ok());
+    assert!(Expected::parse("A/test_1\tAGREED_REJECT x\t#12\n").is_err());
+}
+
+#[test]
 fn duplicate_ids_are_rejected() {
-    assert!(Expected::parse("A/test_1\tx\nA/test_1\ty\n").is_err());
+    assert!(Expected::parse("A/test_1\tx\t#1\nA/test_1\ty\t#1\n").is_err());
+}
+
+#[test]
+fn issue_assignment_follows_the_class() {
+    assert_eq!(issue_for("AGREED_REJECT validator=X"), None);
+    assert_eq!(
+        issue_for(
+            "STATE_MISMATCH post=gov:proposal/*,gov:vote/*/drep/* pre=inputs:drep_pulsing_state #a"
+        ),
+        Some("#1132")
+    );
+    assert_eq!(
+        issue_for("STATE_MISMATCH post=gov:future_pparams/tag pre=none #a"),
+        Some("#1133")
+    );
+    assert_eq!(
+        issue_for("STATE_MISMATCH post=gov:committee/present pre=none #a"),
+        Some("#1134")
+    );
+    assert_eq!(
+        issue_for("STATE_MISMATCH post=instant_stake:* pre=none #a"),
+        Some("#1114")
+    );
 }
 
 #[test]
 fn committed_file_is_bound_to_the_pinned_corpus() {
-    let e = Expected::load().expect("the expected-results file must be committed");
+    let e = Expected::load().expect("the expected-results file must be committed and well formed");
     assert_eq!(
         e.corpus_tag,
         manifest_tag().unwrap(),
