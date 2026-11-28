@@ -16,6 +16,13 @@ thiserror = { workspace = true }
 num-bigint = { workspace = true }
 hex = { workspace = true }
 sha2 = { workspace = true }
+# node-diversity harness (#1116): pin file, report timestamps, and validation of
+# every report against the scenario's own JSON Schema (draft 2020-12, with
+# `format` assertions on).  `default-features = false` drops the HTTP resolvers:
+# schemas are read from the pinned, locally fetched corpus, never from the network.
+toml = { workspace = true }
+chrono = { workspace = true }
+jsonschema = { version = "0.63", default-features = false }
 # Optional: only compiled when upstream-conformance feature is active.
 minicbor   = { workspace = true, optional = true }
 # Pin to anweiss/cddl main branch: range map keys (* N..M => rule) and array map
