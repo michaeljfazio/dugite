@@ -2273,6 +2273,16 @@ impl LedgerState {
         }
     }
 
+    /// Replace this ledger with a state loaded from a snapshot (rollback via
+    /// snapshot, fork-rollback replay, recovery), keeping the CONFIG that is not
+    /// part of a snapshot: the `TestXHardForkAtEpoch` triggers. Every runtime
+    /// `*ls = snapshot_state` goes through here, or a legitimate trigger fork
+    /// would be rejected after the reload.
+    pub fn adopt_snapshot_state(&mut self, mut snapshot_state: LedgerState) {
+        snapshot_state.hard_fork_triggers = std::mem::take(&mut self.hard_fork_triggers);
+        *self = snapshot_state;
+    }
+
     /// Install the `TestXHardForkAtEpoch` triggers from the node config.
     pub fn set_hard_fork_triggers(&mut self, triggers: std::collections::BTreeMap<Era, u64>) {
         self.hard_fork_triggers = triggers;
@@ -2322,6 +2332,19 @@ impl LedgerState {
     /// guaranteed to be adopted yet fewer than `k` blocks followed the voting
     /// deadline, which no honest producer can create.
     pub fn era_due_at_next_boundary(&self) -> Era {
+        self.era_due_at_epoch(self.epoch.0.saturating_add(1))
+    }
+
+    /// The era the ledger is in at the start of `target_epoch`, at or after the
+    /// next boundary.
+    ///
+    /// Several boundaries can lie between the ledger tip and a block (an empty
+    /// epoch after a stall on a low-density devnet). The tick is deterministic
+    /// from ledger state: the protocol version adopted at the FIRST boundary is
+    /// the one every later boundary carries, because no block between them can
+    /// add a proposal or a vote; only the epoch-keyed rules (`TestX` triggers,
+    /// the Shelley transition epoch) can add a fork at a later boundary.
+    pub fn era_due_at_epoch(&self, target_epoch: u64) -> Era {
         const ERAS: [Era; 8] = [
             Era::Byron,
             Era::Shelley,
@@ -2332,7 +2355,7 @@ impl LedgerState {
             Era::Conway,
             Era::Dijkstra,
         ];
-        let next_epoch = self.epoch.0.saturating_add(1);
+        let next_epoch = target_epoch;
         let next_pv = self.next_epoch_protocol_major();
         let mut era = self.era;
         while let Some(&candidate) = ERAS.iter().find(|e| **e > era) {
@@ -2388,8 +2411,9 @@ impl LedgerState {
     ///   re-tagged first block at a real fork (old era when the new one is
     ///   due); either would otherwise leave the ledger in an era its protocol
     ///   version does not match and reject every honest block after it.
-    /// * More than one epoch ahead the tick cannot be forecast; any upgrade is
-    ///   accepted there (such a gap does not occur on a live chain).
+    /// * More than one epoch ahead (an empty epoch, e.g. a stalled low-density
+    ///   devnet) the same rule applies at the block's own epoch
+    ///   ([`Self::era_due_at_epoch`]): never a free pass.
     ///
     /// `strict = false` is for replaying our OWN already-validated blocks
     /// (`ApplyOnly`: ImmutableDB, Mithril): the due-era equality is skipped and
@@ -2442,10 +2466,7 @@ impl LedgerState {
         if !strict {
             return Ok(());
         }
-        if block_epoch > self.epoch.0.saturating_add(1) {
-            return Ok(());
-        }
-        if block.era != self.era_due_at_next_boundary() {
+        if block.era != self.era_due_at_epoch(block_epoch) {
             return Err(wrong(
                 "era is not the era the epoch tick adopts (no hard fork due, or a due one was not taken)",
             ));

@@ -661,6 +661,112 @@ pub struct NodeArgs {
 
 // ─── Node struct ─────────────────────────────────────────────────────────────
 
+/// Who to blame for a wrong-era block being discarded.
+pub(crate) enum WrongEraCulprit<'a> {
+    /// The peer that just delivered it.
+    Peer(SocketAddr),
+    /// It was stored earlier: look the server of these exact bytes up.
+    StoredBytes(&'a [u8]),
+}
+
+/// Which peer served the exact bytes stored under a block hash, so a block that
+/// is rejected LATER (fork replay) can still be traced to its server.
+///
+/// Keyed on `(header hash, blake2b-256 of the stored bytes)`: a re-tagged copy
+/// and the honest copy share the hash but not the bytes, so the peer that
+/// served the rejected bytes is the one blamed. An existing entry is never
+/// overwritten (the first server of those exact bytes is the one that put them
+/// in the ChainDB), and eviction is least-recently-used, never a wholesale
+/// clear an attacker could trigger.
+pub(crate) struct StoredBlockPeers {
+    map: HashMap<
+        (
+            dugite_primitives::hash::Hash32,
+            dugite_primitives::hash::Hash32,
+        ),
+        SocketAddr,
+    >,
+    /// Least recently used first.
+    order: std::collections::VecDeque<(
+        dugite_primitives::hash::Hash32,
+        dugite_primitives::hash::Hash32,
+    )>,
+    cap: usize,
+}
+
+impl StoredBlockPeers {
+    pub(crate) fn new(cap: usize) -> Self {
+        Self {
+            map: HashMap::new(),
+            order: std::collections::VecDeque::new(),
+            cap: cap.max(1),
+        }
+    }
+
+    fn key(
+        hash: &dugite_primitives::hash::Hash32,
+        bytes: &[u8],
+    ) -> (
+        dugite_primitives::hash::Hash32,
+        dugite_primitives::hash::Hash32,
+    ) {
+        (*hash, dugite_primitives::hash::blake2b_256(bytes))
+    }
+
+    /// Record `peer` as the server of `bytes` under `hash`, unless an entry for
+    /// exactly these bytes exists (then it is only marked recently used).
+    pub(crate) fn record(
+        &mut self,
+        hash: &dugite_primitives::hash::Hash32,
+        bytes: &[u8],
+        peer: SocketAddr,
+    ) {
+        let key = Self::key(hash, bytes);
+        if self.map.contains_key(&key) {
+            self.touch(&key);
+            return;
+        }
+        while self.map.len() >= self.cap {
+            match self.order.pop_front() {
+                Some(oldest) => {
+                    self.map.remove(&oldest);
+                }
+                None => break,
+            }
+        }
+        self.map.insert(key, peer);
+        self.order.push_back(key);
+    }
+
+    /// Take (and forget) the server of exactly these bytes.
+    pub(crate) fn take(
+        &mut self,
+        hash: &dugite_primitives::hash::Hash32,
+        bytes: &[u8],
+    ) -> Option<SocketAddr> {
+        let key = Self::key(hash, bytes);
+        let peer = self.map.remove(&key)?;
+        self.order.retain(|k| *k != key);
+        Some(peer)
+    }
+
+    fn touch(
+        &mut self,
+        key: &(
+            dugite_primitives::hash::Hash32,
+            dugite_primitives::hash::Hash32,
+        ),
+    ) {
+        self.order.retain(|k| k != key);
+        self.order.push_back(*key);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn len(&self) -> usize {
+        self.map.len()
+    }
+}
+
 pub struct Node {
     pub(crate) config: NodeConfig,
     pub(crate) topology: Topology,
@@ -760,7 +866,7 @@ pub struct Node {
     peer_failure_tx: Option<mpsc::Sender<(SocketAddr, PeerFailureKind)>>,
     /// Which peer served each block this node stored recently (bounded), so a
     /// block rejected LATER (fork replay) can still be traced to its server.
-    stored_block_peers: parking_lot::Mutex<HashMap<dugite_primitives::hash::Hash32, SocketAddr>>,
+    stored_block_peers: parking_lot::Mutex<StoredBlockPeers>,
     /// Test hook: skip the era-tag checks in the node (header and pre-storage)
     /// so a test can reach the ledger's own check.
     #[cfg(test)]
@@ -2873,7 +2979,7 @@ impl Node {
             shutdown_rx_for_flush: None,
             peer_failure_rx: None,
             peer_failure_tx: None,
-            stored_block_peers: parking_lot::Mutex::new(HashMap::new()),
+            stored_block_peers: parking_lot::Mutex::new(StoredBlockPeers::new(8192)),
             #[cfg(test)]
             skip_era_checks_for_test: false,
             keepalive_rtt_rx: None,
@@ -6576,7 +6682,7 @@ impl Node {
         &self,
         bad_hash: dugite_primitives::hash::Hash32,
         parent: &dugite_primitives::block::Point,
-        peer: Option<SocketAddr>,
+        culprit: WrongEraCulprit<'_>,
     ) {
         {
             let mut db = self.chain_db.write().await;
@@ -6588,7 +6694,14 @@ impl Node {
             db.remove_volatile_blocks_durable(&[bad_hash]);
         }
         let _ = self.handle_ledger_rollback(parent).await;
-        let peer = peer.or_else(|| self.stored_block_peers.lock().remove(&bad_hash));
+        let peer = match culprit {
+            WrongEraCulprit::Peer(peer) => Some(peer),
+            // Blame the peer that served THESE bytes, not whoever served the
+            // honest copy of the same hash.
+            WrongEraCulprit::StoredBytes(bytes) => {
+                self.stored_block_peers.lock().take(&bad_hash, bytes)
+            }
+        };
         if let Some(peer) = peer {
             self.report_peer_fault(peer);
         }
@@ -7053,7 +7166,7 @@ impl Node {
                                     self.discard_wrong_era_block(
                                         fork_block.header.header_hash,
                                         &rollback_point,
-                                        None,
+                                        WrongEraCulprit::StoredBytes(&cbor),
                                     )
                                     .await;
                                     break;
@@ -7175,7 +7288,7 @@ impl Node {
                                             self.discard_wrong_era_block(
                                                 fork_block.header.header_hash,
                                                 &rollback_point,
-                                                None,
+                                                WrongEraCulprit::StoredBytes(&cbor),
                                             )
                                             .await;
                                             return ForkSwitchOutcome::Aborted;
@@ -7467,14 +7580,6 @@ impl Node {
                 return;
             }
         }
-        {
-            let mut peers = self.stored_block_peers.lock();
-            if peers.len() >= 8192 {
-                peers.clear();
-            }
-            peers.insert(block_hash, fetched.peer);
-        }
-
         // Store in ChainDB via ChainSelQueue.
         // `fork_replayed` is set to true when the TriggeredFork path has already
         // applied all fork blocks to the ledger; in that case the single-block
@@ -7492,6 +7597,20 @@ impl Node {
                     block.header.clone(),
                 )
                 .await;
+            // Record the server only when THESE bytes were actually stored
+            // (never for `AlreadyKnown` / `Invalid`).
+            if matches!(
+                result,
+                Some(dugite_storage::AddBlockResult::AddedAsTip { .. })
+                    | Some(dugite_storage::AddBlockResult::StoredAsFork)
+                    | Some(dugite_storage::AddBlockResult::TriggeredFork { .. })
+            ) {
+                self.stored_block_peers.lock().record(
+                    &block_hash,
+                    block.raw_cbor.as_deref().unwrap_or(&[]),
+                    fetched.peer,
+                );
+            }
             match result {
                 Some(dugite_storage::AddBlockResult::AddedAsTip { .. }) => true,
                 Some(dugite_storage::AddBlockResult::StoredAsFork) => {
@@ -7719,8 +7838,12 @@ impl Node {
                     let ls = self.ledger_state.read().await;
                     ls.tip.point.clone()
                 };
-                self.discard_wrong_era_block(block_hash, &parent_point, Some(fetched.peer))
-                    .await;
+                self.discard_wrong_era_block(
+                    block_hash,
+                    &parent_point,
+                    WrongEraCulprit::Peer(fetched.peer),
+                )
+                .await;
                 return;
             }
             if matches!(reason, dugite_consensus::ConsensusError::FutureBlock { .. }) {
@@ -8044,8 +8167,12 @@ impl Node {
                         .header_validation_failures_total
                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     let parent_point = self.ledger_state.read().await.tip.point.clone();
-                    self.discard_wrong_era_block(block_hash, &parent_point, Some(fetched.peer))
-                        .await;
+                    self.discard_wrong_era_block(
+                        block_hash,
+                        &parent_point,
+                        WrongEraCulprit::Peer(fetched.peer),
+                    )
+                    .await;
                     return;
                 }
                 Err(e) => {
@@ -10905,7 +11032,7 @@ impl Node {
                                                     self.discard_wrong_era_block(
                                                         fork_block.header.header_hash,
                                                         &rollback_point,
-                                                        None,
+                                                        WrongEraCulprit::StoredBytes(&cbor),
                                                     )
                                                     .await;
                                                     replay_failed = true;

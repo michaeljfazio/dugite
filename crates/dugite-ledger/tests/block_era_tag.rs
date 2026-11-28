@@ -470,3 +470,104 @@ fn the_ledger_epoch_is_the_epoch_of_its_tip() {
     let ls = ledger_in(Era::Conway);
     assert_eq!(ls.epoch, EpochNo(0));
 }
+
+// ── More than one epoch ahead: no free pass ──────────────────────────────────
+
+/// An empty epoch (a stalled low-density devnet, a node restarted after an idle
+/// period) puts the next block two or more epochs ahead of the ledger tip. The
+/// tick is deterministic from ledger state, so the same rule applies at the
+/// block's own epoch: nothing passes just because the gap is large.
+#[test]
+fn a_block_several_epochs_ahead_is_held_to_the_due_era() {
+    let far = 3 * EPOCH + 100; // three boundaries ahead
+
+    // No fork due: only the ledger's own era passes, whatever the gap.
+    let ls = ledger_at(Era::Conway, 10);
+    assert!(ls
+        .check_block_era(&block(Era::Conway, far, 2, tip_hash(&ls)))
+        .is_ok());
+    for wrong in [Era::Byron, Era::Babbage, Era::Dijkstra] {
+        assert!(
+            ls.check_block_era(&block(wrong, far, 2, tip_hash(&ls)))
+                .is_err(),
+            "{wrong:?} three epochs ahead with no fork due"
+        );
+    }
+
+    // A fork voted for the next boundary is carried through the empty epochs.
+    let mut ls = ledger_at(Era::Babbage, 8);
+    schedule_pv(&mut ls, 9);
+    assert_eq!(ls.era_due_at_epoch(3), Era::Conway);
+    assert!(ls
+        .check_block_era(&block(Era::Conway, far, 2, tip_hash(&ls)))
+        .is_ok());
+    for wrong in [Era::Babbage, Era::Dijkstra] {
+        assert!(
+            ls.check_block_era(&block(wrong, far, 2, tip_hash(&ls)))
+                .is_err(),
+            "{wrong:?} three epochs ahead with a fork to Conway due"
+        );
+    }
+
+    // An epoch-keyed trigger that falls inside the gap is due; one beyond the
+    // block's epoch is not.
+    let mut ls = ledger_at(Era::Alonzo, 5);
+    ls.set_hard_fork_triggers([(Era::Babbage, 2)].into_iter().collect());
+    assert!(ls
+        .check_block_era(&block(Era::Babbage, far, 2, tip_hash(&ls)))
+        .is_ok());
+    assert!(ls
+        .check_block_era(&block(Era::Alonzo, far, 2, tip_hash(&ls)))
+        .is_err());
+    ls.set_hard_fork_triggers([(Era::Babbage, 9)].into_iter().collect());
+    assert!(ls
+        .check_block_era(&block(Era::Alonzo, far, 2, tip_hash(&ls)))
+        .is_ok());
+    assert!(ls
+        .check_block_era(&block(Era::Babbage, far, 2, tip_hash(&ls)))
+        .is_err());
+}
+
+// ── Config survives a ledger replacement ─────────────────────────────────────
+
+/// Rollback via snapshot, fork-rollback replay and recovery all replace the
+/// whole ledger with a state loaded from disk. The triggers are node config, not
+/// part of the snapshot, so `adopt_snapshot_state` carries them over; a plain
+/// `*ls = loaded` loses them and a legitimate `TestXHardForkAtEpoch` fork would
+/// then be rejected.
+#[test]
+fn hard_fork_triggers_survive_a_snapshot_rollback_and_the_trigger_epoch_still_passes() {
+    let mut ls = ledger_at(Era::Alonzo, 5);
+    ls.set_hard_fork_triggers([(Era::Babbage, 1)].into_iter().collect());
+    let fork = block(Era::Babbage, EPOCH + 100, 2, tip_hash(&ls));
+    assert!(
+        ls.check_block_era(&fork).is_ok(),
+        "control: the fork is due"
+    );
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("rollback.snapshot");
+    ls.save_snapshot(&path).expect("save snapshot");
+
+    // What every reload used to do: `*ls = loaded`.
+    let loaded = LedgerState::load_snapshot(&path).expect("load snapshot");
+    assert!(
+        loaded.hard_fork_triggers.is_empty(),
+        "triggers are config, not snapshot content"
+    );
+    assert!(
+        loaded.check_block_era(&fork).is_err(),
+        "without the triggers the legitimate fork would be rejected (the halt)"
+    );
+
+    // What the node does now.
+    ls.adopt_snapshot_state(loaded);
+    assert_eq!(ls.hard_fork_triggers.get(&Era::Babbage), Some(&1));
+    assert!(
+        ls.check_block_era(&fork).is_ok(),
+        "after the rollback the trigger epoch still passes"
+    );
+    assert!(ls
+        .check_block_era(&block(Era::Alonzo, EPOCH + 100, 2, tip_hash(&ls)))
+        .is_err());
+}

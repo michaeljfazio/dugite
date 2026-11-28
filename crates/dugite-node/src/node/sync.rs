@@ -637,7 +637,7 @@ impl Node {
                                     // Replace all non-UTxO ledger state from the snapshot,
                                     // then re-attach the already-restored store.
                                     let store = ls.utxo.utxo_set.detach_store().unwrap();
-                                    *ls = snapshot_state;
+                                    ls.adopt_snapshot_state(snapshot_state);
                                     ls.attach_utxo_store(store);
                                     info!(
                                         snapshot_slot,
@@ -650,13 +650,13 @@ impl Node {
                                         "restore_from_snapshot failed, falling back to in-memory: {e}"
                                     );
                                     let _ = ls.utxo.utxo_set.detach_store();
-                                    *ls = snapshot_state;
+                                    ls.adopt_snapshot_state(snapshot_state);
                                 }
                             }
                         } else {
                             // No live LSM store — use bincode snapshot's in-memory UTxO set.
                             let _ = ls.utxo.utxo_set.detach_store();
-                            *ls = snapshot_state;
+                            ls.adopt_snapshot_state(snapshot_state);
                         }
 
                         let replay_from = snapshot_slot;
@@ -2913,7 +2913,7 @@ impl Node {
                                             .rebuild_address_index();
                                         let utxos = ls.utxo.utxo_set.store().unwrap().len();
                                         let store = ls.utxo.utxo_set.detach_store().unwrap();
-                                        *ls = snapshot_state;
+                                        ls.adopt_snapshot_state(snapshot_state);
                                         ls.attach_utxo_store(store);
                                         info!(
                                             fork_slot = ledger_tip_slot,
@@ -2929,7 +2929,7 @@ impl Node {
                                              during fork-rollback: {e} — using in-memory state"
                                         );
                                         let _ = ls.utxo.utxo_set.detach_store();
-                                        *ls = snapshot_state;
+                                        ls.adopt_snapshot_state(snapshot_state);
                                         info!(
                                             fork_slot = ledger_tip_slot,
                                             recovered_slot = snapshot_slot,
@@ -2939,7 +2939,7 @@ impl Node {
                                 }
                             } else {
                                 let _ = ls.utxo.utxo_set.detach_store();
-                                *ls = snapshot_state;
+                                ls.adopt_snapshot_state(snapshot_state);
                                 info!(
                                     fork_slot = ledger_tip_slot,
                                     recovered_slot = snapshot_slot,

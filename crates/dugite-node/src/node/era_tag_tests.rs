@@ -26,7 +26,7 @@ use dugite_primitives::value::Lovelace;
 use tokio::sync::mpsc;
 
 use super::connection_lifecycle::{FetchedBlock, PeerFailureKind};
-use super::{Node, NodeArgs};
+use super::{Node, NodeArgs, StoredBlockPeers};
 use crate::config::NodeConfig;
 use crate::forge::{forge_block, BlockProducerConfig, BlockProducerCredentials};
 use crate::topology::Topology;
@@ -325,9 +325,15 @@ impl Harness {
     /// Push `cbor` through the real channel and apply it exactly as the run
     /// loop does.
     async fn deliver(&mut self, cbor: &[u8]) -> Block {
+        self.deliver_from("127.0.0.1:3001".parse().unwrap(), cbor)
+            .await
+    }
+
+    /// As [`Self::deliver`], served by `peer`.
+    async fn deliver_from(&mut self, peer: std::net::SocketAddr, cbor: &[u8]) -> Block {
         let block = self.decode(cbor).expect("block decodes");
         let fetched = FetchedBlock {
-            peer: "127.0.0.1:3001".parse().unwrap(),
+            peer,
             block: block.clone(),
             tip_slot: block.slot().0,
             tip_hash: *block.hash().as_bytes(),
@@ -884,4 +890,109 @@ async fn retagged_copy_stored_out_of_order_is_removed_when_its_fork_is_replayed(
     assert!(h.has_block(b.hash()).await);
     assert!(!h.is_marked_invalid(b.hash()).await);
     assert_eq!(h.chain_db_tip_point().await, h.ledger_tip_point().await);
+}
+
+/// An empty epoch puts the next block two epochs ahead of the ledger tip (here:
+/// within the forecast horizon, epoch 2 of a 100-slot epoch). The re-tagged copy
+/// must be rejected like any other, and the honest copy must apply.
+#[tokio::test(flavor = "multi_thread")]
+async fn retagged_block_two_epochs_ahead_is_rejected() {
+    let mut h = Harness::new(10).await;
+    let parent = h.bootstrap(Era::Conway, 10).await;
+    let (slot, honest_cbor) = h
+        .honest_leader_block(Era::Conway, 10, 2 * EPOCH_LENGTH, 240, 2, parent.1)
+        .await;
+    assert!(slot >= 2 * EPOCH_LENGTH, "two epochs past the ledger tip");
+    let failures = h.header_failures();
+    let bad = h.deliver(&retag(&honest_cbor, 8)).await;
+    assert_rejected(&mut h, &bad, Era::Conway, parent, failures).await;
+    let honest = h.deliver(&honest_cbor).await;
+    assert_eq!(
+        h.ledger_tip_point().await,
+        Point::Specific(SlotNo(slot), *honest.hash())
+    );
+    assert_eq!(h.ledger_era().await, Era::Conway);
+}
+
+fn addr(port: u16) -> std::net::SocketAddr {
+    format!("127.0.0.1:{port}").parse().unwrap()
+}
+
+/// The recorded server is the one that served THOSE bytes: the same hash with
+/// other bytes is another entry, and an existing entry is never overwritten.
+#[test]
+fn stored_block_peers_key_on_the_bytes_and_never_overwrite() {
+    let mut m = StoredBlockPeers::new(8);
+    let h = Hash32::from_bytes([7; 32]);
+    m.record(&h, b"honest bytes", addr(1));
+    m.record(&h, b"re-tagged bytes", addr(2));
+    // A later delivery of the same bytes does not take the entry over.
+    m.record(&h, b"honest bytes", addr(3));
+    assert_eq!(m.take(&h, b"re-tagged bytes"), Some(addr(2)));
+    assert_eq!(m.take(&h, b"honest bytes"), Some(addr(1)));
+    assert_eq!(m.take(&h, b"honest bytes"), None, "taken once");
+    assert_eq!(m.take(&h, b"never stored"), None);
+}
+
+/// Eviction is least-recently-used: a flood evicts the oldest entries, never
+/// everything, and an entry that is looked at again survives.
+#[test]
+fn stored_block_peers_evict_least_recently_used_not_everything() {
+    let mut m = StoredBlockPeers::new(4);
+    let h = |i: u8| Hash32::from_bytes([i; 32]);
+    for i in 0..4u8 {
+        m.record(&h(i), b"b", addr(1000 + i as u16));
+    }
+    // Re-recording block 0 marks it recently used (no overwrite).
+    m.record(&h(0), b"b", addr(9));
+    // A flood of 3 new entries evicts the three least recently used (1, 2, 3).
+    for i in 10..13u8 {
+        m.record(&h(i), b"b", addr(2000 + i as u16));
+    }
+    assert_eq!(m.len(), 4, "bounded, not cleared");
+    assert_eq!(
+        m.take(&h(0), b"b"),
+        Some(addr(1000)),
+        "touched entry survives"
+    );
+    assert_eq!(m.take(&h(1), b"b"), None);
+    assert_eq!(m.take(&h(12), b"b"), Some(addr(2012)), "newest survive");
+}
+
+/// Node path: the honest copy is served by P1 and applies; the re-tagged copy of
+/// the same hash comes from P3. P3 is the peer that is faulted, and the map holds
+/// only the honest bytes' server (the re-tagged copy was never stored).
+#[tokio::test(flavor = "multi_thread")]
+async fn the_peer_that_served_the_rejected_bytes_is_the_one_faulted() {
+    let mut h = Harness::new(10).await;
+    let a = h.bootstrap(Era::Conway, 10).await;
+    let (_, honest_cbor) = h
+        .honest_leader_block(Era::Conway, 10, a.0 + 1, a.0 + 100, 2, a.1)
+        .await;
+    let honest = h.decode(&honest_cbor).unwrap();
+    h.deliver_from(addr(3001), &honest_cbor).await;
+    assert_eq!(
+        h.ledger_tip_point().await,
+        Point::Specific(honest.slot(), *honest.hash())
+    );
+
+    // The same hash, re-tagged, from another peer.
+    h.deliver_from(addr(3003), &retag(&honest_cbor, 6)).await;
+    let (peer, kind) = h.peer_rx.try_recv().expect("a peer is reported");
+    assert_eq!(peer, addr(3003), "the server of the rejected bytes");
+    assert_eq!(kind, PeerFailureKind::ProtocolFault);
+    assert!(h.peer_rx.try_recv().is_err());
+
+    let mut peers = h.node.stored_block_peers.lock();
+    assert_eq!(peers.len(), 2, "bootstrap block + the honest copy only");
+    assert_eq!(
+        peers.take(honest.hash(), &honest_cbor),
+        Some(addr(3001)),
+        "the honest copy keeps its server"
+    );
+    assert_eq!(
+        peers.take(honest.hash(), &retag(&honest_cbor, 6)),
+        None,
+        "the re-tagged bytes were never stored"
+    );
 }
