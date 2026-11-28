@@ -6609,14 +6609,53 @@ impl Node {
         &mut self,
         block: &dugite_primitives::block::Block,
     ) -> Result<(), dugite_consensus::ConsensusError> {
-        // Byron has no Praos header crypto — validated on the ledger path.
-        if !block.era.is_shelley_based() {
-            return Ok(());
-        }
-
         // Haskell `getCurrentSlot` (wall clock) for the future-block guard.
         let wall_clock_slot = self.current_wall_clock_slot().await;
         let ls = self.ledger_state.read().await;
+
+        // The block's era tag is attacker-controlled; the era comes from the
+        // LEDGER (Haskell `HardForkEnvelopeErrWrongEra`). This runs BEFORE the
+        // Byron early return: a peer-supplied `[0, ebb]` block on a Conway
+        // ledger must not be waved through as "Byron has no header crypto".
+        if let Err(e) = ls.check_block_era(block) {
+            return Err(dugite_consensus::ConsensusError::InvalidBlock(format!(
+                "era tag check: {e}"
+            )));
+        }
+
+        // Byron has no Praos header crypto — validated on the ledger path. The
+        // decision rests on the LEDGER era (a genesis ledger, tip at Origin,
+        // carries only a placeholder era and takes its first block's tag).
+        // `check_block_era` has already refused a Byron tag on a post-Byron
+        // ledger, so this can only be a Byron block on a Byron ledger.
+        if !block.era.is_shelley_based()
+            && (ls.tip.point == Point::Origin || !ls.era.is_shelley_based())
+        {
+            return Ok(());
+        }
+
+        // Diagnostic only (NOT enforced): Haskell's full rule is that the block
+        // era equals the era of the TICKED protocol-version major. For a block
+        // that needs no epoch tick the un-ticked PV is the ticked PV, so count
+        // disagreements; the first-block-of-epoch case is the open follow-up.
+        if ls.tip.point != Point::Origin
+            && ls.epoch_of_slot(block.slot().0) == ls.epoch.0
+            && block.era
+                != dugite_primitives::era::Era::from_protocol_major(
+                    ls.epochs.protocol_params.protocol_version_major,
+                )
+        {
+            self.metrics
+                .era_parity_mismatch_total
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            debug!(
+                slot = block.slot().0,
+                block_era = %block.era,
+                ledger_era = %ls.era,
+                pv_major = ls.epochs.protocol_params.protocol_version_major,
+                "block era tag differs from the era of the ledger protocol version"
+            );
+        }
 
         // Leader eligibility uses the "set" snapshot (previous-epoch stake).
         let set_snapshot = ls.epochs.snapshots.set.as_ref();
@@ -10939,6 +10978,9 @@ impl Node {
 }
 
 // ─── Tests ───────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod era_tag_tests;
 
 #[cfg(test)]
 mod tests {

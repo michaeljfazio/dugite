@@ -1,0 +1,618 @@
+//! A peer-supplied block's era tag must not steer the ledger (#1233).
+//!
+//! These tests drive the REAL node path: a `Node` built by `Node::new` on a
+//! temporary database, a block pushed through the `fetched_blocks_rx` channel,
+//! and `apply_fetched_block` (ChainSelQueue -> ChainDB -> header validation ->
+//! ledger apply -> rollback on failure). Nothing is mocked below that.
+//!
+//! The block bytes come from the real forge (`forge_block`) with a pool that
+//! sits in the `set` snapshot and holds real VRF, KES and opcert keys, so the
+//! ONLY thing that can reject a re-tagged copy is the era check: every case
+//! first proves the honest, untagged copy of the same bytes passes
+//! `validate_peer_header_full`.
+
+use std::collections::HashMap;
+use std::sync::atomic::Ordering;
+use std::sync::Arc;
+
+use dugite_crypto::keys::PaymentSigningKey;
+use dugite_crypto::{kes, vrf};
+use dugite_ledger::state::{PoolRegistration, StakeSnapshot};
+use dugite_primitives::block::{Block, Point, ProtocolVersion};
+use dugite_primitives::era::Era;
+use dugite_primitives::hash::{blake2b_224, blake2b_256, Hash32};
+use dugite_primitives::time::{BlockNo, EpochNo, SlotNo};
+use dugite_primitives::value::Lovelace;
+use tokio::sync::mpsc;
+
+use super::connection_lifecycle::FetchedBlock;
+use super::{Node, NodeArgs};
+use crate::config::NodeConfig;
+use crate::forge::{forge_block, BlockProducerConfig, BlockProducerCredentials};
+use crate::topology::Topology;
+
+const EPOCH_LENGTH: u64 = 100;
+const SLOTS_PER_KES_PERIOD: u64 = 129_600;
+
+/// A devnet-shaped Shelley genesis. `systemStart` is far in the past so every
+/// slot the tests use is behind the wall clock (no FutureBlock).
+fn shelley_genesis_json(pv_major: u64) -> String {
+    format!(
+        r#"{{
+  "systemStart": "2020-01-01T00:00:00Z",
+  "networkMagic": 42,
+  "networkId": "Testnet",
+  "activeSlotsCoeff": 0.5,
+  "securityParam": 40,
+  "epochLength": {EPOCH_LENGTH},
+  "slotLength": 1,
+  "maxLovelaceSupply": 60000000000000000,
+  "maxKESEvolutions": 62,
+  "slotsPerKESPeriod": {SLOTS_PER_KES_PERIOD},
+  "updateQuorum": 2,
+  "protocolParams": {{
+    "minFeeA": 44, "minFeeB": 155381, "maxBlockBodySize": 90112,
+    "maxTxSize": 16384, "maxBlockHeaderSize": 1100, "keyDeposit": 2000000,
+    "poolDeposit": 500000000, "minPoolCost": 340000000, "eMax": 18,
+    "nOpt": 500, "a0": 0.3, "rho": 0.003, "tau": 0.2,
+    "protocolVersion": {{ "major": {pv_major}, "minor": 0 }}
+  }}
+}}"#
+    )
+}
+
+/// Real keys for one pool: Ed25519 cold key, VRF, Sum6Kes, and an opcert signed
+/// by the cold key.
+fn pool_credentials() -> (BlockProducerCredentials, Hash32) {
+    let cold_sk = PaymentSigningKey::from_bytes(&[0x11; 32]).expect("cold key");
+    let cold_vkey = cold_sk.verification_key().to_bytes().to_vec();
+    let pool_id = blake2b_224(&cold_vkey);
+
+    let vrf_kp = vrf::generate_vrf_keypair_from_secret(&[0x22; 32]);
+    let (kes_sk, kes_pk) = kes::kes_keygen(&[0x33; 32]).expect("kes keygen");
+
+    let (opcert_seq, opcert_kes_period) = (0u64, 0u64);
+    let signable =
+        dugite_crypto::ocert::ocert_signable_bytes(&kes_pk, opcert_seq, opcert_kes_period);
+    let sigma = cold_sk.sign(&signable);
+
+    let vrf_keyhash = blake2b_256(&vrf_kp.public_key);
+    (
+        BlockProducerCredentials {
+            vrf_skey: *vrf_kp.secret_key(),
+            vrf_vkey: vrf_kp.public_key,
+            cold_vkey,
+            kes_skey: kes_sk,
+            kes_vkey: kes_pk.to_vec(),
+            opcert_sequence: opcert_seq,
+            opcert_kes_period,
+            opcert_sigma: sigma,
+            pool_id,
+        },
+        vrf_keyhash,
+    )
+}
+
+struct Harness {
+    node: Node,
+    creds: BlockProducerCredentials,
+    tx: mpsc::Sender<FetchedBlock>,
+    _dir: tempfile::TempDir,
+}
+
+impl Harness {
+    /// A node whose ledger is at protocol version `pv_major`, with the test
+    /// pool holding 100% of the `set` snapshot.
+    async fn new(pv_major: u64) -> Self {
+        let _ = tracing_subscriber::fmt()
+            .with_test_writer()
+            .with_env_filter(
+                tracing_subscriber::EnvFilter::try_from_default_env()
+                    .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn")),
+            )
+            .try_init();
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join("shelley-genesis.json"),
+            shelley_genesis_json(pv_major),
+        )
+        .expect("write genesis");
+
+        let config = NodeConfig {
+            shelley_genesis_file: Some("shelley-genesis.json".into()),
+            network_magic: Some(42),
+            ..NodeConfig::default()
+        };
+        let node = Node::new(NodeArgs {
+            config,
+            topology: Topology::default(),
+            topology_path: dir.path().join("topology.json"),
+            config_path: dir.path().join("config.json"),
+            database_path: dir.path().join("db"),
+            socket_path: dir.path().join("node.sock"),
+            host_addr: "127.0.0.1".into(),
+            port: 0,
+            config_dir: dir.path().to_path_buf(),
+            shelley_kes_key: None,
+            shelley_vrf_key: None,
+            shelley_operational_certificate: None,
+            _shelley_cold_key: None,
+            rpc_config: None,
+            metrics_port: 0,
+            require_metrics: false,
+            compat_metrics: false,
+            liveness_threshold_secs: 0,
+            mempool_max_tx: 100,
+            mempool_max_bytes: 1 << 20,
+            snapshot_max_retained: 2,
+            snapshot_bulk_min_blocks: 50_000,
+            snapshot_bulk_min_secs: 360,
+            storage_config: dugite_storage::StorageConfig::default(),
+            consensus_mode: "praos".into(),
+            validate_all_blocks: false,
+            skip_eagerly_validated_header_crypto: false,
+            log_handle: None,
+        })
+        .expect("Node::new on a temp database");
+
+        let (creds, vrf_keyhash) = pool_credentials();
+
+        // The pool holds all stake in the `set` snapshot (leader election).
+        {
+            let mut ls = node.ledger_state.write().await;
+            assert_eq!(ls.epochs.protocol_params.protocol_version_major, pv_major);
+            let reg = PoolRegistration {
+                pool_id: creds.pool_id,
+                vrf_keyhash,
+                pledge: Lovelace(0),
+                cost: Lovelace(0),
+                margin_numerator: 0,
+                margin_denominator: 1,
+                reward_account: vec![0xe0; 29],
+                owners: vec![],
+                relays: vec![],
+                metadata_url: None,
+                metadata_hash: None,
+            };
+            let mut snap = StakeSnapshot::empty(EpochNo(0));
+            snap.pool_stake.insert(creds.pool_id, Lovelace(1_000_000));
+            snap.pool_params = Arc::new(HashMap::from([(creds.pool_id, reg)]));
+            ls.epochs.snapshots.set = Some(snap);
+        }
+
+        let (tx, rx) = mpsc::channel(16);
+        let mut node = node;
+        node.fetched_blocks_rx = Some(rx);
+        Harness {
+            node,
+            creds,
+            tx,
+            _dir: dir,
+        }
+    }
+
+    async fn ledger_era(&self) -> Era {
+        self.node.ledger_state.read().await.era
+    }
+
+    async fn ledger_tip_point(&self) -> Point {
+        self.node.ledger_state.read().await.tip.point.clone()
+    }
+
+    async fn chain_db_tip_point(&self) -> Point {
+        self.node.chain_db.read().await.get_tip().point
+    }
+
+    fn header_failures(&self) -> u64 {
+        self.node
+            .metrics
+            .header_validation_failures_total
+            .load(Ordering::Relaxed)
+    }
+
+    async fn is_marked_invalid(&self, hash: &Hash32) -> bool {
+        let handle = self.node.chain_sel_handle.as_ref().expect("chain sel");
+        let mut cache = handle.invalid_cache.write().await;
+        cache.get(hash).is_some()
+    }
+
+    /// Forge a block with the REAL forge at `slot`, as `era`, and return its
+    /// wire bytes. Returns `None` if the pool is not the slot leader.
+    async fn forge_at(
+        &mut self,
+        era: Era,
+        pv_major: u64,
+        slot: u64,
+        block_no: u64,
+        prev_hash: Hash32,
+    ) -> Vec<u8> {
+        let nonce = self
+            .node
+            .ledger_state
+            .read()
+            .await
+            .epoch_nonce_for_slot(slot);
+        let cfg = BlockProducerConfig {
+            protocol_version: ProtocolVersion {
+                major: pv_major,
+                minor: 0,
+            },
+            era,
+            slots_per_kes_period: SLOTS_PER_KES_PERIOD,
+            max_kes_evolutions: 62,
+            ..BlockProducerConfig::default()
+        };
+        let (_, cbor) = forge_block(
+            &self.creds,
+            &cfg,
+            SlotNo(slot),
+            BlockNo(block_no),
+            prev_hash,
+            &nonce,
+            vec![],
+        )
+        .expect("forge");
+        cbor
+    }
+
+    fn decode(&self, cbor: &[u8]) -> Result<Block, dugite_serialization::SerializationError> {
+        dugite_serialization::decode_block_with_byron_epoch_length(
+            cbor,
+            self.node.byron_epoch_length,
+        )
+    }
+
+    /// First slot at or after `from` where the pool is elected AND the honest
+    /// block passes the node's full header validation. Returns the honest
+    /// bytes (era `era`).
+    async fn honest_leader_block(
+        &mut self,
+        era: Era,
+        pv_major: u64,
+        from: u64,
+        to: u64,
+        block_no: u64,
+        prev_hash: Hash32,
+    ) -> (u64, Vec<u8>) {
+        let mut last_err = String::new();
+        for slot in from..to {
+            let cbor = self
+                .forge_at(era, pv_major, slot, block_no, prev_hash)
+                .await;
+            let block = self.decode(&cbor).expect("honest block decodes");
+            assert_eq!(block.era, era);
+            match self.node.validate_peer_header_full(&block).await {
+                Ok(()) => return (slot, cbor),
+                Err(e) => last_err = e.to_string(),
+            }
+        }
+        panic!("pool was never elected in slots {from}..{to}; last error: {last_err}");
+    }
+
+    /// Push `cbor` through the real channel and apply it exactly as the run
+    /// loop does.
+    async fn deliver(&mut self, cbor: &[u8]) -> Block {
+        let block = self.decode(cbor).expect("block decodes");
+        let fetched = FetchedBlock {
+            peer: "127.0.0.1:3001".parse().unwrap(),
+            block: block.clone(),
+            tip_slot: block.slot().0,
+            tip_hash: *block.hash().as_bytes(),
+            tip_block_number: block.block_number().0,
+        };
+        self.tx.send(fetched).await.expect("channel open");
+        let received = self
+            .node
+            .fetched_blocks_rx
+            .as_mut()
+            .expect("rx")
+            .recv()
+            .await
+            .expect("block on channel");
+        self.node.apply_fetched_block(received).await;
+        block
+    }
+
+    /// Apply the first (genesis) block, which fixes the ledger era, and return
+    /// `(slot, hash)` of the new tip.
+    async fn bootstrap(&mut self, era: Era, pv_major: u64) -> (u64, Hash32) {
+        let (slot, cbor) = self
+            .honest_leader_block(era, pv_major, 1, 200, 1, Hash32::ZERO)
+            .await;
+        let block = self.deliver(&cbor).await;
+        assert_eq!(self.ledger_era().await, era, "genesis block fixes the era");
+        assert_eq!(
+            self.ledger_tip_point().await,
+            Point::Specific(SlotNo(slot), *block.hash()),
+            "the bootstrap block must apply"
+        );
+        (slot, *block.hash())
+    }
+}
+
+/// Re-wrap forged Conway bytes `[7, body]` under another era tag.
+fn retag(cbor: &[u8], new_tag: u8) -> Vec<u8> {
+    assert_eq!(&cbor[..2], &[0x82, 0x07], "forged Conway block: [7, body]");
+    let mut out = cbor.to_vec();
+    out[1] = new_tag;
+    out
+}
+
+/// Hand-built Byron epoch boundary block `[0, [header, body, extra]]` that
+/// extends `prev_hash`. An EBB has no signature, no VRF and no KES: nothing but
+/// its wrapper says it is not an ordinary block.
+fn byron_ebb(prev_hash: &Hash32, epoch: u64, block_no: u64) -> Vec<u8> {
+    let mut e = minicbor::Encoder::new(Vec::new());
+    e.array(2).unwrap().u8(0).unwrap(); // [0, ebb]
+    e.array(3).unwrap();
+    // header = [magic, prev_hash, body_proof, [epoch, [difficulty]], extra]
+    e.array(5).unwrap();
+    e.u32(42).unwrap();
+    e.bytes(prev_hash.as_bytes()).unwrap();
+    e.bytes(&[0u8; 32]).unwrap();
+    e.array(2).unwrap().u64(epoch).unwrap();
+    e.array(1).unwrap().u64(block_no).unwrap();
+    e.array(1).unwrap().map(0).unwrap();
+    e.array(0).unwrap(); // body: stakeholder ids
+    e.array(1).unwrap().map(0).unwrap(); // extra
+    e.into_writer()
+}
+
+/// Everything a rejected, wrongly tagged block must leave behind.
+async fn assert_rejected(
+    h: &Harness,
+    bad: &Block,
+    era_before: Era,
+    parent: (u64, Hash32),
+    failures_before: u64,
+) {
+    let parent_point = Point::Specific(SlotNo(parent.0), parent.1);
+    assert_eq!(h.ledger_era().await, era_before, "ledger era must not move");
+    assert_eq!(
+        h.ledger_tip_point().await,
+        parent_point,
+        "ledger tip is the parent"
+    );
+    assert_eq!(
+        h.chain_db_tip_point().await,
+        parent_point,
+        "ChainDB tip is the parent"
+    );
+    assert!(
+        h.is_marked_invalid(bad.hash()).await,
+        "block marked invalid"
+    );
+    assert_eq!(
+        h.header_failures(),
+        failures_before + 1,
+        "header-validation failure counted exactly once"
+    );
+}
+
+/// Would chain selection prefer the rejected block over `honest` at equal
+/// height (the Praos tiebreak: opcert, then lower leader VRF within the slot
+/// window)?
+fn rejected_block_wins_the_tiebreak(rejected: &Block, honest: &Block) -> bool {
+    use dugite_consensus::chain_selection::{ChainPreference, ChainSelection};
+    use dugite_primitives::block::Tip;
+    let era = honest.header.protocol_version.era();
+    let slot_window = match era {
+        Era::Conway | Era::Dijkstra => 5,
+        _ => u64::MAX,
+    };
+    let mut sel = ChainSelection::new();
+    sel.set_tip(Tip {
+        point: Point::Specific(honest.header.slot, honest.header.header_hash),
+        block_number: honest.header.block_number,
+    });
+    let cand = Tip {
+        point: Point::Specific(rejected.header.slot, rejected.header.header_hash),
+        block_number: rejected.header.block_number,
+    };
+    matches!(
+        sel.prefer_chain_with_headers(&cand, &honest.header, &rejected.header, era, slot_window),
+        ChainPreference::PreferCandidate
+    )
+}
+
+/// The chain must go on after a rejected block: an honest sibling at the same
+/// height arrives and the ledger ends on it.
+///
+/// The sibling is chosen so that the Praos tiebreak does NOT rank the rejected
+/// block above it. When it does, chain selection finds the rejected block as
+/// the preferred fork tip, refuses the pass (`StoreButDontChange`) and returns
+/// `StoredAsFork` even though the honest block already extended the ChainDB's
+/// selected chain, so the ChainDB tip moves and the ledger does not: that wedge
+/// is filed separately and does not depend on this change.
+async fn assert_honest_block_applies(
+    h: &mut Harness,
+    bad: &Block,
+    era: Era,
+    pv: u64,
+    parent: (u64, Hash32),
+    after_slot: u64,
+) {
+    let mut from = after_slot + 1;
+    let (slot, cbor) = loop {
+        let (slot, cbor) = h
+            .honest_leader_block(era, pv, from, from + 200, 2, parent.1)
+            .await;
+        let candidate = h.decode(&cbor).unwrap();
+        if !rejected_block_wins_the_tiebreak(bad, &candidate) {
+            break (slot, cbor);
+        }
+        from = slot + 1;
+    };
+    let honest = h.deliver(&cbor).await;
+    assert_eq!(
+        h.ledger_tip_point().await,
+        Point::Specific(SlotNo(slot), *honest.hash()),
+        "an honest block after a rejected one must apply"
+    );
+    assert_eq!(h.ledger_era().await, era);
+    assert_eq!(h.chain_db_tip_point().await, h.ledger_tip_point().await);
+}
+
+/// Core of every re-tagged case.
+async fn retagged_case(honest_era: Era, pv: u64, new_tag: u8) {
+    let mut h = Harness::new(pv).await;
+    let parent = h.bootstrap(honest_era, pv).await;
+
+    // A leader block at the next height, signed by the real pool.
+    let (slot, honest_cbor) = h
+        .honest_leader_block(honest_era, pv, parent.0 + 1, parent.0 + 200, 2, parent.1)
+        .await;
+    // Control: the untagged bytes pass full header validation, so the era tag
+    // is the ONLY thing wrong with the re-tagged copy.
+    let honest_block = h.decode(&honest_cbor).unwrap();
+    h.node
+        .validate_peer_header_full(&honest_block)
+        .await
+        .expect("control: honest bytes validate");
+
+    let bad_cbor = retag(&honest_cbor, new_tag);
+    let bad_block = h.decode(&bad_cbor).expect("re-tagged bytes decode by tag");
+    assert_ne!(
+        bad_block.era, honest_era,
+        "the tag must change the decoded era"
+    );
+    let err = h
+        .node
+        .validate_peer_header_full(&bad_block)
+        .await
+        .expect_err("a wrongly tagged block must fail header validation");
+    assert!(err.to_string().contains("era tag check"), "{err}");
+    // Same header bytes, so the same hash as the honest block.
+    assert_eq!(bad_block.header.slot, SlotNo(slot));
+
+    let failures = h.header_failures();
+    let bad = h.deliver(&bad_cbor).await;
+    assert_rejected(&h, &bad, honest_era, parent, failures).await;
+    assert_honest_block_applies(&mut h, &bad, honest_era, pv, parent, slot).await;
+}
+
+/// A Babbage tag on a Conway-era block at PV10 (the reported case).
+#[tokio::test(flavor = "multi_thread")]
+async fn babbage_tag_in_conway_is_rejected() {
+    retagged_case(Era::Conway, 10, 6).await;
+}
+
+/// A Dijkstra tag at PV10: an early upgrade mid-epoch.
+#[tokio::test(flavor = "multi_thread")]
+async fn dijkstra_tag_at_pv10_is_rejected() {
+    retagged_case(Era::Conway, 10, 8).await;
+}
+
+/// A peer-supplied Byron EBB extending the tip, on a Conway ledger. This is the
+/// case that needs no stake: an EBB carries no VRF, KES or signature.
+#[tokio::test(flavor = "multi_thread")]
+async fn byron_ebb_extending_the_tip_is_rejected_on_a_conway_ledger() {
+    let mut h = Harness::new(10).await;
+    let parent = h.bootstrap(Era::Conway, 10).await;
+
+    let ebb_cbor = byron_ebb(&parent.1, 1, 2);
+    let ebb = h.decode(&ebb_cbor).expect("EBB decodes");
+    assert_eq!(ebb.era, Era::Byron);
+    assert_eq!(*ebb.prev_hash(), parent.1);
+
+    let failures = h.header_failures();
+    let bad = h.deliver(&ebb_cbor).await;
+    assert_rejected(&h, &bad, Era::Conway, parent, failures).await;
+    assert_honest_block_applies(&mut h, &bad, Era::Conway, 10, parent, parent.0).await;
+}
+
+/// FINDING (reported in the PR): on main, a peer-supplied `[0, ebb]` block IS
+/// admitted by chain selection and the ChainDB as the selected tip. Nothing
+/// before the ledger looks at the tag, so only the era check stands between
+/// that block and the ledger.
+#[tokio::test(flavor = "multi_thread")]
+async fn byron_ebb_is_admitted_by_chain_selection_as_the_tip() {
+    let mut h = Harness::new(10).await;
+    let parent = h.bootstrap(Era::Conway, 10).await;
+
+    let ebb_cbor = byron_ebb(&parent.1, 1, 2);
+    let ebb = h.decode(&ebb_cbor).unwrap();
+    let handle = h.node.chain_sel_handle.clone().expect("chain sel");
+    let verdict = handle
+        .submit_block_with_header(
+            *ebb.hash(),
+            ebb.slot(),
+            ebb.block_number(),
+            *ebb.prev_hash(),
+            ebb_cbor,
+            ebb.header.clone(),
+        )
+        .await;
+    assert!(
+        matches!(
+            verdict,
+            Some(dugite_storage::AddBlockResult::AddedAsTip { .. })
+        ),
+        "chain selection admits the peer EBB as the tip: {verdict:?}"
+    );
+    assert_eq!(
+        h.chain_db_tip_point().await,
+        Point::Specific(ebb.slot(), *ebb.hash()),
+        "the ChainDB selected tip is now the EBB"
+    );
+}
+
+/// A legitimate era boundary must still pass: a Babbage ledger, then the first
+/// block of the next epoch tagged Conway (PV9 header, the +1 the HFC allows).
+#[tokio::test(flavor = "multi_thread")]
+async fn legitimate_era_boundary_block_is_accepted() {
+    let mut h = Harness::new(8).await;
+    let parent = h.bootstrap(Era::Babbage, 8).await;
+    assert!(parent.0 < EPOCH_LENGTH, "bootstrap block is in epoch 0");
+
+    // First Conway block of epoch 1.
+    let (slot, cbor) = h
+        .honest_leader_block(
+            Era::Conway,
+            9,
+            EPOCH_LENGTH,
+            EPOCH_LENGTH + 100,
+            2,
+            parent.1,
+        )
+        .await;
+    let before = h.header_failures();
+    let block = h.deliver(&cbor).await;
+    assert_eq!(block.era, Era::Conway);
+    assert_eq!(
+        h.ledger_tip_point().await,
+        Point::Specific(SlotNo(slot), *block.hash()),
+        "the era-boundary block must apply"
+    );
+    assert_eq!(h.ledger_era().await, Era::Conway);
+    assert_eq!(h.header_failures(), before, "no header failure");
+    assert!(!h.is_marked_invalid(block.hash()).await);
+}
+
+/// The same Conway tag on the SAME ledger but inside epoch 0 is an early
+/// upgrade, not a boundary: rejected.
+#[tokio::test(flavor = "multi_thread")]
+async fn conway_tag_mid_epoch_on_a_babbage_ledger_is_rejected() {
+    let mut h = Harness::new(8).await;
+    let parent = h.bootstrap(Era::Babbage, 8).await;
+
+    // Elected slot, found with the honest Babbage block; the Conway block at
+    // the same slot has the same VRF input, so the pool is elected there too.
+    let (slot, _) = h
+        .honest_leader_block(Era::Babbage, 8, parent.0 + 1, EPOCH_LENGTH - 1, 2, parent.1)
+        .await;
+    let cbor = h.forge_at(Era::Conway, 9, slot, 2, parent.1).await;
+    let bad_block = h.decode(&cbor).unwrap();
+    assert_eq!(bad_block.era, Era::Conway);
+    let err = h
+        .node
+        .validate_peer_header_full(&bad_block)
+        .await
+        .expect_err("a mid-epoch era upgrade must fail header validation");
+    assert!(err.to_string().contains("era tag check"), "{err}");
+
+    let failures = h.header_failures();
+    let bad = h.deliver(&cbor).await;
+    assert_rejected(&h, &bad, Era::Babbage, parent, failures).await;
+    assert_honest_block_applies(&mut h, &bad, Era::Babbage, 8, parent, slot).await;
+}

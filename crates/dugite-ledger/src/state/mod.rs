@@ -2265,6 +2265,55 @@ impl LedgerState {
         }
     }
 
+    /// Reject a block whose era tag the ledger's current era cannot explain.
+    ///
+    /// Haskell never trusts a block's own era tag: the hard-fork combinator
+    /// derives the era from the LEDGER state (`extendToSlot`), and a block that
+    /// disagrees fails `HardForkEnvelopeErrWrongEra` at header validation and
+    /// `HardForkLedgerErrorWrongEra` at ledger validation. dugite decodes by
+    /// tag and, before this check, followed the tag: a Babbage-tagged block in
+    /// Conway moved the ledger back to Babbage, and a Byron `[0, ebb]` tag
+    /// skipped every Praos header check.
+    ///
+    /// The rule is deliberately weaker than Haskell's "block era == era of the
+    /// ticked protocol-version major" (not enforced yet, see the PR notes):
+    ///
+    /// * `block.era < self.era` (a downgrade) is always an error.
+    /// * `block.era > self.era` is an error unless the block is the first of a
+    ///   new epoch: hard forks are enacted by the epoch-boundary TICK, so an
+    ///   upgrade can only arrive on the first block after a boundary.
+    /// * A ledger whose tip is still `Origin` is exempt. A genesis ledger has
+    ///   no era of its own (`LedgerState::new` stamps `Conway` as a
+    ///   placeholder) and its first block fixes the era: mainnet starts at
+    ///   Byron, a devnet jumps straight to Conway inside epoch 0.
+    ///
+    /// Called from `apply_block_impl` (every validation mode, every path) and
+    /// from the node's header validation, so a wrongly tagged block is rejected
+    /// before it can be adopted as the selected tip.
+    pub fn check_block_era(
+        &self,
+        block: &dugite_primitives::block::Block,
+    ) -> Result<(), LedgerError> {
+        if self.tip.point == Point::Origin {
+            return Ok(());
+        }
+        if block.era < self.era {
+            return Err(LedgerError::WrongBlockEra {
+                block_era: block.era,
+                ledger_era: self.era,
+                reason: "era downgrade",
+            });
+        }
+        if block.era > self.era && self.epoch_of_slot(block.slot().0) <= self.epoch.0 {
+            return Err(LedgerError::WrongBlockEra {
+                block_era: block.era,
+                ledger_era: self.era,
+                reason: "era upgrade outside the first block of a new epoch",
+            });
+        }
+        Ok(())
+    }
+
     /// Compute the first slot of the epoch that contains the given slot.
     /// Uses saturating arithmetic to prevent u64 overflow with extreme values.
     pub fn first_slot_of_epoch(&self, epoch: u64) -> u64 {
@@ -3286,6 +3335,22 @@ fn stake_credential_hash(address: &dugite_primitives::address::Address) -> Optio
 pub enum LedgerError {
     #[error("Block does not connect to tip: expected {expected}, got {got}")]
     BlockDoesNotConnect { expected: String, got: String },
+    /// The block's era tag disagrees with the era the ledger is in.
+    ///
+    /// Haskell fixes a block's era from the ledger state (`extendToSlot`),
+    /// never from a tag the block carries, and rejects a disagreeing block
+    /// with `HardForkEnvelopeErrWrongEra` (header) /
+    /// `HardForkLedgerErrorWrongEra` (ledger). See
+    /// [`LedgerState::check_block_era`].
+    #[error(
+        "Block era {block_era} is not valid on a ledger in era {ledger_era}: {reason} \
+         (HardForkLedgerErrorWrongEra)"
+    )]
+    WrongBlockEra {
+        block_era: Era,
+        ledger_era: Era,
+        reason: &'static str,
+    },
     #[error("UTxO error: {0}")]
     UtxoError(String),
     #[error("Invalid transaction: {0}")]
