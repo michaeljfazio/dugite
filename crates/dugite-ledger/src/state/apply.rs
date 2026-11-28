@@ -333,7 +333,43 @@ impl LedgerState {
     /// `true`, Step 8d's `run_phase2_parallel` + fatality loop is skipped and the
     /// captured `phase2_work_items` are returned for later pooled evaluation;
     /// when `false`, the drain runs inline and an empty vec is returned.
+    ///
+    /// **A rejected `ValidateAll` block leaves the UTxO set as it found it.**
+    /// The body below mutates the state transaction by transaction, so an
+    /// `Err` part-way through a block would otherwise keep the effects of
+    /// the transactions (and the epoch tick, and any era translation) that
+    /// ran before the failing step. Haskell's block application is a pure
+    /// function: `applyBlockEither` returns `Left` and the ticked,
+    /// partially-applied state is discarded
+    /// (`Cardano.Ledger.Shelley.API.Validation`, cardano-ledger
+    /// `f649f975`). The UTxO set is undone here, through its undo journal;
+    /// every other sub-state is undone by the caller, which holds the
+    /// [`crate::ledger_seq::LedgerSeq`] whose tip is the pre-block state
+    /// ([`Self::restore_after_failed_apply`]). `ApplyOnly` re-applies our
+    /// own already-validated blocks and keeps the unjournaled fast path.
     fn apply_block_impl(
+        &mut self,
+        block: &Block,
+        mode: BlockValidationMode,
+        defer_phase2: bool,
+    ) -> Result<Vec<Phase2WorkItem>, LedgerError> {
+        let journal = mode == BlockValidationMode::ValidateAll
+            && !self.utxo.utxo_set.journal_is_open();
+        if journal {
+            self.utxo.utxo_set.begin_journal();
+        }
+        let result = self.apply_block_impl_unjournaled(block, mode, defer_phase2);
+        if journal {
+            if result.is_ok() {
+                self.utxo.utxo_set.commit_journal();
+            } else {
+                self.utxo.utxo_set.rollback_journal();
+            }
+        }
+        result
+    }
+
+    fn apply_block_impl_unjournaled(
         &mut self,
         block: &Block,
         mode: BlockValidationMode,
@@ -3724,6 +3760,208 @@ mod tests {
         replay
             .apply_block(&block, BlockValidationMode::ApplyOnly)
             .expect("ApplyOnly runs no validation predicates");
+    }
+
+    // ── A rejected block leaves no trace ──────────────────────────────────
+    //
+    // Haskell `applyBlockEither` returns `Left` and the ticked, partially
+    // applied state is discarded. dugite applies a block in place, so the UTxO
+    // set is undone by its journal inside `apply_block` and every other
+    // sub-state by `restore_after_failed_apply` from the LedgerSeq.
+
+    /// Everything a block can change, in a form two separately-built states
+    /// can be compared in: the snapshot wire view (every map ordered, #1088)
+    /// and the sorted UTxO set.
+    fn ledger_fingerprint(s: &LedgerState) -> (Vec<u8>, Vec<(TransactionInput, TransactionOutput)>) {
+        let snap = crate::state::snapshot_format::LedgerStateSnapshot::from(s);
+        let mut utxo = s.utxo.utxo_set.iter();
+        utxo.sort_by(|a, b| a.0.cmp(&b.0));
+        (bincode::serialize(&snap).expect("snapshot serializes"), utxo)
+    }
+
+    /// A valid signed spend that also registers a stake credential with the
+    /// correct deposit, so it changes the UTxO set, the certificate state, the
+    /// deposit pot and the fee pot.
+    fn valid_spend_and_register(
+        sk: &dugite_crypto::keys::PaymentSigningKey,
+        input: TransactionInput,
+        id: u8,
+        key_deposit: u64,
+    ) -> Transaction {
+        let mut tx = make_simple_tx(
+            id,
+            vec![input],
+            vec![make_output(10_000_000 - 200_000 - key_deposit)],
+            200_000,
+        );
+        tx.body.certificates = vec![Certificate::ConwayStakeRegistration {
+            credential: Credential::VerificationKey(sk.verification_key().hash()),
+            deposit: Lovelace(key_deposit),
+        }];
+        sign_tx(&mut tx, sk);
+        tx
+    }
+
+    /// A signed spend whose only fault is a stake registration declaring the
+    /// wrong deposit (Haskell `IncorrectDepositDELEG`).
+    fn bad_deposit_spend(
+        sk: &dugite_crypto::keys::PaymentSigningKey,
+        input: TransactionInput,
+        id: u8,
+        key_deposit: u64,
+    ) -> Transaction {
+        let other = dugite_crypto::keys::PaymentSigningKey::from_bytes(&[0x5Bu8; 32]).unwrap();
+        let declared = key_deposit + 1;
+        let mut tx = make_simple_tx(
+            id,
+            vec![input],
+            vec![make_output(10_000_000 - 200_000 - declared)],
+            200_000,
+        );
+        tx.body.certificates = vec![Certificate::ConwayStakeRegistration {
+            credential: Credential::VerificationKey(other.verification_key().hash()),
+            deposit: Lovelace(declared),
+        }];
+        sign_tx(&mut tx, sk);
+        sign_tx(&mut tx, &other);
+        tx
+    }
+
+    fn txin(byte: u8) -> TransactionInput {
+        TransactionInput {
+            transaction_id: Hash32::from_bytes([byte; 32]),
+            index: 0,
+        }
+    }
+
+    /// The failing transaction is the block's SECOND: the first is valid and
+    /// has already been applied when the second is rejected. The block is
+    /// still invalid as a whole, and `apply_block` leaves the UTxO set exactly
+    /// as it was — the first transaction's input unspent, its output absent.
+    #[test]
+    fn test_validate_all_rejects_block_whose_second_tx_is_invalid() {
+        let sk = spender_key();
+        let mut state = conway_state();
+        let key_deposit = state.epochs.protocol_params.key_deposit.0;
+        seed_utxo(&mut state, txin(0x71), output_to_key(&sk, 10_000_000));
+        seed_utxo(&mut state, txin(0x72), output_to_key(&sk, 10_000_000));
+        let utxo_before = ledger_fingerprint(&state).1;
+
+        let tx_a = valid_spend_and_register(&sk, txin(0x71), 0x73, key_deposit);
+        let tx_b = bad_deposit_spend(&sk, txin(0x72), 0x74, key_deposit);
+        let tx_b_hash = tx_b.hash;
+        let block = make_test_block(Era::Conway, 1_000, 1, 9, 0, vec![tx_a, tx_b]);
+
+        match state.apply_block(&block, BlockValidationMode::ValidateAll) {
+            Err(LedgerError::BlockTxValidationFailed { tx_hash, errors, .. }) => {
+                assert_eq!(tx_hash, tx_b_hash.to_hex(), "the SECOND tx is the one rejected");
+                assert!(
+                    errors.contains(
+                        &ValidationError::StakeRegistrationDepositMismatch {
+                            declared: key_deposit + 1,
+                            expected: key_deposit,
+                        }
+                        .to_string()
+                    ),
+                    "rejection must name the deposit mismatch, got: {errors}"
+                );
+            }
+            other => panic!("ValidateAll must reject the block, got: {other:?}"),
+        }
+        assert_eq!(
+            ledger_fingerprint(&state).1,
+            utxo_before,
+            "the rejected block's first tx must leave no UTxO change behind"
+        );
+        assert_eq!(state.tip.point.slot(), None, "tip must not advance");
+    }
+
+    /// Through the LedgerSeq, as the node does: after a valid block, a block
+    /// whose second tx is invalid, and which is also the first block of a new
+    /// epoch (so the epoch tick has run when the tx is rejected), is undone
+    /// byte-for-byte — UTxO, certificates, governance, pots, epoch, nonces —
+    /// and the ledger then accepts the honest block at the same position.
+    #[test]
+    fn test_restore_after_failed_apply_leaves_no_trace() {
+        let sk = spender_key();
+        let mut state = conway_state();
+        let key_deposit = state.epochs.protocol_params.key_deposit.0;
+        seed_utxo(&mut state, txin(0x81), output_to_key(&sk, 10_000_000));
+        seed_utxo(&mut state, txin(0x82), output_to_key(&sk, 10_000_000));
+        seed_utxo(&mut state, txin(0x83), output_to_key(&sk, 10_000_000));
+        let mut seq = crate::ledger_seq::LedgerSeq::with_defaults(state.clone_without_utxos(), 100);
+
+        // Block 1 (epoch 0): one valid tx, pushed to the seq.
+        let mut b1_tx = make_simple_tx(0x84, vec![txin(0x81)], vec![make_output(9_800_000)], 200_000);
+        sign_tx(&mut b1_tx, &sk);
+        let b1 = make_test_block(Era::Conway, 1_000, 1, 9, 0, vec![b1_tx]);
+        let d1 = state
+            .apply_block_with_delta(&b1, BlockValidationMode::ValidateAll)
+            .expect("block 1 is valid");
+        seq.push(d1);
+        let before = ledger_fingerprint(&state);
+        let epoch_before = state.epoch;
+
+        // Block 2: first slot of the next epoch; tx_a valid, tx_b invalid.
+        let next_epoch_slot = state.epoch_length + 10;
+        let tx_a = valid_spend_and_register(&sk, txin(0x82), 0x85, key_deposit);
+        let tx_b = bad_deposit_spend(&sk, txin(0x83), 0x86, key_deposit);
+        let mut b2 = make_test_block(Era::Conway, next_epoch_slot, 2, 9, 0, vec![tx_a.clone(), tx_b]);
+        b2.header.prev_hash = b1.header.header_hash;
+
+        let err = state
+            .apply_block_with_delta(&b2, BlockValidationMode::ValidateAll)
+            .expect_err("block 2 carries an invalid tx");
+        assert!(
+            matches!(err, LedgerError::BlockTxValidationFailed { .. }),
+            "got: {err:?}"
+        );
+        // Precondition of the restore, and proof this test exercises it: the
+        // epoch tick and tx_a's certificate DID change the in-place state.
+        assert_ne!(state.epoch, epoch_before, "the epoch tick ran before the rejection");
+        assert_eq!(ledger_fingerprint(&state).1, before.1, "UTxO undone by the journal");
+        assert_ne!(
+            ledger_fingerprint(&state).0,
+            before.0,
+            "without the restore the non-UTxO state still holds the partial block"
+        );
+
+        assert!(state.restore_after_failed_apply(&seq), "the seq tip is the ledger tip");
+        let after = ledger_fingerprint(&state);
+        assert!(after.0 == before.0, "non-UTxO state must be byte-identical to before block 2");
+        assert_eq!(after.1, before.1, "UTxO set must be identical to before block 2");
+        assert_eq!(state.epoch, epoch_before);
+
+        // The honest block at the same position — tx_a alone — applies.
+        let mut honest = make_test_block(Era::Conway, next_epoch_slot, 2, 9, 0, vec![tx_a]);
+        honest.header.prev_hash = b1.header.header_hash;
+        state
+            .apply_block_with_delta(&honest, BlockValidationMode::ValidateAll)
+            .expect("the honest successor applies on the restored state");
+        assert!(state.utxo.utxo_set.contains(&TransactionInput {
+            transaction_id: Hash32::from_bytes([0x85u8; 32]),
+            index: 0,
+        }));
+    }
+
+    /// The restore refuses, changing nothing, when the seq's tip is not the
+    /// ledger's tip: the seq cannot describe the pre-block state.
+    #[test]
+    fn test_restore_after_failed_apply_refuses_a_seq_behind_the_ledger() {
+        let sk = spender_key();
+        let mut state = conway_state();
+        seed_utxo(&mut state, txin(0x91), output_to_key(&sk, 10_000_000));
+        let seq = crate::ledger_seq::LedgerSeq::with_defaults(state.clone_without_utxos(), 100);
+        let mut tx = make_simple_tx(0x92, vec![txin(0x91)], vec![make_output(9_800_000)], 200_000);
+        sign_tx(&mut tx, &sk);
+        let b1 = make_test_block(Era::Conway, 1_000, 1, 9, 0, vec![tx]);
+        // Applied but NOT pushed: the seq is one block behind.
+        state
+            .apply_block_with_delta(&b1, BlockValidationMode::ValidateAll)
+            .expect("valid");
+        let before = ledger_fingerprint(&state);
+        assert!(!state.restore_after_failed_apply(&seq));
+        assert!(ledger_fingerprint(&state) == before, "a refused restore changes nothing");
     }
 
     /// Haskell's Alonzo+ LEDGER runs DELEGS/CERTS and GOV only for an

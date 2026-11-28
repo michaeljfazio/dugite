@@ -535,6 +535,39 @@ fn import_inline_datum(inline_cbor: &[u8]) -> dugite_primitives::transaction::Ou
     }
 }
 
+/// Undo a block apply that returned `Err`, before the ledger lock is released.
+///
+/// The ledger's undo journal has already reverted the UTxO set; this restores
+/// every other sub-state from the LedgerSeq, whose tip is the pre-block state
+/// (`LedgerState::restore_after_failed_apply`). Holding the ledger write lock
+/// across the failed apply and this call means no reader, snapshot or other
+/// apply ever sees the partially-applied state.
+///
+/// If the seq cannot reconstruct the pre-block state the in-memory ledger is
+/// no longer a state of any chain. The process exits WITHOUT the graceful
+/// shutdown, whose final snapshot would persist that state; the next start
+/// recovers from the last good snapshot. Continuing would diverge.
+pub(crate) fn undo_failed_block_apply(
+    ls: &mut LedgerState,
+    seq: &dugite_ledger::ledger_seq::LedgerSeq,
+    slot: dugite_primitives::time::SlotNo,
+    hash: &dugite_primitives::hash::Hash32,
+) {
+    if !ls.restore_after_failed_apply(seq) {
+        error!(
+            slot = slot.0,
+            hash = %hash.to_hex(),
+            ledger_tip = ?ls.tip.point,
+            seq_tip = ?seq.tip_point(),
+            seq_incoherent = seq.is_incoherent(),
+            "A rejected block left a partially-applied ledger that the LedgerSeq \
+             cannot restore. Exiting without saving a snapshot; the next start \
+             recovers from the last saved one."
+        );
+        std::process::exit(1);
+    }
+}
+
 /// Flatten a `LedgerState` into the primitive [`GovernanceSnapshot`] consumed
 /// by [`crate::metrics::NodeMetrics::set_governance_snapshot`].
 ///
@@ -7036,6 +7069,20 @@ impl Node {
                                             "Fork replay: ledger apply failed: {e} — \
                                                          abandoning fork (block marked invalid)"
                                         );
+                                        // Undo the partial apply first: the rollback
+                                        // below is a no-op when this is the first
+                                        // fork block (the ledger is already at the
+                                        // intersection), and otherwise rewinds only
+                                        // the blocks that were pushed to the seq.
+                                        {
+                                            let seq = self.ledger_seq.read().await;
+                                            undo_failed_block_apply(
+                                                &mut ls,
+                                                &seq,
+                                                fork_slot,
+                                                &fork_block.header.header_hash,
+                                            );
+                                        }
                                         // Release the ledger lock before abandon_failed_fork
                                         // (it re-acquires ledger + chain_db).
                                         drop(ls);
@@ -7829,6 +7876,13 @@ impl Node {
                     //       is implicitly throttled by the existing fetch-rate
                     //       controls and follow-up work (#669) will add explicit
                     //       per-peer disqualification on apply failure.
+                    //
+                    // Undo the partial apply under the lock the apply held, so
+                    // nothing ever sees it.
+                    {
+                        let seq = self.ledger_seq.read().await;
+                        undo_failed_block_apply(&mut ls, &seq, block_slot, &block_hash);
+                    }
                     self.metrics
                         .block_apply_failures
                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -10774,6 +10828,16 @@ impl Node {
                             delta
                         }
                         Err(e) => {
+                            // Undo the partial apply before anything else sees it.
+                            {
+                                let seq = self.ledger_seq.read().await;
+                                undo_failed_block_apply(
+                                    &mut ls,
+                                    &seq,
+                                    next_slot,
+                                    &block.header.header_hash,
+                                );
+                            }
                             // Haskell: TraceForgedInvalidBlock (Error) — own block failed validation.
                             error!(
                                 target: "forge",
