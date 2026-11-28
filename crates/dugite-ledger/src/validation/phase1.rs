@@ -86,7 +86,8 @@ pub(super) fn extract_reward_credential(reward_account: &[u8]) -> Option<Credent
 ///
 /// | Certificate                     | Required Witness                        |
 /// |---------------------------------|-----------------------------------------|
-/// | `PoolRegistration`              | All pool owner VKey hashes              |
+/// | `PoolRegistration`              | Pool operator (cold) key hash AND all   |
+/// |                                 | pool owner VKey hashes                  |
 /// | `PoolRetirement`                | Pool operator (cold) key hash           |
 /// | `StakeDelegation`               | Delegator credential key hash           |
 /// | `StakeDeregistration`           | Credential key hash                     |
@@ -122,8 +123,38 @@ fn cert_required_witnesses(cert: &Certificate) -> Vec<Hash28> {
     };
 
     match cert {
-        // Pool registration: ALL owner key hashes must sign.
-        Certificate::PoolRegistration(params) => params.pool_owners.clone(),
+        // Pool registration: the pool OPERATOR (cold) key AND every owner key
+        // hash must sign. Both requirements apply to a first registration and a
+        // re-registration alike, in every era Shelley..Conway, with no
+        // protocol-version gate (IntersectMBO/cardano-ledger @
+        // f649f9751074d2ab3de033fc3912f29c9862c1f5):
+        //
+        // * operator: `getVKeyWitnessTxCert` -> `poolCertKeyHashWitness`
+        //   (`libs/cardano-ledger-core/src/Cardano/Ledger/Core/TxCert.hs`
+        //   L151-L154, `RegPool sppId -> asWitness sppId`), reached from
+        //   `eras/shelley/impl/src/Cardano/Ledger/Shelley/TxCert.hs` L596
+        //   and `eras/conway/impl/src/Cardano/Ledger/Conway/TxCert.hs` L795.
+        // * owners: `getShelleyWitsVKeyNeededNoGov`
+        //   (`eras/shelley/impl/src/Cardano/Ledger/Shelley/UTxO.hs`
+        //   L210-L251, `owners` at L237-L244: `accum (RegPoolTxCert pool)`
+        //   unions `sppOwners pool`), inherited by Allegra, Mary, Alonzo,
+        //   Babbage and Conway (`getConwayWitsVKeyNeeded`).
+        //
+        // The needed set is checked by `validateNeededWitnesses`
+        // (`Shelley/Rules/Utxow.hs` L412-L423, `MissingVKeyWitnessesUTXOW`).
+        // dugite previously required only the owners, so anyone holding an
+        // owner key could change a pool's parameters without the operator key.
+        // The operator is listed once even when it is also an owner (Haskell's
+        // needed set is a `Set`).
+        Certificate::PoolRegistration(params) => {
+            let mut needed = vec![params.operator];
+            for owner in &params.pool_owners {
+                if !needed.contains(owner) {
+                    needed.push(*owner);
+                }
+            }
+            needed
+        }
 
         // Pool retirement: the operator (cold key / pool_id) must sign.
         Certificate::PoolRetirement { pool_hash, .. } => vec![*pool_hash],
