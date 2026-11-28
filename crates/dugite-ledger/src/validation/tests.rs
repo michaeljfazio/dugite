@@ -2394,6 +2394,27 @@ mod tests {
         )
     }
 
+    /// Standard pool OPERATOR (cold) signing key seed. A pool registration needs a
+    /// valid witness for the operator key as well as for every owner
+    /// (`poolCertKeyHashWitness`, cardano-ledger f649f975; #1204).
+    const POOL_OPERATOR_SEED: [u8; 32] = [43u8; 32];
+
+    /// VKey witness for the standard pool operator with a valid Ed25519
+    /// signature over the given tx hash.
+    fn make_pool_operator_witness_for_tx(tx_hash: &Hash32) -> VKeyWitness {
+        let sk = dugite_crypto::keys::PaymentSigningKey::from_bytes(&POOL_OPERATOR_SEED).unwrap();
+        VKeyWitness {
+            vkey: sk.verification_key().to_bytes().to_vec(),
+            signature: sk.sign(tx_hash.as_bytes()),
+        }
+    }
+
+    /// The standard pool operator key hash (the pool id).
+    fn pool_operator_hash() -> Hash28 {
+        let sk = dugite_crypto::keys::PaymentSigningKey::from_bytes(&POOL_OPERATOR_SEED).unwrap();
+        sk.verification_key().hash()
+    }
+
     /// Return the pool owner key hash (blake2b-224 of the standard pool owner vkey).
     fn pool_owner_hash() -> Hash28 {
         let sk = dugite_crypto::keys::PaymentSigningKey::from_bytes(&POOL_OWNER_SEED).unwrap();
@@ -2419,7 +2440,7 @@ mod tests {
 
     #[test]
     fn test_pool_reregistration_no_duplicate_deposit() {
-        let pool_id = dugite_primitives::hash::Hash28::from_bytes([42u8; 28]);
+        let pool_id = pool_operator_hash();
         let mut utxo_set = UtxoSet::new();
         let input = TransactionInput {
             transaction_id: Hash32::from_bytes([1u8; 32]),
@@ -2445,6 +2466,9 @@ mod tests {
             .push(Certificate::PoolRegistration(make_pool_params(pool_id)));
         let (owner_witness, _) = make_pool_owner_witness_for_tx(&tx.hash);
         tx.witness_set.vkey_witnesses.push(owner_witness);
+        tx.witness_set
+            .vkey_witnesses
+            .push(make_pool_operator_witness_for_tx(&tx.hash));
         let mut registered = HashSet::new();
         registered.insert(pool_id);
         let result = validate_transaction_with_pools(
@@ -2475,7 +2499,7 @@ mod tests {
 
     #[test]
     fn test_new_pool_registration_charges_deposit() {
-        let pool_id = dugite_primitives::hash::Hash28::from_bytes([42u8; 28]);
+        let pool_id = pool_operator_hash();
         let mut utxo_set = UtxoSet::new();
         let input = TransactionInput {
             transaction_id: Hash32::from_bytes([1u8; 32]),
@@ -2504,6 +2528,9 @@ mod tests {
             .push(Certificate::PoolRegistration(make_pool_params(pool_id)));
         let (owner_witness, _) = make_pool_owner_witness_for_tx(&tx.hash);
         tx.witness_set.vkey_witnesses.push(owner_witness);
+        tx.witness_set
+            .vkey_witnesses
+            .push(make_pool_operator_witness_for_tx(&tx.hash));
         let registered: HashSet<Hash28> = HashSet::new();
         let result = validate_transaction_with_pools(
             &tx,
@@ -11847,7 +11874,7 @@ mod tests {
     fn test_vrf_key_already_registered_same_pool_allowed() {
         // A pool re-registering with its OWN VRF key must be accepted (no collision)
         // even when the duplicate-VRF check is active (PV >= 11).
-        let pool_a = Hash28::from_bytes([0xA0u8; 28]);
+        let pool_a = pool_operator_hash();
         let own_vrf = Hash32::from_bytes([0xCCu8; 32]);
 
         let mut params = ProtocolParameters::mainnet_defaults();
@@ -11881,6 +11908,9 @@ mod tests {
             )));
         let (owner_witness, _) = make_pool_owner_witness_for_tx(&tx.hash);
         tx.witness_set.vkey_witnesses.push(owner_witness);
+        tx.witness_set
+            .vkey_witnesses
+            .push(make_pool_operator_witness_for_tx(&tx.hash));
 
         // VRF key is currently held by pool_a itself — re-registration is fine.
         let mut registered_vrf_keys = crate::validation::VrfKeyRegistry::default();
@@ -12240,7 +12270,7 @@ mod tests {
     #[test]
     fn test_pool_cost_at_minimum_accepted() {
         // A pool registration with cost == min_pool_cost must be accepted.
-        let pool_id = Hash28::from_bytes([0xC1u8; 28]);
+        let pool_id = pool_operator_hash();
 
         let mut params = ProtocolParameters::mainnet_defaults();
         // Set min_pool_cost to exactly 340 ADA (which is also the cert's cost).
@@ -12277,6 +12307,9 @@ mod tests {
             )));
         let (owner_witness, _) = make_pool_owner_witness_for_tx(&tx.hash);
         tx.witness_set.vkey_witnesses.push(owner_witness);
+        tx.witness_set
+            .vkey_witnesses
+            .push(make_pool_operator_witness_for_tx(&tx.hash));
 
         let registered_pools: std::collections::HashSet<Hash28> = std::collections::HashSet::new();
 
@@ -12392,7 +12425,7 @@ mod tests {
     fn test_pool_reward_account_correct_network_accepted() {
         // A pool registration with a matching mainnet reward account in a mainnet tx
         // must be accepted.
-        let pool_id = Hash28::from_bytes([0xD1u8; 28]);
+        let pool_id = pool_operator_hash();
         let params = ProtocolParameters::mainnet_defaults();
 
         let mut utxo_set = UtxoSet::new();
@@ -12430,6 +12463,9 @@ mod tests {
             .push(Certificate::PoolRegistration(pool_params));
         let (owner_witness, _) = make_pool_owner_witness_for_tx(&tx.hash);
         tx.witness_set.vkey_witnesses.push(owner_witness);
+        tx.witness_set
+            .vkey_witnesses
+            .push(make_pool_operator_witness_for_tx(&tx.hash));
 
         let registered_pools: std::collections::HashSet<Hash28> = std::collections::HashSet::new();
 
@@ -13638,90 +13674,189 @@ mod tests {
     }
 
     #[test]
-    fn test_cert_witness_pool_registration_with_matching_owner_witnesses() {
-        let pool_deposit = ProtocolParameters::mainnet_defaults().pool_deposit.0;
-        let (utxo_set, _input, mut tx, params) = make_cert_test_tx(pool_deposit, 0);
-
-        let (w1, owner1) = make_cert_vkey_witness([0xA1; 32]);
-        let (w2, owner2) = make_cert_vkey_witness([0xA2; 32]);
-
-        tx.body
-            .certificates
-            .push(Certificate::PoolRegistration(PoolParams {
-                operator: Hash28::from_bytes([0x01; 28]),
-                vrf_keyhash: Hash32::from_bytes([0x02; 32]),
-                pledge: Lovelace(100_000_000),
-                cost: Lovelace(340_000_000),
-                margin: Rational {
-                    numerator: 1,
-                    denominator: 100,
-                },
-                reward_account: {
-                    let mut ra = vec![0xE0u8];
-                    ra.extend_from_slice(&[0x03; 28]);
-                    ra
-                },
-                pool_owners: vec![owner1, owner2],
-                relays: vec![],
-                pool_metadata: None,
-            }));
-        tx.witness_set.vkey_witnesses.push(w1);
-        tx.witness_set.vkey_witnesses.push(w2);
-
-        let result = validate_transaction(&tx, &utxo_set, &params, 100, 300, None);
-        match result {
-            Ok(()) => {}
-            Err(errors) => {
-                assert!(
-                    !errors
-                        .iter()
-                        .any(|e| matches!(e, ValidationError::MissingCertificateWitness(_))),
-                    "Should not have MissingCertificateWitness, got: {errors:?}"
-                );
-            }
-        }
+    fn test_cert_witness_pool_registration_with_matching_operator_and_owner_witnesses() {
+        // The operator (cold) key must sign as well as every owner
+        // (`poolCertKeyHashWitness` + `owners`, cardano-ledger f649f975).
+        let (_, result) = validate_pool_reg(9, false, 0xA0, &[0xA1, 0xA2], &[0xA0, 0xA1, 0xA2]);
+        assert!(
+            result.is_ok(),
+            "operator + every owner witnessed must be accepted, got: {result:?}"
+        );
     }
 
     #[test]
     fn test_cert_witness_pool_registration_missing_owner_witness() {
-        let pool_deposit = ProtocolParameters::mainnet_defaults().pool_deposit.0;
-        let (utxo_set, _input, mut tx, params) = make_cert_test_tx(pool_deposit, 0);
+        // Operator and owners 1 and 2 sign; owner 3 does not. The error must
+        // name exactly owner 3, so this test fails if the owner requirement
+        // is dropped (the operator alone is satisfied).
+        let (_, owner3) = pool_test_key(0xB3);
+        let (_, result) =
+            validate_pool_reg(9, false, 0xB0, &[0xB1, 0xB2, 0xB3], &[0xB0, 0xB1, 0xB2]);
+        assert_eq!(
+            missing_cert_witnesses(&result),
+            vec![owner3.to_hex()],
+            "Expected MissingCertificateWitness for exactly the unsigned owner, got: {result:?}"
+        );
+    }
 
-        let (w1, owner1) = make_cert_vkey_witness([0xB1; 32]);
-        let (w2, owner2) = make_cert_vkey_witness([0xB2; 32]);
-        let owner3 = Hash28::from_bytes([0xB3; 28]); // No witness for this one
+    // ------------------------------------------------------------------
+    // #1204: pool registration requires the OPERATOR (cold) key witness.
+    //
+    // cardano-ledger f649f9751074d2ab3de033fc3912f29c9862c1f5, every era
+    // Shelley..Conway, first registration and re-registration alike:
+    //   Core/TxCert.hs L151-154  poolCertKeyHashWitness (RegPool -> sppId)
+    //   Shelley/TxCert.hs L596 / Conway/TxCert.hs L795  (called unconditionally)
+    //   Shelley/UTxO.hs L237-244 owners (sppOwners of every RegPoolTxCert)
+    //   Shelley/Rules/Utxow.hs L412-423 validateNeededWitnesses
+    // ------------------------------------------------------------------
 
-        tx.body
-            .certificates
-            .push(Certificate::PoolRegistration(PoolParams {
-                operator: Hash28::from_bytes([0x01; 28]),
-                vrf_keyhash: Hash32::from_bytes([0x02; 32]),
-                pledge: Lovelace(100_000_000),
-                cost: Lovelace(340_000_000),
-                margin: Rational {
-                    numerator: 1,
-                    denominator: 100,
-                },
-                reward_account: {
-                    let mut ra = vec![0xE0u8];
-                    ra.extend_from_slice(&[0x03; 28]);
-                    ra
-                },
-                pool_owners: vec![owner1, owner2, owner3],
-                relays: vec![],
-                pool_metadata: None,
-            }));
-        tx.witness_set.vkey_witnesses.push(w1);
-        tx.witness_set.vkey_witnesses.push(w2);
+    fn pool_reg_cert(operator: Hash28, owners: Vec<Hash28>) -> Certificate {
+        Certificate::PoolRegistration(PoolParams {
+            operator,
+            vrf_keyhash: Hash32::from_bytes([0x02; 32]),
+            pledge: Lovelace(100_000_000),
+            cost: Lovelace(340_000_000),
+            margin: Rational {
+                numerator: 1,
+                denominator: 100,
+            },
+            reward_account: {
+                let mut ra = vec![0xE0u8];
+                ra.extend_from_slice(&[0x03; 28]);
+                ra
+            },
+            pool_owners: owners,
+            relays: vec![],
+            pool_metadata: None,
+        })
+    }
 
-        let result = validate_transaction(&tx, &utxo_set, &params, 100, 300, None);
-        assert!(result.is_err());
-        let errors = result.unwrap_err();
-        assert!(
-            errors
-                .iter()
-                .any(|e| matches!(e, ValidationError::MissingCertificateWitness(_))),
-            "Expected MissingCertificateWitness for missing pool owner, got: {errors:?}"
+    /// A real signing key for `seed` and its key hash.
+    fn pool_test_key(seed: u8) -> (dugite_crypto::keys::PaymentSigningKey, Hash28) {
+        let sk = dugite_crypto::keys::PaymentSigningKey::from_bytes(&[seed; 32]).unwrap();
+        let hash = sk.verification_key().hash();
+        (sk, hash)
+    }
+
+    /// Validate a pool (re-)registration through `validate_transaction_with_context`.
+    /// The operator and owners are real keys named by seed; `signers` are the
+    /// seeds that actually sign (valid Ed25519 signatures over the tx hash).
+    /// `already_registered` makes it a re-registration (no deposit), the case
+    /// the issue is about.
+    fn validate_pool_reg(
+        pv_major: u64,
+        already_registered: bool,
+        operator_seed: u8,
+        owner_seeds: &[u8],
+        signers: &[u8],
+    ) -> (Hash28, Result<(), Vec<ValidationError>>) {
+        let deposit = if already_registered {
+            0
+        } else {
+            ProtocolParameters::mainnet_defaults().pool_deposit.0
+        };
+        let (utxo_set, _input, mut tx, mut params) = make_cert_test_tx(deposit, 0);
+        params.protocol_version_major = pv_major;
+        let (_, operator) = pool_test_key(operator_seed);
+        let owners: Vec<Hash28> = owner_seeds.iter().map(|s| pool_test_key(*s).1).collect();
+        tx.body.certificates.push(pool_reg_cert(operator, owners));
+        tx.witness_set.vkey_witnesses = signers
+            .iter()
+            .map(|seed| {
+                let (sk, _) = pool_test_key(*seed);
+                VKeyWitness {
+                    vkey: sk.verification_key().to_bytes().to_vec(),
+                    signature: sk.sign(tx.hash.as_bytes()),
+                }
+            })
+            .collect();
+        let mut ctx = ValidationContext::new();
+        if already_registered {
+            ctx = ctx.with_pools(HashSet::from([operator]));
+        }
+        (
+            operator,
+            validate_transaction_with_context(&tx, &utxo_set, &params, 100, 300, None, ctx),
+        )
+    }
+
+    fn missing_cert_witnesses(r: &Result<(), Vec<ValidationError>>) -> Vec<String> {
+        r.as_ref()
+            .err()
+            .map(|es| {
+                es.iter()
+                    .filter_map(|e| match e {
+                        ValidationError::MissingCertificateWitness(h) => Some(h.clone()),
+                        _ => None,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// A re-registration carrying every OWNER witness but not the operator's
+    /// is rejected, naming exactly the operator key; adding the operator
+    /// witness makes it pass. Holds for every protocol version.
+    #[test]
+    fn test_pool_reregistration_requires_operator_witness_in_every_era() {
+        for pv in [2u64, 3, 4, 5, 6, 7, 8, 9, 10, 11] {
+            let (operator, without) =
+                validate_pool_reg(pv, true, 0xD0, &[0xD1, 0xD2], &[0xD1, 0xD2]);
+            assert_eq!(
+                missing_cert_witnesses(&without),
+                vec![operator.to_hex()],
+                "PV{pv}: re-registration without the operator witness must be rejected, \
+                 naming only the operator; got {without:?}"
+            );
+
+            let (_, with) = validate_pool_reg(pv, true, 0xD0, &[0xD1, 0xD2], &[0xD0, 0xD1, 0xD2]);
+            assert!(
+                with.is_ok(),
+                "PV{pv}: re-registration with operator + owner witnesses must be accepted; \
+                 got {with:?}"
+            );
+        }
+    }
+
+    /// A FIRST registration needs the operator key too: Haskell does not
+    /// distinguish new from existing pools when computing needed witnesses.
+    #[test]
+    fn test_pool_first_registration_requires_operator_witness() {
+        let (operator, without) = validate_pool_reg(9, false, 0xD3, &[0xD4], &[0xD4]);
+        assert_eq!(
+            missing_cert_witnesses(&without),
+            vec![operator.to_hex()],
+            "{without:?}"
+        );
+        let (_, with) = validate_pool_reg(9, false, 0xD3, &[0xD4], &[0xD3, 0xD4]);
+        assert!(with.is_ok(), "{with:?}");
+    }
+
+    /// An owner-less registration still needs the operator.
+    #[test]
+    fn test_pool_registration_without_owners_requires_operator_witness() {
+        let (operator, without) = validate_pool_reg(9, true, 0xD5, &[], &[]);
+        assert_eq!(
+            missing_cert_witnesses(&without),
+            vec![operator.to_hex()],
+            "{without:?}"
+        );
+        let (_, with) = validate_pool_reg(9, true, 0xD5, &[], &[0xD5]);
+        assert!(with.is_ok(), "{with:?}");
+    }
+
+    /// When the operator key is also listed as an owner, one witness covers
+    /// both roles (Haskell's needed set is a `Set`), and a missing witness is
+    /// reported once, not twice.
+    #[test]
+    fn test_pool_registration_operator_that_is_also_owner_needs_one_witness() {
+        let (_, with) = validate_pool_reg(9, true, 0xD6, &[0xD6], &[0xD6]);
+        assert!(with.is_ok(), "{with:?}");
+        let (operator, without) = validate_pool_reg(9, true, 0xD6, &[0xD6], &[]);
+        assert_eq!(
+            missing_cert_witnesses(&without),
+            vec![operator.to_hex()],
+            "{without:?}"
         );
     }
 
