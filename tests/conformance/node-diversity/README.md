@@ -64,6 +64,28 @@ NDC copied them from Amaru, then edited them. `fetch-corpora.sh` checks, at the 
 * Three protocol-parameter files that 32 fixtures reference are not in NDC. They are added from
   Amaru, by SHA-256. The fetch **fails once NDC ships any of them**, so the workaround gets deleted.
 
+## The uplc-conformance runner (Phase 2a, #1124)
+
+`tests/conformance/src/node_diversity/uplc_conformance.rs` (printer: `uplc_print.rs`). Every vector
+goes through dugite's production, protocol-version- and language-gated evaluation path
+(`dugite_uplc::eval_redeemer::eval_script_bytes_gated` for a vector with a `.flat`,
+`eval_program_gated` for the text-only ones: BLS elements and inputs flat cannot carry) with the
+corpus' cost model for its protocol version and Plutus language and the scenario's 10B CPU / 14M MEM.
+Those two functions run the same per-script steps, through the same helpers, as the redeemer path
+(`eval_resolved_redeemer`): language gate, availability rules, scope check, on-chain cost model. They
+omit only what needs a transaction (building and applying the script context). A missing or
+unusable cost model is a harness failure, never a fall back to the reference model.
+
+* The vector list, ids, titles and groups are NDC's `expectations.json`; the runner reads no expected
+  result. A vector it cannot find, or a corpus vector no expectation names, fails the run.
+* `.flat` files in the corpus are hex text.
+* Error classes: `parse/decode error` (text parse, CBOR/flat decode, availability rules),
+  `out of budget`, `evaluation failure` (everything else that stops a run). An evaluator panic is
+  reported as `evaluator panic`, which no expectation names, so it can never score.
+* The score is the site builder's (`just ndc-score`). `ndc_uplc_conformance.rs` bounds the runner's
+  parts against the corpus' own expected files, including a perturbed cost model that must turn a
+  passing vector red.
+
 ## Changing a pin
 
 A pin change is a corpus upgrade: edit `corpora.toml`, run `just ndc-fetch` (it names every

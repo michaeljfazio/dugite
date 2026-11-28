@@ -74,11 +74,35 @@ fn generate(
     pins: &Pins,
     run: &RunInfo,
 ) -> Result<(ReportStatus, String, Value), String> {
+    if scenario == Scenario::UplcConformance {
+        return generate_uplc_conformance(run);
+    }
     let note = stub_note(scenario).to_string();
     Ok((
         ReportStatus::Stub,
         note.clone(),
         empty_report(scenario, era, pins, run, &note),
+    ))
+}
+
+/// `uplc-conformance` (#1114 Phase 2a): every vector through dugite's production gated
+/// evaluation path.  The runner lives in `dugite_conformance::node_diversity::uplc_conformance`.
+fn generate_uplc_conformance(run: &RunInfo) -> Result<(ReportStatus, String, Value), String> {
+    use dugite_conformance::node_diversity::uplc_conformance::run_all;
+    let result = run_all(&corpora_dir())?;
+    let note = format!(
+        "{} vectors evaluated through the production gated path; {} evaluator panics, {} internal errors",
+        result.cases.len(),
+        result.panics.len(),
+        result.internal.len()
+    );
+    for line in result.panics.iter().chain(result.internal.iter()) {
+        eprintln!("uplc-conformance: {line}");
+    }
+    Ok((
+        ReportStatus::Ok,
+        note,
+        uplc_conformance_report(run, &result.cases),
     ))
 }
 
