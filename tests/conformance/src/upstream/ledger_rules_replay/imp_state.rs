@@ -15,8 +15,9 @@
 //!   non-myopic record at all. Those groups are reported as "absent from the
 //!   Haskell dump", never as matched.
 //!
-//! `LedgerEnv` is encoded (cardano-ledger `a88b60bd`,
-//! `eras/conway/impl/src/Cardano/Ledger/Conway/Rules/Ledger.hs`) as
+//! `LedgerEnv` (cardano-ledger `a88b60bd`,
+//! `eras/shelley/impl/src/Cardano/Ledger/Shelley/Rules/Ledger.hs`, `data LedgerEnv`;
+//! Conway's `Environment (LEDGER era)` is that type) is encoded as
 //! `array(5) [ledgerSlotNo, ledgerEpochNo :: Maybe EpochNo, ledgerIx :: TxIx,
 //! ledgerPp, ledgerAccount :: ChainAccountState]`.
 //!

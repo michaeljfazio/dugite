@@ -1,8 +1,21 @@
-//! Phase 4 — ImpSpec ledger-rule replay.
+//! ImpSpec ledger-rule vectors.
 //!
-//! This module replays cardano-ledger ImpSpec test vectors through Dugite's
-//! ledger engine and compares the resulting state against the expected state
-//! encoded in each vector directory.
+//! * **LEDGER and NEWEPOCH are APPLIED and COMPARED.** Each vector's state is
+//!   decoded with the production Haskell-snapshot decoder, imported through
+//!   `LedgerState::from_haskell_snapshot`, the signal is applied through
+//!   `LedgerState::apply_block` (`ValidateAll`), and the result is compared with
+//!   Haskell's `st_out` over an enumerated field list (`project.rs`, which also
+//!   lists what is NOT compared and why). A vector with no `st_out` (Haskell's
+//!   STS rejected) must be rejected by dugite too. Known divergences are pinned in
+//!   `tests/conformance/expected/ledger_rules_replay.tsv` (`expected.rs`).
+//!   See `imp_state.rs`, `apply.rs`, `replay.rs`, `compare.rs`.
+//! * **The other rules are DECODE-ONLY**: POOL, CERT, CERTS, DELEG, GOVCERT, GOV,
+//!   ENACT and RATIFY (ExecSpecRule states, which are not a `NewEpochState`) get a
+//!   signal-shape check in `runner.rs`; nothing is applied or compared.
+//!
+//! `ctx` is not read by the replay: an STS transition is `TRC (env, st, sig)`, and
+//! for LEDGER `env` is the `LedgerEnv` (slot, epoch, protocol parameters, pots)
+//! while NEWEPOCH's `env` is `()`.
 //!
 //! ## Corpus generation: patched ImpSpec (official Haskell test vectors)
 //!
@@ -27,14 +40,17 @@
 //! <fixtures>/ledger-rules/<Rule>/<test_name>/
 //!   conformance_dump_ctx.cbor     -- ExecContext (0xF6 CBOR null for NEWEPOCH)
 //!   conformance_dump_env.cbor     -- Environment (0xF6 CBOR null for NEWEPOCH)
-//!   conformance_dump_st.cbor      -- State (NewEpochState array(7))
+//!   conformance_dump_st.cbor      -- State (NewEpochState array(7); LedgerState array(2) for LEDGER)
 //!   conformance_dump_sig.cbor     -- Signal (EpochNo for NEWEPOCH; tx CBOR for LEDGER)
 //!   conformance_dump_st_out.cbor  -- Haskell expected final state (absent when STS rejects)
 //! ```
 //!
+//! For LEDGER, `st` is a bare `LedgerState` (`array(2)`) and `env` a `LedgerEnv`;
+//! for NEWEPOCH, `st` is a bare `NewEpochState` (`array(7)`). The UTxO is inline.
+//!
 //! Each test-case directory under a rule directory is decoded as one `ImpVector`.
-//! See `vector.rs` for the decoder, `bridge.rs` for state/signal decoding,
-//! `runner.rs` for validation, and `compare.rs` for state comparison.
+//! See `vector.rs` for the decoder, `bridge.rs` for the decode-only checks,
+//! `runner.rs` for those checks, and `replay.rs` for the apply-and-compare.
 
 pub mod apply;
 pub mod bridge;

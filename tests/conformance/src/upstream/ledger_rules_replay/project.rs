@@ -20,13 +20,13 @@
 //! * `NewEpochState` — `eras/shelley/impl/src/Cardano/Ledger/Shelley/LedgerState/Types.hs`
 //!   `data NewEpochState`: `nesEL`, `nesBprev`, `nesBcur`, `nesEs`, `nesRu`,
 //!   `nesPd`, `stashedAVVMAddresses`.
-//! * `EpochState` — same file: `esChainAccountState`, `esLedgerState`,
+//! * `EpochState` — same file: `esChainAccountState`, `esLState`,
 //!   `esSnapshots`, `esNonMyopic`.
 //! * `LedgerState` — same file: `lsUTxOState`, `lsCertState`.
 //! * `UTxOState` — same file: `utxosUtxo`, `utxosDeposited`, `utxosFees`,
 //!   `utxosGovState`, `utxosInstantStake`, `utxosDonation`.
-//! * `CertState` — `libs/cardano-ledger-core/src/Cardano/Ledger/State/CertState.hs`:
-//!   `certVState`, `certPState`, `certDState`.
+//! * `CertState` — `eras/conway/impl/src/Cardano/Ledger/Conway/State/CertState.hs`
+//!   `data ConwayCertState`: `conwayCertVState`, `conwayCertPState`, `conwayCertDState`.
 //! * `ConwayGovState` — `eras/conway/impl/src/Cardano/Ledger/Conway/Governance.hs`:
 //!   `cgsProposals`, `cgsCommittee`, `cgsConstitution`, `cgsCurPParams`,
 //!   `cgsPrevPParams`, `cgsFuturePParams`, `cgsDRepPulsingState`.
