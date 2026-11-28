@@ -30,6 +30,11 @@ common_dir = "crates/amaru-ledger/tests/data/transaction/common"
 
 # ── ledger-rules: NDC vs Amaru ───────────────────────────────────────────────────────────────
 [ledger_rules]
+# Files NDC ships under era-history/, protocol-parameters/ or test-credentials/ that Amaru's
+# common/ directory does not have.  Every file Amaru has there must be in NDC byte for byte; any
+# other NDC-only file must be listed, and a listed file that disappears fails the fetch.
+ndc_only_files = ["test-credentials/foo.vk", "test-credentials/tx.json", "test-credentials/tx.signed.json"]
+
 # Workaround for an NDC defect: 32 fixtures (1 + 14 + 17, counted by fetch-corpora.sh) reference
 # these three protocol-parameter files, but NDC does not ship them.  They are fetched from Amaru
 # at amaru.dataset_commit (the `common_dir` of the Amaru checkout) and checked by SHA-256.  fetch-corpora.sh FAILS once NDC ships any of
@@ -50,25 +55,27 @@ sha256 = "1bd993bac8ac2c9163bebccffd4343b372d2800fdf1986fa0654ce7e4cdcd59c"
 fixtures = 1
 
 # NDC's fixtures are Amaru's at `amaru.dataset_commit` plus NDC's own edits.  fetch-corpora.sh
-# compares every fixture after normalising what NDC is known to rewrite mechanically (`category`
-# added; JSON nulls and default-empty `initial_state` sections dropped).  Whatever still differs
-# must be listed here, id -> the top-level fixture keys that differ.  The check fails on a
-# difference that is not listed, and on a listed entry that no longer differs (remove it).
+# compares every fixture type-strictly after undoing the mechanical rewrites NDC made (rules R1-R6
+# in scripts/node-diversity/ledger_rules_check.py: a `category` key added; nulls and default-empty
+# sections of `initial_state` dropped).  Whatever still differs must be listed here, fixture id ->
+# the exact LEAF PATHS that differ.  The check fails on a path that is not listed, and on a listed
+# path that no longer differs (remove it).  `just ndc-fetch` after a pin change; to regenerate the
+# list: ledger_rules_check.py diff-paths.
 #
 # Two kinds of edit:
 #   * title / description wording only (00016, 00039, 00054, 00112, 00113, 00130);
 #   * 00034, 00055, 00056, 00057: NDC replaced Amaru's `max_reference_scripts_size = 50`
-#     override and its 50-byte scripts with the real Conway 204,800-byte limit and
-#     ~200 KiB scripts, so the fixtures need no parameter override.  These four differ in
-#     transaction, initial_state and protocol_parameters: NDC's bytes are what we score against.
+#     override (`protocol_parameters.$override`) and its 50-byte scripts with the real Conway
+#     204,800-byte limit and ~200 KiB scripts, so the fixtures need no parameter override.  The
+#     rewritten transaction and UTxO outputs are hex leaves; NDC's bytes are what we score against.
 [ledger_rules.known_divergences]
 "00016" = ["description"]
-"00034" = ["description", "initial_state", "protocol_parameters", "transaction"]
+"00034" = ["description", "initial_state.utxo[0].output", "initial_state.utxo[1].output", "protocol_parameters.$override", "transaction"]
 "00039" = ["title"]
 "00054" = ["description"]
-"00055" = ["description", "initial_state", "protocol_parameters", "transaction"]
-"00056" = ["description", "initial_state", "protocol_parameters", "transaction"]
-"00057" = ["description", "initial_state", "protocol_parameters", "transaction"]
+"00055" = ["description", "initial_state.utxo[0].output", "initial_state.utxo[1].output", "protocol_parameters.$override", "transaction"]
+"00056" = ["description", "initial_state.utxo[0].output", "initial_state.utxo[1].output", "initial_state.utxo[2].output", "protocol_parameters.$override", "transaction"]
+"00057" = ["description", "initial_state.utxo[0].output", "protocol_parameters.$override", "transaction"]
 "00112" = ["title"]
 "00113" = ["title"]
 "00130" = ["title"]

@@ -40,8 +40,11 @@ die() {
     exit 1
 }
 
+# Read the pins.  The status of pins.py is checked on its own: `eval "$(cmd)"` reports eval's
+# status, never cmd's, so a failing pins.py would otherwise be ignored.
+pin_assignments=$(python3 -I "$HERE/pins.py" "$PINS") || die "invalid pins in $PINS"
 # shellcheck disable=SC2154  # assigned by eval
-eval "$(python3 -I "$HERE/pins.py" "$PINS")" || die "cannot read pins from $PINS"
+eval "$pin_assignments"
 
 mkdir -p "$DIR"
 DIR=$(cd "$DIR" && pwd)
@@ -99,15 +102,19 @@ extract() {
         die "$name: $url has sha256 $actual, pin is $digest"
     fi
     # Refuse an archive that could write outside its directory, or that holds links or devices.
-    local listing
-    listing=$(zstd -dcq "$work/archive.tar.zst" | tar -t) || die "$name: archive does not unpack"
-    if grep -Eq '^/|(^|/)\.\.(/|$)' <<<"$listing"; then
+    # Each listing is captured into a variable first: `... | grep -q` can exit early and make the
+    # producer die of SIGPIPE, which under pipefail makes the check pass or fail by accident.
+    local names details types
+    names=$(zstd -dcq "$work/archive.tar.zst" | tar -t) || die "$name: archive does not unpack"
+    if grep -E '^/|(^|/)\.\.(/|$)' <<<"$names" >/dev/null; then
         rm -rf "$work"
         die "$name: archive has an absolute or parent-relative path"
     fi
-    if zstd -dcq "$work/archive.tar.zst" | tar -tv | cut -c1 | grep -qv '[-d]'; then
+    details=$(zstd -dcq "$work/archive.tar.zst" | tar -tv) || die "$name: archive does not unpack"
+    types=$(cut -c1 <<<"$details" | sort -u | tr -d '\n')
+    if [[ ! "$types" =~ ^[-d]+$ ]]; then
         rm -rf "$work"
-        die "$name: archive holds something other than files and directories"
+        die "$name: archive holds something other than files and directories (entry types: $types)"
     fi
     mkdir "$work/out"
     zstd -dcq "$work/archive.tar.zst" | tar -x -C "$work/out"
@@ -128,11 +135,12 @@ do_amaru() {
 
 do_ledger_rules() {
     local ndc_fixtures="$DIR/ndc/scenarios/ledger-rules/fixtures" target="$DIR/ledger-rules" partial="$DIR/ledger-rules.partial"
+    # Nothing may read fixtures made under other pins while this runs, or after it fails.
+    rm -rf "$target" "$partial"
     [[ -d "$ndc_fixtures" && -d "$DIR/amaru" ]] || die "ledger-rules needs the ndc and amaru components"
     # 1. NDC must lack exactly the pinned files, with the pinned fixture counts.
     python3 -I "$HERE/ledger_rules_check.py" unresolved "$PINS" "$ndc_fixtures"
     # 2. Assemble the fixture root: NDC's fixtures plus the missing parameter files, from Amaru.
-    rm -rf "$partial"
     cp -R "$ndc_fixtures" "$partial"
     local entry file digest rest source
     for entry in ${MISSING_PARAMS[@]+"${MISSING_PARAMS[@]}"}; do
@@ -153,7 +161,6 @@ do_ledger_rules() {
         rm -rf "$partial"
         die "ledger-rules fixtures do not match Amaru at $AMARU_DATASET_COMMIT"
     fi
-    rm -rf "$target"
     mv "$partial" "$target"
 }
 
@@ -187,6 +194,9 @@ wants() {
     return 1
 }
 
+# Fixtures assembled under older pins must not survive ANY failure below, including a checkout
+# that refuses to move: remove them first, rebuild them last.
+if wants ledger-rules; then rm -rf "$DIR/ledger-rules" "$DIR/ledger-rules.partial"; fi
 if wants ndc || wants ledger-rules; then do_ndc; fi
 if wants amaru || wants ledger-rules; then do_amaru; fi
 if wants ledger-rules; then do_ledger_rules; fi

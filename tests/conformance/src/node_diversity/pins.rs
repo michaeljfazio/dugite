@@ -40,9 +40,12 @@ pub struct AmaruPin {
 pub struct LedgerRulesPins {
     #[serde(default)]
     pub missing_protocol_parameters: Vec<MissingParameterFile>,
-    /// Fixture id -> the top-level keys in which NDC intentionally differs from Amaru.
+    /// Fixture id -> the leaf paths at which NDC intentionally differs from Amaru.
     #[serde(default)]
     pub known_divergences: BTreeMap<String, Vec<String>>,
+    /// Files NDC ships next to Amaru's `common/` files that Amaru does not have.
+    #[serde(default)]
+    pub ndc_only_files: Vec<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -68,9 +71,24 @@ pub fn repo_root() -> PathBuf {
         .to_path_buf()
 }
 
-/// The pin file of the repository.
+/// The pin file: `$DUGITE_NDC_PINS` (the fetch script honours it too), else the repository's own.
 pub fn default_pins_path() -> PathBuf {
-    repo_root().join("tests/conformance/node-diversity/corpora.toml")
+    std::env::var_os("DUGITE_NDC_PINS")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| repo_root().join("tests/conformance/node-diversity/corpora.toml"))
+}
+
+/// SHA-256 (lowercase hex) of the pin file's bytes.  A report records it, so a report made under
+/// other pins can be told from one made under the current pins.
+pub fn pins_sha256() -> Result<String, String> {
+    use sha2::{Digest, Sha256};
+    let path = default_pins_path();
+    let bytes =
+        std::fs::read(&path).map_err(|e| format!("cannot read pins {}: {e}", path.display()))?;
+    Ok(Sha256::digest(&bytes)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect())
 }
 
 /// Where `fetch-corpora.sh` puts the corpora: `$DUGITE_NDC_DIR`, or `target/node-diversity/corpora`.
@@ -147,8 +165,15 @@ impl Pins {
             if id.len() != 5 || !id.bytes().all(|b| b.is_ascii_digit()) {
                 return Err(format!("known_divergences id {id:?} is not five digits"));
             }
-            if keys.is_empty() {
+            if keys.is_empty() || keys.iter().any(String::is_empty) {
                 return Err(format!("known_divergences {id} lists no keys"));
+            }
+        }
+        for file in &self.ledger_rules.ndc_only_files {
+            if file.is_empty() || file.starts_with('/') || file.split('/').any(|p| p == "..") {
+                return Err(format!(
+                    "ndc_only_files entry {file:?} is not a relative path"
+                ));
             }
         }
         for (what, url) in [
