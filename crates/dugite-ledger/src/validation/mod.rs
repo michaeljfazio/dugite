@@ -2835,29 +2835,44 @@ pub fn validate_transaction_with_context(
     // `cardano-ledger-conway:Cardano.Ledger.Conway.Rules.GovCert`.
     // ------------------------------------------------------------------
     let mut extra_errors_pre: Vec<ValidationError> = Vec::new();
-    if let (Some(dreps), Some(deposits)) = (
-        context.registered_dreps.as_deref(),
-        context.drep_deposits.as_deref(),
-    ) {
+    if let Some(dreps) = context.registered_dreps.as_deref() {
+        // Left-to-right over the EVOLVING registry (Conway/Rules/Certs.hs
+        // L242-246): a `RegDRep` earlier in this tx stores ITS deposit, which
+        // a later `UnregDRep` of the same credential must refund. That
+        // in-tx deposit is known from the transaction itself, so it is
+        // compared whether or not `drep_deposits` (the stored deposits of
+        // DReps registered BEFORE this tx) was supplied.
+        let deposits = context.drep_deposits.as_deref();
+        let mut overlay = conway::DRepRegistryOverlay::new(dreps);
         for cert in &tx.body.certificates {
-            if let dugite_primitives::transaction::Certificate::UnregDRep { credential, refund } =
-                cert
-            {
-                let key = credential.to_typed_hash32();
-                if !dreps.contains(&key) {
-                    // Already flagged inside as DRepNotRegistered; skip
-                    // refund check (Haskell's `?!` short-circuit).
-                    continue;
-                }
-                if let Some(stored_deposit) = deposits.get(&key) {
-                    if refund.0 != *stored_deposit {
-                        extra_errors_pre.push(ValidationError::DRepIncorrectRefund {
-                            credential_hash: key.to_hex(),
-                            declared: refund.0,
-                            expected: *stored_deposit,
-                        });
+            match cert {
+                dugite_primitives::transaction::Certificate::RegDRep {
+                    credential,
+                    deposit,
+                    ..
+                } => overlay.register(credential.to_typed_hash32(), deposit.0),
+                dugite_primitives::transaction::Certificate::UnregDRep { credential, refund } => {
+                    let key = credential.to_typed_hash32();
+                    if !overlay.contains(&key) {
+                        // Already flagged inside as DRepNotRegistered; skip
+                        // refund check (Haskell's `?!` short-circuit).
+                        continue;
                     }
+                    let expected = overlay
+                        .in_tx_deposit(&key)
+                        .or_else(|| deposits.and_then(|d| d.get(&key).copied()));
+                    if let Some(stored_deposit) = expected {
+                        if refund.0 != stored_deposit {
+                            extra_errors_pre.push(ValidationError::DRepIncorrectRefund {
+                                credential_hash: key.to_hex(),
+                                declared: refund.0,
+                                expected: stored_deposit,
+                            });
+                        }
+                    }
+                    overlay.unregister(key);
                 }
+                _ => {}
             }
         }
     }
@@ -4060,17 +4075,28 @@ pub fn validate_transaction_with_pools(
     // ------------------------------------------------------------------
     if params.protocol_version_major >= 10 {
         if let Some(dreps) = registered_dreps {
-            // Track DRep credentials registered within THIS tx (RegDRep cert
-            // preceding a VoteDelegation in the same tx is valid).
-            let mut new_dreps: std::collections::HashSet<dugite_primitives::hash::Hash32> =
-                std::collections::HashSet::new();
+            // Evolving registry: a RegDRep cert preceding a VoteDelegation in
+            // the same tx is valid, and an UnregDRep preceding it is not
+            // (`checkDRepRegistered` reads `vsDRepsL` of the state the earlier
+            // certs produced — Conway/Rules/Certs.hs L242-246).
+            let mut overlay = conway::DRepRegistryOverlay::new(dreps);
             for cert in &tx.body.certificates {
-                // A RegDRep cert expands the per-tx set before delegation checks.
-                if let dugite_primitives::transaction::Certificate::RegDRep { credential, .. } =
-                    cert
-                {
-                    new_dreps.insert(credential.to_typed_hash32());
-                    continue;
+                match cert {
+                    dugite_primitives::transaction::Certificate::RegDRep {
+                        credential,
+                        deposit,
+                        ..
+                    } => {
+                        overlay.register(credential.to_typed_hash32(), deposit.0);
+                        continue;
+                    }
+                    dugite_primitives::transaction::Certificate::UnregDRep {
+                        credential, ..
+                    } => {
+                        overlay.unregister(credential.to_typed_hash32());
+                        continue;
+                    }
+                    _ => {}
                 }
                 // Extract the DRep target from certs that carry one.
                 let opt_drep: Option<&dugite_primitives::transaction::DRep> = match cert {
@@ -4094,7 +4120,7 @@ pub fn validate_transaction_with_pools(
                     // pseudo-DReps (Abstain, NoConfidence) and Some for
                     // KeyHash/ScriptHash — exactly the split we need.
                     if let Some(drep_key) = drep_target.credential_hash32() {
-                        if !dreps.contains(&drep_key) && !new_dreps.contains(&drep_key) {
+                        if !overlay.contains(&drep_key) {
                             errors.push(ValidationError::DelegateeDRepNotRegistered {
                                 drep_id: drep_key.to_hex(),
                             });
@@ -4241,54 +4267,61 @@ pub fn validate_transaction_with_pools(
     // `cardano-ledger-conway:Cardano.Ledger.Conway.Rules.Deleg`.
     // ------------------------------------------------------------------
     if params.protocol_version_major >= 9 {
+        //
+        // Left-to-right over the EVOLVING registry. Haskell's CERTS folds the
+        // certificates in order and GOVCERT reads `vsDRepsL` of the state the
+        // earlier certs produced (cardano-ledger
+        // f649f9751074d2ab3de033fc3912f29c9862c1f5,
+        // Conway/Rules/Certs.hs L242-246; Conway/Rules/GovCert.hs L210-219
+        // for RegDRep, L234-242 for UnRegDRep). So `[RegDRep X, UnRegDRep X]`
+        // and `[UnRegDRep X, RegDRep X]` (X registered) are accepted, while
+        // `[RegDRep X, RegDRep X]` and `[UnRegDRep X, UnRegDRep X]` are not.
+        // Both predicates share this one walk (`ConwayDRepAlreadyRegistered`,
+        // `ConwayDRepNotRegistered`).
         if let Some(dreps) = registered_dreps {
+            let mut overlay = conway::DRepRegistryOverlay::new(dreps);
             for cert in &tx.body.certificates {
-                if let dugite_primitives::transaction::Certificate::RegDRep { credential, .. } =
-                    cert
-                {
-                    // `to_typed_hash32` matches the kind-tagged keys used by
-                    // the DRep registry — without this, a script DRep with the
-                    // same 28-byte hash as a key DRep would falsely collide.
-                    let key = credential.to_typed_hash32();
-                    if dreps.contains(&key) {
-                        errors.push(ValidationError::DRepAlreadyRegistered {
-                            credential_hash: key.to_hex(),
-                        });
+                match cert {
+                    dugite_primitives::transaction::Certificate::RegDRep {
+                        credential,
+                        deposit,
+                        ..
+                    } => {
+                        // `to_typed_hash32` matches the kind-tagged keys used
+                        // by the DRep registry — without this, a script DRep
+                        // with the same 28-byte hash as a key DRep would
+                        // falsely collide.
+                        let key = credential.to_typed_hash32();
+                        if overlay.contains(&key) {
+                            errors.push(ValidationError::DRepAlreadyRegistered {
+                                credential_hash: key.to_hex(),
+                            });
+                        }
+                        overlay.register(key, deposit.0);
                     }
+                    dugite_primitives::transaction::Certificate::UnregDRep {
+                        credential, ..
+                    } => {
+                        let key = credential.to_typed_hash32();
+                        if !overlay.contains(&key) {
+                            errors.push(ValidationError::DRepNotRegistered {
+                                credential_hash: key.to_hex(),
+                            });
+                        }
+                        overlay.unregister(key);
+                    }
+                    _ => {}
                 }
             }
         }
 
         // ------------------------------------------------------------------
-        // DRep not registered check (Haskell `ConwayDRepNotRegistered`)
-        //
-        // An `UnregDRep` certificate is rejected when the named DRep credential
-        // is NOT present in the DRep registry.  Without this check, the deposit
-        // accounting in `calculate_deposits_and_refunds` would credit the
-        // `refund` amount from the certificate even though no deposit was ever
-        // made — effectively minting ADA from nothing.
-        //
-        // This check is symmetric to the `ConwayDRepAlreadyRegistered` check
-        // above (RegDRep must NOT be registered; UnregDRep MUST be registered).
-        //
-        // Reference: Haskell `ConwayDRepNotRegistered` in
-        // `cardano-ledger-conway:Cardano.Ledger.Conway.Rules.GovCert`.
+        // DRep not registered check (Haskell `ConwayDRepNotRegistered`) —
+        // decided in the left-to-right walk above, against the evolving
+        // registry. Without it the deposit accounting in
+        // `calculate_deposits_and_refunds` would credit the `refund` of a
+        // certificate that never had a deposit.
         // ------------------------------------------------------------------
-        if let Some(dreps) = registered_dreps {
-            for cert in &tx.body.certificates {
-                if let dugite_primitives::transaction::Certificate::UnregDRep {
-                    credential, ..
-                } = cert
-                {
-                    let key = credential.to_typed_hash32();
-                    if !dreps.contains(&key) {
-                        errors.push(ValidationError::DRepNotRegistered {
-                            credential_hash: key.to_hex(),
-                        });
-                    }
-                }
-            }
-        }
 
         // (ConwayDRepIncorrectRefund predicate is enforced in
         //  `validate_transaction_with_context` where `drep_deposits` is in
