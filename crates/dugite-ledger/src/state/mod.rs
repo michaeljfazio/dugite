@@ -2494,6 +2494,16 @@ impl LedgerState {
         // (0.95)^432000 (about 10^-9600) resp. (0.95)^86400 (about 10^-1900).
         // A devnet (epochLength 400, f = 0.5) or a node idle for a long time
         // can plausibly skip one.
+        //
+        // Residual risk, accepted on purpose: across an N-epoch gap a block may
+        // be up to N eras above the ledger even when no fork is pending. The
+        // alternative (cap at the target of a pending HardForkInitiation, an
+        // in-flight pulser ratification, a PPUP vote that could still become
+        // final, or an epoch-keyed trigger) needs those mechanisms read exactly
+        // right at every later boundary; a mistake there halts an honest chain,
+        // which is worse than this residual. It needs an empty epoch to exist at
+        // all (devnet-only) and is visible: the parity counter fires whenever
+        // the block's era differs from the first-boundary forecast.
         let allowed_up = u32::try_from(boundaries).unwrap_or(u32::MAX);
         if block.era.to_era_index() > self.era.to_era_index().saturating_add(allowed_up) {
             return Err(wrong("more eras than skipped epoch boundaries"));
