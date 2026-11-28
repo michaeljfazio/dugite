@@ -42,6 +42,8 @@ pub(crate) mod raw;
 pub(crate) mod reader;
 
 /// Rule-level entry points for the node-diversity conformance harness.
+#[cfg(feature = "conformance-rules")]
+#[doc(hidden)]
 pub mod rules;
 
 // In-house era decoders — all 8 Cardano eras.

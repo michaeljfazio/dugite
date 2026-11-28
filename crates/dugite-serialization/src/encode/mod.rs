@@ -15,6 +15,8 @@ mod block;
 mod certificate;
 mod governance;
 mod protocol_params;
+#[cfg(feature = "conformance-rules")]
+#[doc(hidden)]
 pub mod rules;
 mod script;
 pub(crate) mod transaction;

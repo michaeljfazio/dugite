@@ -17,6 +17,11 @@ num-bigint = { workspace = true }
 num-traits = { workspace = true }
 crc32fast = { workspace = true }
 
+[features]
+# Rule-level decode/encode entry points for the node-diversity cbor-decoding conformance harness
+# (`tests/conformance`).  Off by default: nothing in the node uses them.
+conformance-rules = []
+
 [dev-dependencies]
 proptest = { workspace = true }
 criterion = { workspace = true }

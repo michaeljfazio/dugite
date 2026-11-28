@@ -4,7 +4,10 @@
 //! node-diversity `cbor-decoding` harness compares them with the dataset's expected files).
 //! Each is a call into the encoder the production paths already use for that item; items that the
 //! production encoders only emit inline (a datum option, pool metadata) were split out of their
-//! parent encoder unchanged.  Nothing here changes what any encoder emits.
+//! parent encoder unchanged.  Production encoders are unchanged.  Not every entry is one:
+//! `vote`, `ex_units`, `ex_unit_prices`, `constitution`, `account_balance_interval(s)`, `data`,
+//! `bytes` and `network_id` are written here from the CBOR primitives, because production only
+//! emits those items inside a parent encoding.
 
 use std::collections::BTreeMap;
 
@@ -26,6 +29,19 @@ use crate::cbor::*;
 
 pub fn uint(v: u64) -> Vec<u8> {
     encode_uint(v)
+}
+
+pub fn bytes(b: &[u8]) -> Vec<u8> {
+    encode_bytes(b)
+}
+
+/// `network_id`: written back as the `uint` it was read from; a value the decoder turned into
+/// `None` has no encoding, so `null` stands in.
+pub fn network_id(n: &Option<u8>) -> Vec<u8> {
+    match n {
+        Some(v) => encode_uint(u64::from(*v)),
+        None => encode_null(),
+    }
 }
 
 pub fn lovelace(v: &Lovelace) -> Vec<u8> {

@@ -8,7 +8,7 @@ build = "build.rs"
 [dependencies]
 dugite-primitives = { workspace = true }
 dugite-crypto = { workspace = true }
-dugite-serialization = { workspace = true }
+dugite-serialization = { workspace = true, features = ["conformance-rules"] }
 dugite-ledger = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

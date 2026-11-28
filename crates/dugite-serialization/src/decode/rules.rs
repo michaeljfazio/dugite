@@ -6,17 +6,20 @@
 //! function is a thin call into the decoder the production paths already use for that item
 //! (the block, transaction and witness decoders call the same `read_*` functions), plus the
 //! "whole input consumed" check that a standalone decode needs and an embedded one gets from the
-//! enclosing structure.  Nothing here changes what any decoder accepts.
+//! enclosing structure.  The production decoders are unchanged; the wrappers add the whole-input
+//! check and nothing else, and a rule dugite has no decoder for at that granularity gets no
+//! wrapper (the harness reports it as a failure).
 //!
 //! Visibility: the `read_*` functions these call were private to their era module and are now
-//! `pub(crate)`.  This module is the only new public surface.
+//! `pub(crate)`.  This module is the only new public surface, behind the `conformance-rules`
+//! feature and hidden from the documentation; it exposes no crate-private type.
 
 use std::collections::BTreeMap;
 
 use dugite_primitives::block::{Block, BlockHeader, OperationalCert, ProtocolVersion};
 use dugite_primitives::credentials::Credential;
 use dugite_primitives::era::Era;
-use dugite_primitives::hash::{Hash, Hash28, Hash32};
+use dugite_primitives::hash::{Hash28, Hash32};
 use dugite_primitives::transaction::{
     AccountBalanceInterval, Anchor, AuxiliaryData, Certificate, Constitution, CostModels, DRep,
     ExUnitPrices, ExUnits, GovAction, GovActionId, NativeScript, OutputDatum, PlutusData,
@@ -34,7 +37,7 @@ use crate::error::SerializationError;
 type Res<T> = Result<T, SerializationError>;
 
 /// Run `f` on a reader over `bytes` and require that it consumes every byte.
-pub fn whole<T>(bytes: &[u8], f: impl FnOnce(&mut Reader<'_>) -> Res<T>) -> Res<T> {
+fn whole<T>(bytes: &[u8], f: impl FnOnce(&mut Reader<'_>) -> Res<T>) -> Res<T> {
     let mut r = Reader::new(bytes);
     let value = f(&mut r)?;
     if r.position() != bytes.len() {
@@ -56,8 +59,16 @@ pub fn lovelace(bytes: &[u8]) -> Res<Lovelace> {
     whole(bytes, helpers::read_lovelace)
 }
 
-pub fn network_id(bytes: &[u8]) -> Res<u8> {
-    whole(bytes, helpers::read_network_id)
+/// The transaction body's `network_id` (key 15): a `uint`, where any value other than 0 and 1
+/// decodes to `None` (see the key-15 arm of `decode_conway_tx_body`), so that is what is returned.
+pub fn network_id(bytes: &[u8]) -> Res<Option<u8>> {
+    whole(bytes, |r| {
+        let raw = r.read_uint()?;
+        Ok(match raw {
+            0 | 1 => Some(raw as u8),
+            _ => None,
+        })
+    })
 }
 
 pub fn hash28(bytes: &[u8]) -> Res<Hash28> {
@@ -68,9 +79,11 @@ pub fn hash32(bytes: &[u8]) -> Res<Hash32> {
     whole(bytes, helpers::read_hash32)
 }
 
-/// A fixed-size byte string of `N` bytes (`vkey`, `signature`, ...).
-pub fn fixed_bytes<const N: usize>(bytes: &[u8]) -> Res<Hash<N>> {
-    whole(bytes, helpers::read_hash::<N>)
+/// A byte string as the Conway/Dijkstra header, operational certificate and witness readers
+/// read keys and signatures (`vkey`, `vrf_vkey`, `kes_vkey`, `signature`): `read_bytes_owned`,
+/// which accepts definite and indefinite strings of any length.
+pub fn bytes_owned(bytes: &[u8]) -> Res<Vec<u8>> {
+    whole(bytes, |r| r.read_bytes_owned())
 }
 
 pub fn rational(bytes: &[u8]) -> Res<Rational> {
@@ -286,11 +299,14 @@ pub fn redeemers(bytes: &[u8], era: Era) -> Res<Vec<Redeemer>> {
     whole(bytes, |r| conway::read_redeemers(r, era))
 }
 
-/// `data = #6.24(bytes .cbor plutus_data)`, as the inline-datum arm of the datum option reads it.
+/// `data = #6.24(bytes .cbor plutus_data)`, read exactly as the inline-datum arm of the datum
+/// option reads it: the embedded bytes are decoded with the plutus-data reader and NOT checked to
+/// be fully consumed (the production arm does not check either).
 pub fn data(bytes: &[u8]) -> Res<PlutusData> {
     whole(bytes, |r| {
         let inner = r.read_embedded_cbor_bytes()?.to_vec();
-        whole(&inner, conway::read_plutus_data)
+        let mut inner_r = Reader::new(&inner);
+        conway::read_plutus_data(&mut inner_r)
     })
 }
 
