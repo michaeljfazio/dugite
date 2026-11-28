@@ -1138,7 +1138,7 @@ fn read_native_script(r: &mut Reader<'_>) -> Result<NativeScript, SerializationE
 }
 
 /// Read a single Plutus redeemer: `[tag, index, plutus_data, ex_units]`.
-fn read_redeemer(r: &mut Reader<'_>) -> Result<Redeemer, SerializationError> {
+pub(crate) fn read_redeemer(r: &mut Reader<'_>) -> Result<Redeemer, SerializationError> {
     let arr_len = r.read_array_header()?;
     if !matches!(arr_len, Some(4)) {
         return Err(SerializationError::CborDecode(format!(
