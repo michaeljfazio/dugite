@@ -881,4 +881,28 @@ mod tests {
             "Voting redeemer data must be I(99)"
         );
     }
+
+    /// V3 counterpart of the V1/V2 duplicate-input test: `txInfoInputs` is built
+    /// from the `Set TxIn`, so a pre-PV9 duplicate wire TxIn is listed once.
+    #[test]
+    fn populate_tx_info_v3_duplicate_wire_input_is_listed_once() {
+        let dup = TransactionInput {
+            transaction_id: h32(0x38),
+            index: 0,
+        };
+        let other = TransactionInput {
+            transaction_id: h32(0x11),
+            index: 3,
+        };
+        let body = minimal_tx_body(vec![dup.clone(), other.clone(), dup.clone()], vec![], 1);
+        let tx = build_tx(body, empty_witness_set());
+        let resolved = vec![
+            (dup, enterprise_output(7), vec![]),
+            (other, enterprise_output(9), vec![]),
+        ];
+        let info = populate_tx_info_v3(&tx, &resolved, &slot_cfg()).unwrap();
+        assert_eq!(info.inputs.len(), 2, "the duplicate must collapse");
+        assert_eq!(info.inputs[0].out_ref.tx_id, [0x11; 32]);
+        assert_eq!(info.inputs[1].out_ref.tx_id, [0x38; 32]);
+    }
 }

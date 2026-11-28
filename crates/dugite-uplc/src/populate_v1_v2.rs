@@ -824,4 +824,37 @@ mod tests {
         assert_eq!(v1.fee, v2.fee);
         assert_eq!(v1.txid, v2.txid);
     }
+
+    /// `inputsTxBodyL` is a `Set TxIn`; before PV9 cardano-ledger's `decodeSet`
+    /// (`Set.fromList`) collapses a duplicate wire TxIn, so `txInfoInputs` lists
+    /// it ONCE. A tx that lists one script-locked input twice must present a
+    /// deduplicated input list to the script (V1 and V2), or a script that
+    /// indexes or counts its inputs sees a different context and budget.
+    #[test]
+    fn v1_v2_duplicate_wire_input_is_listed_once_in_the_script_context() {
+        let dup = TransactionInput {
+            transaction_id: h32(0x38),
+            index: 0,
+        };
+        let other = TransactionInput {
+            transaction_id: h32(0x11),
+            index: 3,
+        };
+        let mut body = minimal_body(1);
+        // Wire order: dup, other, dup. Set order: other, dup.
+        body.inputs = vec![dup.clone(), other.clone(), dup.clone()];
+        let mut tx = build_tx(body);
+        tx.era = Era::Babbage;
+        let resolved = vec![
+            (dup, enterprise_output(7), vec![]),
+            (other, enterprise_output(9), vec![]),
+        ];
+        let v1 = populate_tx_info_v1(&tx, &resolved, &slot_cfg()).unwrap();
+        let v2 = populate_tx_info_v2(&tx, &resolved, &slot_cfg()).unwrap();
+        for (name, inputs) in [("V1", &v1.inputs), ("V2", &v2.inputs)] {
+            assert_eq!(inputs.len(), 2, "{name}: the duplicate must collapse");
+            assert_eq!(inputs[0].out_ref.tx_id, [0x11; 32], "{name}: sorted order");
+            assert_eq!(inputs[1].out_ref.tx_id, [0x38; 32], "{name}: sorted order");
+        }
+    }
 }
