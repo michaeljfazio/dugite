@@ -14161,20 +14161,19 @@ fn make_tx_with_committee_hot_auth(
     }
 }
 
-/// Regression: TreasuryValueMismatch must NOT abort apply_block for confirmed
-/// on-chain blocks.
+/// A Conway tx whose declared `treasury_value` differs from the ledger's
+/// treasury rejects the block in `ValidateAll`, and the ledger's treasury is
+/// not overwritten with the declared value.
 ///
-/// Scenario: our `state.epochs.treasury` is 0, but a Conway block contains a tx with
-/// `treasury_value = 5_000_000_000`.  Prior to the fix, `apply_block` returned
-/// `Err(TreasuryValueMismatch)` and the block's outputs were never inserted.
-/// After the fix, the block applies successfully, the outputs are in the UTxO
-/// set, and `state.epochs.treasury` is updated to the declared value.
+/// Haskell Conway LEDGER compares the declared value with the treasury at
+/// block entry and fails `ConwayTreasuryValueMismatch`; a LEDGER failure
+/// makes the block invalid (`applyBlockEither`). Before #678 dugite copied the
+/// declared value into its own treasury, which hid treasury drift.
 ///
-/// The treasury check only fires in `ValidateAll` mode (at-tip validation),
-/// not in `ApplyOnly` mode (bulk replay).  This test uses `ValidateAll` to
-/// reproduce the exact failure path from slot 107229218.
+/// The check runs only in `ValidateAll`; `ApplyOnly` re-applies already
+/// validated blocks and runs no predicates.
 #[test]
-fn test_treasury_mismatch_does_not_abort_apply_block() {
+fn test_treasury_mismatch_rejects_block_in_validate_all() {
     let mut params = ProtocolParameters::mainnet_defaults();
     // Conway (protocol >= 9) so that the treasury check fires.
     params.protocol_version_major = 9;
@@ -14224,16 +14223,11 @@ fn test_treasury_mismatch_does_not_abort_apply_block() {
     );
 }
 
-/// Regression: cascading InputNotFound after TreasuryValueMismatch.
-///
-/// Block A: tx_a has treasury_value mismatch → pre-fix: apply_block aborts,
-///   outputs of tx_a never inserted.
-/// Block B (next): tx_b spends tx_a's output → pre-fix: InputNotFound
-///   (cascade failure), node forks from network.
-///
-/// After the fix: tx_a's output is inserted normally, tx_b succeeds.
+/// A block rejected for a treasury mismatch inserts none of its outputs: a
+/// later block that spends one must fail with a missing input, exactly as it
+/// would on a node that never saw the rejected block.
 #[test]
-fn test_treasury_mismatch_no_cascade_in_downstream_block() {
+fn test_treasury_mismatch_rejected_block_inserts_no_outputs() {
     let mut params = ProtocolParameters::mainnet_defaults();
     params.protocol_version_major = 9;
     let mut state = LedgerState::new(params);
@@ -14277,9 +14271,6 @@ fn test_treasury_mismatch_no_cascade_in_downstream_block() {
         "output_a must NOT be in UTxO set when Block A is rejected"
     );
 
-    // The "no cascade" property is preserved because Block A doesn't apply
-    // at all — there's nothing to cascade from. Downstream blocks that
-    // reference rejected outputs would correctly fail Phase-1 InputNotFound.
 }
 
 /// A CommitteeHotAuth for a cold credential that is neither a current nor a

@@ -89,7 +89,7 @@ fn is_phase2_outcome_error(e: &ValidationError) -> bool {
 /// tolerated Phase-1 class, and no "missing input" tolerance: the UTxO the
 /// block is validated against is the full state reached by applying every
 /// predecessor, so an unresolved input means the block (or the local state)
-/// is wrong. Sources: cardano-ledger `085b8cc6b1`, ouroboros-consensus
+/// is wrong. Sources: cardano-ledger `f649f975`, ouroboros-consensus
 /// `136122cc66`.
 ///
 /// Phase-2 outcomes keep their existing apply-time semantics: a Babbage+
@@ -1513,43 +1513,10 @@ impl LedgerState {
                 let has_redeemers = !tx.witness_set.redeemers.is_empty();
 
                 if tx.is_valid {
-                    // Conway LEDGERS: treasury value check.
-                    //
-                    // Haskell `Cardano.Ledger.Conway.Rules.Ledger.hs:364,442` checks
-                    // `declared == actual` where `actual = ChainAccountState.casTreasury`
-                    // (frozen at block entry, constant intra-block — every tx in the
-                    // block compares against the SAME pre-block treasury value).
-                    //
-                    // Issue #678: the previous self-correction
-                    // (`self.epochs.treasury = declared_treasury`) silently masked
-                    // upstream treasury-calculation drift during live sync. Removing
-                    // the snap exposes the underlying divergence — the
-                    // MismatchedTreasuryValue WARN now points at a real per-epoch
-                    // accounting bug that must be fixed in the treasury update path,
-                    // not papered over here. Same masking-removed pattern as
-                    // #438 / #481 / #624 / #626.
-                    if self.epochs.protocol_params.protocol_version_major >= 9 {
-                        if let Some(declared_treasury) = tx.body.treasury_value {
-                            if declared_treasury.0 != self.epochs.treasury.0 {
-                                let delta =
-                                    declared_treasury.0.saturating_sub(self.epochs.treasury.0)
-                                        as i128
-                                        - self.epochs.treasury.0.saturating_sub(declared_treasury.0)
-                                            as i128;
-                                warn!(
-                                    tx_hash = %tx.hash.to_hex(),
-                                    slot = block.slot().0,
-                                    declared = declared_treasury.0,
-                                    actual = self.epochs.treasury.0,
-                                    delta_lovelace = delta,
-                                    "TreasuryValueMismatch — dugite's treasury differs \
-                                     from on-chain declared value (issue #678). \
-                                     The self-correction was removed; treasury \
-                                     accumulates over epoch boundaries from this point."
-                                );
-                            }
-                        }
-                    }
+                    // The Conway treasury-value check (Haskell
+                    // `validateTreasuryValue`, `ConwayTreasuryValueMismatch`,
+                    // against the treasury at block entry) is the validator's
+                    // below: a mismatch rejects the block.
 
                     // A CommitteeHotAuth for a credential that is neither a
                     // current nor a potential future member is rejected by the
