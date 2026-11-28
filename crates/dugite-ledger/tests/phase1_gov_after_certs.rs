@@ -26,7 +26,7 @@
 
 use std::sync::{Arc, Mutex, OnceLock};
 
-use dugite_ledger::state::{BlockValidationMode, LedgerState};
+use dugite_ledger::state::{BlockValidationMode, LedgerState, ProposalState};
 use dugite_ledger::utxo::UtxoSet;
 use dugite_ledger::validation::{validate_transaction_with_context, ValidationError};
 use dugite_primitives::address::{Address, ByronAddress};
@@ -381,41 +381,18 @@ fn apply_single_tx_block(
     (result, log_lines_for(&hash))
 }
 
-/// The GOV predicates this change concerns.
-fn is_gov_class(e: &ValidationError) -> bool {
-    matches!(
-        e,
-        ValidationError::VotersDoNotExist { .. }
-            | ValidationError::UnelectedCommitteeVoters { .. }
-            | ValidationError::ProposalReturnAccountDoesNotExist { .. }
-            | ValidationError::TreasuryWithdrawalReturnAccountsDoNotExist { .. }
-    )
-}
-
-const GOV_CLASS_NAMES: [&str; 4] = [
-    "VotersDoNotExist",
-    "UnelectedCommitteeVoters",
-    "ProposalReturnAccountDoesNotExist",
-    "TreasuryWithdrawalReturnAccountsDoNotExist",
-];
-
-/// Both production paths must raise none of the GOV-class failures.
+/// Both production paths must accept the tx with no error and no Phase-1 warning.
 fn assert_accepted_on_both_paths(ledger: LedgerState, utxo: UtxoSet, tx: Transaction) {
     let mut ledger = ledger;
     let errors = mempool_errors(&ledger, &utxo, &tx);
-    let gov: Vec<_> = errors.iter().filter(|e| is_gov_class(e)).collect();
     assert!(
-        gov.is_empty(),
-        "Haskell accepts this tx (GOV reads certStateAfterCERTS); mempool raised {gov:?} (all errors: {errors:?})"
+        errors.is_empty(),
+        "Haskell accepts this tx (GOV reads certStateAfterCERTS); mempool raised {errors:?}"
     );
     let (result, warns) = apply_single_tx_block(&mut ledger, tx);
-    let bad: Vec<_> = warns
-        .iter()
-        .filter(|l| GOV_CLASS_NAMES.iter().any(|n| l.contains(n)))
-        .collect();
     assert!(
-        bad.is_empty() && result.is_ok(),
-        "apply_block(ValidateAll) must accept it; result {result:?}, GOV-class warnings {bad:?}"
+        result.is_ok() && warns.is_empty(),
+        "apply_block(ValidateAll) must accept it with no Phase-1 warning; result {result:?}, warnings {warns:?}"
     );
 }
 
@@ -767,4 +744,83 @@ fn pv11_vote_by_a_hot_key_of_an_unelected_cold_key_is_still_rejected() {
         &[&hot],
     );
     assert_rejected_on_both_paths(ledger, utxo, tx, is_unelected, "UnelectedCommitteeVoters");
+}
+
+/// PV11: `CommitteeHotAuth cold hot` in the tx, where `cold` is only a
+/// POTENTIAL member (it is in a live `UpdateCommittee` proposal, so the
+/// certificate is valid: `isPotentialFutureMember`) and not on the ENACTED
+/// committee, plus a vote by `hot`. After CERTS `hot` is authorised but not
+/// elected, so Haskell raises `UnelectedCommitteeVoters` (Gov.hs L478-481,
+/// `authorizedElectedHotCommitteeCredentials` L581-591) and, since the hot key
+/// is a known committee member, no `VotersDoNotExist`.
+///
+/// The enacted-committee filter in `post_certs_context` is what separates the
+/// two sets: without it every authorised hot key counts as elected and this
+/// predicate never fires.
+#[test]
+fn pv11_hot_auth_for_a_cold_key_that_is_not_enacted_then_vote_is_unelected() {
+    let cold = Signer::new(0x85);
+    let hot = Signer::new(0x86);
+    let r = Signer::new(0x87);
+    let (mut ledger, utxo) = ledger_at(11);
+    pre_register_account(&mut ledger, &r);
+    // A live UpdateCommittee proposal that would seat `cold` makes the
+    // HotAuth certificate itself valid; `cold` is still not enacted.
+    let update_committee = ProposalProcedure {
+        deposit: Lovelace(GOV_DEPOSIT),
+        return_addr: r.reward_addr(),
+        gov_action: GovAction::UpdateCommittee {
+            prev_action_id: None,
+            members_to_remove: vec![],
+            members_to_add: std::iter::once((cold.cred(), 500)).collect(),
+            threshold: Rational {
+                numerator: 2,
+                denominator: 3,
+            },
+        },
+        anchor: Anchor {
+            url: String::new(),
+            data_hash: Hash32::ZERO,
+        },
+    };
+    Arc::make_mut(&mut ledger.gov.governance).proposals.insert(
+        GovActionId {
+            transaction_id: Hash32::from_bytes([0xCC; 32]),
+            action_index: 0,
+        },
+        ProposalState {
+            procedure: update_committee,
+            proposed_epoch: EpochNo(0),
+            expires_epoch: EpochNo(100),
+            yes_votes: 0,
+            no_votes: 0,
+            abstain_votes: 0,
+            submission_index: 0,
+        },
+    );
+    let tx = gov_tx(
+        0x5A,
+        vec![Certificate::CommitteeHotAuth {
+            cold_credential: cold.cred(),
+            hot_credential: hot.cred(),
+        }],
+        vec![info_proposal(&r)],
+        vec![cc_voter(&hot)],
+        0,
+        &[&cold, &hot],
+    );
+    let errors = mempool_errors(&ledger, &utxo, &tx);
+    assert!(
+        errors.iter().any(is_unelected),
+        "an authorised but not enacted hot key must raise UnelectedCommitteeVoters; got {errors:?}"
+    );
+    assert!(
+        !errors.iter().any(is_voters_missing),
+        "the hot key is authorised after CERTS, so it is a known voter; got {errors:?}"
+    );
+    let (result, warns) = apply_single_tx_block(&mut ledger, tx);
+    assert!(
+        result.is_err() || warns.iter().any(|l| l.contains("UnelectedCommitteeVoters")),
+        "ValidateAll must flag it; result {result:?}, warns {warns:?}"
+    );
 }
