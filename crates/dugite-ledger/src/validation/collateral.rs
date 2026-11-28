@@ -28,6 +28,7 @@ use dugite_primitives::value::AssetName;
 
 use crate::utxo::UtxoLookup;
 
+use super::input_set::tx_in_set;
 use super::scripts::compute_script_ref_hash;
 use super::ValidationError;
 
@@ -81,7 +82,9 @@ pub(crate) fn check_collateral(
     let mut collateral_multi_asset: BTreeMap<PolicyId, BTreeMap<AssetName, i128>> = BTreeMap::new();
     let mut script_locked_inputs: Vec<String> = Vec::new();
 
-    for col_input in &body.collateral {
+    // `collateral_inputs` is a `Set TxIn` too (same `decodeSet`): a pre-PV9
+    // duplicate is one collateral input, counted once.
+    for col_input in tx_in_set(&body.collateral) {
         match utxo_set.lookup(col_input) {
             Some(output) => {
                 // ScriptsNotPaidUTxO: collateral inputs must be at VKey (non-script) addresses.
@@ -293,7 +296,8 @@ pub(crate) fn check_max_collateral_inputs(
     params: &ProtocolParameters,
     errors: &mut Vec<ValidationError>,
 ) {
-    let actual = tx.body.collateral.len() as u64;
+    // `Set.size` of the collateral set, not the wire array length.
+    let actual = tx_in_set(&tx.body.collateral).len() as u64;
     if actual > params.max_collateral_inputs {
         errors.push(ValidationError::TooManyCollateralInputs {
             max: params.max_collateral_inputs,
@@ -339,7 +343,9 @@ fn check_ex_units(
 /// non-None `policy_hash`).
 fn check_redeemer_indices(tx: &Transaction, errors: &mut Vec<ValidationError>) {
     let body = &tx.body;
-    let input_count = body.inputs.len();
+    // Size of the `Set TxIn`, not of the wire array: a pre-PV9 duplicate TxIn
+    // collapses (see `input_set`).
+    let input_count = tx_in_set(&body.inputs).len();
     let mint_count = body.mint.len();
     let cert_count = body.certificates.len();
     let withdrawal_count = body.withdrawals.len();
@@ -419,12 +425,7 @@ pub(crate) fn check_script_redeemers(
 
     // Cardano sorts inputs by (tx_id, index) for deterministic redeemer index
     // assignment.
-    let mut sorted_inputs: Vec<_> = body.inputs.iter().collect();
-    sorted_inputs.sort_by(|a, b| {
-        a.transaction_id
-            .cmp(&b.transaction_id)
-            .then(a.index.cmp(&b.index))
-    });
+    let sorted_inputs = tx_in_set(&body.inputs);
 
     for (idx, input) in sorted_inputs.iter().enumerate() {
         if let Some(utxo) = utxo_set.lookup(input) {
@@ -793,12 +794,7 @@ pub(crate) fn check_extra_redeemers(
     // Spend: PLUTUS-script-locked inputs only (sorted by TxIn).
     // A redeemer for a native-script-locked input is extra (not in
     // `redeemersNeeded`), matching Haskell's `hasExactSetOfRedeemers`.
-    let mut sorted_inputs: Vec<_> = body.inputs.iter().collect();
-    sorted_inputs.sort_by(|a, b| {
-        a.transaction_id
-            .cmp(&b.transaction_id)
-            .then(a.index.cmp(&b.index))
-    });
+    let sorted_inputs = tx_in_set(&body.inputs);
     for (idx, input) in sorted_inputs.iter().enumerate() {
         if let Some(utxo) = utxo_set.lookup(input) {
             let script_hash: Option<&Hash28> = match &utxo.address {
@@ -1141,12 +1137,7 @@ pub(crate) fn redeemer_script_version_map(
     // ------------------------------------------------------------------ Spend
     // Inputs are sorted by (tx_hash, output_index) to determine the redeemer
     // index, matching Haskell's `toSortedList (txins txb)`.
-    let mut sorted_inputs: Vec<_> = body.inputs.iter().collect();
-    sorted_inputs.sort_by(|a, b| {
-        a.transaction_id
-            .cmp(&b.transaction_id)
-            .then(a.index.cmp(&b.index))
-    });
+    let sorted_inputs = tx_in_set(&body.inputs);
     for (idx, input) in sorted_inputs.iter().enumerate() {
         if let Some(utxo) = utxo_set.lookup(input) {
             let script_hash = match &utxo.address {
