@@ -134,7 +134,13 @@ The state-comparison helper `compare::compare_states` has no caller. A check tha
 
 Note that an empty `SKIP_LIST` means no vector is skipped *by policy*. A vector can still report `Skipped` at runtime if the runner cannot construct its precondition; that is visible in the run output, not hidden by the list.
 
-**Status:** decode checks passing. `SKIP_LIST` in `tests/conformance/src/upstream/ledger_rules_replay/mod.rs` is empty.
+**LEDGER and NEWEPOCH** (about 8,000 vectors) are the exception: each is decoded with the production Haskell-snapshot decoder, imported through `LedgerState::from_haskell_snapshot`, applied through `LedgerState::apply_block`, and compared with Haskell's `st_out` over an enumerated field list (`ledger_rules_replay/project.rs`, which also lists the fields that are not compared and why). LEDGER accept/reject is dugite's validator's verdict (not `apply_block`'s, which applies Phase-1-invalid transactions of a confirmed block, #1131); a vector Haskell rejected must be rejected by the validator, and its reason is pinned. NEWEPOCH has no coverage of ratification, enactment or expiry until the snapshot import maps `cgsDRepPulsingState` (#1132). Known divergences are pinned in `tests/conformance/expected/ledger_rules_replay.tsv`; the gate fails on an unknown id, an entry that now matches, a changed observed result and a stale id, and every divergence entry links an open issue.
+
+```bash
+just test-conformance-ledger-rules-apply-compare
+```
+
+**Status (decode-only rules):** decode checks passing. `SKIP_LIST` in `tests/conformance/src/upstream/ledger_rules_replay/mod.rs` is empty.
 
 **Replay locally:**
 
@@ -193,7 +199,7 @@ To iterate on a capture script without publishing a release, `just regenerate-co
 
 ### Currently pinned
 
-`[release].tag = "conformance-corpus-v20260725-154355"`, built from:
+`[release].tag = "conformance-corpus-v20261128-084556"`, built from:
 
 | Area | Pin |
 |---|---|

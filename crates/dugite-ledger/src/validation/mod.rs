@@ -19,7 +19,7 @@ mod datum;
 pub mod mir;
 mod phase1;
 pub mod ppup;
-mod scripts;
+pub(crate) mod scripts;
 pub(crate) mod size_check;
 pub mod withdrawals;
 
@@ -84,22 +84,37 @@ thread_local! {
     static SKIP_PHASE2_EVAL: Cell<bool> = const { Cell::new(false) };
 }
 
-/// Set the thread-local phase-2 skip flag and return the previous value.
+/// RAII guard for the thread-local phase-2 skip flag.
 ///
-/// Used by the block-apply parallel-phase-2 path. Always restore the returned
-/// value with [`restore_phase2_eval`] (even on error) to avoid leaking the
-/// skip state across invocations.
-pub(crate) fn suppress_phase2_eval() -> bool {
-    SKIP_PHASE2_EVAL.with(|c| {
-        let prev = c.get();
-        c.set(true);
-        prev
-    })
+/// Constructing the guard sets the flag to `true` and remembers the previous
+/// value; dropping it restores that value. Because restoration happens in
+/// `Drop`, it runs on every exit path of the holder: normal return, early
+/// `return Err(..)`, `?`, and panic unwinding. Nested guards compose, since
+/// each restores exactly what it found.
+///
+/// This replaces a manual set/restore pair whose restore was skipped by the
+/// early exits of `apply_block`, which left the flag set on the thread and made
+/// every later `validate_transaction_with_context` on it skip Phase-2. A tx
+/// that the Haskell ledger rejects was then accepted, so the verdict depended
+/// on what the thread had done before (#1193).
+#[must_use = "the phase-2 skip flag is restored when the guard is dropped"]
+pub(crate) struct Phase2SkipGuard {
+    prev: bool,
 }
 
-/// Restore the thread-local phase-2 skip flag to a previously-saved value.
-pub(crate) fn restore_phase2_eval(prev: bool) {
-    SKIP_PHASE2_EVAL.with(|c| c.set(prev));
+impl Phase2SkipGuard {
+    /// Suppress sequential phase-2 evaluation on this thread until the guard
+    /// is dropped.
+    pub(crate) fn new() -> Self {
+        let prev = SKIP_PHASE2_EVAL.with(|c| c.replace(true));
+        Self { prev }
+    }
+}
+
+impl Drop for Phase2SkipGuard {
+    fn drop(&mut self) {
+        SKIP_PHASE2_EVAL.with(|c| c.set(self.prev));
+    }
 }
 
 /// Re-validate an already-admitted mempool transaction against the current
@@ -151,8 +166,8 @@ pub fn reapply_tx_for_mempool(
     slot_config: Option<&SlotConfig>,
     context: ValidationContext,
 ) -> Result<(), Vec<ValidationError>> {
-    let prev = suppress_phase2_eval();
-    let result = validate_transaction_with_context(
+    let _skip_phase2 = Phase2SkipGuard::new();
+    validate_transaction_with_context(
         tx,
         utxo_set,
         params,
@@ -160,9 +175,7 @@ pub fn reapply_tx_for_mempool(
         tx_size,
         slot_config,
         context,
-    );
-    restore_phase2_eval(prev);
-    result
+    )
 }
 
 /// On-chain governance proposal record used by validation rules that need
@@ -428,6 +441,24 @@ pub struct ValidationContext {
     /// Reference: Haskell `authorizedElectedHotCommitteeCredentials` in
     /// `eras/conway/impl/src/Cardano/Ledger/CertState.hs`.
     pub committee_authorized_elected_hot_keys: Option<Arc<HashSet<Hash32>>>,
+    /// Cold credential -> hot credential for every committee member that has
+    /// authorised a hot key (Haskell `csCommitteeCreds` entries that are
+    /// `CommitteeHotCredential`), keys and values in the typed-hash form.
+    ///
+    /// [`Self::committee_authorized_hot_keys`] is the value set of this map.
+    /// The map itself is needed to evolve the committee state through a
+    /// transaction's own `CommitteeHotAuth` / `CommitteeColdResign`
+    /// certificates before the GOV predicates read it (see
+    /// [`conway::post_certs_context`]): a re-authorisation or a resignation
+    /// must remove the cold key's PREVIOUS hot key, which the value set alone
+    /// cannot say. When `None`, the evolution can only add hot keys.
+    pub committee_hot_key_by_cold: Option<Arc<HashMap<Hash32, Hash32>>>,
+    /// Cold credentials of the ENACTED committee (`committeeMembers
+    /// electedCommittee`), the filter of
+    /// `authorizedElectedHotCommitteeCredentials` (Governance.hs L581-591).
+    /// Together with [`Self::committee_hot_key_by_cold`] it lets the post-CERTS
+    /// context recompute [`Self::committee_authorized_elected_hot_keys`].
+    pub committee_enacted_cold: Option<Arc<HashSet<Hash32>>>,
     // ---------------------------------------------------------------------
     // MIR (Move Instantaneous Rewards) — Shelley–Babbage only.
     //
@@ -727,6 +758,19 @@ impl ValidationContext {
         hot_keys: Arc<HashSet<Hash32>>,
     ) -> Self {
         self.committee_authorized_elected_hot_keys = Some(hot_keys);
+        self
+    }
+
+    /// Supply the committee's cold -> hot credential map and the enacted
+    /// committee's cold credentials, so the GOV predicates can read the
+    /// committee state AFTER the transaction's own certificates.
+    pub fn with_committee_hot_key_registry(
+        mut self,
+        hot_by_cold: HashMap<Hash32, Hash32>,
+        enacted_cold: HashSet<Hash32>,
+    ) -> Self {
+        self.committee_hot_key_by_cold = Some(Arc::new(hot_by_cold));
+        self.committee_enacted_cold = Some(Arc::new(enacted_cold));
         self
     }
 
@@ -2791,29 +2835,44 @@ pub fn validate_transaction_with_context(
     // `cardano-ledger-conway:Cardano.Ledger.Conway.Rules.GovCert`.
     // ------------------------------------------------------------------
     let mut extra_errors_pre: Vec<ValidationError> = Vec::new();
-    if let (Some(dreps), Some(deposits)) = (
-        context.registered_dreps.as_deref(),
-        context.drep_deposits.as_deref(),
-    ) {
+    if let Some(dreps) = context.registered_dreps.as_deref() {
+        // Left-to-right over the EVOLVING registry (Conway/Rules/Certs.hs
+        // L242-246): a `RegDRep` earlier in this tx stores ITS deposit, which
+        // a later `UnregDRep` of the same credential must refund. That
+        // in-tx deposit is known from the transaction itself, so it is
+        // compared whether or not `drep_deposits` (the stored deposits of
+        // DReps registered BEFORE this tx) was supplied.
+        let deposits = context.drep_deposits.as_deref();
+        let mut overlay = conway::DRepRegistryOverlay::new(dreps);
         for cert in &tx.body.certificates {
-            if let dugite_primitives::transaction::Certificate::UnregDRep { credential, refund } =
-                cert
-            {
-                let key = credential.to_typed_hash32();
-                if !dreps.contains(&key) {
-                    // Already flagged inside as DRepNotRegistered; skip
-                    // refund check (Haskell's `?!` short-circuit).
-                    continue;
-                }
-                if let Some(stored_deposit) = deposits.get(&key) {
-                    if refund.0 != *stored_deposit {
-                        extra_errors_pre.push(ValidationError::DRepIncorrectRefund {
-                            credential_hash: key.to_hex(),
-                            declared: refund.0,
-                            expected: *stored_deposit,
-                        });
+            match cert {
+                dugite_primitives::transaction::Certificate::RegDRep {
+                    credential,
+                    deposit,
+                    ..
+                } => overlay.register(credential.to_typed_hash32(), deposit.0),
+                dugite_primitives::transaction::Certificate::UnregDRep { credential, refund } => {
+                    let key = credential.to_typed_hash32();
+                    if !overlay.contains(&key) {
+                        // Already flagged inside as DRepNotRegistered; skip
+                        // refund check (Haskell's `?!` short-circuit).
+                        continue;
                     }
+                    let expected = overlay
+                        .in_tx_deposit(&key)
+                        .or_else(|| deposits.and_then(|d| d.get(&key).copied()));
+                    if let Some(stored_deposit) = expected {
+                        if refund.0 != stored_deposit {
+                            extra_errors_pre.push(ValidationError::DRepIncorrectRefund {
+                                credential_hash: key.to_hex(),
+                                declared: refund.0,
+                                expected: stored_deposit,
+                            });
+                        }
+                    }
+                    overlay.unregister(key);
                 }
+                _ => {}
             }
         }
     }
@@ -2829,6 +2888,21 @@ pub fn validate_transaction_with_context(
     // unknown voters first into a `HashSet` and skipping them when the
     // `DisallowedVoters` loop iterates.
     let mut extra_errors: Vec<ValidationError> = Vec::new();
+
+    // The GOV predicates below read the registries AFTER the transaction's own
+    // certificates, not before. Haskell's LEDGER rule runs CERTS first and
+    // passes `certStateAfterCERTS` to GOV (cardano-ledger
+    // f649f9751074d2ab3de033fc3912f29c9862c1f5,
+    // eras/conway/impl/src/Cardano/Ledger/Conway/Rules/Ledger.hs L394-421), and
+    // GOV takes `knownDReps`, `knownStakePools`, `knownCommitteeMembers` and the
+    // accounts from that state (Rules/Gov.hs L467-474). So a `RegDRep` /
+    // `RegPool` / `CommitteeHotAuth` / stake registration earlier in the tx makes
+    // a vote or a return account valid, and an `UnRegDRep` / stake
+    // deregistration / `CommitteeColdResign` makes it invalid.
+    // `conway::post_certs_context` folds the certificates over a clone of
+    // `context`; `None` means no certificate can matter and `context` is used.
+    let post_certs_ctx = conway::post_certs_context(&tx.body, &context);
+    let gov_ctx: &ValidationContext = post_certs_ctx.as_ref().unwrap_or(&context);
     if params.protocol_version_major >= 9 && !tx.body.voting_procedures.is_empty() {
         // -------------------------------------------------------------------
         // UnelectedCommitteeVoters (PV >= 11): every CC vote whose hot
@@ -2841,7 +2915,7 @@ pub fn validate_transaction_with_context(
         // `eras/conway/impl/src/Cardano/Ledger/Conway/Rules/Gov.hs`.
         // -------------------------------------------------------------------
         if params.protocol_version_major >= 11 {
-            if let Some(elected) = context.committee_authorized_elected_hot_keys.as_ref() {
+            if let Some(elected) = gov_ctx.committee_authorized_elected_hot_keys.as_ref() {
                 let mut unelected_hot: Vec<Hash32> = Vec::new();
                 let mut seen: HashSet<Hash32> = HashSet::new();
                 for (voter, vp_map) in tx.body.voting_procedures.iter() {
@@ -2883,7 +2957,7 @@ pub fn validate_transaction_with_context(
         let mut unknown_voters: Vec<Voter> = Vec::new();
         let mut unknown_voter_set: HashSet<Voter> = HashSet::new();
         for (voter, vp_map) in tx.body.voting_procedures.iter() {
-            if !vp_map.is_empty() && conway::is_voter_unknown(voter, &context) {
+            if !vp_map.is_empty() && conway::is_voter_unknown(voter, gov_ctx) {
                 unknown_voters.push(voter.clone());
                 unknown_voter_set.insert(voter.clone());
             }
@@ -3275,7 +3349,7 @@ pub fn validate_transaction_with_context(
     if params.protocol_version_major >= 9 && !tx.body.proposal_procedures.is_empty() {
         let mut bad_addrs: Vec<String> = Vec::new();
         for proposal in &tx.body.proposal_procedures {
-            if conway::is_proposal_return_account_unregistered(proposal, params, &context) {
+            if conway::is_proposal_return_account_unregistered(proposal, params, gov_ctx) {
                 // Hex-encode the raw return_addr bytes for the diagnostic.
                 // Matches the fold-based encoding used for withdrawal account
                 // hex strings above so error formatting stays consistent
@@ -3326,7 +3400,7 @@ pub fn validate_transaction_with_context(
         // staking credential → account info). When `reward_accounts` is
         // `None`, the predicate is silently skipped (lenient default).
         // -------------------------------------------------------------------
-        if let Some(reward_accounts) = context.reward_accounts.as_ref() {
+        if let Some(reward_accounts) = gov_ctx.reward_accounts.as_ref() {
             let mut bad_withdrawal_addrs: Vec<String> = Vec::new();
             for proposal in &tx.body.proposal_procedures {
                 if let GovAction::TreasuryWithdrawals { withdrawals, .. } = &proposal.gov_action {
@@ -4001,17 +4075,28 @@ pub fn validate_transaction_with_pools(
     // ------------------------------------------------------------------
     if params.protocol_version_major >= 10 {
         if let Some(dreps) = registered_dreps {
-            // Track DRep credentials registered within THIS tx (RegDRep cert
-            // preceding a VoteDelegation in the same tx is valid).
-            let mut new_dreps: std::collections::HashSet<dugite_primitives::hash::Hash32> =
-                std::collections::HashSet::new();
+            // Evolving registry: a RegDRep cert preceding a VoteDelegation in
+            // the same tx is valid, and an UnregDRep preceding it is not
+            // (`checkDRepRegistered` reads `vsDRepsL` of the state the earlier
+            // certs produced — Conway/Rules/Certs.hs L242-246).
+            let mut overlay = conway::DRepRegistryOverlay::new(dreps);
             for cert in &tx.body.certificates {
-                // A RegDRep cert expands the per-tx set before delegation checks.
-                if let dugite_primitives::transaction::Certificate::RegDRep { credential, .. } =
-                    cert
-                {
-                    new_dreps.insert(credential.to_typed_hash32());
-                    continue;
+                match cert {
+                    dugite_primitives::transaction::Certificate::RegDRep {
+                        credential,
+                        deposit,
+                        ..
+                    } => {
+                        overlay.register(credential.to_typed_hash32(), deposit.0);
+                        continue;
+                    }
+                    dugite_primitives::transaction::Certificate::UnregDRep {
+                        credential, ..
+                    } => {
+                        overlay.unregister(credential.to_typed_hash32());
+                        continue;
+                    }
+                    _ => {}
                 }
                 // Extract the DRep target from certs that carry one.
                 let opt_drep: Option<&dugite_primitives::transaction::DRep> = match cert {
@@ -4035,7 +4120,7 @@ pub fn validate_transaction_with_pools(
                     // pseudo-DReps (Abstain, NoConfidence) and Some for
                     // KeyHash/ScriptHash — exactly the split we need.
                     if let Some(drep_key) = drep_target.credential_hash32() {
-                        if !dreps.contains(&drep_key) && !new_dreps.contains(&drep_key) {
+                        if !overlay.contains(&drep_key) {
                             errors.push(ValidationError::DelegateeDRepNotRegistered {
                                 drep_id: drep_key.to_hex(),
                             });
@@ -4182,54 +4267,61 @@ pub fn validate_transaction_with_pools(
     // `cardano-ledger-conway:Cardano.Ledger.Conway.Rules.Deleg`.
     // ------------------------------------------------------------------
     if params.protocol_version_major >= 9 {
+        //
+        // Left-to-right over the EVOLVING registry. Haskell's CERTS folds the
+        // certificates in order and GOVCERT reads `vsDRepsL` of the state the
+        // earlier certs produced (cardano-ledger
+        // f649f9751074d2ab3de033fc3912f29c9862c1f5,
+        // Conway/Rules/Certs.hs L242-246; Conway/Rules/GovCert.hs L210-219
+        // for RegDRep, L234-242 for UnRegDRep). So `[RegDRep X, UnRegDRep X]`
+        // and `[UnRegDRep X, RegDRep X]` (X registered) are accepted, while
+        // `[RegDRep X, RegDRep X]` and `[UnRegDRep X, UnRegDRep X]` are not.
+        // Both predicates share this one walk (`ConwayDRepAlreadyRegistered`,
+        // `ConwayDRepNotRegistered`).
         if let Some(dreps) = registered_dreps {
+            let mut overlay = conway::DRepRegistryOverlay::new(dreps);
             for cert in &tx.body.certificates {
-                if let dugite_primitives::transaction::Certificate::RegDRep { credential, .. } =
-                    cert
-                {
-                    // `to_typed_hash32` matches the kind-tagged keys used by
-                    // the DRep registry — without this, a script DRep with the
-                    // same 28-byte hash as a key DRep would falsely collide.
-                    let key = credential.to_typed_hash32();
-                    if dreps.contains(&key) {
-                        errors.push(ValidationError::DRepAlreadyRegistered {
-                            credential_hash: key.to_hex(),
-                        });
+                match cert {
+                    dugite_primitives::transaction::Certificate::RegDRep {
+                        credential,
+                        deposit,
+                        ..
+                    } => {
+                        // `to_typed_hash32` matches the kind-tagged keys used
+                        // by the DRep registry — without this, a script DRep
+                        // with the same 28-byte hash as a key DRep would
+                        // falsely collide.
+                        let key = credential.to_typed_hash32();
+                        if overlay.contains(&key) {
+                            errors.push(ValidationError::DRepAlreadyRegistered {
+                                credential_hash: key.to_hex(),
+                            });
+                        }
+                        overlay.register(key, deposit.0);
                     }
+                    dugite_primitives::transaction::Certificate::UnregDRep {
+                        credential, ..
+                    } => {
+                        let key = credential.to_typed_hash32();
+                        if !overlay.contains(&key) {
+                            errors.push(ValidationError::DRepNotRegistered {
+                                credential_hash: key.to_hex(),
+                            });
+                        }
+                        overlay.unregister(key);
+                    }
+                    _ => {}
                 }
             }
         }
 
         // ------------------------------------------------------------------
-        // DRep not registered check (Haskell `ConwayDRepNotRegistered`)
-        //
-        // An `UnregDRep` certificate is rejected when the named DRep credential
-        // is NOT present in the DRep registry.  Without this check, the deposit
-        // accounting in `calculate_deposits_and_refunds` would credit the
-        // `refund` amount from the certificate even though no deposit was ever
-        // made — effectively minting ADA from nothing.
-        //
-        // This check is symmetric to the `ConwayDRepAlreadyRegistered` check
-        // above (RegDRep must NOT be registered; UnregDRep MUST be registered).
-        //
-        // Reference: Haskell `ConwayDRepNotRegistered` in
-        // `cardano-ledger-conway:Cardano.Ledger.Conway.Rules.GovCert`.
+        // DRep not registered check (Haskell `ConwayDRepNotRegistered`) —
+        // decided in the left-to-right walk above, against the evolving
+        // registry. Without it the deposit accounting in
+        // `calculate_deposits_and_refunds` would credit the `refund` of a
+        // certificate that never had a deposit.
         // ------------------------------------------------------------------
-        if let Some(dreps) = registered_dreps {
-            for cert in &tx.body.certificates {
-                if let dugite_primitives::transaction::Certificate::UnregDRep {
-                    credential, ..
-                } = cert
-                {
-                    let key = credential.to_typed_hash32();
-                    if !dreps.contains(&key) {
-                        errors.push(ValidationError::DRepNotRegistered {
-                            credential_hash: key.to_hex(),
-                        });
-                    }
-                }
-            }
-        }
 
         // (ConwayDRepIncorrectRefund predicate is enforced in
         //  `validate_transaction_with_context` where `drep_deposits` is in

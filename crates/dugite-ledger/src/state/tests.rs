@@ -18777,3 +18777,236 @@ fn drep_absent_from_the_frozen_registry_is_not_expired() {
     let snap = expiry_snapshot(576, &[]);
     assert!(!snap.drep_is_expired(&Hash32::from_bytes([0x44; 32])));
 }
+
+// ── Shelley-era TTL is inclusive; Allegra+ is exclusive ─────────────────────
+//
+// cardano-ledger f649f9751074d2ab3de033fc3912f29c9862c1f5:
+//   Shelley/Rules/Utxo.hs L410-L423   validateTimeToLive: `ttl >= slot`
+//   Allegra/Scripts.hs    L502-L509   inInterval:         `slot < invalidHereafter`
+// `apply_block(ValidateAll)` validates every peer block through
+// `validate_transaction_with_context`. Until Phase-1 failures are block-fatal
+// the verdict only reaches the caller as the "Phase-1 validation divergence"
+// warning, so the test captures that log line: it is the observable output of
+// the production path today, and the assertion keeps its meaning once the
+// failure becomes an `Err`.
+
+/// Collects everything the subscriber writes.
+#[derive(Clone, Default)]
+struct LogCapture(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+impl std::io::Write for LogCapture {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(buf);
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for LogCapture {
+    type Writer = LogCapture;
+    fn make_writer(&'a self) -> Self::Writer {
+        self.clone()
+    }
+}
+
+/// Apply a one-tx block at `slot` under `pv_major` with the tx's ttl set to
+/// `ttl`. Returns the apply result and whether the tx was reported as expired,
+/// either as a block-fatal error or in the Phase-1 divergence log.
+fn apply_ttl_block(pv_major: u64, ttl: u64, slot: u64) -> (Result<(), LedgerError>, bool) {
+    let mut params = ProtocolParameters::mainnet_defaults();
+    params.protocol_version_major = pv_major;
+    params.min_utxo_value = Lovelace(1_000_000);
+    let mut state = LedgerState::new(params);
+    let input = TransactionInput {
+        transaction_id: Hash32::from_bytes([0xE0; 32]),
+        index: 0,
+    };
+    state
+        .utxo
+        .utxo_set
+        .insert(input.clone(), make_lovelace_output(10_000_000));
+    let mut tx = make_simple_tx(0xE1, vec![input], vec![make_lovelace_output(5_000_000)]);
+    tx.body.fee = Lovelace(5_000_000);
+    tx.body.ttl = Some(SlotNo(ttl));
+    let mut block = make_test_block(slot, 1, Hash32::ZERO, vec![tx]);
+    block.header.protocol_version.major = pv_major;
+    if pv_major < 3 {
+        block.era = Era::Shelley;
+        block.transactions[0].era = Era::Shelley;
+    }
+
+    let capture = LogCapture::default();
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(capture.clone())
+        .with_ansi(false)
+        .with_max_level(tracing::Level::WARN)
+        .finish();
+    let result = tracing::subscriber::with_default(subscriber, || {
+        state
+            .apply_block(&block, BlockValidationMode::ValidateAll)
+            .map(|_| ())
+    });
+    let logs = String::from_utf8(capture.0.lock().unwrap().clone()).unwrap();
+    let expired = logs.contains("TTL expired")
+        || matches!(&result, Err(LedgerError::BlockTxValidationFailed { errors, .. }) if errors.contains("TTL expired"));
+    (result, expired)
+}
+
+#[test]
+fn test_apply_block_shelley_ttl_equal_to_slot_is_accepted() {
+    let (result, expired) = apply_ttl_block(2, 1_000, 1_000);
+    assert!(
+        !expired,
+        "Shelley block whose tx has ttl == slot must not be reported expired; got {result:?}"
+    );
+    assert!(result.is_ok(), "got {result:?}");
+}
+
+#[test]
+fn test_apply_block_shelley_ttl_below_slot_is_expired() {
+    let (result, expired) = apply_ttl_block(2, 999, 1_000);
+    assert!(expired, "slot > ttl must expire; got {result:?}");
+}
+
+#[test]
+fn test_apply_block_allegra_ttl_equal_to_slot_is_expired() {
+    let (result, expired) = apply_ttl_block(3, 1_000, 1_000);
+    assert!(
+        expired,
+        "Allegra+ upper bound is exclusive: ttl == slot must expire; got {result:?}"
+    );
+}
+
+// ── A pool registration needs the OPERATOR (cold) key witness ───────────────
+//
+// cardano-ledger f649f9751074d2ab3de033fc3912f29c9862c1f5: `poolCertKeyHashWitness`
+// (Core/TxCert.hs L151-154, reached from Shelley/TxCert.hs L596 and
+// Conway/TxCert.hs L795) plus the owners (Shelley/UTxO.hs L237-244).
+// `apply_block(ValidateAll)` validates every peer block through
+// `validate_transaction_with_context`. Phase-1 failures are not yet block-fatal,
+// so the verdict reaches the caller as the "Phase-1 validation divergence"
+// warning; capture it as the observable output of the production path.
+
+fn make_pool_params_for_witness_test(operator: Hash28, owner: Hash28) -> PoolParams {
+    PoolParams {
+        operator,
+        vrf_keyhash: Hash32::from_bytes([0x02; 32]),
+        pledge: Lovelace(100_000_000),
+        cost: Lovelace(340_000_000),
+        margin: Rational {
+            numerator: 1,
+            denominator: 100,
+        },
+        reward_account: {
+            let mut ra = vec![0xE0u8];
+            ra.extend_from_slice(&[0x03; 28]);
+            ra
+        },
+        pool_owners: vec![owner],
+        relays: vec![],
+        pool_metadata: None,
+    }
+}
+
+/// Apply a block carrying one RE-registration of an existing pool, signed by
+/// the seeds in `signers`. Returns the operator key hash and the captured log.
+fn apply_pool_reregistration(
+    operator_seed: u8,
+    owner_seed: u8,
+    signers: &[u8],
+) -> (Hash28, String) {
+    let key = |seed: u8| {
+        let sk = dugite_crypto::keys::PaymentSigningKey::from_bytes(&[seed; 32]).unwrap();
+        let hash = sk.verification_key().hash();
+        (sk, hash)
+    };
+    let (_, operator) = key(operator_seed);
+    let (_, owner) = key(owner_seed);
+
+    let mut state = LedgerState::new(ProtocolParameters::mainnet_defaults());
+    let input = TransactionInput {
+        transaction_id: Hash32::from_bytes([0xF0; 32]),
+        index: 0,
+    };
+    state
+        .utxo
+        .utxo_set
+        .insert(input.clone(), make_lovelace_output(10_000_000));
+    // The pool already exists, so this is a re-registration (no deposit).
+    std::sync::Arc::make_mut(&mut state.certs.pool_params).insert(
+        operator,
+        PoolRegistration {
+            pool_id: operator,
+            vrf_keyhash: Hash32::from_bytes([0x02; 32]),
+            pledge: Lovelace(100_000_000),
+            cost: Lovelace(340_000_000),
+            margin_numerator: 1,
+            margin_denominator: 100,
+            reward_account: {
+                let mut ra = vec![0xE0u8];
+                ra.extend_from_slice(&[0x03; 28]);
+                ra
+            },
+            owners: vec![owner],
+            relays: vec![],
+            metadata_url: None,
+            metadata_hash: None,
+        },
+    );
+
+    let mut tx = make_simple_tx(0xF1, vec![input], vec![make_lovelace_output(9_800_000)]);
+    tx.body.fee = Lovelace(200_000);
+    tx.body.certificates.push(Certificate::PoolRegistration(
+        make_pool_params_for_witness_test(operator, owner),
+    ));
+    tx.witness_set.vkey_witnesses = signers
+        .iter()
+        .map(|seed| {
+            let (sk, _) = key(*seed);
+            VKeyWitness {
+                vkey: sk.verification_key().to_bytes().to_vec(),
+                signature: sk.sign(tx.hash.as_bytes()),
+            }
+        })
+        .collect();
+    let block = make_test_block(1_000, 1, Hash32::ZERO, vec![tx]);
+
+    let capture = LogCapture::default();
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(capture.clone())
+        .with_ansi(false)
+        .with_max_level(tracing::Level::WARN)
+        .finish();
+    let _ = tracing::subscriber::with_default(subscriber, || {
+        state.apply_block(&block, BlockValidationMode::ValidateAll)
+    });
+    let logs = String::from_utf8(capture.0.lock().unwrap().clone()).unwrap();
+    (operator, logs)
+}
+
+#[test]
+fn test_apply_block_pool_reregistration_without_operator_witness_is_reported() {
+    // Owner signs, operator does not.
+    let (operator, logs) = apply_pool_reregistration(0xF2, 0xF3, &[0xF3]);
+    assert!(
+        logs.contains(&format!(
+            "Missing VKey witness for certificate credential: {}",
+            operator.to_hex()
+        )),
+        "a re-registration without the operator witness must be flagged for the \
+         operator key {}; log was:\n{logs}",
+        operator.to_hex()
+    );
+}
+
+#[test]
+fn test_apply_block_pool_reregistration_with_operator_witness_is_not_flagged() {
+    let (_, logs) = apply_pool_reregistration(0xF2, 0xF3, &[0xF2, 0xF3]);
+    assert!(
+        !logs.contains("Missing VKey witness for certificate credential"),
+        "operator + owner both signed; no certificate witness may be reported missing; \
+         log was:\n{logs}"
+    );
+}

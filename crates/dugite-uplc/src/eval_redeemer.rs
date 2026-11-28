@@ -340,19 +340,14 @@ pub(crate) fn eval_resolved_redeemer(
     // so callers (dugite-ledger Phase-2 error path and the CLI EvalTx
     // response) can mirror that behaviour.
     let mut trace_log: Vec<String> = Vec::new();
-    let mut tracker = match resolve_applied_costs(cost_models, r.language, major_pv) {
-        Some(applied) => BudgetTracker::with_applied(initial_budget, applied),
-        None => BudgetTracker::new(initial_budget),
-    };
-    // Select the Plutus `BuiltinSemanticsVariant` ONCE from the script's
-    // language + the block's major protocol version. This governs the small
-    // set of builtins whose RESULT changed across protocol versions — today
-    // only `consByteString` (lenient `fromIntegral`/mod-256 for PlutusV1/V2 at
-    // every PV; strict `Word8` range-check for PlutusV3). See
-    // [`SemanticsVariant::for_script`].
-    let variant = crate::builtin::semantics::SemanticsVariant::for_script(r.language, major_pv);
-    let eval_result =
-        evaluate_with_budget(applied_term, &mut tracker, Some(&mut trace_log), variant);
+    let (eval_result, consumed) = run_cek(
+        applied_term,
+        r.language,
+        major_pv,
+        resolve_applied_costs(cost_models, r.language, major_pv),
+        initial_budget,
+        &mut trace_log,
+    );
     // #761 Bug 2 capture: on a FAILED eval, dump the applied term with a
     // unique name + the error message (when DUGITE_DUMP_FAILED_ONLY is set).
     if let Err(ref err) = eval_result {
@@ -425,9 +420,226 @@ pub(crate) fn eval_resolved_redeemer(
     }
 
     Ok(RedeemerEvalOutcome {
-        consumed: tracker.consumed(),
+        consumed,
         result_term,
         logs: trace_log,
+    })
+}
+
+/// Run the CEK machine on a fully prepared term under the already-resolved
+/// cost model `applied` (see [`resolve_applied_costs`]; `None` = the reference
+/// model, which only the redeemer path's legacy no-cost-model case uses); the
+/// single place the production evaluation path builds its budget tracker and
+/// `BuiltinSemanticsVariant`. Shared by [`eval_resolved_redeemer`] and the
+/// gated entry points so they cannot drift. Taking the resolved costs, not the
+/// raw model, means a caller that holds an `AppliedCosts` cannot be silently
+/// run under the fallback. Returns the machine result and the budget consumed.
+fn run_cek(
+    term: Term,
+    language: ScriptLanguage,
+    major_pv: u32,
+    applied: Option<crate::cost_apply::AppliedCosts>,
+    initial_budget: ExBudget,
+    trace_log: &mut Vec<String>,
+) -> (Result<crate::machine::Value, UplcError>, ExBudget) {
+    let mut tracker = match applied {
+        Some(applied) => BudgetTracker::with_applied(initial_budget, applied),
+        None => BudgetTracker::new(initial_budget),
+    };
+    // Select the Plutus `BuiltinSemanticsVariant` ONCE from the script's
+    // language + the block's major protocol version. This governs the small
+    // set of builtins whose RESULT changed across protocol versions — today
+    // only `consByteString` (lenient `fromIntegral`/mod-256 for PlutusV1/V2 at
+    // every PV; strict `Word8` range-check for PlutusV3). See
+    // [`SemanticsVariant::for_script`].
+    let variant = crate::builtin::semantics::SemanticsVariant::for_script(language, major_pv);
+    let result = evaluate_with_budget(term, &mut tracker, Some(trace_log), variant);
+    (result, tracker.consumed())
+}
+
+/// What the gated entry points return on success: the raw CEK value (the
+/// caller reads it back to a term), the budget consumed and the trace log.
+#[derive(Debug)]
+pub struct ProgramEvalOutcome {
+    pub value: crate::machine::Value,
+    pub consumed: ExBudget,
+    pub logs: Vec<String>,
+}
+
+/// Why [`eval_program_gated`] failed, split by pipeline stage so a caller can
+/// tell a script that never became a runnable program from one that ran and
+/// failed. `consumed` is what the machine had charged when it stopped.
+#[derive(Debug)]
+pub enum ProgramEvalError {
+    /// Rejected before the machine started: language not yet available at
+    /// this protocol version, flat/CBOR decode failure, or the
+    /// protocol-version availability rules (builtin availability, `constr`/
+    /// `case` needing program >= 1.1.0, van Rossem bounds).
+    Decode(UplcError),
+    /// The eager scope check ([`crate::scope_check::check_scope`]) found a
+    /// free variable, which the ledger treats as a script failure.
+    Scope(UplcError),
+    /// The machine ran and failed (script error, builtin failure, budget
+    /// exhausted, ...).
+    Eval {
+        error: UplcError,
+        consumed: ExBudget,
+    },
+    /// The cost model for `language` was missing or could not be applied, so
+    /// the machine would have run under the reference-model FALLBACK rather
+    /// than the on-chain model. Refused here: a conformance caller must never
+    /// be scored against a model it did not ask for.
+    CostModelUnavailable,
+}
+
+/// The production, protocol-version- and language-gated evaluation of a
+/// stand-alone program (no transaction, no script context, no argument
+/// application), for callers that hold a program and a cost model but no
+/// transaction: the node-diversity `uplc-conformance` runner.
+///
+/// **Not for production callers, hence behind the `parser` feature.** It takes
+/// a [`Program`] that did NOT come through the flat decoder (the runner parses
+/// text for vectors flat cannot carry), so the decoder's own checks never ran.
+/// On-chain script bytes must go through [`eval_script_bytes_gated`].
+///
+/// It performs exactly the per-script steps of [`eval_resolved_redeemer`], in
+/// the same order, through the same helpers: the ledger-language gate
+/// ([`crate::flat::term::validate_ledger_language_available`]), the
+/// protocol-version availability rules
+/// ([`crate::flat::term::validate_program_availability`]), the eager scope
+/// check, then [`run_cek`] under the on-chain cost model (resolved FIRST, so a
+/// vector with no usable model is refused before anything else scores it). It omits only what
+/// needs a transaction: building and applying the `ScriptContext`, and the
+/// V3 "must return unit" classification of that applied result.
+///
+/// `program` is the decoded script; a caller holding on-chain script bytes
+/// decodes them with [`eval_script_bytes_gated`], which adds the CBOR/flat
+/// decode in front of the same path.
+#[cfg(feature = "parser")]
+pub fn eval_program_gated(
+    program: Program,
+    language: ScriptLanguage,
+    major_pv: u32,
+    cost_models: &CostModels,
+    initial_budget: ExBudget,
+) -> Result<ProgramEvalOutcome, ProgramEvalError> {
+    let applied = require_applied_costs(cost_models, language, major_pv)?;
+    crate::flat::term::validate_ledger_language_available(language, major_pv)
+        .map_err(ProgramEvalError::Decode)?;
+    prepare_decoded_program(program, language, major_pv, applied)?.run(initial_budget)
+}
+
+/// The on-chain cost model for `(language, major_pv)`, or
+/// [`ProgramEvalError::CostModelUnavailable`]: the gated entry points never
+/// run under the reference-model fallback.
+fn require_applied_costs(
+    cost_models: &CostModels,
+    language: ScriptLanguage,
+    major_pv: u32,
+) -> Result<crate::cost_apply::AppliedCosts, ProgramEvalError> {
+    resolve_applied_costs(Some(cost_models), language, major_pv)
+        .ok_or(ProgramEvalError::CostModelUnavailable)
+}
+
+/// Gated evaluation starting from on-chain script bytes: the
+/// CBOR-bytestring-wrapped flat that `deserialiseScript` takes. The cost model
+/// is resolved first; the language gate runs BEFORE the decode, as in
+/// [`eval_resolved_redeemer`].
+///
+/// This is [`prepare_script_bytes_gated`] followed by [`PreparedScript::run`]:
+/// the two halves are the only implementation, so a caller that times them
+/// apart (the node-diversity `uplc-turbo` runner) measures the same path.
+pub fn eval_script_bytes_gated(
+    script_bytes: &[u8],
+    language: ScriptLanguage,
+    major_pv: u32,
+    cost_models: &CostModels,
+    initial_budget: ExBudget,
+) -> Result<ProgramEvalOutcome, ProgramEvalError> {
+    prepare_script_bytes_gated(script_bytes, language, major_pv, cost_models)?.run(initial_budget)
+}
+
+/// A script that has passed every step of [`eval_script_bytes_gated`] that
+/// precedes the CEK run (cost-model resolution, language gate, CBOR/flat
+/// decode, availability rules, scope check) and is ready to run.
+///
+/// Splitting preparation from the run lets a benchmark time the machine alone.
+/// `Clone` is cheap for the term (it is `Rc`-shared) and lets a caller take a
+/// fresh copy per run outside its timer, as [`PreparedScript::run`] consumes it.
+#[derive(Debug, Clone)]
+pub struct PreparedScript {
+    program: Program,
+    language: ScriptLanguage,
+    major_pv: u32,
+    applied: crate::cost_apply::AppliedCosts,
+}
+
+/// Everything [`eval_script_bytes_gated`] does before the CEK run, in the same
+/// order (cost model, language gate, decode, availability, scope check).
+pub fn prepare_script_bytes_gated(
+    script_bytes: &[u8],
+    language: ScriptLanguage,
+    major_pv: u32,
+    cost_models: &CostModels,
+) -> Result<PreparedScript, ProgramEvalError> {
+    let applied = require_applied_costs(cost_models, language, major_pv)?;
+    crate::flat::term::validate_ledger_language_available(language, major_pv)
+        .map_err(ProgramEvalError::Decode)?;
+    let program = match decode_script_bytes(script_bytes) {
+        Ok(p) => p,
+        Err(PhaseTwoError::ScriptEvaluationFailed(e)) => return Err(ProgramEvalError::Decode(e)),
+        Err(other) => {
+            return Err(ProgramEvalError::Decode(UplcError::Internal(
+                other.to_string(),
+            )))
+        }
+    };
+    prepare_decoded_program(program, language, major_pv, applied)
+}
+
+impl PreparedScript {
+    /// Run the CEK machine under the prepared cost model: the single
+    /// [`run_cek`] call every gated entry point ends in.
+    pub fn run(self, initial_budget: ExBudget) -> Result<ProgramEvalOutcome, ProgramEvalError> {
+        let mut logs = Vec::new();
+        let (result, consumed) = run_cek(
+            self.program.term,
+            self.language,
+            self.major_pv,
+            Some(self.applied),
+            initial_budget,
+            &mut logs,
+        );
+        match result {
+            Ok(value) => Ok(ProgramEvalOutcome {
+                value,
+                consumed,
+                logs,
+            }),
+            Err(error) => Err(ProgramEvalError::Eval { error, consumed }),
+        }
+    }
+}
+
+fn prepare_decoded_program(
+    program: Program,
+    language: ScriptLanguage,
+    major_pv: u32,
+    applied: crate::cost_apply::AppliedCosts,
+) -> Result<PreparedScript, ProgramEvalError> {
+    crate::flat::term::validate_program_availability(
+        &program.term,
+        &program.version,
+        language,
+        major_pv,
+    )
+    .map_err(ProgramEvalError::Decode)?;
+    crate::scope_check::check_scope(&program.term).map_err(ProgramEvalError::Scope)?;
+    Ok(PreparedScript {
+        program,
+        language,
+        major_pv,
+        applied,
     })
 }
 
@@ -1615,5 +1827,243 @@ mod tests {
             PhaseTwoError::ScriptEvaluationFailed(crate::UplcError::BudgetExhausted { .. }) => {}
             other => panic!("expected BudgetExhausted, got: {other:?}"),
         }
+    }
+
+    // ── eval_program_gated / eval_script_bytes_gated ──────────────────────────
+
+    #[cfg(feature = "parser")]
+    fn unit_program() -> Program {
+        Program {
+            version: ver(1, 0, 0),
+            term: Term::Const(Constant::Unit),
+        }
+    }
+
+    #[cfg(feature = "parser")]
+    fn v3_models() -> CostModels {
+        CostModels {
+            plutus_v3: Some(vec![1; 350]),
+            ..CostModels::default()
+        }
+    }
+
+    fn big_budget() -> ExBudget {
+        ExBudget {
+            cpu: 10_000_000_000,
+            mem: 14_000_000,
+        }
+    }
+
+    /// The semantics variant comes from the SCRIPT's language and the block's protocol version:
+    /// `consByteString 256` wraps (lenient `fromIntegral`) for PlutusV2 and fails (strict `Word8`
+    /// range check) for PlutusV3. Forcing one variant for both makes one of the two assertions
+    /// fail, which is what bounds `run_cek`'s variant selection.
+    #[test]
+    fn gated_evaluation_selects_the_semantics_variant_from_language_and_pv() {
+        let cons = Program {
+            version: ver(1, 0, 0),
+            term: Term::App(
+                Rc::new(Term::App(
+                    Rc::new(Term::Builtin(crate::term::BuiltinId::ConsByteString)),
+                    Rc::new(Term::Const(Constant::Integer(BigInt::from(256)))),
+                )),
+                Rc::new(Term::Const(Constant::ByteString(vec![]))),
+            ),
+        };
+        let bytes = cons.to_cbor().unwrap();
+        let v2_models = CostModels {
+            plutus_v2: Some(vec![1; 332]),
+            ..CostModels::default()
+        };
+        let v3_models = CostModels {
+            plutus_v3: Some(vec![1; 350]),
+            ..CostModels::default()
+        };
+        let lenient = eval_script_bytes_gated(
+            &bytes,
+            ScriptLanguage::PlutusV2,
+            8,
+            &v2_models,
+            big_budget(),
+        )
+        .expect("PlutusV2 consByteString wraps 256 to 0");
+        assert!(matches!(
+            lenient.value,
+            crate::machine::Value::Const(Constant::ByteString(ref b)) if b == &[0u8]
+        ));
+        let strict = eval_script_bytes_gated(
+            &bytes,
+            ScriptLanguage::PlutusV3,
+            10,
+            &v3_models,
+            big_budget(),
+        );
+        assert!(
+            matches!(strict, Err(ProgramEvalError::Eval { .. })),
+            "PlutusV3 consByteString 256 must fail: {strict:?}"
+        );
+    }
+
+    /// The cost model is resolved before the bytes are even looked at: undecodable bytes with
+    /// no usable model are a cost-model refusal, never a (scorable) decode failure.
+    #[test]
+    fn gated_script_bytes_check_the_cost_model_before_decoding() {
+        let err = eval_script_bytes_gated(
+            &[0xfe, 0xfe],
+            ScriptLanguage::PlutusV3,
+            10,
+            &CostModels::default(),
+            big_budget(),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, ProgramEvalError::CostModelUnavailable),
+            "{err:?}"
+        );
+    }
+
+    #[cfg(feature = "parser")]
+    #[test]
+    fn gated_program_evaluates_and_reports_consumed_budget() {
+        let out = eval_program_gated(
+            unit_program(),
+            ScriptLanguage::PlutusV3,
+            10,
+            &v3_models(),
+            big_budget(),
+        )
+        .expect("a unit constant evaluates");
+        assert!(out.consumed.cpu > 0 && out.consumed.mem > 0);
+        assert!(matches!(
+            out.value,
+            crate::machine::Value::Const(Constant::Unit)
+        ));
+    }
+
+    #[cfg(feature = "parser")]
+    #[test]
+    fn gated_program_applies_the_language_gate_before_anything_else() {
+        // PlutusV3 is introduced at protocol major 9.
+        let err = eval_program_gated(
+            unit_program(),
+            ScriptLanguage::PlutusV3,
+            8,
+            &v3_models(),
+            big_budget(),
+        )
+        .unwrap_err();
+        assert!(matches!(err, ProgramEvalError::Decode(_)), "{err:?}");
+    }
+
+    #[cfg(feature = "parser")]
+    #[test]
+    fn gated_program_applies_the_availability_rules() {
+        // `constr` needs program version >= 1.1.0 (the flat path's own gate).
+        let program = Program {
+            version: ver(1, 0, 0),
+            term: Term::Constr {
+                tag: 0,
+                args: vec![],
+            },
+        };
+        let err = eval_program_gated(
+            program,
+            ScriptLanguage::PlutusV3,
+            11,
+            &v3_models(),
+            big_budget(),
+        )
+        .unwrap_err();
+        assert!(matches!(err, ProgramEvalError::Decode(_)), "{err:?}");
+    }
+
+    #[cfg(feature = "parser")]
+    #[test]
+    fn gated_program_runs_the_eager_scope_check() {
+        // A free variable under a never-forced delay: the machine would never reach it.
+        let program = Program {
+            version: ver(1, 0, 0),
+            term: Term::Delay(Rc::new(Term::Var(1))),
+        };
+        let err = eval_program_gated(
+            program,
+            ScriptLanguage::PlutusV3,
+            10,
+            &v3_models(),
+            big_budget(),
+        )
+        .unwrap_err();
+        assert!(matches!(err, ProgramEvalError::Scope(_)), "{err:?}");
+    }
+
+    #[cfg(feature = "parser")]
+    #[test]
+    fn gated_program_refuses_to_fall_back_to_the_reference_cost_model() {
+        let err = eval_program_gated(
+            unit_program(),
+            ScriptLanguage::PlutusV3,
+            10,
+            &CostModels::default(),
+            big_budget(),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, ProgramEvalError::CostModelUnavailable),
+            "{err:?}"
+        );
+    }
+
+    #[cfg(feature = "parser")]
+    #[test]
+    fn gated_program_reports_budget_exhaustion_as_an_eval_error() {
+        let err = eval_program_gated(
+            unit_program(),
+            ScriptLanguage::PlutusV3,
+            10,
+            &v3_models(),
+            ExBudget { cpu: 0, mem: 0 },
+        )
+        .unwrap_err();
+        match err {
+            ProgramEvalError::Eval {
+                error: crate::UplcError::BudgetExhausted { .. },
+                ..
+            } => {}
+            other => panic!("expected BudgetExhausted, got {other:?}"),
+        }
+    }
+
+    #[cfg(feature = "parser")]
+    #[test]
+    fn gated_script_bytes_decode_the_cbor_wrapper_and_agree_with_the_program_path() {
+        let bytes = unit_program().to_cbor().unwrap();
+        let from_bytes = eval_script_bytes_gated(
+            &bytes,
+            ScriptLanguage::PlutusV3,
+            10,
+            &v3_models(),
+            big_budget(),
+        )
+        .unwrap();
+        let from_program = eval_program_gated(
+            unit_program(),
+            ScriptLanguage::PlutusV3,
+            10,
+            &v3_models(),
+            big_budget(),
+        )
+        .unwrap();
+        assert_eq!(from_bytes.consumed, from_program.consumed);
+        // Bare (unwrapped) flat is not an on-chain script: rejected, as in the redeemer path.
+        let bare = unit_program().to_flat().unwrap();
+        let err = eval_script_bytes_gated(
+            &bare,
+            ScriptLanguage::PlutusV3,
+            10,
+            &v3_models(),
+            big_budget(),
+        )
+        .unwrap_err();
+        assert!(matches!(err, ProgramEvalError::Decode(_)), "{err:?}");
     }
 }

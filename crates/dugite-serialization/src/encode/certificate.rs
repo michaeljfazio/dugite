@@ -99,14 +99,18 @@ pub(crate) fn encode_pool_params(params: &PoolParams) -> Vec<u8> {
 
     // pool_metadata
     match &params.pool_metadata {
-        Some(meta) => {
-            buf.extend(encode_array_header(2));
-            buf.extend(encode_text(&meta.url));
-            buf.extend(encode_hash32(&meta.hash));
-        }
+        Some(meta) => buf.extend(encode_pool_metadata(meta)),
         None => buf.extend(encode_null()),
     }
 
+    buf
+}
+
+/// Encode `pool_metadata = [url, metadata_hash]`.
+pub(crate) fn encode_pool_metadata(meta: &PoolMetadata) -> Vec<u8> {
+    let mut buf = encode_array_header(2);
+    buf.extend(encode_text(&meta.url));
+    buf.extend(encode_hash32(&meta.hash));
     buf
 }
 

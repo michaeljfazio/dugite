@@ -62,8 +62,8 @@ fn stub_note(scenario: Scenario) -> &'static str {
     match scenario {
         Scenario::LedgerRules => "ledger-rules runner not implemented yet (#1114 Phase 2b); this report carries no result",
         Scenario::CborDecoding => "cbor-decoding runner not implemented yet (#1114 Phase 2c); this report carries no result",
-        Scenario::UplcConformance => "uplc-conformance runner not implemented yet (#1114 Phase 2a); this report carries no result",
-        Scenario::UplcTurbo => "uplc-turbo runner not implemented yet (#1114 Phase 2d); this report carries no result",
+        // These two have real runners (`generate` never asks for their stub).
+        Scenario::UplcConformance | Scenario::UplcTurbo => unreachable!("{scenario} has a runner"),
     }
 }
 
@@ -74,6 +74,24 @@ fn generate(
     pins: &Pins,
     run: &RunInfo,
 ) -> Result<(ReportStatus, String, Value), String> {
+    if scenario == Scenario::CborDecoding {
+        return dugite_conformance::node_diversity::cbor_decoding::generate_for_runner(
+            &corpora_dir(),
+            era,
+            pins,
+            run,
+        );
+    }
+    if scenario == Scenario::LedgerRules {
+        // Phase 2b (#1125): the real runner.
+        return dugite_conformance::node_diversity::ledger_rules::report::generate(pins, run);
+    }
+    if scenario == Scenario::UplcConformance {
+        return generate_uplc_conformance(run);
+    }
+    if scenario == Scenario::UplcTurbo {
+        return generate_uplc_turbo(run);
+    }
     let note = stub_note(scenario).to_string();
     Ok((
         ReportStatus::Stub,
@@ -81,6 +99,48 @@ fn generate(
         empty_report(scenario, era, pins, run, &note),
     ))
 }
+
+/// `uplc-conformance` (#1114 Phase 2a): every vector through dugite's production gated
+/// evaluation path.  The runner lives in `dugite_conformance::node_diversity::uplc_conformance`.
+fn generate_uplc_conformance(run: &RunInfo) -> Result<(ReportStatus, String, Value), String> {
+    use dugite_conformance::node_diversity::uplc_conformance::run_all;
+    let result = run_all(&corpora_dir())?;
+    // A panic, an internal error or a decoder arm that is not wired is a dugite defect the report
+    // must not carry as a result: it makes the generator fail, so an error report is written.
+    if let Some(fatal) = result.fatal() {
+        return Err(fatal);
+    }
+    Ok((
+        ReportStatus::Ok,
+        result.summary(),
+        uplc_conformance_report(run, &result.cases),
+    ))
+}
+
+/// `uplc-turbo` (#1114 Phase 2d): the runner is `dugite_conformance::node_diversity::uplc_turbo`.
+/// A run that is sampled or not on the publishing runner is written as a `stub`.
+fn generate_uplc_turbo(run: &RunInfo) -> Result<(ReportStatus, String, Value), String> {
+    use dugite_conformance::node_diversity::uplc_turbo::run_all;
+    let result = run_all(&corpora_dir())?;
+    // Only a full run on the publishing runner is `ok`.  Any other run is a `stub`, the status a
+    // publish step already refuses, so a laptop or sampled run cannot be published by mistake.
+    // The score of a stub is still printed by `just ndc-score`.
+    let status = if result.publishable() {
+        ReportStatus::Ok
+    } else {
+        ReportStatus::Stub
+    };
+    Ok((
+        status,
+        result.summary(),
+        uplc_turbo_report(run, Some(&result.machine), &result.benchmarks),
+    ))
+}
+
+// `mem_bytes` of `uplc-turbo` counts allocator requests; only this test binary installs the counter.
+#[global_allocator]
+static ALLOCATOR: dugite_conformance::node_diversity::uplc_turbo::CountingAllocator =
+    dugite_conformance::node_diversity::uplc_turbo::CountingAllocator;
 
 /// What every `ndc_report_*` test does.
 fn run_scenario(test: &str, scenario: Scenario) {
