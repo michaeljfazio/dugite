@@ -226,6 +226,9 @@ pub fn encode_constant(w: &mut BitWriter, c: &Constant) -> FlatResult<()> {
 /// 3. From protocol version 11 (`vanRossemPV`), a `Constr`'s FIELD COUNT is
 ///    bounded at 1024 (`maxBoundsByPV`'s `mbConstr`). The tag is unbounded —
 ///    see [`MAX_CONSTR_FIELDS`].
+/// 4. The program's declared version is in `plcVersionsAvailableIn language
+///    major_pv` (`mkTermToEvaluate`, see [`validate_plc_version_available`]).
+///    Unlike 1-3 this is an evaluation-time check in Haskell too.
 pub fn validate_program_availability(
     term: &Term,
     version: &(
@@ -237,7 +240,111 @@ pub fn validate_program_availability(
     major_pv: u32,
 ) -> FlatResult<()> {
     let version_1_1_0_or_later = version >= &plc_version_1_1_0();
-    validate_term_depth(term, language, major_pv, version_1_1_0_or_later, 0)
+    validate_term_depth(term, language, major_pv, version_1_1_0_or_later, 0)?;
+    // Last, as in Haskell: the decoder's checks above run at deserialisation,
+    // the program-version check only afterwards, in `mkTermToEvaluate`.
+    validate_plc_version_available(version, language, major_pv)
+}
+
+/// A protocol major version and the Plutus Core program versions
+/// (`major.minor.patch`) a ledger language gains at it.
+type PlcVersionsIntroduced = (u32, &'static [(u8, u8, u8)]);
+
+/// The Plutus Core program versions each ledger language gains at each
+/// protocol major version — Haskell `plcVersionsIntroducedIn`.
+///
+/// `IntersectMBO/plutus` @ `1.71.0.0` (the version cardano-node 11.2.1 ships;
+/// the table is identical at `1.72.0.0`),
+/// `plutus-ledger-api/src/PlutusLedgerApi/Common/Versions.hs` L362-385:
+///
+/// ```haskell
+/// PlutusV1 -> [ (alonzoPV, [plcVersion100]), (vanRossemPV, [plcVersion110]), (dijkstraPV, [plcVersion120]) ]
+/// PlutusV2 -> [ (vasilPV,  [plcVersion100]), (vanRossemPV, [plcVersion110]), (dijkstraPV, [plcVersion120]) ]
+/// PlutusV3 -> [ (changPV,  [plcVersion100, plcVersion110]), (dijkstraPV, [plcVersion120]) ]
+/// PlutusV4 -> [ (dijkstraPV, [plcVersion100, plcVersion110, plcVersion120]) ]
+/// ```
+///
+/// with alonzo = 5, vasil = 7, chang = 9, vanRossem = 11, dijkstra = 12
+/// (`ProtocolVersions.hs`).
+const fn plc_versions_introduced_in(language: ScriptLanguage) -> &'static [PlcVersionsIntroduced] {
+    const V100: (u8, u8, u8) = (1, 0, 0);
+    const V110: (u8, u8, u8) = (1, 1, 0);
+    const V120: (u8, u8, u8) = (1, 2, 0);
+    match language {
+        ScriptLanguage::PlutusV1 => &[(5, &[V100]), (11, &[V110]), (12, &[V120])],
+        ScriptLanguage::PlutusV2 => &[(7, &[V100]), (11, &[V110]), (12, &[V120])],
+        ScriptLanguage::PlutusV3 => &[(9, &[V100, V110]), (12, &[V120])],
+        ScriptLanguage::PlutusV4 => &[(12, &[V100, V110, V120])],
+    }
+}
+
+/// Whether a program declaring `version` may run as `language` at `major_pv`
+/// — Haskell `v \`Set.member\` plcVersionsAvailableIn ll pv`, where
+/// `plcVersionsAvailableIn = collectUpTo . plcVersionsIntroducedIn` is the
+/// union of every entry introduced at a protocol version `<= major_pv`.
+/// Membership is of the exact triple: `1.0.1` and `2.0.0` are never available.
+pub fn plc_version_available_in(
+    version: &(
+        num_bigint::BigUint,
+        num_bigint::BigUint,
+        num_bigint::BigUint,
+    ),
+    language: ScriptLanguage,
+    major_pv: u32,
+) -> bool {
+    plc_versions_introduced_in(language)
+        .iter()
+        .filter(|(introduced, _)| *introduced <= major_pv)
+        .flat_map(|(_, versions)| versions.iter())
+        .any(|&(a, b, c)| {
+            version.0 == num_bigint::BigUint::from(a)
+                && version.1 == num_bigint::BigUint::from(b)
+                && version.2 == num_bigint::BigUint::from(c)
+        })
+}
+
+/// Reject a program whose declared Plutus Core version is not available for
+/// its ledger language at `major_pv`.
+///
+/// `IntersectMBO/plutus` @ `1.71.0.0`,
+/// `plutus-ledger-api/src/PlutusLedgerApi/Common/Eval.hs` L124-128
+/// (`mkTermToEvaluate`, identical at `1.72.0.0` and `1.63.0.0`):
+///
+/// ```haskell
+/// -- check that the Plutus Core language version is available
+/// -- See Note [Checking the Plutus Core language version]
+/// unless (v `Set.member` plcVersionsAvailableIn ll pv) $
+///   throwing _ScriptDecodeError $
+///     PlutusCoreLanguageNotAvailableError v ll pv
+/// ```
+///
+/// The Note says: "this check has been in `mkTermToEvaluate`, which makes it a
+/// phase 2 failure". `deserialiseScript` (the phase-1 `validScript` path) never
+/// reads the version, so a script with a disallowed version is well-formed:
+/// cardano-ledger turns the `Left` into a script failure
+/// (`runPlutusScriptWithLogs` → `explainPlutusEvaluationError`), which rejects
+/// an `is_valid = true` transaction (`ValidationTagMismatch …
+/// FailedUnexpectedly`) and is the legitimate outcome of an `is_valid = false`
+/// one. In dugite the `FlatDecode` error below becomes
+/// `PhaseTwoError::ScriptEvaluationFailed`, the same phase-2 class.
+pub fn validate_plc_version_available(
+    version: &(
+        num_bigint::BigUint,
+        num_bigint::BigUint,
+        num_bigint::BigUint,
+    ),
+    language: ScriptLanguage,
+    major_pv: u32,
+) -> FlatResult<()> {
+    if plc_version_available_in(version, language, major_pv) {
+        Ok(())
+    } else {
+        Err(UplcError::FlatDecode(format!(
+            "Plutus Core language version {}.{}.{} is not available for ledger language \
+             {language:?} at protocol version {major_pv}",
+            version.0, version.1, version.2
+        )))
+    }
 }
 
 /// The protocol MAJOR version at which each ledger Plutus language became
@@ -1740,6 +1847,106 @@ mod tests {
                     });
             }
         }
+    }
+
+    // -----------------------------------------------------------------
+    // Program-version gate (`plcVersionsAvailableIn`, `mkTermToEvaluate`)
+    // -----------------------------------------------------------------
+
+    /// The seven node-diversity `uplc-conformance` vectors
+    /// (`<pv>/<lang>/program/version/*`): each declares a version that
+    /// cardano-node does not allow for its language at its PV.
+    #[test]
+    fn plc_version_gate_rejects_the_seven_conformance_vectors() {
+        use ScriptLanguage::*;
+        for (pv, lang, v) in [
+            (10, PlutusV1, ver(1, 1, 0)),
+            (10, PlutusV2, ver(1, 1, 0)),
+            (10, PlutusV3, ver(2, 0, 0)),
+            (11, PlutusV1, ver(2, 0, 0)),
+            (11, PlutusV3, ver(1, 0, 1)),
+            (11, PlutusV3, ver(1, 2, 0)),
+            (11, PlutusV3, ver(2, 0, 0)),
+        ] {
+            let err = validate_program_availability(&Term::Error, &v, lang, pv)
+                .expect_err(&format!("{v:?} as {lang:?} at PV{pv} must be rejected"));
+            assert!(matches!(err, UplcError::FlatDecode(_)), "got {err:?}");
+        }
+    }
+
+    /// The whole (language, PV) table from PV5 to PV13, written out
+    /// independently of `plc_versions_introduced_in`, so a wrong entry there
+    /// fails here. Candidate versions include near misses (1.0.1, 0.x, 2.0.0).
+    #[test]
+    fn plc_version_gate_matches_plcversionsavailablein_table() {
+        use ScriptLanguage::*;
+        let expected = |lang: ScriptLanguage, pv: u32| -> Vec<(u64, u64, u64)> {
+            let mut out = Vec::new();
+            let (v100, v110) = match lang {
+                PlutusV1 => (5, 11),
+                PlutusV2 => (7, 11),
+                PlutusV3 => (9, 9),
+                PlutusV4 => (12, 12),
+            };
+            if pv >= v100 {
+                out.push((1, 0, 0));
+            }
+            if pv >= v110 {
+                out.push((1, 1, 0));
+            }
+            if pv >= 12 {
+                out.push((1, 2, 0));
+            }
+            out
+        };
+        let candidates = [
+            (0, 0, 0),
+            (0, 1, 0),
+            (1, 0, 0),
+            (1, 0, 1),
+            (1, 1, 0),
+            (1, 1, 1),
+            (1, 2, 0),
+            (1, 3, 0),
+            (2, 0, 0),
+        ];
+        for lang in [PlutusV1, PlutusV2, PlutusV3, PlutusV4] {
+            for pv in 5..=13 {
+                let allowed = expected(lang, pv);
+                for c in candidates {
+                    let v = ver(c.0, c.1, c.2);
+                    assert_eq!(
+                        plc_version_available_in(&v, lang, pv),
+                        allowed.contains(&c),
+                        "{c:?} as {lang:?} at PV{pv}"
+                    );
+                    assert_eq!(
+                        validate_program_availability(&Term::Error, &v, lang, pv).is_ok(),
+                        allowed.contains(&c),
+                        "validate_program_availability: {c:?} as {lang:?} at PV{pv}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// A version component too large for any machine integer is decodable
+    /// (Haskell `Natural`) and must be rejected by the gate, not panic.
+    #[test]
+    fn plc_version_gate_rejects_huge_version_components() {
+        let huge = num_bigint::BigUint::from(u128::MAX) * 7u8;
+        let v = (
+            huge.clone(),
+            num_bigint::BigUint::ZERO,
+            num_bigint::BigUint::ZERO,
+        );
+        assert!(!plc_version_available_in(&v, ScriptLanguage::PlutusV3, 11));
+        let v = (
+            num_bigint::BigUint::from(1u8),
+            huge,
+            num_bigint::BigUint::ZERO,
+        );
+        assert!(!plc_version_available_in(&v, ScriptLanguage::PlutusV3, 11));
     }
 
     // ─────────────────────────────────────────────────────────────────
