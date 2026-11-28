@@ -111,3 +111,25 @@ ExUnits) and a unit test of the variant selection in `eval_redeemer.rs`, not in 
 
 A pin change is a corpus upgrade: edit `corpora.toml`, run `just ndc-fetch` (it names every
 difference to resolve), `just ndc-selftest`, `just ndc-reports`, and compare `just ndc-score`.
+
+## The uplc-turbo runner (Phase 2d, #1178)
+
+`tests/conformance/src/node_diversity/uplc_turbo.rs`; `just ndc-report uplc-turbo` (release profile; about
+2.5 minutes for the 3,997 programs on an Apple M2 Max). `just ndc-turbo-quick` runs every 40th program into
+`reports-quick/` and writes a `stub`, so a sample can never be published.
+
+* **Path.** Each corpus file is the on-chain script (a raw CBOR byte string around flat, not hex text). It goes
+  through `dugite_uplc::eval_redeemer::prepare_script_bytes_gated` once (cost model, language gate, decode,
+  availability, scope check: untimed) and `PreparedScript::run` 50 times (timed). `eval_script_bytes_gated`, which
+  the `uplc-conformance` runner uses, is exactly those two calls.
+* **Measurement.** The fastest 30 of 50 sequential runs; `cpu_us` and `mem_bytes` are means over those same runs.
+  `mem_bytes` is the cumulative bytes the evaluation requested from the allocator on its thread (a counting global
+  allocator installed by the test binary; a reallocation counts as a new allocation of its new size, frees are not
+  subtracted): Go's `TotalAlloc`, as Dingo reports, not a resident peak.
+* **Cost models.** Protocol version 10 and 11 use the `uplc-conformance` corpus' models, version 9 the version 10
+  arrays (same semantics variant), version 8 `uplc-turbo-cost-models-pv8.json` (variant A, from Amaru, with its
+  provenance in the file). Budgets agree with cardano-node's and Amaru's published reports for all 3,997 programs.
+* **A program that does not evaluate** gets `null` budgets and `mem_bytes` and `cpu_us` 0, so it disagrees with the
+  nodes that did evaluate it; a panic or internal error fails the run.
+* **Trend-only.** The schema has no room for it, so the `.status.json` note says whether the run was on the publishing
+  runner (`DUGITE_NDC_PUBLISHING_RUNNER` set) or trend-only, with the machine, rustc, load average and wall time.

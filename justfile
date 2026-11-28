@@ -472,8 +472,10 @@ ndc-report scenario:
         report="$out/$file"
         rm -f "$report" "$report.status.json"
         # A failing run still writes its report; carry on to the other era, fail at the end.
+        # uplc-turbo measures time: it needs the release profile (the runner refuses a debug build).
+        profile=(); [[ "$scenario" == uplc-turbo ]] && profile=(--cargo-profile release)
         DUGITE_NDC_REQUIRE=1 DUGITE_NDC_CBOR_ERA="$era" DUGITE_NDC_REPORT="$report" \
-            cargo nextest run -p dugite-conformance --test ndc_reports --no-tests=fail \
+            cargo nextest run ${profile[@]+"${profile[@]}"} -p dugite-conformance --test ndc_reports --no-tests=fail \
             -E "test(=ndc_report_${scenario//-/_})" || { echo "ndc-report: the $scenario ($era) run FAILED" >&2; rc=1; }
         # A test that was skipped would pass without writing anything: insist on the file.
         if [[ ! -s "$report" || ! -s "$report.status.json" ]]; then
@@ -489,6 +491,11 @@ ndc-report scenario:
         fi
     done
     exit $rc
+
+# A QUICK, NOT PUBLISHABLE uplc-turbo run: every 40th program, written to reports-quick/ so it can
+# never be mistaken for the real report (its status is `stub`).  The full run is `just ndc-report uplc-turbo`.
+ndc-turbo-quick:
+    DUGITE_NDC_TURBO_SAMPLE=40 DUGITE_NDC_REPORTS_DIR=target/node-diversity/reports-quick just ndc-report uplc-turbo
 
 # The whole ndc_reports test binary against NDC's real schema.json files, with the corpus REQUIRED
 # (a missing corpus fails instead of skipping): the red-proofs of the schema validation run here.

@@ -77,6 +77,9 @@ fn generate(
     if scenario == Scenario::UplcConformance {
         return generate_uplc_conformance(run);
     }
+    if scenario == Scenario::UplcTurbo {
+        return generate_uplc_turbo(run);
+    }
     let note = stub_note(scenario).to_string();
     Ok((
         ReportStatus::Stub,
@@ -101,6 +104,28 @@ fn generate_uplc_conformance(run: &RunInfo) -> Result<(ReportStatus, String, Val
         uplc_conformance_report(run, &result.cases),
     ))
 }
+
+/// `uplc-turbo` (#1114 Phase 2d): the runner is `dugite_conformance::node_diversity::uplc_turbo`.
+/// A sampled run is a partial result, written as a `stub` so a publish step refuses it.
+fn generate_uplc_turbo(run: &RunInfo) -> Result<(ReportStatus, String, Value), String> {
+    use dugite_conformance::node_diversity::uplc_turbo::run_all;
+    let result = run_all(&corpora_dir())?;
+    let status = if result.sampled {
+        ReportStatus::Stub
+    } else {
+        ReportStatus::Ok
+    };
+    Ok((
+        status,
+        result.summary(),
+        uplc_turbo_report(run, Some(&result.machine), &result.benchmarks),
+    ))
+}
+
+// `mem_bytes` of `uplc-turbo` counts allocator requests; only this test binary installs the counter.
+#[global_allocator]
+static ALLOCATOR: dugite_conformance::node_diversity::uplc_turbo::CountingAllocator =
+    dugite_conformance::node_diversity::uplc_turbo::CountingAllocator;
 
 /// What every `ndc_report_*` test does.
 fn run_scenario(test: &str, scenario: Scenario) {
