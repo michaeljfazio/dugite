@@ -19,7 +19,7 @@ mod datum;
 pub mod mir;
 mod phase1;
 pub mod ppup;
-mod scripts;
+pub(crate) mod scripts;
 pub(crate) mod size_check;
 pub mod withdrawals;
 
