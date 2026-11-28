@@ -88,6 +88,7 @@ pub const NOT_PRESERVED_BYTES: &[(&str, &str, &str)] = &[
     ("ByronUpdVote", "proposal_id_raw", "Byron-only; Byron blocks are outside both datasets"),
     ("CompactValueDecoded", "multi_asset_raw", "ledger-state / MemPack snapshot import type: not decoded by any rule of the dataset"),
     ("DatumOption", "datum", "ledger-state / MemPack snapshot import type: not decoded by any rule of the dataset"),
+    ("HaskellUtxoEntry", "txout_mempack", "ledger-state / MemPack snapshot import type: not decoded by any rule of the dataset"),
     ("HaskellGovState", "committee_raw", "ledger-state / MemPack snapshot import type: not decoded by any rule of the dataset"),
     ("HaskellGovState", "drep_pulsing_raw", "ledger-state / MemPack snapshot import type: not decoded by any rule of the dataset"),
     ("HaskellGovState", "proposals_raw", "ledger-state / MemPack snapshot import type: not decoded by any rule of the dataset"),
