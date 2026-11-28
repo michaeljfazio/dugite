@@ -16,6 +16,7 @@ default-members = [
     "crates/dugite-config",
     "crates/dugite-uplc",
     "crates/dugite-rpc",
+    "crates/dugite-tx-admission",
     "tests/conformance",
     "tests/golden",
 ]
@@ -37,6 +38,7 @@ members = [
     "crates/dugite-config",
     "crates/dugite-uplc",
     "crates/dugite-rpc",
+    "crates/dugite-tx-admission",
     "tests/conformance",
     "tests/golden",
 ]
@@ -65,6 +67,7 @@ dugite-lsm = { path = "crates/dugite-lsm" }
 dugite-monitor = { path = "crates/dugite-monitor" }
 dugite-uplc = { path = "crates/dugite-uplc" }
 dugite-rpc = { path = "crates/dugite-rpc" }
+dugite-tx-admission = { path = "crates/dugite-tx-admission" }
 
 # Terminal UI
 ratatui = "0.30"

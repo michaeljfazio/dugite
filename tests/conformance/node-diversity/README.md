@@ -12,6 +12,7 @@ The runners themselves are Phases 2a-2d.
 | Report envelopes, writer, schema validation | `tests/conformance/src/node_diversity/` |
 | Runners and harness tests | `tests/conformance/tests/ndc_reports.rs` |
 | Score with NDC's own builder | `scripts/node-diversity/score-reports.sh` |
+| `ledger-rules` runner and strict gate (#1125) | `ledger-rules/README.md`, `just ndc-gate` |
 | Recipes | `just ndc-fetch`, `ndc-report <scenario>`, `ndc-reports`, `ndc-score`, `ndc-selftest` |
 
 ```sh
@@ -91,14 +92,15 @@ version and Plutus language is used, with the scenario's 10B CPU / 14M MEM.
   decoder arm that says it is "not yet wired" are reported as `evaluator panic`,
   `evaluator internal error` and `decoder not yet wired`; no expectation names them, so they never score,
   and a run that produces one writes an `error` report and fails. (A decoder that simply lacks a case
-  and says "unknown ..." is a `parse/decode error`; #1127 tracks 62 of those.)
+  and says "unknown ..." is a `parse/decode error`.)
 
-**What the 990 mean** (as pinned; `just ndc-score`): 703 vectors pass on the full textual result and
-budget; 287 pass on the class alone (218 `evaluation failure`, 62 `parse/decode error`, 7
-`out of budget`), where nothing but the class is compared. Of the 62 `parse/decode error` passes, 58 are
-the text parser rejecting a `.uplc` and 4 are the flat decoder. The 74 failures are pinned in
-`uplc-conformance-known-failures.json` with the observed outcome and the issue tracking each (#1127,
-#1128, #1129, #1130); `ndc_uplc_conformance.rs` fails on a new failure, on a listed vector that now
+**What the 1059 mean** (as pinned; `just ndc-score`): 746 vectors pass on the full textual result and
+budget; 313 pass on the class alone (237 `evaluation failure`, 69 `parse/decode error`, 7
+`out of budget`), where nothing but the class is compared. Of the 69 `parse/decode error` passes, 58 are
+the text parser rejecting a `.uplc`, 4 are the flat decoder and 7 are the program-version gate
+(`plcVersionsAvailableIn`, #1128). The 5 failures are pinned in
+`uplc-conformance-known-failures.json` with the observed outcome and the issue tracking each (#1129,
+#1130); `ndc_uplc_conformance.rs` fails on a new failure, on a listed vector that now
 passes, and on a changed outcome. Reporting itself never fails on a score.
 
 **What cannot go red.** Mutation checks against this corpus show the protocol version handed to the
@@ -111,3 +113,35 @@ ExUnits) and a unit test of the variant selection in `eval_redeemer.rs`, not in 
 
 A pin change is a corpus upgrade: edit `corpora.toml`, run `just ndc-fetch` (it names every
 difference to resolve), `just ndc-selftest`, `just ndc-reports`, and compare `just ndc-score`.
+
+## The uplc-turbo runner (Phase 2d, #1178)
+
+The runner is `tests/conformance/src/node_diversity/uplc_turbo.rs`.
+
+* `just ndc-report uplc-turbo` runs all 3,997 programs in the release profile. It takes about 2.5 minutes on an Apple M2 Max.
+* `just ndc-turbo-quick` runs every 40th program and writes to `reports-quick/`. The result is always a `stub`.
+
+**Path.** Each corpus file is the on-chain script: a raw CBOR byte string around flat. It is not hex text.
+The runner calls `prepare_script_bytes_gated` once. This step is not timed. It does the cost model, the language gate, the decode, the availability rules and the scope check.
+Then it calls `PreparedScript::run` 50 times. This step is timed. `eval_script_bytes_gated` is these two calls, so there is one evaluator.
+
+**Measurement.** The runner keeps the 30 fastest of 50 sequential runs.
+`cpu_us` and `mem_bytes` are means over those same runs.
+`mem_bytes` is the number of bytes the evaluation asked the allocator for, on its own thread. A counting global allocator in the test binary does this.
+A reallocation counts as a new allocation. A free does not subtract. This is the same as Go `TotalAlloc`, which Dingo reports. It is not a peak.
+
+**Cost models.** Protocol versions 10 and 11 use the models of the `uplc-conformance` corpus. Version 9 uses the version 10 arrays. Version 8 uses `uplc-turbo-cost-models-pv8.json`.
+The runner checks the SHA-256 of that file and the length of its two arrays (332).
+The file has no pinned copy to compare with. These checks guard it instead:
+* A test lists budgets from the cardano-node report for programs of each protocol version and language.
+* `every_program_budget_equals_the_published_reports` compares the budget of all 3,997 programs with the cardano-node report and the Amaru report. `just ndc-report uplc-turbo` runs it in release.
+
+**Who may publish.** Only a complete run with `DUGITE_NDC_PUBLISHING_RUNNER` set has status `ok`.
+Every other run has status `stub`. This includes a run on a laptop and a sample.
+A publish step must refuse a `stub`. `just ndc-score` still shows the score of a `stub`.
+The `.status.json` note gives the machine, the rustc version, the load average and the wall time.
+
+**Failures.** A corpus file without a valid outer CBOR wrapper stops the run.
+A program that does not evaluate gets `null` budgets and `null` `mem_bytes`, and `cpu_us` 0.
+On the publishing runner such a program stops the run, because every corpus program ran on mainnet.
+A panic or an internal error always stops the run.

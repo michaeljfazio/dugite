@@ -11,6 +11,12 @@ status-level = "pass"
 # ever must.
 slow-timeout = { period = "120s", terminate-after = 2, grace-period = "10s" }
 
+# The uplc-turbo report times 3,997 programs 50 times each: about 150s on an idle Apple M2 Max, more
+# on a busy machine.  It is the one test that legitimately runs past the backstop above (20 minutes).
+[[profile.default.overrides]]
+filter = 'test(=ndc_report_uplc_turbo)'
+slow-timeout = { period = "120s", terminate-after = 10, grace-period = "10s" }
+
 [profile.ci]
 # CI runs all tests even if some fail
 fail-fast = false

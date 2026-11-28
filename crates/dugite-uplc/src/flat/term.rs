@@ -34,10 +34,10 @@
 //! | 3   | Unit                    | (no bits)                               |
 //! | 4   | Bool                    | 1 bit                                   |
 //!
-//! Compound tags (5=List, 6=Pair, 8=Data) use the Apply connector (7)
-//! and are fully supported. BLS atomic tags (9/10/11) are not wired
-//! for the flat constant payload (BLS constants do not appear in
-//! flat-encoded scripts).
+//! Compound tags (5=List, 6=Pair, 12=Array) use the Apply connector (7)
+//! and are fully supported, as are the atomic tags 8=Data and 13=Value.
+//! BLS atomic tags (9/10/11) are not wired for the flat constant payload
+//! (BLS constants do not appear in flat-encoded scripts).
 //!
 //! ## Defensive properties
 //!
@@ -46,7 +46,7 @@
 //! - **No `unwrap` / `panic!`** on adversarial bytes — every error
 //!   surfaces as [`UplcError::FlatDecode`].
 //! - **Unknown term tags** (10..=15) and unknown universe tags
-//!   (5..=15 for now) return typed errors.
+//!   (14..=15) return typed errors.
 //! - **Pre-allocations clamped** via `safe_alloc_capacity` against the
 //!   remaining bit budget of the input.
 
@@ -226,6 +226,9 @@ pub fn encode_constant(w: &mut BitWriter, c: &Constant) -> FlatResult<()> {
 /// 3. From protocol version 11 (`vanRossemPV`), a `Constr`'s FIELD COUNT is
 ///    bounded at 1024 (`maxBoundsByPV`'s `mbConstr`). The tag is unbounded —
 ///    see [`MAX_CONSTR_FIELDS`].
+/// 4. The program's declared version is in `plcVersionsAvailableIn language
+///    major_pv` (`mkTermToEvaluate`, see [`validate_plc_version_available`]).
+///    Unlike 1-3 this is an evaluation-time check in Haskell too.
 pub fn validate_program_availability(
     term: &Term,
     version: &(
@@ -237,7 +240,117 @@ pub fn validate_program_availability(
     major_pv: u32,
 ) -> FlatResult<()> {
     let version_1_1_0_or_later = version >= &plc_version_1_1_0();
-    validate_term_depth(term, language, major_pv, version_1_1_0_or_later, 0)
+    validate_term_depth(term, language, major_pv, version_1_1_0_or_later, 0)?;
+    // Last, as in Haskell: the decoder's checks above run at deserialisation,
+    // the program-version check only afterwards, in `mkTermToEvaluate`.
+    validate_plc_version_available(version, language, major_pv)
+}
+
+/// A protocol major version and the Plutus Core program versions
+/// (`major.minor.patch`) a ledger language gains at it.
+type PlcVersionsIntroduced = (u32, &'static [(u8, u8, u8)]);
+
+/// The Plutus Core program versions each ledger language gains at each
+/// protocol major version — Haskell `plcVersionsIntroducedIn`.
+///
+/// `IntersectMBO/plutus` @ `1.70.0.0` (the version the current mainnet release,
+/// cardano-node 11.1.3, ships),
+/// `plutus-ledger-api/src/PlutusLedgerApi/Common/Versions.hs` L362-382:
+///
+/// ```haskell
+/// PlutusV1 -> [ (alonzoPV, [plcVersion100]), (vanRossemPV, [plcVersion110]) ]
+/// PlutusV2 -> [ (vasilPV,  [plcVersion100]), (vanRossemPV, [plcVersion110]) ]
+/// PlutusV3 -> [ (changPV,  [plcVersion100, plcVersion110]) ]
+/// PlutusV4 -> [ (dijkstraPV, [plcVersion100, plcVersion110]) ]
+/// ```
+///
+/// with alonzo = 5, vasil = 7, chang = 9, vanRossem = 11, dijkstra = 12
+/// (`ProtocolVersions.hs`).
+///
+/// Not yet followed: plutus `1.71.0.0` (pre-release cardano-node 11.2.x) adds
+/// `(dijkstraPV, [plcVersion120])` to every language, together with a change
+/// to `case` on builtin values that depends on the program version
+/// (`Eval.hs` `defaultCaserBuiltinFor pv plcVersion`: `caseBuiltin` only for
+/// `plcVersion >= plcVersion120` at `dijkstraPV`). dugite's machine does not
+/// implement that semantics, so 1.2.0 stays unavailable until it does.
+const fn plc_versions_introduced_in(language: ScriptLanguage) -> &'static [PlcVersionsIntroduced] {
+    const V100: (u8, u8, u8) = (1, 0, 0);
+    const V110: (u8, u8, u8) = (1, 1, 0);
+    match language {
+        ScriptLanguage::PlutusV1 => &[(5, &[V100]), (11, &[V110])],
+        ScriptLanguage::PlutusV2 => &[(7, &[V100]), (11, &[V110])],
+        ScriptLanguage::PlutusV3 => &[(9, &[V100, V110])],
+        ScriptLanguage::PlutusV4 => &[(12, &[V100, V110])],
+    }
+}
+
+/// Whether a program declaring `version` may run as `language` at `major_pv`
+/// — Haskell `v \`Set.member\` plcVersionsAvailableIn ll pv`, where
+/// `plcVersionsAvailableIn = collectUpTo . plcVersionsIntroducedIn` is the
+/// union of every entry introduced at a protocol version `<= major_pv`.
+/// Membership is of the exact triple: `1.0.1` and `2.0.0` are never available.
+pub fn plc_version_available_in(
+    version: &(
+        num_bigint::BigUint,
+        num_bigint::BigUint,
+        num_bigint::BigUint,
+    ),
+    language: ScriptLanguage,
+    major_pv: u32,
+) -> bool {
+    plc_versions_introduced_in(language)
+        .iter()
+        .filter(|(introduced, _)| *introduced <= major_pv)
+        .flat_map(|(_, versions)| versions.iter())
+        .any(|&(a, b, c)| {
+            version.0 == num_bigint::BigUint::from(a)
+                && version.1 == num_bigint::BigUint::from(b)
+                && version.2 == num_bigint::BigUint::from(c)
+        })
+}
+
+/// Reject a program whose declared Plutus Core version is not available for
+/// its ledger language at `major_pv`.
+///
+/// `IntersectMBO/plutus` @ `1.70.0.0` (cardano-node 11.1.3),
+/// `plutus-ledger-api/src/PlutusLedgerApi/Common/Eval.hs` L123-127
+/// (`mkTermToEvaluate`; the same check at `1.63.0.0`, `1.71.0.0`, `1.72.0.0`):
+///
+/// ```haskell
+/// -- check that the Plutus Core language version is available
+/// -- See Note [Checking the Plutus Core language version]
+/// unless (v `Set.member` plcVersionsAvailableIn ll pv) $
+///   throwing _ScriptDecodeError $
+///     PlutusCoreLanguageNotAvailableError v ll pv
+/// ```
+///
+/// The Note says: "this check has been in `mkTermToEvaluate`, which makes it a
+/// phase 2 failure". `deserialiseScript` (the phase-1 `validScript` path) never
+/// reads the version, so a script with a disallowed version is well-formed:
+/// cardano-ledger turns the `Left` into a script failure
+/// (`runPlutusScriptWithLogs` → `explainPlutusEvaluationError`), which rejects
+/// an `is_valid = true` transaction (`ValidationTagMismatch …
+/// FailedUnexpectedly`) and is the legitimate outcome of an `is_valid = false`
+/// one. In dugite the `FlatDecode` error below becomes
+/// `PhaseTwoError::ScriptEvaluationFailed`, the same phase-2 class.
+pub fn validate_plc_version_available(
+    version: &(
+        num_bigint::BigUint,
+        num_bigint::BigUint,
+        num_bigint::BigUint,
+    ),
+    language: ScriptLanguage,
+    major_pv: u32,
+) -> FlatResult<()> {
+    if plc_version_available_in(version, language, major_pv) {
+        Ok(())
+    } else {
+        Err(UplcError::FlatDecode(format!(
+            "Plutus Core language version {}.{}.{} is not available for ledger language \
+             {language:?} at protocol version {major_pv}",
+            version.0, version.1, version.2
+        )))
+    }
 }
 
 /// The protocol MAJOR version at which each ledger Plutus language became
@@ -620,11 +733,14 @@ pub fn uni_size(tag: &TypeTag) -> usize {
 /// |  9   | `DefaultUniBls12_381_G1_Element` | BLS12-381 G1        |
 /// | 10   | `DefaultUniBls12_381_G2_Element` | BLS12-381 G2        |
 /// | 11   | `DefaultUniBls12_381_MlResult`   | BLS12-381 MlResult |
+/// | 12   | `DefaultUniProtoArray` | type-constructor for Array     |
+/// | 13   | `DefaultUniValue`  | builtin multi-asset Value          |
 ///
 /// Compound type atom sequences are a PRE-ORDER (root-first) serialisation of
 /// the application tree, so the `Apply` atom (7) comes FIRST:
 ///
 /// * `List(a)`   → `[1][7][1][5][…type-a…][0]`              (`Apply(ProtoList, a)`)
+/// * `Array(a)`  → `[1][7][1][12][…type-a…][0]`             (`Apply(ProtoArray, a)`)
 /// * `Pair(a,b)` → `[1][7][1][7][1][6][…a…][…b…][0]`        (`Apply(Apply(ProtoPair, a), b)`)
 /// * `Data`      → `[1][8][0]`
 ///
@@ -686,6 +802,8 @@ enum UniNode {
     Complete(TypeTag),
     /// `DefaultUniProtoList` — awaits one argument.
     ProtoList,
+    /// `DefaultUniProtoArray` — awaits one argument.
+    ProtoArray,
     /// `DefaultUniProtoPair` — awaits two arguments.
     ProtoPair,
     /// `DefaultUniProtoPair` applied to its first argument — awaits the second.
@@ -723,6 +841,7 @@ fn parse_uni_from_atoms(atoms: &[u8], pos: usize) -> FlatResult<(UniNode, usize)
             };
             let applied = match func {
                 UniNode::ProtoList => UniNode::Complete(TypeTag::List(Box::new(arg_tag))),
+                UniNode::ProtoArray => UniNode::Complete(TypeTag::Array(Box::new(arg_tag))),
                 UniNode::ProtoPair => UniNode::ProtoPair1(arg_tag),
                 UniNode::ProtoPair1(first) => {
                     UniNode::Complete(TypeTag::Pair(Box::new(first), Box::new(arg_tag)))
@@ -739,6 +858,11 @@ fn parse_uni_from_atoms(atoms: &[u8], pos: usize) -> FlatResult<(UniNode, usize)
         9 => Ok((UniNode::Complete(TypeTag::Bls12_381G1Element), pos + 1)),
         10 => Ok((UniNode::Complete(TypeTag::Bls12_381G2Element), pos + 1)),
         11 => Ok((UniNode::Complete(TypeTag::Bls12_381MlResult), pos + 1)),
+        // `withDecodedUni`: `12 -> k DefaultUniProtoArray`, `13 -> k DefaultUniValue`.
+        // Neither is gated by protocol version or ledger language (see
+        // `decode_value_payload` for the provenance).
+        12 => Ok((UniNode::ProtoArray, pos + 1)),
+        13 => Ok((UniNode::Complete(TypeTag::Value), pos + 1)),
         _ => Err(UplcError::FlatDecode(format!(
             "unknown universe tag atom {atom:#06b}"
         ))),
@@ -753,7 +877,7 @@ fn parse_type_from_atoms(atoms: &[u8], pos: usize) -> FlatResult<(TypeTag, usize
     match node {
         UniNode::Complete(t) => Ok((t, next)),
         _ => Err(UplcError::FlatDecode(
-            "universe-tag list is an unapplied type constructor (List/Pair without argument)"
+            "universe-tag list is an unapplied type constructor (List/Pair/Array without argument)"
                 .into(),
         )),
     }
@@ -803,11 +927,13 @@ fn collect_type_atoms(t: &TypeTag, atoms: &mut Vec<u8>) -> FlatResult<()> {
         TypeTag::Bls12_381G1Element => atoms.push(9),
         TypeTag::Bls12_381G2Element => atoms.push(10),
         TypeTag::Bls12_381MlResult => atoms.push(11),
-        TypeTag::Array(_) | TypeTag::Value => {
-            return Err(UplcError::Encode(
-                "Array / Value flat encoding not yet wired".into(),
-            ));
+        TypeTag::Array(elem) => {
+            // Array a = Apply(ProtoArray, a) → pre-order [7, 12, …a].
+            atoms.push(7); // Apply
+            atoms.push(12); // ProtoArray
+            collect_type_atoms(elem, atoms)?;
         }
+        TypeTag::Value => atoms.push(13),
     }
     Ok(())
 }
@@ -828,11 +954,8 @@ fn constant_type_tag(c: &Constant) -> FlatResult<TypeTag> {
         Constant::Bls12_381G1Element(_) => Ok(TypeTag::Bls12_381G1Element),
         Constant::Bls12_381G2Element(_) => Ok(TypeTag::Bls12_381G2Element),
         Constant::Bls12_381MlResult(_) => Ok(TypeTag::Bls12_381MlResult),
-        Constant::Array { .. } | Constant::Value(_) => Err(UplcError::Encode(
-            "Array / Value constants cannot appear in flat-encoded \
-             scripts (flat codec not yet wired for PV1.1.0 types)"
-                .into(),
-        )),
+        Constant::Array { elem_type, .. } => Ok(TypeTag::Array(Box::new(elem_type.clone()))),
+        Constant::Value(_) => Ok(TypeTag::Value),
     }
 }
 
@@ -898,13 +1021,25 @@ fn decode_constant_value(r: &mut BitReader<'_>, tag: &TypeTag) -> FlatResult<Con
                 b: Box::new(b),
             })
         }
-        TypeTag::Bls12_381G1Element
-        | TypeTag::Bls12_381G2Element
-        | TypeTag::Bls12_381MlResult
-        | TypeTag::Array(_)
-        | TypeTag::Value => Err(UplcError::FlatDecode(format!(
-            "constant payload for type {tag:?} not yet wired"
-        ))),
+        TypeTag::Array(elem_type) => {
+            // `decodeDefaultUniValue`: `compile (DefaultUniArray a) =
+            // Strict.fromList <$> decodeListWith (compile a)` — bit-identical
+            // to a list constant, with no condition beyond the element decoder.
+            let mut elements = Vec::new();
+            while r.read_bit()? {
+                elements.push(decode_constant_value(r, elem_type)?);
+            }
+            Ok(Constant::Array {
+                elem_type: (**elem_type).clone(),
+                elements,
+            })
+        }
+        TypeTag::Value => decode_value_payload(r),
+        TypeTag::Bls12_381G1Element | TypeTag::Bls12_381G2Element | TypeTag::Bls12_381MlResult => {
+            Err(UplcError::FlatDecode(format!(
+                "constant payload for type {tag:?} not yet wired"
+            )))
+        }
     }
 }
 
@@ -959,13 +1094,123 @@ fn encode_constant_value(w: &mut BitWriter, c: &Constant) -> FlatResult<()> {
                     .into(),
             ));
         }
-        Constant::Array { .. } | Constant::Value(_) => {
-            return Err(UplcError::Encode(
-                "Array / Value constants flat encoding not yet wired".into(),
-            ));
+        Constant::Array { elements, .. } => {
+            // Orphan `Flat (Strict.Vector a)`: `encode = encode . Strict.toList`.
+            for elem in elements {
+                w.write_bit(true);
+                encode_constant_value(w, elem)?;
+            }
+            w.write_bit(false);
+        }
+        Constant::Value(outer) => {
+            // `Flat Value`: `encode (Value v _ _ _) = Flat.encode v` over
+            // `Map K (Map K Quantity)`, i.e. an ascending-key list of
+            // `(currency, list (token, quantity))`. `BTreeMap` iterates in
+            // ascending byte order, matching strict `ByteString` `Ord`.
+            for (currency, inner) in outer {
+                w.write_bit(true);
+                w.write_bytestring(currency)?;
+                for (token, qty) in inner {
+                    w.write_bit(true);
+                    w.write_bytestring(token)?;
+                    write_integer_bigint(w, &BigInt::from(*qty))?;
+                }
+                w.write_bit(false);
+            }
+            w.write_bit(false);
         }
     }
     Ok(())
+}
+
+/// Maximum byte length of a `value` currency symbol or token name —
+/// `PlutusCore.Value.maxKeyLen = 32` (both keys; no 28-byte rule).
+const VALUE_MAX_KEY_LEN: usize = 32;
+
+/// Decode a flat `value` constant payload.
+///
+/// Haskell (`IntersectMBO/plutus` @ `83fb488e05046a3698d0a80013c5fa76be2c0cf2`,
+/// plutus-core 1.70.0.0 — the version cardano-node 11.1.3 ships;
+/// `plutus-core/plutus-core/src/PlutusCore/Value.hs`):
+///
+/// ```haskell
+/// instance Flat.Flat Value where
+///   decode = do
+///     outer <- Flat.decodeListWith $ do
+///       currency <- Flat.decode
+///       inner <- Flat.decodeListWith ((,) <$> Flat.decode <*> Flat.decode)
+///       pure (currency, inner)
+///     buildValueWith "Value Flat decoder" pure pure outer
+/// ```
+///
+/// Each key is a `K` (`Flat ByteString`, then `k b = if B.length b <=
+/// maxKeyLen ...` else fail) and each amount a `Quantity` (`Flat Integer`,
+/// then fail outside `[-2^127, 2^127 - 1]`). `buildValueWith` then fails
+/// unless currency symbols are strictly ascending, token names are strictly
+/// ascending, no quantity is zero, and no inner map is empty. Every failure
+/// is the same generic deserialisation failure, so check order only decides
+/// the message, never acceptance.
+///
+/// No protocol-version or ledger-language gate applies to this constant
+/// type: `withDecodedUni` decodes tag 13 unconditionally and
+/// `scriptCBORDecoder`'s `checkConstant` bounds only `defaultUniSize` (1 for
+/// `value`). Identical at plutus 1.63.0.0 and 1.71.0.0.
+fn decode_value_payload(r: &mut BitReader<'_>) -> FlatResult<Constant> {
+    use std::collections::BTreeMap;
+    let mut outer: BTreeMap<Vec<u8>, BTreeMap<Vec<u8>, i128>> = BTreeMap::new();
+    let mut prev_currency: Option<Vec<u8>> = None;
+    while r.read_bit()? {
+        let currency = read_value_key(r)?;
+        if prev_currency.as_ref().is_some_and(|p| *p >= currency) {
+            return Err(UplcError::FlatDecode(
+                "value constant: currency symbols not strictly ascending".into(),
+            ));
+        }
+        let mut inner: BTreeMap<Vec<u8>, i128> = BTreeMap::new();
+        let mut prev_token: Option<Vec<u8>> = None;
+        while r.read_bit()? {
+            let token = read_value_key(r)?;
+            let qty = read_integer_bigint(r)?;
+            let qty = i128::try_from(&qty).map_err(|_| {
+                UplcError::FlatDecode(format!(
+                    "value constant: quantity out of signed 128-bit integer bounds: {qty}"
+                ))
+            })?;
+            if prev_token.as_ref().is_some_and(|p| *p >= token) {
+                return Err(UplcError::FlatDecode(
+                    "value constant: token names not strictly ascending".into(),
+                ));
+            }
+            if qty == 0 {
+                return Err(UplcError::FlatDecode(
+                    "value constant: zero quantity".into(),
+                ));
+            }
+            prev_token = Some(token.clone());
+            inner.insert(token, qty);
+        }
+        if inner.is_empty() {
+            return Err(UplcError::FlatDecode(
+                "value constant: empty inner map".into(),
+            ));
+        }
+        prev_currency = Some(currency.clone());
+        outer.insert(currency, inner);
+    }
+    Ok(Constant::Value(outer))
+}
+
+/// Read one `value` key (`Flat K`): a flat bytestring of at most
+/// [`VALUE_MAX_KEY_LEN`] bytes.
+fn read_value_key(r: &mut BitReader<'_>) -> FlatResult<Vec<u8>> {
+    let key = r.read_bytestring()?;
+    if key.len() > VALUE_MAX_KEY_LEN {
+        return Err(UplcError::FlatDecode(format!(
+            "value constant: key of {} bytes exceeds {VALUE_MAX_KEY_LEN}",
+            key.len()
+        )));
+    }
+    Ok(key)
 }
 
 /// Encode an arbitrary-precision integer into the flat bit stream.
@@ -1742,6 +1987,105 @@ mod tests {
         }
     }
 
+    // -----------------------------------------------------------------
+    // Program-version gate (`plcVersionsAvailableIn`, `mkTermToEvaluate`)
+    // -----------------------------------------------------------------
+
+    /// The seven node-diversity `uplc-conformance` vectors
+    /// (`<pv>/<lang>/program/version/*`): each declares a version that
+    /// cardano-node does not allow for its language at its PV.
+    #[test]
+    fn plc_version_gate_rejects_the_seven_conformance_vectors() {
+        use ScriptLanguage::*;
+        for (pv, lang, v) in [
+            (10, PlutusV1, ver(1, 1, 0)),
+            (10, PlutusV2, ver(1, 1, 0)),
+            (10, PlutusV3, ver(2, 0, 0)),
+            (11, PlutusV1, ver(2, 0, 0)),
+            (11, PlutusV3, ver(1, 0, 1)),
+            (11, PlutusV3, ver(1, 2, 0)),
+            (11, PlutusV3, ver(2, 0, 0)),
+        ] {
+            let err = validate_program_availability(&Term::Error, &v, lang, pv)
+                .expect_err(&format!("{v:?} as {lang:?} at PV{pv} must be rejected"));
+            assert!(matches!(err, UplcError::FlatDecode(_)), "got {err:?}");
+        }
+    }
+
+    /// The whole (language, PV) table from PV5 to PV13 (plutus 1.70.0.0), written out
+    /// independently of `plc_versions_introduced_in`, so a wrong entry there
+    /// fails here. Candidate versions include near misses (1.0.1, 0.x, 2.0.0).
+    #[test]
+    fn plc_version_gate_matches_plcversionsavailablein_table() {
+        use ScriptLanguage::*;
+        let expected = |lang: ScriptLanguage, pv: u32| -> Vec<(u64, u64, u64)> {
+            let mut out = Vec::new();
+            let (v100, v110) = match lang {
+                PlutusV1 => (5, 11),
+                PlutusV2 => (7, 11),
+                PlutusV3 => (9, 9),
+                PlutusV4 => (12, 12),
+            };
+            if pv >= v100 {
+                out.push((1, 0, 0));
+            }
+            if pv >= v110 {
+                out.push((1, 1, 0));
+            }
+            // 1.2.0 is never available: plutus 1.70.0.0 (node 11.1.3) has no
+            // `plcVersion120` entry for any language.
+            out
+        };
+        let candidates = [
+            (0, 0, 0),
+            (0, 1, 0),
+            (1, 0, 0),
+            (1, 0, 1),
+            (1, 1, 0),
+            (1, 1, 1),
+            (1, 2, 0),
+            (1, 3, 0),
+            (2, 0, 0),
+        ];
+        for lang in [PlutusV1, PlutusV2, PlutusV3, PlutusV4] {
+            for pv in 5..=13 {
+                let allowed = expected(lang, pv);
+                for c in candidates {
+                    let v = ver(c.0, c.1, c.2);
+                    assert_eq!(
+                        plc_version_available_in(&v, lang, pv),
+                        allowed.contains(&c),
+                        "{c:?} as {lang:?} at PV{pv}"
+                    );
+                    assert_eq!(
+                        validate_program_availability(&Term::Error, &v, lang, pv).is_ok(),
+                        allowed.contains(&c),
+                        "validate_program_availability: {c:?} as {lang:?} at PV{pv}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// A version component too large for any machine integer is decodable
+    /// (Haskell `Natural`) and must be rejected by the gate, not panic.
+    #[test]
+    fn plc_version_gate_rejects_huge_version_components() {
+        let huge = num_bigint::BigUint::from(u128::MAX) * 7u8;
+        let v = (
+            huge.clone(),
+            num_bigint::BigUint::ZERO,
+            num_bigint::BigUint::ZERO,
+        );
+        assert!(!plc_version_available_in(&v, ScriptLanguage::PlutusV3, 11));
+        let v = (
+            num_bigint::BigUint::from(1u8),
+            huge,
+            num_bigint::BigUint::ZERO,
+        );
+        assert!(!plc_version_available_in(&v, ScriptLanguage::PlutusV3, 11));
+    }
+
     // ─────────────────────────────────────────────────────────────────
     // #845: differential round-trip property test for the flat Term
     // codec — the same motivation as `data::tests::data_cbor_round_trip_
@@ -1800,6 +2144,284 @@ mod tests {
                 ),
             ]
         })
+    }
+
+    // -----------------------------------------------------------------------
+    // `(array T)` and `value` constants (universe tags 12 and 13)
+    // -----------------------------------------------------------------------
+    //
+    // Haskell: IntersectMBO/plutus @ 83fb488e05046a3698d0a80013c5fa76be2c0cf2
+    // (plutus-core 1.70.0.0, shipped by cardano-node 11.1.3),
+    // `PlutusCore/Default/Universe.hs` `encodeUni`/`withDecodedUni`
+    // (`12 -> k DefaultUniProtoArray`, `13 -> k DefaultUniValue`) and
+    // `PlutusCore/Value.hs` `Flat Value` / `buildValueWith`.
+
+    use crate::term::{Constant as C, TypeTag as TT};
+    use std::collections::BTreeMap;
+
+    fn hex(s: &str) -> Vec<u8> {
+        (0..s.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap())
+            .collect()
+    }
+
+    /// Decode `bytes` as a program, assert it re-encodes to the same bytes,
+    /// and return its term.
+    fn decode_round_trip(bytes: &[u8]) -> Term {
+        let p = crate::program::Program::from_flat(bytes).expect("corpus program must decode");
+        assert_eq!(
+            p.to_flat().expect("re-encode"),
+            bytes,
+            "flat encoding must round-trip byte-for-byte"
+        );
+        p.term
+    }
+
+    /// `node-diversity uplc-conformance` `builtin/constant/array/emptyArray.flat`:
+    /// `(program 1.1.0 (con (array integer) []))`.
+    #[test]
+    fn corpus_empty_array_decodes_and_round_trips() {
+        let t = decode_round_trip(&hex("0101004bf201"));
+        assert_eq!(
+            t,
+            Term::Const(C::Array {
+                elem_type: TT::Integer,
+                elements: vec![]
+            })
+        );
+    }
+
+    /// `.../constant/array/unitArray.flat`:
+    /// `(program 1.1.0 (con (array unit) [(), (), (), (), ()]))` — unit
+    /// elements are zero-width, so only the cons bits carry the length.
+    #[test]
+    fn corpus_unit_array_decodes_and_round_trips() {
+        let t = decode_round_trip(&hex("0101004bf26f81"));
+        assert_eq!(
+            t,
+            Term::Const(C::Array {
+                elem_type: TT::Unit,
+                elements: vec![C::Unit; 5]
+            })
+        );
+    }
+
+    /// `.../semantics/valueData/multi-currency.flat`:
+    /// `[(builtin valueData) (con value [(#aa, [(#aa, 1)]), (#bb, [(#bb, 2)])])]`.
+    #[test]
+    fn corpus_value_constant_decodes_and_round_trips() {
+        let t = decode_round_trip(&hex("01000037c49d4101aa008101aa00024101bb008101bb000401"));
+        let Term::App(_, arg) = t else {
+            panic!("expected an application, got {t:?}")
+        };
+        let mut expected = BTreeMap::new();
+        expected.insert(vec![0xaa], BTreeMap::from([(vec![0xaa], 1i128)]));
+        expected.insert(vec![0xbb], BTreeMap::from([(vec![0xbb], 2i128)]));
+        assert_eq!(*arg, Term::Const(C::Value(expected)));
+    }
+
+    /// Encode `(con value …)` from a RAW entry list, preserving whatever
+    /// order, duplicates and zero entries the caller gives — the encoder for
+    /// `Constant::Value` cannot express non-canonical input.
+    type RawValueEntry = (Vec<u8>, Vec<(Vec<u8>, BigInt)>);
+
+    fn raw_value_constant(entries: &[RawValueEntry]) -> Vec<u8> {
+        let mut w = BitWriter::new();
+        encode_type_tag(&mut w, &TT::Value).unwrap();
+        for (currency, inner) in entries {
+            w.write_bit(true);
+            w.write_bytestring(currency).unwrap();
+            for (token, qty) in inner {
+                w.write_bit(true);
+                w.write_bytestring(token).unwrap();
+                write_integer_bigint(&mut w, qty).unwrap();
+            }
+            w.write_bit(false);
+        }
+        w.write_bit(false);
+        w.finish()
+    }
+
+    fn decode_raw(bytes: &[u8]) -> FlatResult<Constant> {
+        decode_constant(&mut BitReader::new(bytes))
+    }
+
+    fn entry(c: &[u8], inner: &[(&[u8], i128)]) -> RawValueEntry {
+        (
+            c.to_vec(),
+            inner
+                .iter()
+                .map(|(t, q)| (t.to_vec(), BigInt::from(*q)))
+                .collect(),
+        )
+    }
+
+    /// Every `buildValueWith` / `K` / `Quantity` failure is a decode failure.
+    #[test]
+    fn value_constant_rejects_every_non_canonical_payload() {
+        let cases: Vec<(&str, Vec<RawValueEntry>)> = vec![
+            (
+                "duplicate currency",
+                vec![entry(b"a", &[(b"t", 1)]), entry(b"a", &[(b"u", 1)])],
+            ),
+            (
+                "descending currency",
+                vec![entry(b"b", &[(b"t", 1)]), entry(b"a", &[(b"t", 1)])],
+            ),
+            (
+                "prefix currency after its extension",
+                vec![entry(b"ab", &[(b"t", 1)]), entry(b"a", &[(b"t", 1)])],
+            ),
+            (
+                "duplicate token",
+                vec![entry(b"a", &[(b"t", 1), (b"t", 2)])],
+            ),
+            (
+                "descending token",
+                vec![entry(b"a", &[(b"u", 1), (b"t", 2)])],
+            ),
+            ("zero quantity", vec![entry(b"a", &[(b"t", 0)])]),
+            ("empty inner map", vec![entry(b"a", &[])]),
+            ("33-byte currency", vec![entry(&[0xaa; 33], &[(b"t", 1)])]),
+            ("33-byte token", vec![entry(b"a", &[(&[0xaa; 33], 1)])]),
+            (
+                "quantity 2^127",
+                vec![(
+                    b"a".to_vec(),
+                    vec![(b"t".to_vec(), BigInt::from(1) << 127u32)],
+                )],
+            ),
+            (
+                "quantity -2^127 - 1",
+                vec![(
+                    b"a".to_vec(),
+                    vec![(b"t".to_vec(), -(BigInt::from(1) << 127u32) - 1)],
+                )],
+            ),
+        ];
+        for (name, entries) in cases {
+            let err = decode_raw(&raw_value_constant(&entries))
+                .expect_err(&format!("{name}: must be rejected"));
+            assert!(
+                matches!(err, UplcError::FlatDecode(_)),
+                "{name}: expected FlatDecode, got {err:?}"
+            );
+        }
+    }
+
+    /// The boundary cases Haskell accepts: empty value, empty and 32-byte
+    /// keys, negative quantities, and both signed-128 extremes.
+    #[test]
+    fn value_constant_accepts_canonical_boundaries() {
+        assert_eq!(
+            decode_raw(&raw_value_constant(&[])).unwrap(),
+            C::Value(BTreeMap::new())
+        );
+        let entries = vec![
+            entry(b"", &[(b"", i128::MIN)]),
+            entry(b"a", &[(b"t", -1), (&[0xff; 32], i128::MAX)]),
+            entry(&[0xff; 32], &[(b"t", 7)]),
+        ];
+        let C::Value(v) = decode_raw(&raw_value_constant(&entries)).unwrap() else {
+            panic!("expected a value constant")
+        };
+        assert_eq!(v.len(), 3);
+        assert_eq!(v[&b"a".to_vec()][&vec![0xff; 32]], i128::MAX);
+        assert_eq!(v[&Vec::new()][&Vec::new()], i128::MIN);
+        // And our own encoder emits exactly the canonical bytes back.
+        let mut w = BitWriter::new();
+        encode_constant(&mut w, &C::Value(v)).unwrap();
+        assert_eq!(w.finish(), raw_value_constant(&entries));
+    }
+
+    /// Universe-tag shapes around tag 12: `array` is a one-argument type
+    /// constructor, so a bare or doubly-applied `12` is ill-kinded, and 14/15
+    /// are still unknown (`withDecodedUni`'s `_ -> empty`).
+    #[test]
+    fn array_universe_tag_kind_checks() {
+        fn with_atoms(atoms: &[u8]) -> Vec<u8> {
+            let mut w = BitWriter::new();
+            for &a in atoms {
+                w.write_bit(true);
+                w.write_bits8(a, CONST_TAG_WIDTH).unwrap();
+            }
+            w.write_bit(false);
+            w.write_bit(false); // empty list/array payload
+            w.finish()
+        }
+        for bad in [&[12][..], &[7, 12, 12], &[7, 12], &[7, 0, 12], &[14], &[15]] {
+            assert!(
+                matches!(decode_raw(&with_atoms(bad)), Err(UplcError::FlatDecode(_))),
+                "atoms {bad:?} must be rejected"
+            );
+        }
+        // array (list integer) and list (array integer) are both well-kinded.
+        assert_eq!(
+            decode_raw(&with_atoms(&[7, 12, 7, 5, 0])).unwrap(),
+            C::Array {
+                elem_type: TT::List(Box::new(TT::Integer)),
+                elements: vec![]
+            }
+        );
+        assert_eq!(
+            decode_raw(&with_atoms(&[7, 5, 7, 12, 0])).unwrap(),
+            C::ProtoList {
+                elem_type: TT::Array(Box::new(TT::Integer)),
+                elements: vec![]
+            }
+        );
+    }
+
+    /// `scriptCBORDecoder` gates these constants by NOTHING but the
+    /// `defaultUniSize <= mbHeader` bound: every ledger language at every
+    /// protocol version from its introduction accepts them.
+    #[test]
+    fn array_and_value_constants_are_not_language_or_pv_gated() {
+        let consts = [
+            Term::Const(C::Value(BTreeMap::new())),
+            Term::Const(C::Array {
+                elem_type: TT::Integer,
+                elements: vec![C::Integer(BigInt::from(1))],
+            }),
+        ];
+        for t in &consts {
+            for (lang, from) in [
+                (ScriptLanguage::PlutusV1, 5),
+                (ScriptLanguage::PlutusV2, 7),
+                (ScriptLanguage::PlutusV3, 9),
+                (ScriptLanguage::PlutusV4, 12),
+            ] {
+                for pv in from..=12 {
+                    // Only versions the program-version gate allows here, so a
+                    // rejection can only come from the constant.
+                    for v in [ver(1, 0, 0), ver(1, 1, 0)]
+                        .into_iter()
+                        .filter(|v| plc_version_available_in(v, lang, pv))
+                    {
+                        validate_program_availability(t, &v, lang, pv).unwrap_or_else(|e| {
+                            panic!("{lang:?} at PV{pv} must accept {t:?}: {e:?}")
+                        });
+                    }
+                }
+            }
+        }
+        // The size bound still applies from PV11: array^16 integer has size 33.
+        let mut ty = TT::Integer;
+        for _ in 0..15 {
+            ty = TT::Array(Box::new(ty));
+        }
+        let deep = Term::Const(C::Array {
+            elem_type: ty,
+            elements: vec![],
+        });
+        assert_eq!(uni_size(&too_big_type(&deep)), 33);
+        assert!(
+            validate_program_availability(&deep, &ver(1, 1, 0), ScriptLanguage::PlutusV3, 11)
+                .is_err()
+        );
+        validate_program_availability(&deep, &ver(1, 1, 0), ScriptLanguage::PlutusV3, 10)
+            .expect("mbHeader is unbounded below PV11");
     }
 
     proptest::proptest! {
