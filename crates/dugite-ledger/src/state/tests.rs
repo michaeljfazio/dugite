@@ -14270,7 +14270,6 @@ fn test_treasury_mismatch_rejected_block_inserts_no_outputs() {
         !state.utxo.utxo_set.contains(&output_a),
         "output_a must NOT be in UTxO set when Block A is rejected"
     );
-
 }
 
 /// A CommitteeHotAuth for a cold credential that is neither a current nor a

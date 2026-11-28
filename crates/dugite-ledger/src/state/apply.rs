@@ -353,8 +353,8 @@ impl LedgerState {
         mode: BlockValidationMode,
         defer_phase2: bool,
     ) -> Result<Vec<Phase2WorkItem>, LedgerError> {
-        let journal = mode == BlockValidationMode::ValidateAll
-            && !self.utxo.utxo_set.journal_is_open();
+        let journal =
+            mode == BlockValidationMode::ValidateAll && !self.utxo.utxo_set.journal_is_open();
         if journal {
             self.utxo.utxo_set.begin_journal();
         }
@@ -3772,11 +3772,16 @@ mod tests {
     /// Everything a block can change, in a form two separately-built states
     /// can be compared in: the snapshot wire view (every map ordered, #1088)
     /// and the sorted UTxO set.
-    fn ledger_fingerprint(s: &LedgerState) -> (Vec<u8>, Vec<(TransactionInput, TransactionOutput)>) {
+    fn ledger_fingerprint(
+        s: &LedgerState,
+    ) -> (Vec<u8>, Vec<(TransactionInput, TransactionOutput)>) {
         let snap = crate::state::snapshot_format::LedgerStateSnapshot::from(s);
         let mut utxo = s.utxo.utxo_set.iter();
         utxo.sort_by(|a, b| a.0.cmp(&b.0));
-        (bincode::serialize(&snap).expect("snapshot serializes"), utxo)
+        (
+            bincode::serialize(&snap).expect("snapshot serializes"),
+            utxo,
+        )
     }
 
     /// A valid signed spend that also registers a stake credential with the
@@ -3853,8 +3858,14 @@ mod tests {
         let block = make_test_block(Era::Conway, 1_000, 1, 9, 0, vec![tx_a, tx_b]);
 
         match state.apply_block(&block, BlockValidationMode::ValidateAll) {
-            Err(LedgerError::BlockTxValidationFailed { tx_hash, errors, .. }) => {
-                assert_eq!(tx_hash, tx_b_hash.to_hex(), "the SECOND tx is the one rejected");
+            Err(LedgerError::BlockTxValidationFailed {
+                tx_hash, errors, ..
+            }) => {
+                assert_eq!(
+                    tx_hash,
+                    tx_b_hash.to_hex(),
+                    "the SECOND tx is the one rejected"
+                );
                 assert!(
                     errors.contains(
                         &ValidationError::StakeRegistrationDepositMismatch {
@@ -3892,7 +3903,12 @@ mod tests {
         let mut seq = crate::ledger_seq::LedgerSeq::with_defaults(state.clone_without_utxos(), 100);
 
         // Block 1 (epoch 0): one valid tx, pushed to the seq.
-        let mut b1_tx = make_simple_tx(0x84, vec![txin(0x81)], vec![make_output(9_800_000)], 200_000);
+        let mut b1_tx = make_simple_tx(
+            0x84,
+            vec![txin(0x81)],
+            vec![make_output(9_800_000)],
+            200_000,
+        );
         sign_tx(&mut b1_tx, &sk);
         let b1 = make_test_block(Era::Conway, 1_000, 1, 9, 0, vec![b1_tx]);
         let d1 = state
@@ -3906,7 +3922,14 @@ mod tests {
         let next_epoch_slot = state.epoch_length + 10;
         let tx_a = valid_spend_and_register(&sk, txin(0x82), 0x85, key_deposit);
         let tx_b = bad_deposit_spend(&sk, txin(0x83), 0x86, key_deposit);
-        let mut b2 = make_test_block(Era::Conway, next_epoch_slot, 2, 9, 0, vec![tx_a.clone(), tx_b]);
+        let mut b2 = make_test_block(
+            Era::Conway,
+            next_epoch_slot,
+            2,
+            9,
+            0,
+            vec![tx_a.clone(), tx_b],
+        );
         b2.header.prev_hash = b1.header.header_hash;
 
         let err = state
@@ -3918,18 +3941,34 @@ mod tests {
         );
         // Precondition of the restore, and proof this test exercises it: the
         // epoch tick and tx_a's certificate DID change the in-place state.
-        assert_ne!(state.epoch, epoch_before, "the epoch tick ran before the rejection");
-        assert_eq!(ledger_fingerprint(&state).1, before.1, "UTxO undone by the journal");
+        assert_ne!(
+            state.epoch, epoch_before,
+            "the epoch tick ran before the rejection"
+        );
+        assert_eq!(
+            ledger_fingerprint(&state).1,
+            before.1,
+            "UTxO undone by the journal"
+        );
         assert_ne!(
             ledger_fingerprint(&state).0,
             before.0,
             "without the restore the non-UTxO state still holds the partial block"
         );
 
-        assert!(state.restore_after_failed_apply(&seq), "the seq tip is the ledger tip");
+        assert!(
+            state.restore_after_failed_apply(&seq),
+            "the seq tip is the ledger tip"
+        );
         let after = ledger_fingerprint(&state);
-        assert!(after.0 == before.0, "non-UTxO state must be byte-identical to before block 2");
-        assert_eq!(after.1, before.1, "UTxO set must be identical to before block 2");
+        assert!(
+            after.0 == before.0,
+            "non-UTxO state must be byte-identical to before block 2"
+        );
+        assert_eq!(
+            after.1, before.1,
+            "UTxO set must be identical to before block 2"
+        );
         assert_eq!(state.epoch, epoch_before);
 
         // The honest block at the same position — tx_a alone — applies.
@@ -3952,7 +3991,12 @@ mod tests {
         let mut state = conway_state();
         seed_utxo(&mut state, txin(0x91), output_to_key(&sk, 10_000_000));
         let seq = crate::ledger_seq::LedgerSeq::with_defaults(state.clone_without_utxos(), 100);
-        let mut tx = make_simple_tx(0x92, vec![txin(0x91)], vec![make_output(9_800_000)], 200_000);
+        let mut tx = make_simple_tx(
+            0x92,
+            vec![txin(0x91)],
+            vec![make_output(9_800_000)],
+            200_000,
+        );
         sign_tx(&mut tx, &sk);
         let b1 = make_test_block(Era::Conway, 1_000, 1, 9, 0, vec![tx]);
         // Applied but NOT pushed: the seq is one block behind.
@@ -3961,7 +4005,10 @@ mod tests {
             .expect("valid");
         let before = ledger_fingerprint(&state);
         assert!(!state.restore_after_failed_apply(&seq));
-        assert!(ledger_fingerprint(&state) == before, "a refused restore changes nothing");
+        assert!(
+            ledger_fingerprint(&state) == before,
+            "a refused restore changes nothing"
+        );
     }
 
     /// Haskell's Alonzo+ LEDGER runs DELEGS/CERTS and GOV only for an
