@@ -91,15 +91,15 @@ version and Plutus language is used, with the scenario's 10B CPU / 14M MEM.
   decoder arm that says it is "not yet wired" are reported as `evaluator panic`,
   `evaluator internal error` and `decoder not yet wired`; no expectation names them, so they never score,
   and a run that produces one writes an `error` report and fails. (A decoder that simply lacks a case
-  and says "unknown ..." is a `parse/decode error`; #1127 tracks 62 of those.)
+  and says "unknown ..." is a `parse/decode error`.)
 
-**What the 997 mean** (as pinned; `just ndc-score`): 703 vectors pass on the full textual result and
-budget; 294 pass on the class alone (218 `evaluation failure`, 69 `parse/decode error`, 7
+**What the 1059 mean** (as pinned; `just ndc-score`): 746 vectors pass on the full textual result and
+budget; 313 pass on the class alone (237 `evaluation failure`, 69 `parse/decode error`, 7
 `out of budget`), where nothing but the class is compared. Of the 69 `parse/decode error` passes, 58 are
 the text parser rejecting a `.uplc`, 4 are the flat decoder and 7 are the program-version gate
-(`plcVersionsAvailableIn`, #1128). The 67 failures are pinned in
-`uplc-conformance-known-failures.json` with the observed outcome and the issue tracking each (#1127,
-#1129, #1130); `ndc_uplc_conformance.rs` fails on a new failure, on a listed vector that now
+(`plcVersionsAvailableIn`, #1128). The 5 failures are pinned in
+`uplc-conformance-known-failures.json` with the observed outcome and the issue tracking each (#1129,
+#1130); `ndc_uplc_conformance.rs` fails on a new failure, on a listed vector that now
 passes, and on a changed outcome. Reporting itself never fails on a score.
 
 **What cannot go red.** Mutation checks against this corpus show the protocol version handed to the
