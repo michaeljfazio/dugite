@@ -48,6 +48,40 @@ Corpora go to `target/node-diversity/corpora/` and reports to `target/node-diver
   milliseconds, flat `implementation_commit`, one report per era); the other three are version 1.
   See the table in `report.rs`.
 
+## The cbor-decoding runner
+
+`tests/conformance/src/node_diversity/cbor_decoding/` (Phase 2c, #1126) runs the pinned
+cardano-cbor-dataset, once per era (`DUGITE_NDC_CBOR_ERA=conway|dijkstra`). Each sample goes to
+dugite's production decoder for its rule (`dugite_serialization::decode::rules`); a sample that must
+decode is re-encoded with dugite's own encoder (`encode::rules`) and compared with `.expected.cbor`
+(after the dataset's normalisation, exactly for the byte-exact rules); a sample that must be refused
+must fail to decode. `registry.rs` is the rule to decoder table. A rule with no entry FAILS every one
+of its samples (never skipped), and a rule is left out when dugite has no decoder at that
+granularity, rather than given a decoder written for the harness.
+
+The report's per-sample value is only `true`, so the harness guards itself, and publishes the
+numbers next to the report as `<report>.guards.json` (and in the status sidecar's note):
+
+* **No input-byte reuse.** `scrub.rs` clears every preserved-bytes field between decode and encode
+  and panics (a harness failure, never a sample failure) if one is left. A source scan of
+  `dugite-primitives` fails the tests when a new field that could hold preserved bytes is neither
+  scrubbed nor audited as harmless, and every decoded type a codec does not scrub must be declared
+  `NoPreservedBytes`. `reuse_of_preserved_bytes_would_make_a_wrong_encoding_look_right` shows the
+  encoder echoing an input from preserved bytes and the harness path not doing so.
+* **Discriminating samples.** `discriminating_valid_samples` counts valid samples whose input
+  differs from `.expected.cbor` (and how many pass). Because the comparison normalises first, a
+  stricter count is published too, `echo_proof_valid_samples`: the samples that echoing the input
+  cannot pass (`normalize(input) != expected`).
+* **Invalid samples count only if the rule's valid samples all decode.** The ungated number is
+  published as `invalid_samples_refused_by_decoder`.
+* **The dataset is checked against the harness**: every valid sample must equal `normalize(input)`,
+  or agree once map entries and set elements are ordered, `Map`/`Set` re-encodings being what the
+  reference does for some rules. Anything else is a harness defect and fails the run.
+* The protocol version is stated in the report (`11.0` Conway, `12.0` Dijkstra).
+
+`DUGITE_NDC_CBOR_EXPLAIN=<substring of a sample key>` prints input, expected and actual bytes for
+every mismatching sample whose key contains it.
+
 ## The ledger-rules fixtures
 
 NDC copied them from Amaru, then edited them. `fetch-corpora.sh` checks, at the pinned Amaru commit:
