@@ -26,3 +26,4 @@ pub mod pins;
 pub mod report;
 pub mod uplc_conformance;
 pub mod uplc_print;
+pub mod uplc_turbo;

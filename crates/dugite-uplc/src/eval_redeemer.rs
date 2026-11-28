@@ -526,7 +526,7 @@ pub fn eval_program_gated(
     let applied = require_applied_costs(cost_models, language, major_pv)?;
     crate::flat::term::validate_ledger_language_available(language, major_pv)
         .map_err(ProgramEvalError::Decode)?;
-    eval_decoded_program(program, language, major_pv, applied, initial_budget)
+    prepare_decoded_program(program, language, major_pv, applied)?.run(initial_budget)
 }
 
 /// The on-chain cost model for `(language, major_pv)`, or
@@ -545,6 +545,10 @@ fn require_applied_costs(
 /// CBOR-bytestring-wrapped flat that `deserialiseScript` takes. The cost model
 /// is resolved first; the language gate runs BEFORE the decode, as in
 /// [`eval_resolved_redeemer`].
+///
+/// This is [`prepare_script_bytes_gated`] followed by [`PreparedScript::run`]:
+/// the two halves are the only implementation, so a caller that times them
+/// apart (the node-diversity `uplc-turbo` runner) measures the same path.
 pub fn eval_script_bytes_gated(
     script_bytes: &[u8],
     language: ScriptLanguage,
@@ -552,6 +556,32 @@ pub fn eval_script_bytes_gated(
     cost_models: &CostModels,
     initial_budget: ExBudget,
 ) -> Result<ProgramEvalOutcome, ProgramEvalError> {
+    prepare_script_bytes_gated(script_bytes, language, major_pv, cost_models)?.run(initial_budget)
+}
+
+/// A script that has passed every step of [`eval_script_bytes_gated`] that
+/// precedes the CEK run (cost-model resolution, language gate, CBOR/flat
+/// decode, availability rules, scope check) and is ready to run.
+///
+/// Splitting preparation from the run lets a benchmark time the machine alone.
+/// `Clone` is cheap for the term (it is `Rc`-shared) and lets a caller take a
+/// fresh copy per run outside its timer, as [`PreparedScript::run`] consumes it.
+#[derive(Debug, Clone)]
+pub struct PreparedScript {
+    program: Program,
+    language: ScriptLanguage,
+    major_pv: u32,
+    applied: crate::cost_apply::AppliedCosts,
+}
+
+/// Everything [`eval_script_bytes_gated`] does before the CEK run, in the same
+/// order (cost model, language gate, decode, availability, scope check).
+pub fn prepare_script_bytes_gated(
+    script_bytes: &[u8],
+    language: ScriptLanguage,
+    major_pv: u32,
+    cost_models: &CostModels,
+) -> Result<PreparedScript, ProgramEvalError> {
     let applied = require_applied_costs(cost_models, language, major_pv)?;
     crate::flat::term::validate_ledger_language_available(language, major_pv)
         .map_err(ProgramEvalError::Decode)?;
@@ -564,16 +594,39 @@ pub fn eval_script_bytes_gated(
             )))
         }
     };
-    eval_decoded_program(program, language, major_pv, applied, initial_budget)
+    prepare_decoded_program(program, language, major_pv, applied)
 }
 
-fn eval_decoded_program(
+impl PreparedScript {
+    /// Run the CEK machine under the prepared cost model: the single
+    /// [`run_cek`] call every gated entry point ends in.
+    pub fn run(self, initial_budget: ExBudget) -> Result<ProgramEvalOutcome, ProgramEvalError> {
+        let mut logs = Vec::new();
+        let (result, consumed) = run_cek(
+            self.program.term,
+            self.language,
+            self.major_pv,
+            Some(self.applied),
+            initial_budget,
+            &mut logs,
+        );
+        match result {
+            Ok(value) => Ok(ProgramEvalOutcome {
+                value,
+                consumed,
+                logs,
+            }),
+            Err(error) => Err(ProgramEvalError::Eval { error, consumed }),
+        }
+    }
+}
+
+fn prepare_decoded_program(
     program: Program,
     language: ScriptLanguage,
     major_pv: u32,
     applied: crate::cost_apply::AppliedCosts,
-    initial_budget: ExBudget,
-) -> Result<ProgramEvalOutcome, ProgramEvalError> {
+) -> Result<PreparedScript, ProgramEvalError> {
     crate::flat::term::validate_program_availability(
         &program.term,
         &program.version,
@@ -582,23 +635,12 @@ fn eval_decoded_program(
     )
     .map_err(ProgramEvalError::Decode)?;
     crate::scope_check::check_scope(&program.term).map_err(ProgramEvalError::Scope)?;
-    let mut logs = Vec::new();
-    let (result, consumed) = run_cek(
-        program.term,
+    Ok(PreparedScript {
+        program,
         language,
         major_pv,
-        Some(applied),
-        initial_budget,
-        &mut logs,
-    );
-    match result {
-        Ok(value) => Ok(ProgramEvalOutcome {
-            value,
-            consumed,
-            logs,
-        }),
-        Err(error) => Err(ProgramEvalError::Eval { error, consumed }),
-    }
+        applied,
+    })
 }
 
 /// Convert a [`crate::data::Data`] into the term that pre-application
