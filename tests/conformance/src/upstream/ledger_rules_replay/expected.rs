@@ -82,9 +82,12 @@ pub struct Expected {
     pub entries: BTreeMap<String, Entry>,
 }
 
+/// `#NNNN`, or several joined by commas.
 fn is_issue_ref(s: &str) -> bool {
-    s.strip_prefix('#')
-        .is_some_and(|d| !d.is_empty() && d.chars().all(|c| c.is_ascii_digit()))
+    s.split(',').all(|one| {
+        one.strip_prefix('#')
+            .is_some_and(|d| !d.is_empty() && d.chars().all(|c| c.is_ascii_digit()))
+    })
 }
 
 impl Expected {
@@ -194,32 +197,66 @@ impl Expected {
     }
 }
 
-/// The open issue that tracks an observed result, by rule.
+/// The open issues that track an observed result, comma-separated.
 ///
-/// * `#1132`: the import never maps `cgsDRepPulsingState`, so a NEWEPOCH that
-///   should ratify / enact / expire does not.
-/// * `#1133`: the import drops `cgsFuturePParams`.
-/// * `#1134`: the import ignores `cgsCommittee = SNothing`.
-/// * `#1131`: `apply_block` applies Phase-1-invalid transactions. (No entry maps
-///   here today: those vectors are `AGREED_REJECT`.)
-/// * `#1114`: classes with no issue of their own yet; they are tracked in the
-///   plan until each is split out.
+/// Mapped from what differs, so an entry that shows several classes lists each:
 ///
-/// Returns `None` for an `AGREED_REJECT` (no issue).
-pub fn issue_for(observed: &str) -> Option<&'static str> {
+/// * `#1132`: NEWEPOCH proposals not ratified / enacted / expired (the import
+///   never maps `cgsDRepPulsingState`); `#1133`: `cgsFuturePParams` dropped;
+///   `#1134`: `cgsCommittee = SNothing` ignored.
+/// * `#1194`: `instant_stake` keeps zero entries; `#1195`: a DRep deregistration
+///   keeps its votes (LEDGER); `#1196`: non-myopic likelihoods; `#1197`:
+///   mark-snapshot delegations of zero-stake credentials; `#1198`:
+///   `dormant_epochs`.
+/// * `#1190` / `#1191` / `#1192`: the validator accepts what Haskell rejected
+///   (resign-committee-cold cert / DRep refund / proposal deposit); keyed by
+///   vector id, because the observed result does not carry the transaction.
+///
+/// `Ok(None)` for an `AGREED_REJECT` (no issue). `Err` for a result that fits
+/// none of these: regeneration then fails instead of inventing an issue.
+pub fn issue_for(id: &str, observed: &str) -> Result<Option<String>, String> {
     if observed.starts_with("AGREED_REJECT") {
-        return None;
+        return Ok(None);
     }
     let has = |needle: &str| observed.contains(needle);
-    Some(if has("gov:future_pparams/") {
-        "#1133"
-    } else if has("gov:committee/present") {
-        "#1134"
-    } else if has("gov:proposal/") && has("inputs:drep_pulsing_state") {
-        "#1132"
-    } else {
-        "#1114"
-    })
+    let mut issues: Vec<&str> = Vec::new();
+    if observed.starts_with("ACCEPTED_BY_DUGITE_REJECTED_BY_HASKELL") {
+        match id {
+            "LEDGER/test_6097" | "LEDGER/test_6133" => issues.push("#1190"),
+            "LEDGER/test_6121" => issues.push("#1191"),
+            "LEDGER/test_5672" | "LEDGER/test_7808" | "LEDGER/test_7811" => issues.push("#1192"),
+            _ => {}
+        }
+    }
+    if has("gov:future_pparams/") {
+        issues.push("#1133");
+    }
+    if has("gov:committee/present") {
+        issues.push("#1134");
+    }
+    if has("gov:proposal/") && has("inputs:drep_pulsing_state") {
+        issues.push("#1132");
+    }
+    if has("instant_stake:") {
+        issues.push("#1194");
+    }
+    if has("gov:vote/") && id.starts_with("LEDGER/") {
+        issues.push("#1195");
+    }
+    if has("non_myopic:likelihood/") {
+        issues.push("#1196");
+    }
+    if has("snapshots:mark/deleg/") {
+        issues.push("#1197");
+    }
+    if has("vstate:dormant_epochs") {
+        issues.push("#1198");
+    }
+    if issues.is_empty() {
+        return Err(format!("{id}: no issue covers `{observed}`"));
+    }
+    issues.sort();
+    Ok(Some(issues.join(",")))
 }
 
 /// `Rule/test_N` sorted by rule, then N numerically.

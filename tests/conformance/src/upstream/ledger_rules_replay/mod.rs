@@ -637,9 +637,14 @@ fn run_checks(dir: &Path, selection: Selection) {
                             id.clone(),
                             Entry {
                                 observed: o.clone(),
-                                issue: issue_for(o)
-                                    .expect("a divergence always has an issue")
-                                    .to_string(),
+                                issue: match issue_for(&id, o) {
+                                    Ok(Some(i)) => i,
+                                    Ok(None) => "-".into(),
+                                    Err(e) => {
+                                        failures.push(e);
+                                        "-".into()
+                                    }
+                                },
                             },
                         );
                         *classes

@@ -97,6 +97,9 @@ pub fn replay_vector(vec: &ImpVector) -> Option<Replay> {
 
 /// [`replay_vector`] with an optional post-state hook.
 ///
+/// Keep the fresh-thread isolation below: verdicts that depend on what the thread
+/// or process evaluated before are tracked as #1193.
+///
 /// Every replay runs on a FRESH thread (so no per-thread cache is shared with an
 /// earlier replay on the caller's thread). That is NOT enough to make the verdict
 /// independent of what the PROCESS replayed before: in one process the same

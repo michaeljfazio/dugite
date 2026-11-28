@@ -146,6 +146,8 @@ fn every_divergence_must_link_an_issue() {
     assert!(Expected::parse("A/test_1\tX\t-\n").is_err());
     assert!(Expected::parse("A/test_1\tX\t#\n").is_err());
     assert!(Expected::parse("A/test_1\tX\t#12\n").is_ok());
+    assert!(Expected::parse("A/test_1\tX\t#12,#13\n").is_ok());
+    assert!(Expected::parse("A/test_1\tX\t#12,\n").is_err());
     // an agreed rejection has no issue, and a divergence cannot hide as one
     assert!(Expected::parse("A/test_1\tAGREED_REJECT x\t-\n").is_ok());
     assert!(Expected::parse("A/test_1\tAGREED_REJECT x\t#12\n").is_err());
@@ -158,25 +160,46 @@ fn duplicate_ids_are_rejected() {
 
 #[test]
 fn issue_assignment_follows_the_class() {
-    assert_eq!(issue_for("AGREED_REJECT validator=X"), None);
+    let i = |id: &str, o: &str| issue_for(id, o).unwrap();
+    assert_eq!(i("LEDGER/test_1", "AGREED_REJECT validator=X"), None);
     assert_eq!(
-        issue_for(
-            "STATE_MISMATCH post=gov:proposal/*,gov:vote/*/drep/* pre=inputs:drep_pulsing_state #a"
-        ),
-        Some("#1132")
+        i("NEWEPOCH/test_1", "STATE_MISMATCH post=gov:proposal/*,vstate:dormant_epochs pre=inputs:drep_pulsing_state #a").as_deref(),
+        Some("#1132,#1198")
     );
     assert_eq!(
-        issue_for("STATE_MISMATCH post=gov:future_pparams/tag pre=none #a"),
+        i(
+            "NEWEPOCH/test_1",
+            "STATE_MISMATCH post=gov:future_pparams/tag pre=none #a"
+        )
+        .as_deref(),
         Some("#1133")
     );
     assert_eq!(
-        issue_for("STATE_MISMATCH post=gov:committee/present pre=none #a"),
+        i(
+            "NEWEPOCH/test_1",
+            "STATE_MISMATCH post=gov:committee/present pre=none #a"
+        )
+        .as_deref(),
         Some("#1134")
     );
     assert_eq!(
-        issue_for("STATE_MISMATCH post=instant_stake:* pre=none #a"),
-        Some("#1114")
+        i(
+            "LEDGER/test_1",
+            "STATE_MISMATCH post=instant_stake:* pre=none #a"
+        )
+        .as_deref(),
+        Some("#1194")
     );
+    assert_eq!(
+        i(
+            "LEDGER/test_6121",
+            "ACCEPTED_BY_DUGITE_REJECTED_BY_HASKELL validator=ok applied pre=none #a"
+        )
+        .as_deref(),
+        Some("#1191")
+    );
+    // a result that fits no issue is an error, never a placeholder
+    assert!(issue_for("LEDGER/test_1", "STATE_MISMATCH post=pots:fees pre=none #a").is_err());
 }
 
 #[test]
