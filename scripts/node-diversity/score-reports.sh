@@ -10,7 +10,9 @@
 # temporary COPY of the checkout that holds only a `dugite` node, so no other node's report is
 # downloaded.  Nothing is installed: the builder is Python standard library only.  Prints one line
 # per scenario and an overall score.  A score never fails this script; an unreadable report, a
-# missing corpus or a builder error does.
+# missing corpus, a builder error or a report written by a FAILED generator (status `error`) does.
+# Each report's .status.json must also match the current corpora.toml and this checkout's commit;
+# a report that does not is marked STALE (or UNBOUND when it has no status file), never passed off as current.
 #
 # Notes:
 #  * The builder asks the GitHub API (unauthenticated: 60 requests an hour) which Amaru and CBOR
@@ -89,22 +91,34 @@ place uplc-turbo.json uplc-turbo dugite.json
 }
 grep -E "^(warn|failed)" "$SITE/build.log" >&2 || true
 
-python3 -I - "$SITE/_site" "$REPORTS" <<'PY'
+PINS_SHA=$(python3 -I -c 'import hashlib,sys; print(hashlib.sha256(open(sys.argv[1], "rb").read()).hexdigest())' "$PINS")
+HEAD_COMMIT=$(git -C "$ROOT" rev-parse HEAD)
+python3 -I - "$SITE/_site" "$REPORTS" "$PINS_SHA" "$HEAD_COMMIT" <<'PY'
 import json
 import pathlib
 import sys
 
 site, reports = pathlib.Path(sys.argv[1]), pathlib.Path(sys.argv[2])
+pins_sha, head = sys.argv[3], sys.argv[4]
+errors = []
 
 
 def status(name):
+    """What the report's sidecar says, bound to the CURRENT pins and commit; "" only for a current ok."""
     try:
         side = json.loads((reports / f"{name}.status.json").read_text())
-    except OSError:
-        return "NO STATUS FILE"
-    if side["status"] == "ok":
-        return ""
-    return f'{side["status"].upper()}: {side["note"]}'
+    except (OSError, ValueError):
+        return "UNBOUND: no readable status file, so nothing ties this report to its inputs"
+    notes = []
+    if side.get("pins_sha256") != pins_sha:
+        notes.append("STALE: made under other pins than the current corpora.toml")
+    if side.get("implementation_commit") != head:
+        notes.append(f'STALE: made at {str(side.get("implementation_commit"))[:10]}, this checkout is {head[:10]}')
+    if side["status"] != "ok":
+        notes.append(f'{side["status"].upper()}: {side["note"]}')
+    if side["status"] == "error":
+        errors.append(name)
+    return "; ".join(notes)
 
 
 files = {
@@ -134,4 +148,8 @@ for score in node["scenario_scores"]:
             actual = sum(v for k, v in totals.items() if k.endswith("_actual"))
             print(f'  {era:<16} {actual:>5} / {expected:<5} {(actual / expected * 100 if expected else 0):6.2f}%')
 print(f'{"overall":<18} {node["conformance"]["ratio"] * 100:.2f}%  (four scenarios weighted equally; a scenario with no result scores 0)')
+# A score never fails this script.  A report left by a generator that FAILED is a harness failure.
+if errors:
+    print(f"score-reports: {len(errors)} report(s) come from a failed generator: {', '.join(sorted(errors))}", file=sys.stderr)
+    sys.exit(1)
 PY

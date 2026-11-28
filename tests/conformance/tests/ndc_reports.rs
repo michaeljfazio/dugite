@@ -108,6 +108,8 @@ fn run_scenario(test: &str, scenario: Scenario) {
         path.display(),
         status.as_str()
     );
+    // The error report is on disk and valid, so the scenario can still be published; the RUN fails.
+    ensure_not_error(status, &path).unwrap_or_else(|e| panic!("{test}: {e}"));
 }
 
 // ── the four runners (stubs in Phase 1) ─────────────────────────────────────────────────────
@@ -141,6 +143,7 @@ fn ndc_pins_file_is_well_formed() {
     assert_eq!(pins.ledger_rules.missing_protocol_parameters.len(), 3);
     assert_eq!(pins.fixtures_using_missing_parameters(), 32);
     assert_eq!(pins.ledger_rules.known_divergences.len(), 10);
+    assert_eq!(pins.ledger_rules.ndc_only_files.len(), 3);
     // The two commits a report names are the pinned ones.
     assert_eq!(
         pins.ledger_rules_dataset_commit(),
@@ -358,10 +361,23 @@ fn ndc_crashed_generator_writes_an_error_report() {
         })
         .unwrap();
         assert_eq!(status, ReportStatus::Error, "{scenario}");
+        // The report is written, and the run still fails.
+        assert!(path.is_file(), "{scenario}: no error report was written");
+        let verdict = ensure_not_error(status, &path);
+        assert!(
+            verdict.is_err(),
+            "{scenario}: an error report did not fail the run"
+        );
         let side: Value =
             serde_json::from_str(&std::fs::read_to_string(status_path(&path)).unwrap()).unwrap();
         assert_eq!(side["status"], "error");
         assert_eq!(side["scenario"], scenario.id());
+        // The sidecar binds the report to its inputs.
+        assert_eq!(side["implementation_commit"], run.implementation_commit);
+        assert_eq!(
+            side["pins_sha256"],
+            dugite_conformance::node_diversity::pins::pins_sha256().unwrap()
+        );
         let note = side["note"].as_str().unwrap();
         assert!(
             note.contains("generator panicked: generator crashed")

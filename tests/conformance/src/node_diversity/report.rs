@@ -26,7 +26,7 @@ use chrono::{DateTime, SecondsFormat, Utc};
 use serde::ser::{Serialize, Serializer};
 use serde_json::{json, Map, Value};
 
-use super::pins::{repo_root, Pins};
+use super::pins::{pins_sha256, repo_root, Pins};
 
 /// The environment variable that names the report file a runner writes.
 pub const REPORT_ENV: &str = "DUGITE_NDC_REPORT";
@@ -374,12 +374,15 @@ pub fn status_path(report: &Path) -> PathBuf {
 
 /// Write a report and its status sidecar.  The sidecar is how a later publish step tells a real
 /// result from a stub or an error report, which no schema can express for three of the four
-/// scenarios.
+/// scenarios.  It also binds the report to its inputs: the SHA-256 of the pin file and the dugite
+/// commit it was made with, so a report left over from other pins or another commit cannot pass
+/// for a current one (`score-reports.sh` checks both).
 pub fn write_report(
     path: &Path,
     scenario: Scenario,
     status: ReportStatus,
     note: &str,
+    run: &RunInfo,
     report: &Value,
 ) -> Result<(), String> {
     if let Some(parent) = path.parent() {
@@ -393,6 +396,11 @@ pub fn write_report(
     sidecar.insert("scenario".into(), scenario.id().into());
     sidecar.insert("status".into(), status.as_str().into());
     sidecar.insert("note".into(), note.into());
+    sidecar.insert("pins_sha256".into(), pins_sha256()?.into());
+    sidecar.insert(
+        "implementation_commit".into(),
+        run.implementation_commit.clone().into(),
+    );
     let mut text =
         serde_json::to_string_pretty(&Value::Object(sidecar)).map_err(|e| e.to_string())?;
     text.push('\n');
@@ -426,14 +434,27 @@ pub fn write_generated(
     };
     match outcome {
         Ok((status, note, report)) => {
-            write_report(path, scenario, status, &note, &report)?;
+            write_report(path, scenario, status, &note, run, &report)?;
             Ok(status)
         }
         Err(message) => {
             let report = empty_report(scenario, era, pins, run, &message);
-            write_report(path, scenario, ReportStatus::Error, &message, &report)?;
+            write_report(path, scenario, ReportStatus::Error, &message, run, &report)?;
             Ok(ReportStatus::Error)
         }
+    }
+}
+
+/// The harness verdict on a written report: an `error` report is on disk (so the scenario can
+/// still be published as a failure) but the run must FAIL.  A stub is not an error; a score never is.
+pub fn ensure_not_error(status: ReportStatus, path: &Path) -> Result<(), String> {
+    if status == ReportStatus::Error {
+        Err(format!(
+            "the generator failed; an error report was written to {} and the run fails (see its .status.json)",
+            path.display()
+        ))
+    } else {
+        Ok(())
     }
 }
 

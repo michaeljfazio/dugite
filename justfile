@@ -452,36 +452,61 @@ ndc-selftest:
     scripts/node-diversity/test-fetch-corpora.sh
 
 # Write one scenario's schema-validated report (ledger-rules, cbor-decoding, uplc-conformance, uplc-turbo).
+# A generator that fails still leaves an error report (so the scenario can be published), and the recipe FAILS.
 ndc-report scenario:
     #!/usr/bin/env bash
     set -euo pipefail
     # Verify the pins first, unless `ndc-reports` already did.
     [[ "${DUGITE_NDC_FETCHED:-}" == 1 ]] || scripts/node-diversity/fetch-corpora.sh >/dev/null
     out="${DUGITE_NDC_REPORTS_DIR:-target/node-diversity/reports}"
+    case "$out" in /*) ;; *) out="$PWD/$out" ;; esac   # absolute or relative: the test runs in another directory
     mkdir -p "$out"
     case "{{scenario}}" in
         ledger-rules | uplc-conformance | uplc-turbo) targets=("{{scenario}}:{{scenario}}.json:conway") ;;
         cbor-decoding) targets=("cbor-decoding:cbor-decoding-conway.json:conway" "cbor-decoding:cbor-decoding-dijkstra.json:dijkstra") ;;
         *) echo "unknown scenario '{{scenario}}' (ledger-rules, cbor-decoding, uplc-conformance, uplc-turbo)" >&2; exit 2 ;;
     esac
+    rc=0
     for target in "${targets[@]}"; do
         IFS=: read -r scenario file era <<<"$target"
         report="$out/$file"
         rm -f "$report" "$report.status.json"
-        DUGITE_NDC_REQUIRE=1 DUGITE_NDC_CBOR_ERA="$era" DUGITE_NDC_REPORT="$PWD/$report" \
+        # A failing run still writes its report; carry on to the other era, fail at the end.
+        DUGITE_NDC_REQUIRE=1 DUGITE_NDC_CBOR_ERA="$era" DUGITE_NDC_REPORT="$report" \
             cargo nextest run -p dugite-conformance --test ndc_reports --no-tests=fail \
-            -E "test(=ndc_report_${scenario//-/_})"
+            -E "test(=ndc_report_${scenario//-/_})" || { echo "ndc-report: the $scenario ($era) run FAILED" >&2; rc=1; }
         # A test that was skipped would pass without writing anything: insist on the file.
-        [[ -s "$report" && -s "$report.status.json" ]] || { echo "ndc-report: $report was not written" >&2; exit 1; }
-        echo "ndc-report: $report ($(python3 -I -c 'import json,sys; print(json.load(open(sys.argv[1]))["status"])' "$report.status.json"))"
+        if [[ ! -s "$report" || ! -s "$report.status.json" ]]; then
+            echo "ndc-report: $report was not written" >&2
+            rc=1
+            continue
+        fi
+        status=$(python3 -I -c 'import json,sys; print(json.load(open(sys.argv[1]))["status"])' "$report.status.json")
+        echo "ndc-report: $report ($status)"
+        if [[ "$status" == error ]]; then
+            echo "ndc-report: $report is an ERROR report: the generator failed (see $report.status.json)" >&2
+            rc=1
+        fi
     done
+    exit $rc
 
-# Write all four reports, schema-validated (cbor-decoding once per era).
+# The whole ndc_reports test binary against NDC's real schema.json files, with the corpus REQUIRED
+# (a missing corpus fails instead of skipping): the red-proofs of the schema validation run here.
+ndc-harness-test: ndc-fetch
+    DUGITE_NDC_REQUIRE=1 cargo nextest run -p dugite-conformance --test ndc_reports --no-tests=fail
+
+# Write all four reports, schema-validated (cbor-decoding once per era), and run the harness tests
+# with the corpus required.  Every step runs; the recipe fails if any step failed.
 ndc-reports: ndc-fetch
-    DUGITE_NDC_FETCHED=1 just ndc-report ledger-rules
-    DUGITE_NDC_FETCHED=1 just ndc-report cbor-decoding
-    DUGITE_NDC_FETCHED=1 just ndc-report uplc-conformance
-    DUGITE_NDC_FETCHED=1 just ndc-report uplc-turbo
+    #!/usr/bin/env bash
+    set -uo pipefail
+    rc=0
+    for scenario in ledger-rules cbor-decoding uplc-conformance uplc-turbo; do
+        DUGITE_NDC_FETCHED=1 just ndc-report "$scenario" || rc=1
+    done
+    just ndc-harness-test || rc=1
+    [[ $rc -eq 0 ]] || echo "ndc-reports: FAILED (see above)" >&2
+    exit $rc
 
 # Score the reports with NDC's own site builder (--preview) and print one line per scenario.
 ndc-score:
