@@ -8,6 +8,8 @@ name: Dependabot auto-merge
 #   * the update is a cargo semver-PATCH update;
 #   * the PR changes Cargo.lock and nothing else;
 #   * every crate whose version moves in Cargo.lock is on ALLOW below.
+# The gate runs on every PR event and turns auto-merge OFF whenever it
+# rejects, and an approval is pinned to the head commit it checked.
 # Anything else, including a diff this script cannot read, stays open for a
 # human review. A deny-list would let every crate nobody thought of through;
 # consensus, crypto, CBOR and big-integer crates must never be in ALLOW.
@@ -24,51 +26,54 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - id: meta
+        continue-on-error: true
         uses: dependabot/fetch-metadata@v2
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Enable auto-merge for allow-listed patch updates
-        if: >-
-          steps.meta.outputs.update-type == 'version-update:semver-patch' &&
-          steps.meta.outputs.package-ecosystem == 'cargo'
+      - name: Gate auto-merge (runs on every event; rejects revoke it)
+        if: always()
         env:
           PR_URL: ${{ github.event.pull_request.html_url }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          UPDATE_TYPE: ${{ steps.meta.outputs.update-type }}
+          ECOSYSTEM: ${{ steps.meta.outputs.package-ecosystem }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          set -euo pipefail
+          set -uo pipefail
+          # Every rejection turns auto-merge OFF, so an approval given for an
+          # earlier head commit cannot carry over to content never checked.
+          reject() {
+            echo "$1; manual review."
+            gh pr merge --disable-auto "$PR_URL" >/dev/null 2>&1 || true
+            exit 0
+          }
+          [ "$UPDATE_TYPE" = "version-update:semver-patch" ] || reject "update type is '${UPDATE_TYPE:-unknown}'"
+          [ "$ECOSYSTEM" = "cargo" ] || reject "ecosystem is '${ECOSYSTEM:-unknown}'"
+
           # Crates with no path into consensus, wire formats, signatures,
           # hashing or arithmetic. Add to this list only after that check.
           ALLOW='^(anyhow|thiserror|thiserror-impl|chrono|sysinfo|clap|clap_builder|clap_derive|clap_lex|indicatif|console|ratatui|crossterm|tempfile|criterion|proptest|insta)$'
 
-          files=$(gh pr diff "$PR_URL" --name-only)
-          if [ "$files" != "Cargo.lock" ]; then
-            echo "PR changes more than Cargo.lock; manual review: $files"
-            exit 0
-          fi
+          files=$(gh pr diff "$PR_URL" --name-only) || reject "could not read the PR's files"
+          [ "$files" = "Cargo.lock" ] || reject "PR changes more than Cargo.lock: $(echo $files)"
 
-          diff=$(gh pr diff "$PR_URL")
+          diff=$(gh pr diff "$PR_URL") || reject "could not read the PR diff"
           # A package added to or removed from the lockfile has its name on a
           # +/- line, which the context-line match below would not see.
           if printf '%s\n' "$diff" | grep -qE '^[-+]name = '; then
-            echo "Lockfile adds or removes a package; manual review."
-            exit 0
+            reject "lockfile adds or removes a package"
           fi
 
           # Crates whose version line changes in the lockfile diff.
           moved=$(printf '%s\n' "$diff" \
             | grep -B1 -E '^[-+]version = ' \
             | sed -n 's/^ name = "\(.*\)"$/\1/p' | sort -u)
-          if [ -z "$moved" ]; then
-            echo "Could not read which crates moved; manual review."
-            exit 0
-          fi
+          [ -n "$moved" ] || reject "could not read which crates moved"
           for crate in $moved; do
-            if ! printf '%s\n' "$crate" | grep -qE "$ALLOW"; then
-              echo "$crate is not on the allow-list; manual review."
-              exit 0
-            fi
+            printf '%s\n' "$crate" | grep -qE "$ALLOW" || reject "$crate is not on the allow-list"
           done
 
-          echo "Allow-listed patch update ($(echo $moved)); enabling auto-merge."
-          gh pr merge --auto --squash "$PR_URL"
+          # Pin the approval to the commit this gate checked.
+          echo "Allow-listed patch update ($(echo $moved)) at $HEAD_SHA; enabling auto-merge."
+          gh pr merge --auto --squash --match-head-commit "$HEAD_SHA" "$PR_URL"
