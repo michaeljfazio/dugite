@@ -2382,7 +2382,9 @@ impl LedgerState {
     /// the next-epoch major for a block that crosses an epoch boundary, else
     /// the current one. Diagnostics only.
     pub fn protocol_major_for_slot(&self, slot: u64) -> u64 {
-        if self.epoch_of_slot(slot) == self.epoch.0.saturating_add(1) {
+        // Any block past the next boundary is judged against the FIRST
+        // boundary's forecast (the only one ledger state can give).
+        if self.epoch_of_slot(slot) > self.epoch.0 {
             self.next_epoch_protocol_major()
         } else {
             self.epochs.protocol_params.protocol_version_major
@@ -2412,8 +2414,9 @@ impl LedgerState {
     ///   due); either would otherwise leave the ledger in an era its protocol
     ///   version does not match and reject every honest block after it.
     /// * More than one epoch ahead (an empty epoch, e.g. a stalled low-density
-    ///   devnet) the same rule applies at the block's own epoch
-    ///   ([`Self::era_due_at_epoch`]): never a free pass.
+    ///   devnet) only the first tick can be forecast, so the rule is monotonic:
+    ///   no downgrade and at most one era per skipped boundary. Never a free
+    ///   pass, never an exact match against an incomplete forecast.
     ///
     /// `strict = false` is for replaying our OWN already-validated blocks
     /// (`ApplyOnly`: ImmutableDB, Mithril): the due-era equality is skipped and
@@ -2466,10 +2469,34 @@ impl LedgerState {
         if !strict {
             return Ok(());
         }
-        if block.era != self.era_due_at_epoch(block_epoch) {
-            return Err(wrong(
-                "era is not the era the epoch tick adopts (no hard fork due, or a due one was not taken)",
-            ));
+        let boundaries = block_epoch - self.epoch.0; // >= 1 here
+        if boundaries == 1 {
+            // Exactly one tick: the first-boundary forecast is complete.
+            if block.era != self.era_due_at_next_boundary() {
+                return Err(wrong(
+                    "era is not the era the epoch tick adopts (no hard fork due, or a due one was not taken)",
+                ));
+            }
+            return Ok(());
+        }
+        // Two or more skipped boundaries. Only the FIRST tick can be forecast
+        // from ledger state: a hard fork ratified by the pulser, or a PPUP vote
+        // that only becomes final later, can enact at a LATER boundary inside
+        // the gap, and an exact match here could reject an honest chain, which
+        // is worse than the bug. So accept exactly the monotonic set: never a
+        // downgrade (rejected above), and at most one era per skipped boundary.
+        // The node counts a disagreement with the first-boundary forecast in
+        // `dugite_era_parity_mismatch_total`.
+        //
+        // A gap of two or more epochs is a devnet-only situation. A mainnet or
+        // preprod epoch is 432000 slots and a preview epoch 86400, all at
+        // f = 0.05, so an epoch with no block at all has probability
+        // (0.95)^432000 (about 10^-9600) resp. (0.95)^86400 (about 10^-1900).
+        // A devnet (epochLength 400, f = 0.5) or a node idle for a long time
+        // can plausibly skip one.
+        let allowed_up = u32::try_from(boundaries).unwrap_or(u32::MAX);
+        if block.era.to_era_index() > self.era.to_era_index().saturating_add(allowed_up) {
+            return Err(wrong("more eras than skipped epoch boundaries"));
         }
         Ok(())
     }

@@ -893,10 +893,10 @@ async fn retagged_copy_stored_out_of_order_is_removed_when_its_fork_is_replayed(
 }
 
 /// An empty epoch puts the next block two epochs ahead of the ledger tip (here:
-/// within the forecast horizon, epoch 2 of a 100-slot epoch). The re-tagged copy
-/// must be rejected like any other, and the honest copy must apply.
+/// within the forecast horizon, epoch 2 of a 100-slot epoch). A re-tag DOWNGRADE
+/// across the gap (Conway to Babbage) is rejected and the honest copy applies.
 #[tokio::test(flavor = "multi_thread")]
-async fn retagged_block_two_epochs_ahead_is_rejected() {
+async fn retag_downgrade_two_epochs_ahead_is_rejected() {
     let mut h = Harness::new(10).await;
     let parent = h.bootstrap(Era::Conway, 10).await;
     let (slot, honest_cbor) = h
@@ -904,7 +904,7 @@ async fn retagged_block_two_epochs_ahead_is_rejected() {
         .await;
     assert!(slot >= 2 * EPOCH_LENGTH, "two epochs past the ledger tip");
     let failures = h.header_failures();
-    let bad = h.deliver(&retag(&honest_cbor, 8)).await;
+    let bad = h.deliver(&retag(&honest_cbor, 6)).await;
     assert_rejected(&mut h, &bad, Era::Conway, parent, failures).await;
     let honest = h.deliver(&honest_cbor).await;
     assert_eq!(

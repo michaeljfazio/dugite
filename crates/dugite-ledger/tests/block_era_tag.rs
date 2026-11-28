@@ -473,58 +473,82 @@ fn the_ledger_epoch_is_the_epoch_of_its_tip() {
 
 // ── More than one epoch ahead: no free pass ──────────────────────────────────
 
-/// An empty epoch (a stalled low-density devnet, a node restarted after an idle
-/// period) puts the next block two or more epochs ahead of the ledger tip. The
-/// tick is deterministic from ledger state, so the same rule applies at the
-/// block's own epoch: nothing passes just because the gap is large.
+/// An empty epoch (a stalled low-density devnet, a node idle for a long time)
+/// puts the next block two or more epochs ahead of the ledger tip. Only the first
+/// tick can be forecast, so the rule is monotonic: no downgrade, at most one era
+/// per skipped boundary. It is neither a free pass nor an exact match against an
+/// incomplete forecast.
 #[test]
-fn a_block_several_epochs_ahead_is_held_to_the_due_era() {
+fn a_block_several_epochs_ahead_is_monotonic_and_bounded_by_the_gap() {
     let far = 3 * EPOCH + 100; // three boundaries ahead
 
-    // No fork due: only the ledger's own era passes, whatever the gap.
     let ls = ledger_at(Era::Conway, 10);
     assert!(ls
         .check_block_era(&block(Era::Conway, far, 2, tip_hash(&ls)))
         .is_ok());
-    for wrong in [Era::Byron, Era::Babbage, Era::Dijkstra] {
+    // A re-tag DOWNGRADE across the gap is rejected.
+    for wrong in [Era::Byron, Era::Shelley, Era::Babbage] {
         assert!(
             ls.check_block_era(&block(wrong, far, 2, tip_hash(&ls)))
                 .is_err(),
-            "{wrong:?} three epochs ahead with no fork due"
+            "{wrong:?} three epochs ahead is a downgrade"
         );
     }
 
-    // A fork voted for the next boundary is carried through the empty epochs.
-    let mut ls = ledger_at(Era::Babbage, 8);
-    schedule_pv(&mut ls, 9);
-    assert_eq!(ls.era_due_at_epoch(3), Era::Conway);
+    // More eras than skipped boundaries is rejected: Alonzo to Dijkstra is three
+    // eras, so two skipped boundaries are not enough but three are.
+    let ls = ledger_at(Era::Alonzo, 5);
+    let two = 2 * EPOCH + 100;
     assert!(ls
-        .check_block_era(&block(Era::Conway, far, 2, tip_hash(&ls)))
-        .is_ok());
-    for wrong in [Era::Babbage, Era::Dijkstra] {
-        assert!(
-            ls.check_block_era(&block(wrong, far, 2, tip_hash(&ls)))
-                .is_err(),
-            "{wrong:?} three epochs ahead with a fork to Conway due"
-        );
-    }
-
-    // An epoch-keyed trigger that falls inside the gap is due; one beyond the
-    // block's epoch is not.
-    let mut ls = ledger_at(Era::Alonzo, 5);
-    ls.set_hard_fork_triggers([(Era::Babbage, 2)].into_iter().collect());
-    assert!(ls
-        .check_block_era(&block(Era::Babbage, far, 2, tip_hash(&ls)))
-        .is_ok());
-    assert!(ls
-        .check_block_era(&block(Era::Alonzo, far, 2, tip_hash(&ls)))
+        .check_block_era(&block(Era::Dijkstra, two, 2, tip_hash(&ls)))
         .is_err());
-    ls.set_hard_fork_triggers([(Era::Babbage, 9)].into_iter().collect());
     assert!(ls
-        .check_block_era(&block(Era::Alonzo, far, 2, tip_hash(&ls)))
+        .check_block_era(&block(Era::Dijkstra, far, 2, tip_hash(&ls)))
+        .is_ok());
+}
+
+/// An honest two-epoch gap in which a hard fork enacts at the SECOND boundary
+/// (the first boundary's forecast knows nothing of it): must pass. Conway to
+/// Dijkstra by a ratified HardForkInitiation, and Babbage to Conway by a PPUP
+/// vote that only becomes final in the empty epoch.
+#[test]
+fn an_honest_two_epoch_gap_with_a_fork_at_the_second_boundary_passes() {
+    let two = 2 * EPOCH + 100;
+
+    let ls = ledger_at(Era::Conway, 10);
+    assert_eq!(
+        ls.era_due_at_next_boundary(),
+        Era::Conway,
+        "nothing forecast"
+    );
+    assert!(ls
+        .check_block_era(&block(Era::Dijkstra, two, 2, tip_hash(&ls)))
+        .is_ok());
+
+    let ls = ledger_at(Era::Babbage, 8);
+    assert!(ls
+        .check_block_era(&block(Era::Conway, two, 2, tip_hash(&ls)))
+        .is_ok());
+}
+
+/// A re-tag that jumps two or more eras across a ONE-epoch gap is rejected: with
+/// one boundary the forecast is complete and exact.
+#[test]
+fn a_jump_of_two_eras_across_a_one_epoch_gap_is_rejected() {
+    let next = EPOCH + 100;
+    // No fork due.
+    let ls = ledger_at(Era::Alonzo, 5);
+    assert!(ls
+        .check_block_era(&block(Era::Conway, next, 2, tip_hash(&ls)))
+        .is_err());
+    // A fork to Babbage is due (PV7): Conway is two eras and still wrong.
+    let mut ls = ledger_at(Era::Alonzo, 6);
+    schedule_pv(&mut ls, 7);
+    assert!(ls
+        .check_block_era(&block(Era::Babbage, next, 2, tip_hash(&ls)))
         .is_ok());
     assert!(ls
-        .check_block_era(&block(Era::Babbage, far, 2, tip_hash(&ls)))
+        .check_block_era(&block(Era::Conway, next, 2, tip_hash(&ls)))
         .is_err());
 }
 
