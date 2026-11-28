@@ -223,6 +223,45 @@ impl<'b> Reader<'b> {
         }
     }
 
+    /// Open a fixed-arity record that Haskell decodes with `RecD` (before decoder version
+    /// 12): a DEFINITE array of exactly `n` elements; an indefinite array is a decode failure.
+    ///
+    /// `Coders.hs`:
+    ///
+    /// ```haskell
+    /// decodeCount (RecD cn) n = decodeRecordNamed "RecD" (const n) (pure (n, cn))
+    /// ```
+    ///
+    /// The inner decoder of that `decodeRecordNamed` is `pure`, so `decodeListLikeT` reads the
+    /// break (`decodeBreakOr`) immediately after the head, BEFORE any field is read; the
+    /// fields are decoded afterwards by `ApplyD`. `9f <fields> ff` therefore fails with
+    /// "Excess terms in array" in Conway. From decoder version 12 the same types switch to a
+    /// field-reading `decodeRecordNamed` (e.g. `ExUnits.hs`
+    /// `ifDecoderVersionAtLeast (natVersion @12) decodeExUnits $ decode $ RecD ...`) and accept
+    /// the indefinite form; dugite keeps the definite-only rule until Dijkstra is live.
+    ///
+    /// (Unverified and deliberately not modelled: by that reading Haskell below v12 would
+    /// also accept `9f ff <fields>`; dugite rejects it.)
+    ///
+    /// Types affected: the Mary value pair, `ExUnits`, `Prices`, `GovActionId`,
+    /// `VotingProcedure`, `ProposalProcedure`, `Constitution`, `Anchor`, and the Praos header
+    /// and header body.
+    pub fn read_definite_record_header(
+        &mut self,
+        name: &str,
+        n: u64,
+    ) -> Result<(), SerializationError> {
+        match self.read_array_header()? {
+            Some(len) if len == n => Ok(()),
+            None => Err(SerializationError::CborDecode(format!(
+                "{name}: indefinite-length array not accepted (RecD record, decoder version < 12)"
+            ))),
+            Some(len) => Err(SerializationError::CborDecode(format!(
+                "{name}: expected array({n}), got array({len})"
+            ))),
+        }
+    }
+
     /// Close a record opened with [`read_record_header`](Self::read_record_header):
     /// a no-op for a definite array, and the mandatory break for an indefinite one.
     pub fn close_record(&mut self, indefinite: bool) -> Result<(), SerializationError> {
@@ -1053,15 +1092,21 @@ impl<'b> Reader<'b> {
                 tag.as_u64()
             )));
         }
-        // Consume the 2-element array header.
+        // Haskell `decodeRationalWithTag` (`Binary/Plain.hs`) reads the pair with
+        // `decodeCollectionWithLen decodeListLenOrIndef decodeInteger` and requires EXACTLY two
+        // elements (`DecoderErrorSizeMismatch "Rational" 2`): a definite array(2) or an
+        // indefinite array holding two integers followed by the break.
         let arr_len = self.read_array_header()?;
-        if arr_len != Some(2) {
+        if !matches!(arr_len, Some(2) | None) {
             return Err(SerializationError::CborDecode(format!(
                 "read_rational: expected array(2), got {arr_len:?} at position {pos}"
             )));
         }
         let numerator = self.read_uint()?;
         let denominator = self.read_uint()?;
+        if arr_len.is_none() {
+            self.expect_break()?;
+        }
         if denominator == 0 {
             return Err(SerializationError::CborDecode(
                 "read_rational: denominator is zero".into(),

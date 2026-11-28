@@ -614,12 +614,11 @@ fn read_shelley_value(r: &mut Reader<'_>) -> Result<Value, SerializationError> {
             Ok(Value::lovelace(coin))
         }
         Type::Array | Type::ArrayIndef => {
-            // [coin, multiasset_map] — Haskell `decodeMaryValue` accepts both array forms.
-            let indef = r.read_record_header("shelley value array", 2)?;
+            // [coin, multiasset_map] — `RecD MaryValue` below decoder version 12: definite only.
+            r.read_definite_record_header("shelley value array", 2)?;
             let coin = Lovelace(r.read_uint()?);
             // multiasset_map: { policy_id => { asset_name => quantity } }
             let multi_asset = read_multiasset_map_u64(r)?;
-            r.close_record(indef)?;
             if multi_asset.is_empty() {
                 Ok(Value::lovelace(coin.0))
             } else {

@@ -111,9 +111,15 @@ pub fn decode_dijkstra_block_minimal(inner_cbor: &[u8]) -> Result<Block, Seriali
 /// Covers both Conway and Dijkstra eras; the only difference at the
 /// header layer is Dijkstra's optional 11th header_body element
 /// (`prevNonce`), which `decode_conway_header_inner` already handles.
-pub fn decode_conway_block_header(inner_cbor: &[u8]) -> Result<BlockHeader, SerializationError> {
+///
+/// `era` is `Era::Conway` or `Era::Dijkstra`: only Dijkstra accepts the optional 11th
+/// `prevNonce` header-body element.
+pub fn decode_conway_block_header(
+    inner_cbor: &[u8],
+    era: Era,
+) -> Result<BlockHeader, SerializationError> {
     let mut r = Reader::new(inner_cbor);
-    let raw = KeepRaw::parse_with(&mut r, |r| decode_conway_header_inner(r, Era::Conway))?;
+    let raw = KeepRaw::parse_with(&mut r, |r| decode_conway_header_inner(r, era))?;
     let header_hash = blake2b_256(raw.raw);
     let mut h = raw.value;
     h.header_hash = header_hash;
@@ -305,7 +311,9 @@ fn decode_conway_header_inner(
     era: Era,
 ) -> Result<BlockHeader, SerializationError> {
     // header = [header_body, kes_signature]
-    let hdr_indef = r.read_record_header("conway header", 2)?;
+    // Praos `HeaderRaw` is `RecD HeaderRaw` (cardano-protocol `Praos/BlockHeader.hs`):
+    // definite only before decoder version 12.
+    r.read_definite_record_header("conway header", 2)?;
 
     // Conway header_body = array(10).
     // Dijkstra may add an optional 11th element: prevNonce (bytes(32) or null).
@@ -316,17 +324,16 @@ fn decode_conway_header_inner(
     // exactly 10 elements, definite or indefinite. Only Dijkstra carries the optional
     // 11th `prevNonce` element.
     let body_arr = r.read_array_header()?;
+    // `HeaderBody` is `RecD HeaderBody` as well: definite only.
     let body_len = match body_arr {
         Some(10) => 10,
         Some(11) if era == Era::Dijkstra => 11,
-        None => 0, // indefinite: the optional 11th element is detected below
         _ => {
             return Err(SerializationError::CborDecode(format!(
                 "header_body: expected array(10), got {body_arr:?}"
             )));
         }
     };
-    let body_indef = body_arr.is_none();
 
     // 0: block_number
     let block_number = r.read_uint()?;
@@ -358,23 +365,17 @@ fn decode_conway_header_inner(
     //
     // We read the 11th element when present; both absent and CBOR-null map to
     // `None` in our `prev_nonce: Option<Hash32>` field.
-    let has_prev_nonce = if body_indef {
-        era == Era::Dijkstra && r.peek_major()? != Type::Break
-    } else {
-        body_len == 11
-    };
+    let has_prev_nonce = body_len == 11;
     let prev_nonce: Option<Hash32> = if has_prev_nonce {
         read_optional_hash32_nullable(r)?
     } else {
         None
     };
-    r.close_record(body_indef)?;
 
     let raw_header_body = r.slice_from(body_start).to_vec();
 
     // KES signature (second element of outer array)
     let kes_signature = r.read_bytes_owned()?;
-    r.close_record(hdr_indef)?;
 
     Ok(BlockHeader {
         header_hash: Hash32::ZERO, // filled in by caller after blake2b_256(raw)
@@ -1241,11 +1242,13 @@ fn read_value(r: &mut Reader<'_>) -> Result<Value, SerializationError> {
         }
         Type::Array | Type::ArrayIndef => {
             // Haskell `decodeMaryValue`: `TypeListLen | TypeListLen64 | TypeListLenIndef
-            // -> decodeValuePair` (a `RecD` 2-record, so the indefinite form is accepted).
-            let indef = r.read_record_header("value array", 2)?;
+            // -> decodeValuePair`, but the pair is `RecD MaryValue` before decoder version 12,
+            // and `RecD` demands the break right after the head (`Coders.hs`
+            // `decodeCount (RecD cn) n = decodeRecordNamed "RecD" (const n) (pure (n, cn))`),
+            // so an indefinite pair fails in Conway. See `read_definite_record_header`.
+            r.read_definite_record_header("value array", 2)?;
             let coin = Lovelace(r.read_uint()?);
             let multi_asset = read_multiasset_map_u64(r)?;
-            r.close_record(indef)?;
             if multi_asset.is_empty() {
                 Ok(Value::lovelace(coin.0))
             } else {
@@ -1886,7 +1889,7 @@ pub(crate) fn read_anchor(r: &mut Reader<'_>) -> Result<Anchor, SerializationErr
     // Conway CDDL: url = text (CBOR major type 3).
     // Some implementations may encode the URL as bytes (major type 2); handle both
     // to stay robust against non-canonical encodings.
-    let indef = r.read_record_header("anchor", 2)?;
+    r.read_definite_record_header("anchor", 2)?;
     let ty = r.peek_major()?;
     let url = match ty {
         minicbor::data::Type::String => r.read_str()?.to_string(),
@@ -1899,7 +1902,6 @@ pub(crate) fn read_anchor(r: &mut Reader<'_>) -> Result<Anchor, SerializationErr
         }
     };
     let data_hash = read_hash32(r)?;
-    r.close_record(indef)?;
     Ok(Anchor { url, data_hash })
 }
 
@@ -1969,10 +1971,9 @@ fn read_voter(r: &mut Reader<'_>) -> Result<Voter, SerializationError> {
 
 pub(crate) fn read_gov_action_id(r: &mut Reader<'_>) -> Result<GovActionId, SerializationError> {
     // gov_action_id = [transaction_id, gov_action_index]
-    let indef = r.read_record_header("gov_action_id", 2)?;
+    r.read_definite_record_header("gov_action_id", 2)?;
     let transaction_id = read_hash32(r)?;
     let action_index = r.read_uint()? as u32;
-    r.close_record(indef)?;
     Ok(GovActionId {
         transaction_id,
         action_index,
@@ -1990,10 +1991,9 @@ pub(crate) fn read_voting_procedure_for_test(
 
 fn read_voting_procedure(r: &mut Reader<'_>) -> Result<VotingProcedure, SerializationError> {
     // voting_procedure = [vote, anchor / null]
-    let indef = r.read_record_header("voting_procedure", 2)?;
+    r.read_definite_record_header("voting_procedure", 2)?;
     let vote = read_vote(r)?;
     let anchor = read_optional_anchor(r)?;
-    r.close_record(indef)?;
     Ok(VotingProcedure { vote, anchor })
 }
 
@@ -2014,12 +2014,11 @@ pub(crate) fn read_proposal_procedure(
     era: Era,
 ) -> Result<ProposalProcedure, SerializationError> {
     // proposal_procedure = [deposit, reward_account, gov_action, anchor]
-    let indef = r.read_record_header("proposal_procedure", 4)?;
+    r.read_definite_record_header("proposal_procedure", 4)?;
     let deposit = read_lovelace(r)?;
     let return_addr = r.read_bytes_owned()?;
     let gov_action = read_gov_action(r, era)?;
     let anchor = read_anchor(r)?;
-    r.close_record(indef)?;
     Ok(ProposalProcedure {
         deposit,
         return_addr,
@@ -2165,10 +2164,9 @@ pub(crate) fn read_optional_hash28_gov(
 
 fn read_constitution(r: &mut Reader<'_>) -> Result<Constitution, SerializationError> {
     // constitution = [anchor, scripthash / null]
-    let indef = r.read_record_header("constitution", 2)?;
+    r.read_definite_record_header("constitution", 2)?;
     let anchor = read_anchor(r)?;
     let script_hash = read_optional_hash28_gov(r)?;
-    r.close_record(indef)?;
     Ok(Constitution {
         anchor,
         script_hash,
@@ -2403,10 +2401,9 @@ pub(crate) fn read_cost_models(r: &mut Reader<'_>) -> Result<CostModels, Seriali
 
 pub(crate) fn read_ex_unit_prices(r: &mut Reader<'_>) -> Result<ExUnitPrices, SerializationError> {
     // ex_unit_prices = [mem_price, step_price] — both are rationals
-    let indef = r.read_record_header("ex_unit_prices", 2)?;
+    r.read_definite_record_header("ex_unit_prices", 2)?;
     let mem = r.read_rational()?;
     let step = r.read_rational()?;
-    r.close_record(indef)?;
     Ok(ExUnitPrices {
         mem_price: Rational {
             numerator: mem.numerator,
@@ -2420,10 +2417,9 @@ pub(crate) fn read_ex_unit_prices(r: &mut Reader<'_>) -> Result<ExUnitPrices, Se
 }
 
 pub(crate) fn read_ex_units(r: &mut Reader<'_>) -> Result<ExUnits, SerializationError> {
-    let indef = r.read_record_header("ex_units", 2)?;
+    r.read_definite_record_header("ex_units", 2)?;
     let mem = r.read_uint()?;
     let steps = r.read_uint()?;
-    r.close_record(indef)?;
     Ok(ExUnits { mem, steps })
 }
 
@@ -3039,8 +3035,17 @@ pub(crate) fn decode_conway_tx_standalone(
     let mut r = Reader::new(cbor);
 
     // tx = [body, witness_set, is_valid, aux_data]
-    // Haskell `Ann (RecD AlonzoTx)` = `decodeRecordNamed` (definite or indefinite).
-    let tx_indef = r.read_record_header(&format!("{era:?} tx"), 4)?;
+    //
+    // Haskell (`Alonzo/Tx.hs`, cardano-ledger `f649f975`): `decodeRecordNamed "AlonzoTx" fst`
+    // whose body peeks the token type after the witnesses: a bool is the `isValid` flag
+    // (4 elements), anything else means the flag was omitted (3 elements, `IsValid True`).
+    // The record is definite or indefinite and its size must match what was read.
+    let tx_len = r.read_array_header()?;
+    if !matches!(tx_len, Some(3) | Some(4) | None) {
+        return Err(SerializationError::CborDecode(format!(
+            "{era:?} tx: expected array(3) or array(4), got {tx_len:?}"
+        )));
+    }
 
     // 1. Body — capture raw bytes for hash computation
     let body_raw = KeepRaw::parse_with(&mut r, |r| decode_conway_tx_body(r, era))?;
@@ -3053,9 +3058,12 @@ pub(crate) fn decode_conway_tx_standalone(
     let raw_witness_cbor = ws_raw.raw.to_vec();
     let witness_set = ws_raw.value;
 
-    // 3. is_valid bool
-    // Haskell decodes it with `decCBOR @Bool`: any other token is a decode failure.
-    let is_valid = r.read_bool()?;
+    // 3. is_valid bool (optional on the wire, see above)
+    let (flag_supplied, is_valid) = if r.peek_major()? == Type::Bool {
+        (true, r.read_bool()?)
+    } else {
+        (false, true)
+    };
 
     // 4. Auxiliary data (null or a value)
     let auxiliary_data = {
@@ -3067,7 +3075,7 @@ pub(crate) fn decode_conway_tx_standalone(
             Some(decode_auxiliary_data(&mut r, era)?)
         }
     };
-    r.close_record(tx_indef)?;
+    r.close_sum_record(tx_len, if flag_supplied { 4 } else { 3 })?;
 
     Ok(Transaction {
         hash: tx_hash,
@@ -5900,8 +5908,13 @@ mod tests {
 
     #[test]
     fn conway_standalone_tx_rejects_wrong_arity() {
-        let cbor = [0x83, 0xa0, 0xa0, 0xf6];
-        assert!(decode_conway_tx_standalone(&cbor, Era::Conway).is_err());
+        // array(3) is the valid flag-less form (`Alonzo/Tx.hs`); 2 and 5 are not.
+        for cbor in [
+            &[0x82, 0xa0, 0xa0][..],
+            &[0x85, 0xa0, 0xa0, 0xf5, 0xf6, 0xf6],
+        ] {
+            assert!(decode_conway_tx_standalone(cbor, Era::Conway).is_err());
+        }
     }
 
     #[test]

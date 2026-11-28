@@ -226,6 +226,53 @@ fn tx_submission_accepts_indefinite_outputs_and_keeps_the_tx_id() {
     }
 }
 
+/// `Alonzo/Tx.hs` (cardano-ledger `f649f975`) peeks the token after the witnesses: a bool is
+/// the `isValid` flag (4 elements), anything else means it was omitted (3 elements,
+/// `IsValid True`); the record may be definite or indefinite but its size must match.
+#[test]
+fn standalone_tx_accepts_the_three_element_form_without_is_valid() {
+    let b = body(&[indef_map_output()], None);
+    let mut three = vec![0x83];
+    three.extend_from_slice(&b);
+    three.extend([0xa0, 0xf6]); // wits {}, aux null
+    let tx = decode_transaction(6, &three).expect("3-element tx");
+    assert!(tx.is_valid);
+    assert_eq!(tx.hash, blake2b_256(&b));
+
+    // indefinite framing, with and without the flag
+    for (flag, wire) in [
+        (true, {
+            let mut v = vec![0x9f];
+            v.extend_from_slice(&b);
+            v.extend([0xa0, 0xf4, 0xf6, 0xff]);
+            v
+        }),
+        (false, {
+            let mut v = vec![0x9f];
+            v.extend_from_slice(&b);
+            v.extend([0xa0, 0xf6, 0xff]);
+            v
+        }),
+    ] {
+        let tx = decode_transaction(6, &wire).expect("indefinite tx");
+        assert_eq!(tx.is_valid, !flag);
+    }
+
+    // sizes that do not match what was read, and a non-bool in the flag position, are refused
+    let mut wrong = vec![0x84];
+    wrong.extend_from_slice(&b);
+    wrong.extend([0xa0, 0xf6]); // array(4) but only three elements follow
+    assert!(decode_transaction(6, &wrong).is_err());
+    let mut not_bool = vec![0x84];
+    not_bool.extend_from_slice(&b);
+    not_bool.extend([0xa0, 0x00, 0xf6]);
+    assert!(decode_transaction(6, &not_bool).is_err());
+    let mut excess = vec![0x9f];
+    excess.extend_from_slice(&b);
+    excess.extend([0xa0, 0xf5, 0xf6, 0x00, 0xff]);
+    assert!(decode_transaction(6, &excess).is_err());
+}
+
 #[test]
 fn standalone_output_decoders_accept_indefinite_forms_in_every_era() {
     for era in [5u16, 6, 7] {

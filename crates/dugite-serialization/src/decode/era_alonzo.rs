@@ -677,11 +677,11 @@ pub(crate) fn read_value(r: &mut Reader<'_>) -> Result<Value, SerializationError
             Ok(Value::lovelace(coin))
         }
         Type::Array | Type::ArrayIndef => {
-            // Haskell `decodeMaryValue`: `TypeListLen | TypeListLen64 | TypeListLenIndef`.
-            let indef = r.read_record_header("value array", 2)?;
+            // Haskell `decodeMaryValue` pair is `RecD MaryValue` below decoder version 12:
+            // an indefinite array fails (see `read_definite_record_header`).
+            r.read_definite_record_header("value array", 2)?;
             let coin = Lovelace(r.read_uint()?);
             let multi_asset = read_multiasset_map_u64(r)?;
-            r.close_record(indef)?;
             if multi_asset.is_empty() {
                 Ok(Value::lovelace(coin.0))
             } else {
