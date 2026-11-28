@@ -160,12 +160,8 @@ fn decode_conway_block_mode(
 
     // block = [header, tx_bodies, tx_witness_sets, auxiliary_data_set, invalid_txs]
     // 5 elements (Alonzo+).
-    let block_arr = r.read_array_header()?;
-    if !matches!(block_arr, Some(5)) {
-        return Err(SerializationError::CborDecode(format!(
-            "conway block: expected array(5), got {block_arr:?}"
-        )));
-    }
+    // Haskell: `decodeRecordNamed "Block" (const 5)` (definite or indefinite).
+    let block_indef = r.read_record_header("conway block", 5)?;
 
     // -------------------------------------------------------------------------
     // 1. Header
@@ -228,6 +224,7 @@ fn decode_conway_block_mode(
     let invalid_tx_indices: Vec<u64> = r.read_set(|r| r.read_uint())?;
     let invalid_set: std::collections::HashSet<usize> =
         invalid_tx_indices.into_iter().map(|i| i as usize).collect();
+    r.close_record(block_indef)?;
 
     // -------------------------------------------------------------------------
     // Build transactions
@@ -305,30 +302,31 @@ fn empty_witness_set() -> TransactionWitnessSet {
 
 fn decode_conway_header_inner(
     r: &mut Reader<'_>,
-    _era: Era,
+    era: Era,
 ) -> Result<BlockHeader, SerializationError> {
     // header = [header_body, kes_signature]
-    let hdr_arr = r.read_array_header()?;
-    if !matches!(hdr_arr, Some(2)) {
-        return Err(SerializationError::CborDecode(format!(
-            "conway header: expected array(2), got {hdr_arr:?}"
-        )));
-    }
+    let hdr_indef = r.read_record_header("conway header", 2)?;
 
     // Conway header_body = array(10).
     // Dijkstra may add an optional 11th element: prevNonce (bytes(32) or null).
     // We accept array(10) or array(11) to handle both.
     // Capture raw bytes (the KES-signed message) — includes the 11th element.
     let body_start = r.position();
+    // Haskell's Praos `HeaderBody` is `decodeRecordNamed "HeaderBody" (const 10)`:
+    // exactly 10 elements, definite or indefinite. Only Dijkstra carries the optional
+    // 11th `prevNonce` element.
     let body_arr = r.read_array_header()?;
     let body_len = match body_arr {
-        Some(n @ (10 | 11)) => n,
+        Some(10) => 10,
+        Some(11) if era == Era::Dijkstra => 11,
+        None => 0, // indefinite: the optional 11th element is detected below
         _ => {
             return Err(SerializationError::CborDecode(format!(
-                "conway/dijkstra header_body: expected array(10) or array(11), got {body_arr:?}"
+                "header_body: expected array(10), got {body_arr:?}"
             )));
         }
     };
+    let body_indef = body_arr.is_none();
 
     // 0: block_number
     let block_number = r.read_uint()?;
@@ -360,16 +358,23 @@ fn decode_conway_header_inner(
     //
     // We read the 11th element when present; both absent and CBOR-null map to
     // `None` in our `prev_nonce: Option<Hash32>` field.
-    let prev_nonce: Option<Hash32> = if body_len == 11 {
+    let has_prev_nonce = if body_indef {
+        era == Era::Dijkstra && r.peek_major()? != Type::Break
+    } else {
+        body_len == 11
+    };
+    let prev_nonce: Option<Hash32> = if has_prev_nonce {
         read_optional_hash32_nullable(r)?
     } else {
         None
     };
+    r.close_record(body_indef)?;
 
     let raw_header_body = r.slice_from(body_start).to_vec();
 
     // KES signature (second element of outer array)
     let kes_signature = r.read_bytes_owned()?;
+    r.close_record(hdr_indef)?;
 
     Ok(BlockHeader {
         header_hash: Hash32::ZERO, // filled in by caller after blake2b_256(raw)
@@ -442,16 +447,12 @@ fn read_vrf_cert(r: &mut Reader<'_>) -> Result<(Vec<u8>, Vec<u8>), Serialization
 
 fn read_operational_cert(r: &mut Reader<'_>) -> Result<OperationalCert, SerializationError> {
     // operational_cert = [hot_vkey(32), seq_num, kes_period, sigma(64)]
-    let arr_len = r.read_array_header()?;
-    if !matches!(arr_len, Some(4)) {
-        return Err(SerializationError::CborDecode(format!(
-            "operational_cert: expected array(4), got {arr_len:?}"
-        )));
-    }
+    let indef = r.read_record_header("operational_cert", 4)?;
     let hot_vkey = r.read_bytes_owned()?;
     let sequence_number = r.read_uint()?;
     let kes_period = r.read_uint()?;
     let sigma = r.read_bytes_owned()?;
+    r.close_record(indef)?;
     Ok(OperationalCert {
         hot_vkey,
         sequence_number,
@@ -461,14 +462,10 @@ fn read_operational_cert(r: &mut Reader<'_>) -> Result<OperationalCert, Serializ
 }
 
 fn read_protocol_version(r: &mut Reader<'_>) -> Result<ProtocolVersion, SerializationError> {
-    let arr_len = r.read_array_header()?;
-    if !matches!(arr_len, Some(2)) {
-        return Err(SerializationError::CborDecode(format!(
-            "protocol_version: expected array(2), got {arr_len:?}"
-        )));
-    }
+    let indef = r.read_record_header("protocol_version", 2)?;
     let major = r.read_uint()?;
     let minor = r.read_uint()?;
+    r.close_record(indef)?;
     Ok(ProtocolVersion { major, minor })
 }
 
@@ -788,12 +785,7 @@ fn decode_sub_transactions(
     r.for_each_array_item(|r| {
         // DijkstraSubTx = [body, wits, auxData] — array(3), verbatim shape
         // of decodeRecordNamed "DijkstraSubTx" (const 3).
-        let arr_len = r.read_array_header()?;
-        if !matches!(arr_len, Some(3)) {
-            return Err(SerializationError::CborDecode(format!(
-                "Dijkstra sub-tx: expected array(3) [body, wits, auxData], got {arr_len:?}"
-            )));
-        }
+        let sub_indef = r.read_record_header("Dijkstra sub-tx [body, wits, auxData]", 3)?;
 
         // 1. Body — capture raw bytes for TxId computation. This span is
         // exactly the body's own bytes (KeepRaw scopes to the inner
@@ -823,6 +815,7 @@ fn decode_sub_transactions(
                 Some(decode_auxiliary_data(r, Era::Dijkstra)?)
             }
         };
+        r.close_record(sub_indef)?;
 
         out.push(sub);
         Ok(())
@@ -1096,14 +1089,10 @@ fn decode_account_balance_interval(
 }
 
 fn read_tx_input(r: &mut Reader<'_>) -> Result<TransactionInput, SerializationError> {
-    let arr_len = r.read_array_header()?;
-    if !matches!(arr_len, Some(2)) {
-        return Err(SerializationError::CborDecode(format!(
-            "tx_input: expected array(2), got {arr_len:?}"
-        )));
-    }
+    let indef = r.read_record_header("tx_input", 2)?;
     let tx_hash = read_hash32(r)?;
     let index = r.read_uint()? as u32;
+    r.close_record(indef)?;
     Ok(TransactionInput {
         transaction_id: tx_hash,
         index,
@@ -1131,13 +1120,25 @@ fn read_babbage_tx_output_with_raw(
 /// 1. **Legacy array**: `[address, value]` or `[address, value, datum_hash]`
 /// 2. **Post-Alonzo map**: `{ 0: address, 1: value, ? 2: datum_option, ? 3: script_ref }`
 fn read_babbage_tx_output(r: &mut Reader<'_>) -> Result<TransactionOutput, SerializationError> {
+    // Haskell `decodeBabbageTxOut` (cardano-ledger `Babbage/TxOut.hs`):
+    //
+    // ```haskell
+    // peekTokenType >>= \case
+    //   TypeMapLenIndef -> decodeTxOut decAddr
+    //   TypeMapLen      -> decodeTxOut decAddr
+    //   _               -> oldTxOut          -- decodeListLenOrIndef
+    // ```
+    //
+    // `0xbb` (an 8-byte map length) is cborg's `TypeMapLen64`, which is NOT matched
+    // above: it falls to `oldTxOut` and fails there. minicbor reports it as
+    // `Type::Map` too, so the head byte is checked explicitly.
     let ty = r.peek_major()?;
     match ty {
-        Type::Array => {
+        Type::Array | Type::ArrayIndef => {
             // Legacy array form
             read_legacy_tx_output(r)
         }
-        Type::Map => {
+        Type::Map | Type::MapIndef if r.peek_byte() != Some(0xbb) => {
             // Post-Alonzo map form
             read_map_tx_output(r)
         }
@@ -1148,25 +1149,29 @@ fn read_babbage_tx_output(r: &mut Reader<'_>) -> Result<TransactionOutput, Seria
 }
 
 fn read_legacy_tx_output(r: &mut Reader<'_>) -> Result<TransactionOutput, SerializationError> {
+    // Haskell `oldTxOut`: `decodeListLenOrIndef`; definite 2 or 3, or an indefinite
+    // array of 2 or 3 elements closed by a break ("Excess terms in TxOut" otherwise).
     let arr_len = r.read_array_header()?;
-    let n = match arr_len {
-        Some(2) | Some(3) => arr_len.unwrap(),
-        _ => {
-            return Err(SerializationError::CborDecode(format!(
-                "legacy tx_out: expected array(2) or array(3), got {arr_len:?}"
-            )));
-        }
-    };
+    if !matches!(arr_len, Some(2) | Some(3) | None) {
+        return Err(SerializationError::CborDecode(format!(
+            "legacy tx_out: expected array(2) or array(3), got {arr_len:?}"
+        )));
+    }
     let addr_bytes = r.read_bytes_owned()?;
     let address = Address::from_bytes(&addr_bytes)
         .map_err(|e| SerializationError::InvalidData(format!("output address: {e}")))?;
     let value = read_value(r)?;
-    let datum = if n == 3 {
+    let has_datum_hash = match arr_len {
+        Some(n) => n == 3,
+        None => r.peek_major()? != Type::Break,
+    };
+    let datum = if has_datum_hash {
         let dh = read_hash32(r)?;
         OutputDatum::DatumHash(dh)
     } else {
         OutputDatum::None
     };
+    r.close_record(arr_len.is_none())?;
     Ok(TransactionOutput {
         address,
         value,
@@ -1237,15 +1242,13 @@ fn read_value(r: &mut Reader<'_>) -> Result<Value, SerializationError> {
             let coin = r.read_uint()?;
             Ok(Value::lovelace(coin))
         }
-        Type::Array => {
-            let arr_len = r.read_array_header()?;
-            if !matches!(arr_len, Some(2)) {
-                return Err(SerializationError::CborDecode(format!(
-                    "value array: expected array(2), got {arr_len:?}"
-                )));
-            }
+        Type::Array | Type::ArrayIndef => {
+            // Haskell `decodeMaryValue`: `TypeListLen | TypeListLen64 | TypeListLenIndef
+            // -> decodeValuePair` (a `RecD` 2-record, so the indefinite form is accepted).
+            let indef = r.read_record_header("value array", 2)?;
             let coin = Lovelace(r.read_uint()?);
             let multi_asset = read_multiasset_map_u64(r)?;
+            r.close_record(indef)?;
             if multi_asset.is_empty() {
                 Ok(Value::lovelace(coin.0))
             } else {
@@ -1371,32 +1374,32 @@ fn read_withdrawals(r: &mut Reader<'_>) -> Result<BTreeMap<Vec<u8>, Lovelace>, S
 
 /// Read a datum_option: `[0, datum_hash]` or `[1, tag(24) bytes]`.
 fn read_datum_option(r: &mut Reader<'_>) -> Result<OutputDatum, SerializationError> {
-    let arr_len = r.read_array_header()?;
-    if !matches!(arr_len, Some(2)) {
-        return Err(SerializationError::CborDecode(format!(
-            "datum_option: expected array(2), got {arr_len:?}"
-        )));
-    }
+    // Haskell `Datum` is `Summands "Datum"` (`decodeRecordSum`): definite or indefinite.
+    let indef = r.read_record_header("datum_option", 2)?;
     let disc = r.read_uint()?;
-    match disc {
+    let out = match disc {
         0 => {
             let dh = read_hash32(r)?;
-            Ok(OutputDatum::DatumHash(dh))
+            OutputDatum::DatumHash(dh)
         }
         1 => {
             // Inline datum: tag(24) bytes containing serialized PlutusData
             let inner_bytes = r.read_embedded_cbor_bytes()?.to_vec();
             let mut inner_r = Reader::new(&inner_bytes);
             let pd = read_plutus_data(&mut inner_r)?;
-            Ok(OutputDatum::InlineDatum {
+            OutputDatum::InlineDatum {
                 data: pd,
                 raw_cbor: Some(inner_bytes),
-            })
+            }
         }
-        other => Err(SerializationError::CborDecode(format!(
-            "datum_option: unknown discriminator {other}"
-        ))),
-    }
+        other => {
+            return Err(SerializationError::CborDecode(format!(
+                "datum_option: unknown discriminator {other}"
+            )));
+        }
+    };
+    r.close_record(indef)?;
+    Ok(out)
 }
 
 /// Read a script reference: `#6.24(bytes .cbor script)` where the embedded
@@ -1418,41 +1421,30 @@ fn read_script_ref(
     // script_ref = #6.24(bytes .cbor script)
     let inner = r.read_embedded_cbor_bytes()?.to_vec();
     let mut sr = Reader::new(&inner);
-    let arr_len = sr.read_array_header()?;
-    if !matches!(arr_len, Some(2)) {
-        return Err(SerializationError::CborDecode(format!(
-            "script_ref: expected array(2), got {arr_len:?}"
-        )));
-    }
+    // Haskell `Script` is `Summands "AlonzoScript"` (`decodeRecordSum`): the inner
+    // `[type, script]` array may be definite or indefinite.
+    let indef = sr.read_record_header("script_ref", 2)?;
     let script_type = sr.read_uint()?;
-    match script_type {
+    let out = match script_type {
         0 => {
             // Native script — value is an array, read in place.
             let ns = read_native_script(&mut sr)?;
-            Ok(ScriptRef::NativeScript(ns))
+            ScriptRef::NativeScript(ns)
         }
-        1 => {
-            let script_bytes = sr.read_bytes_owned()?;
-            Ok(ScriptRef::PlutusV1(script_bytes))
+        1 => ScriptRef::PlutusV1(sr.read_bytes_owned()?),
+        2 => ScriptRef::PlutusV2(sr.read_bytes_owned()?),
+        3 => ScriptRef::PlutusV3(sr.read_bytes_owned()?),
+        // PlutusV4: Dijkstra language tag 4. Wire shape identical to V3 —
+        // `bstr(flat_program)`. Cost-model slot 3 (issue #475 Phase 5).
+        4 => ScriptRef::PlutusV4(sr.read_bytes_owned()?),
+        other => {
+            return Err(SerializationError::CborDecode(format!(
+                "script_ref: unknown script type {other}"
+            )));
         }
-        2 => {
-            let script_bytes = sr.read_bytes_owned()?;
-            Ok(ScriptRef::PlutusV2(script_bytes))
-        }
-        3 => {
-            let script_bytes = sr.read_bytes_owned()?;
-            Ok(ScriptRef::PlutusV3(script_bytes))
-        }
-        4 => {
-            // PlutusV4: Dijkstra language tag 4. Wire shape identical to V3 —
-            // `bstr(flat_program)`. Cost-model slot 3 (issue #475 Phase 5).
-            let script_bytes = sr.read_bytes_owned()?;
-            Ok(ScriptRef::PlutusV4(script_bytes))
-        }
-        other => Err(SerializationError::CborDecode(format!(
-            "script_ref: unknown script type {other}"
-        ))),
-    }
+    };
+    sr.close_record(indef)?;
+    Ok(out)
 }
 
 /// Capture the ORIGINAL wire byte span of each native script in a `native_scripts`
@@ -1529,7 +1521,9 @@ pub fn reference_native_script_original_bytes(output_cbor: &[u8]) -> Option<Vec<
             // script_ref = #6.24(bytes .cbor [type, script])
             let inner = r.read_embedded_cbor_bytes()?.to_vec();
             let mut sr = Reader::new(&inner);
-            if matches!(sr.read_array_header()?, Some(2)) && sr.read_uint()? == 0 {
+            // Indefinite `[type, script]` arrays are valid (`decodeRecordSum`), and the
+            // native script's hash is over its ORIGINAL bytes, so accept both forms.
+            if sr.read_record_header("script_ref", 2).is_ok() && sr.read_uint()? == 0 {
                 let kr = KeepRaw::parse_with(&mut sr, read_native_script)?;
                 found = Some(kr.raw.to_vec());
             }
@@ -1633,14 +1627,23 @@ pub(crate) fn read_conway_certificate_for_test(
 }
 
 fn read_conway_certificate(r: &mut Reader<'_>) -> Result<Certificate, SerializationError> {
-    let arr_len = r.read_array_header()?;
-    if arr_len.is_none() {
-        return Err(SerializationError::CborDecode(
-            "certificate: expected definite-length array".into(),
-        ));
-    }
+    // Haskell `decodeRecordSum "ConwayTxCert"` (`Conway/TxCert.hs`): `decodeListLenOrIndef`
+    // then the per-tag decoder returns `(size, cert)`; a definite array must declare exactly
+    // `size`, an indefinite one must be closed by a break right after the fields.
+    let declared = r.read_array_header()?;
     let cert_type = r.read_uint()?;
-    match cert_type {
+    // Element count of the whole record (tag included) per certificate type; unknown
+    // types, and the removed types 5 and 6, fail in their arm below.
+    let size: u64 = match cert_type {
+        0 | 1 => 2,
+        2 | 4 | 7 | 8 | 9 | 14 | 15 | 17 | 18 => 3,
+        10 | 11 | 12 | 16 => 4,
+        13 => 5,
+        // `1 + listLenInt (Just group)` with the 9-field `PoolParams` group.
+        3 => 10,
+        _ => 0,
+    };
+    let cert = match cert_type {
         // ── Shelley legacy certificates ──────────────────────────────────────
         0 => {
             let cred = read_stake_credential(r)?;
@@ -1802,25 +1805,27 @@ fn read_conway_certificate(r: &mut Reader<'_>) -> Result<Certificate, Serializat
         other => Err(SerializationError::CborDecode(format!(
             "conway certificate: unknown type {other}"
         ))),
-    }
+    }?;
+    r.close_sum_record(declared, size)?;
+    Ok(cert)
 }
 
 fn read_stake_credential(r: &mut Reader<'_>) -> Result<Credential, SerializationError> {
-    let arr_len = r.read_array_header()?;
-    if !matches!(arr_len, Some(2)) {
-        return Err(SerializationError::CborDecode(format!(
-            "stake_credential: expected array(2), got {arr_len:?}"
-        )));
-    }
+    // Haskell `Credential` is `decodeRecordSum "Credential"`: definite or indefinite.
+    let indef = r.read_record_header("stake_credential", 2)?;
     let disc = r.read_uint()?;
     let hash = read_hash28_cert(r)?;
-    match disc {
-        0 => Ok(Credential::VerificationKey(hash)),
-        1 => Ok(Credential::Script(hash)),
-        other => Err(SerializationError::CborDecode(format!(
-            "stake_credential: unknown discriminator {other}"
-        ))),
-    }
+    let cred = match disc {
+        0 => Credential::VerificationKey(hash),
+        1 => Credential::Script(hash),
+        other => {
+            return Err(SerializationError::CborDecode(format!(
+                "stake_credential: unknown discriminator {other}"
+            )));
+        }
+    };
+    r.close_record(indef)?;
+    Ok(cred)
 }
 
 fn read_hash28_cert(r: &mut Reader<'_>) -> Result<Hash28, SerializationError> {
@@ -1846,28 +1851,23 @@ pub(crate) fn read_drep_for_test(r: &mut Reader<'_>) -> Result<DRep, Serializati
 }
 
 fn read_drep(r: &mut Reader<'_>) -> Result<DRep, SerializationError> {
-    let arr_len = r.read_array_header()?;
-    if arr_len.is_none() {
-        return Err(SerializationError::CborDecode(
-            "drep: expected definite-length array".into(),
-        ));
-    }
+    // Haskell `DRep` is `decodeRecordSum "DRep"`: `(2, ..)` for key/script hash and `(1, ..)`
+    // for the two argument-less constructors; definite or indefinite.
+    let declared = r.read_array_header()?;
     let disc = r.read_uint()?;
-    match disc {
-        0 => {
-            let h28 = read_hash28_cert(r)?;
-            Ok(DRep::KeyHash(h28.to_hash32_padded()))
+    let (size, drep) = match disc {
+        0 => (2, DRep::KeyHash(read_hash28_cert(r)?.to_hash32_padded())),
+        1 => (2, DRep::ScriptHash(read_hash28_cert(r)?)),
+        2 => (1, DRep::Abstain),
+        3 => (1, DRep::NoConfidence),
+        other => {
+            return Err(SerializationError::CborDecode(format!(
+                "drep: unknown discriminator {other}"
+            )));
         }
-        1 => {
-            let h28 = read_hash28_cert(r)?;
-            Ok(DRep::ScriptHash(h28))
-        }
-        2 => Ok(DRep::Abstain),
-        3 => Ok(DRep::NoConfidence),
-        other => Err(SerializationError::CborDecode(format!(
-            "drep: unknown discriminator {other}"
-        ))),
-    }
+    };
+    r.close_sum_record(declared, size)?;
+    Ok(drep)
 }
 
 fn read_optional_anchor(r: &mut Reader<'_>) -> Result<Option<Anchor>, SerializationError> {
@@ -1884,12 +1884,7 @@ pub(crate) fn read_anchor(r: &mut Reader<'_>) -> Result<Anchor, SerializationErr
     // Conway CDDL: url = text (CBOR major type 3).
     // Some implementations may encode the URL as bytes (major type 2); handle both
     // to stay robust against non-canonical encodings.
-    let arr_len = r.read_array_header()?;
-    if !matches!(arr_len, Some(2)) {
-        return Err(SerializationError::CborDecode(format!(
-            "anchor: expected array(2), got {arr_len:?}"
-        )));
-    }
+    let indef = r.read_record_header("anchor", 2)?;
     let ty = r.peek_major()?;
     let url = match ty {
         minicbor::data::Type::String => r.read_str()?.to_string(),
@@ -1902,6 +1897,7 @@ pub(crate) fn read_anchor(r: &mut Reader<'_>) -> Result<Anchor, SerializationErr
         }
     };
     let data_hash = read_hash32(r)?;
+    r.close_record(indef)?;
     Ok(Anchor { url, data_hash })
 }
 
@@ -1949,53 +1945,32 @@ pub(crate) fn read_voter_for_test(r: &mut Reader<'_>) -> Result<Voter, Serializa
 }
 
 fn read_voter(r: &mut Reader<'_>) -> Result<Voter, SerializationError> {
-    let arr_len = r.read_array_header()?;
-    if !matches!(arr_len, Some(2)) {
-        return Err(SerializationError::CborDecode(format!(
-            "voter: expected array(2), got {arr_len:?}"
-        )));
-    }
+    // Haskell `Voter` is `decodeRecordSum "Voter"` (definite or indefinite).
+    let indef = r.read_record_header("voter", 2)?;
     let disc = r.read_uint()?;
-    match disc {
-        0 => {
-            let h = read_hash28_cert(r)?;
-            Ok(Voter::ConstitutionalCommittee(Credential::VerificationKey(
-                h,
-            )))
+    let voter = match disc {
+        0 => Voter::ConstitutionalCommittee(Credential::VerificationKey(read_hash28_cert(r)?)),
+        1 => Voter::ConstitutionalCommittee(Credential::Script(read_hash28_cert(r)?)),
+        2 => Voter::DRep(Credential::VerificationKey(read_hash28_cert(r)?)),
+        3 => Voter::DRep(Credential::Script(read_hash28_cert(r)?)),
+        // Pool key hash (28 bytes) padded to Hash32
+        4 => Voter::StakePool(read_hash28_cert(r)?.to_hash32_padded()),
+        other => {
+            return Err(SerializationError::CborDecode(format!(
+                "voter: unknown discriminator {other}"
+            )));
         }
-        1 => {
-            let h = read_hash28_cert(r)?;
-            Ok(Voter::ConstitutionalCommittee(Credential::Script(h)))
-        }
-        2 => {
-            let h = read_hash28_cert(r)?;
-            Ok(Voter::DRep(Credential::VerificationKey(h)))
-        }
-        3 => {
-            let h = read_hash28_cert(r)?;
-            Ok(Voter::DRep(Credential::Script(h)))
-        }
-        4 => {
-            // Pool key hash (28 bytes) padded to Hash32
-            let h28 = read_hash28_cert(r)?;
-            Ok(Voter::StakePool(h28.to_hash32_padded()))
-        }
-        other => Err(SerializationError::CborDecode(format!(
-            "voter: unknown discriminator {other}"
-        ))),
-    }
+    };
+    r.close_record(indef)?;
+    Ok(voter)
 }
 
 pub(crate) fn read_gov_action_id(r: &mut Reader<'_>) -> Result<GovActionId, SerializationError> {
     // gov_action_id = [transaction_id, gov_action_index]
-    let arr_len = r.read_array_header()?;
-    if !matches!(arr_len, Some(2)) {
-        return Err(SerializationError::CborDecode(format!(
-            "gov_action_id: expected array(2), got {arr_len:?}"
-        )));
-    }
+    let indef = r.read_record_header("gov_action_id", 2)?;
     let transaction_id = read_hash32(r)?;
     let action_index = r.read_uint()? as u32;
+    r.close_record(indef)?;
     Ok(GovActionId {
         transaction_id,
         action_index,
@@ -2013,14 +1988,10 @@ pub(crate) fn read_voting_procedure_for_test(
 
 fn read_voting_procedure(r: &mut Reader<'_>) -> Result<VotingProcedure, SerializationError> {
     // voting_procedure = [vote, anchor / null]
-    let arr_len = r.read_array_header()?;
-    if !matches!(arr_len, Some(2)) {
-        return Err(SerializationError::CborDecode(format!(
-            "voting_procedure: expected array(2), got {arr_len:?}"
-        )));
-    }
+    let indef = r.read_record_header("voting_procedure", 2)?;
     let vote = read_vote(r)?;
     let anchor = read_optional_anchor(r)?;
+    r.close_record(indef)?;
     Ok(VotingProcedure { vote, anchor })
 }
 
@@ -2041,16 +2012,12 @@ pub(crate) fn read_proposal_procedure(
     era: Era,
 ) -> Result<ProposalProcedure, SerializationError> {
     // proposal_procedure = [deposit, reward_account, gov_action, anchor]
-    let arr_len = r.read_array_header()?;
-    if !matches!(arr_len, Some(4)) {
-        return Err(SerializationError::CborDecode(format!(
-            "proposal_procedure: expected array(4), got {arr_len:?}"
-        )));
-    }
+    let indef = r.read_record_header("proposal_procedure", 4)?;
     let deposit = read_lovelace(r)?;
     let return_addr = r.read_bytes_owned()?;
     let gov_action = read_gov_action(r, era)?;
     let anchor = read_anchor(r)?;
+    r.close_record(indef)?;
     Ok(ProposalProcedure {
         deposit,
         return_addr,
@@ -2082,14 +2049,19 @@ pub(crate) fn read_gov_action_for_test(
 }
 
 fn read_gov_action(r: &mut Reader<'_>, era: Era) -> Result<GovAction, SerializationError> {
-    let arr_len = r.read_array_header()?;
-    if arr_len.is_none() {
-        return Err(SerializationError::CborDecode(
-            "gov_action: expected definite-length array".into(),
-        ));
-    }
+    // Haskell `GovAction` is `decodeRecordSum "GovAction"` (definite or indefinite; a definite
+    // array must declare exactly the constructor's size, tag included).
+    let declared = r.read_array_header()?;
     let disc = r.read_uint()?;
-    match disc {
+    let size: u64 = match disc {
+        0 => 4,
+        1 | 2 | 5 => 3,
+        3 => 2,
+        4 => 5,
+        6 => 1,
+        _ => 0,
+    };
+    let action = match disc {
         0 => {
             // ParameterChange
             let prev_action_id = read_optional_gov_action_id(r)?;
@@ -2104,14 +2076,10 @@ fn read_gov_action(r: &mut Reader<'_>, era: Era) -> Result<GovAction, Serializat
         1 => {
             // HardForkInitiation
             let prev_action_id = read_optional_gov_action_id(r)?;
-            let ver_arr = r.read_array_header()?;
-            if !matches!(ver_arr, Some(2)) {
-                return Err(SerializationError::CborDecode(format!(
-                    "HardForkInitiation: protocol version expected array(2), got {ver_arr:?}"
-                )));
-            }
+            let ver_indef = r.read_record_header("HardForkInitiation protocol version", 2)?;
             let major = r.read_uint()?;
             let minor = r.read_uint()?;
+            r.close_record(ver_indef)?;
             Ok(GovAction::HardForkInitiation {
                 prev_action_id,
                 protocol_version: (major, minor),
@@ -2166,7 +2134,9 @@ fn read_gov_action(r: &mut Reader<'_>, era: Era) -> Result<GovAction, Serializat
         other => Err(SerializationError::CborDecode(format!(
             "gov_action: unknown discriminator {other}"
         ))),
-    }
+    }?;
+    r.close_sum_record(declared, size)?;
+    Ok(action)
 }
 
 fn read_optional_gov_action_id(
@@ -2193,14 +2163,10 @@ pub(crate) fn read_optional_hash28_gov(
 
 fn read_constitution(r: &mut Reader<'_>) -> Result<Constitution, SerializationError> {
     // constitution = [anchor, scripthash / null]
-    let arr_len = r.read_array_header()?;
-    if !matches!(arr_len, Some(2)) {
-        return Err(SerializationError::CborDecode(format!(
-            "constitution: expected array(2), got {arr_len:?}"
-        )));
-    }
+    let indef = r.read_record_header("constitution", 2)?;
     let anchor = read_anchor(r)?;
     let script_hash = read_optional_hash28_gov(r)?;
+    r.close_record(indef)?;
     Ok(Constitution {
         anchor,
         script_hash,
@@ -2435,14 +2401,10 @@ pub(crate) fn read_cost_models(r: &mut Reader<'_>) -> Result<CostModels, Seriali
 
 pub(crate) fn read_ex_unit_prices(r: &mut Reader<'_>) -> Result<ExUnitPrices, SerializationError> {
     // ex_unit_prices = [mem_price, step_price] — both are rationals
-    let arr_len = r.read_array_header()?;
-    if !matches!(arr_len, Some(2)) {
-        return Err(SerializationError::CborDecode(format!(
-            "ex_unit_prices: expected array(2), got {arr_len:?}"
-        )));
-    }
+    let indef = r.read_record_header("ex_unit_prices", 2)?;
     let mem = r.read_rational()?;
     let step = r.read_rational()?;
+    r.close_record(indef)?;
     Ok(ExUnitPrices {
         mem_price: Rational {
             numerator: mem.numerator,
@@ -2456,14 +2418,10 @@ pub(crate) fn read_ex_unit_prices(r: &mut Reader<'_>) -> Result<ExUnitPrices, Se
 }
 
 pub(crate) fn read_ex_units(r: &mut Reader<'_>) -> Result<ExUnits, SerializationError> {
-    let arr_len = r.read_array_header()?;
-    if !matches!(arr_len, Some(2)) {
-        return Err(SerializationError::CborDecode(format!(
-            "ex_units: expected array(2), got {arr_len:?}"
-        )));
-    }
+    let indef = r.read_record_header("ex_units", 2)?;
     let mem = r.read_uint()?;
     let steps = r.read_uint()?;
+    r.close_record(indef)?;
     Ok(ExUnits { mem, steps })
 }
 
@@ -2472,17 +2430,13 @@ fn read_pool_voting_thresholds(
     ppu: &mut ProtocolParamUpdate,
 ) -> Result<(), SerializationError> {
     // pool_voting_thresholds = [5 rationals]
-    let arr_len = r.read_array_header()?;
-    if !matches!(arr_len, Some(5)) {
-        return Err(SerializationError::CborDecode(format!(
-            "pool_voting_thresholds: expected array(5), got {arr_len:?}"
-        )));
-    }
+    let indef = r.read_record_header("pool_voting_thresholds", 5)?;
     let motion_no_confidence = r.read_rational()?;
     let committee_normal = r.read_rational()?;
     let committee_no_confidence = r.read_rational()?;
     let hard_fork = r.read_rational()?;
     let security = r.read_rational()?;
+    r.close_record(indef)?;
     let cvt = |rat: Rational| Rational {
         numerator: rat.numerator,
         denominator: rat.denominator,
@@ -2500,12 +2454,7 @@ fn read_drep_voting_thresholds(
     ppu: &mut ProtocolParamUpdate,
 ) -> Result<(), SerializationError> {
     // drep_voting_thresholds = [10 rationals]
-    let arr_len = r.read_array_header()?;
-    if !matches!(arr_len, Some(10)) {
-        return Err(SerializationError::CborDecode(format!(
-            "drep_voting_thresholds: expected array(10), got {arr_len:?}"
-        )));
-    }
+    let indef = r.read_record_header("drep_voting_thresholds", 10)?;
     let motion_no_confidence = r.read_rational()?;
     let committee_normal = r.read_rational()?;
     let committee_no_confidence = r.read_rational()?;
@@ -2516,6 +2465,7 @@ fn read_drep_voting_thresholds(
     let pp_technical = r.read_rational()?;
     let pp_governance = r.read_rational()?;
     let treasury = r.read_rational()?;
+    r.close_record(indef)?;
     let cvt = |rat: Rational| Rational {
         numerator: rat.numerator,
         denominator: rat.denominator,
@@ -2572,14 +2522,11 @@ pub(crate) fn decode_conway_witness_set(
                 // and ACCEPTS a duplicate. Use lenient `read_set` so a dup-vkey
                 // tx that Haskell accepts at live-mainnet PV11 does not hard-fail.
                 vkey_witnesses = r.read_set(|r| {
-                    let arr_len = r.read_array_header()?;
-                    if !matches!(arr_len, Some(2)) {
-                        return Err(SerializationError::CborDecode(
-                            "vkeywitness: expected array(2)".into(),
-                        ));
-                    }
+                    // Haskell `WitVKey`: `decodeRecordNamed "WitVKey" (const 2)`.
+                    let indef = r.read_record_header("vkeywitness", 2)?;
                     let vkey = r.read_bytes_owned()?;
                     let signature = r.read_bytes_owned()?;
+                    r.close_record(indef)?;
                     Ok(VKeyWitness { vkey, signature })
                 })?;
             }
@@ -2600,16 +2547,13 @@ pub(crate) fn decode_conway_witness_set(
                 // gated at `natVersion @12`. At PV9-11 Haskell silently dedups
                 // and ACCEPTS a duplicate. Use lenient `read_set`.
                 bootstrap_witnesses = r.read_set(|r| {
-                    let arr_len = r.read_array_header()?;
-                    if !matches!(arr_len, Some(4)) {
-                        return Err(SerializationError::CborDecode(
-                            "bootstrap_witness: expected array(4)".into(),
-                        ));
-                    }
+                    // Haskell `BootstrapWitness`: `decodeRecordNamed ... (const 4)`.
+                    let indef = r.read_record_header("bootstrap_witness", 4)?;
                     let vkey = r.read_bytes_owned()?;
                     let sig = r.read_bytes_owned()?;
                     let chain_code = r.read_bytes_owned()?;
                     let attrs = r.read_bytes_owned()?;
+                    r.close_record(indef)?;
                     Ok(BootstrapWitness {
                         vkey,
                         signature: sig,
@@ -2716,14 +2660,13 @@ fn read_redeemers_raw(r: &mut Reader<'_>, era: Era) -> Result<Vec<Redeemer>, Ser
             // so the outer type check must accept MapIndef too.
             let pairs = r.read_map(
                 |r| {
-                    let key_arr = r.read_array_header()?;
-                    if !matches!(key_arr, Some(2)) {
-                        return Err(SerializationError::CborDecode(format!(
-                            "redeemer key: expected array(2), got {key_arr:?}"
-                        )));
-                    }
+                    // The map key is `decCBOR @PlutusPurposeAsIx` (`Summands`/record: definite
+                    // or indefinite). The map VALUE below is the opposite: a plain tuple
+                    // `decCBOR` = `decodeListLenOf 2`, definite-only.
+                    let key_indef = r.read_record_header("redeemer key", 2)?;
                     let tag = read_redeemer_tag(r)?;
                     let index = r.read_uint()? as u32;
+                    r.close_record(key_indef)?;
                     Ok((tag, index))
                 },
                 |r| {
@@ -2760,16 +2703,13 @@ fn read_redeemers_raw(r: &mut Reader<'_>, era: Era) -> Result<Vec<Redeemer>, Ser
         Type::Array | Type::ArrayIndef => {
             // Pre-Conway array form: [* [tag, index, data, ex_units]]
             r.read_array(|r| {
-                let arr_len = r.read_array_header()?;
-                if !matches!(arr_len, Some(4)) {
-                    return Err(SerializationError::CborDecode(format!(
-                        "redeemer: expected array(4), got {arr_len:?}"
-                    )));
-                }
+                // Haskell `decodeRecordNamed "Redeemer" (const 4)`.
+                let indef = r.read_record_header("redeemer", 4)?;
                 let tag = read_redeemer_tag(r)?;
                 let index = r.read_uint()? as u32;
                 let data = read_plutus_data(r)?;
                 let ex_units = read_ex_units(r)?;
+                r.close_record(indef)?;
                 Ok(Redeemer {
                     tag,
                     index,
@@ -2893,7 +2833,7 @@ fn read_native_script(r: &mut Reader<'_>) -> Result<NativeScript, SerializationE
             NativeScript::ScriptAny(scripts)
         }
         3 => {
-            let n = r.read_uint()? as u32;
+            let n = r.read_native_script_threshold()?;
             let scripts = r.read_array(read_native_script)?;
             NativeScript::ScriptNOfK(n, scripts)
         }
@@ -2924,9 +2864,11 @@ fn read_native_script(r: &mut Reader<'_>) -> Result<NativeScript, SerializationE
     // Indefinite-length outer array: consume the trailing CBOR break byte
     // (0xff), exactly as upstream `decodeListLikeT` does for the `Nothing`
     // (indefinite) case. For a definite-length array nothing further is needed.
-    if arr_len.is_none() {
-        r.expect_break()?;
-    }
+    //
+    // For a DEFINITE array the declared length must equal the constructor's element count
+    // (`decodeRecordSum`'s `matchSize`): `[0, h]` is 2, `[3, n, [..]]` is 3.
+    let size = if disc == 3 { 3 } else { 2 };
+    r.close_sum_record(arr_len, size)?;
     Ok(script)
 }
 
@@ -2993,15 +2935,13 @@ fn read_plutus_data_depth(
                 }
                 102 => {
                     // Explicit alternative: tag(102) [alternative_int, [* plutus_data]]
+                    // Haskell `decodeConstrExtended`: definite array(2) or an indefinite
+                    // array closed by a break.
                     r.read_tag()?; // consume tag
-                    let inner_arr = r.read_array_header()?;
-                    if !matches!(inner_arr, Some(2)) {
-                        return Err(SerializationError::CborDecode(format!(
-                            "plutus_data Constr102: expected array(2), got {inner_arr:?}"
-                        )));
-                    }
+                    let indef = r.read_record_header("plutus_data Constr102", 2)?;
                     let alt = r.read_uint()?;
                     let fields = r.read_array(|r| read_plutus_data_depth(r, depth + 1))?;
+                    r.close_record(indef)?;
                     Ok(PlutusData::Constr(alt, fields))
                 }
                 _ => {
@@ -3097,20 +3037,8 @@ pub(crate) fn decode_conway_tx_standalone(
     let mut r = Reader::new(cbor);
 
     // tx = [body, witness_set, is_valid, aux_data]
-    let arr_len = r.read_array_header()?;
-    match arr_len {
-        Some(4) => {}
-        Some(n) => {
-            return Err(SerializationError::CborDecode(format!(
-                "{era:?} tx: expected array(4), got array({n})"
-            )));
-        }
-        None => {
-            return Err(SerializationError::CborDecode(format!(
-                "{era:?} tx: expected definite-length array"
-            )));
-        }
-    }
+    // Haskell `Ann (RecD AlonzoTx)` = `decodeRecordNamed` (definite or indefinite).
+    let tx_indef = r.read_record_header(&format!("{era:?} tx"), 4)?;
 
     // 1. Body — capture raw bytes for hash computation
     let body_raw = KeepRaw::parse_with(&mut r, |r| decode_conway_tx_body(r, era))?;
@@ -3124,15 +3052,8 @@ pub(crate) fn decode_conway_tx_standalone(
     let witness_set = ws_raw.value;
 
     // 3. is_valid bool
-    let is_valid = {
-        let ty = r.peek_major()?;
-        if ty == Type::Bool {
-            r.read_bool()?
-        } else {
-            r.skip()?;
-            true
-        }
-    };
+    // Haskell decodes it with `decCBOR @Bool`: any other token is a decode failure.
+    let is_valid = r.read_bool()?;
 
     // 4. Auxiliary data (null or a value)
     let auxiliary_data = {
@@ -3144,6 +3065,7 @@ pub(crate) fn decode_conway_tx_standalone(
             Some(decode_auxiliary_data(&mut r, era)?)
         }
     };
+    r.close_record(tx_indef)?;
 
     Ok(Transaction {
         hash: tx_hash,
@@ -5646,10 +5568,25 @@ mod tests {
     }
 
     #[test]
-    fn gov_action_indefinite_array_rejected() {
+    fn gov_action_indefinite_array_accepted_like_haskell() {
+        // `decodeRecordSum "GovAction"` accepts an indefinite array closed by a break:
+        // `[_ 6]` is InfoAction. (An earlier version of this test pinned the opposite; the
+        // Haskell-classified cardano-cbor-dataset `gov_action/valid` holds indefinite forms.)
         let data = [0x9f, 0x06, 0xff];
         let mut r = Reader::new(&data);
-        assert!(read_gov_action(&mut r, Era::Conway).is_err());
+        assert!(matches!(
+            read_gov_action(&mut r, Era::Conway).unwrap(),
+            GovAction::InfoAction
+        ));
+        // Missing break / excess element / wrong definite arity are still refused.
+        for bad in [
+            &[0x9f, 0x06][..],
+            &[0x9f, 0x06, 0x00, 0xff],
+            &[0x82, 0x06, 0x00],
+        ] {
+            let mut r = Reader::new(bad);
+            assert!(read_gov_action(&mut r, Era::Conway).is_err(), "{bad:02x?}");
+        }
     }
 
     // ── Protocol param update ─────────────────────────────────────────────

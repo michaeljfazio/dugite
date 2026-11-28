@@ -160,6 +160,91 @@ impl<'b> Reader<'b> {
         }
     }
 
+    /// Open a fixed-arity record: a definite array of exactly `n` elements, or
+    /// an indefinite-length array that [`close_record`](Self::close_record)
+    /// later closes with its break. Returns `true` when the array is
+    /// indefinite.
+    ///
+    /// This is `cardano-ledger-binary`'s `decodeRecordNamed name (const n)`
+    /// (`Cardano.Ledger.Binary.Decoding.Decoder`, `decodeListLikeT`):
+    ///
+    /// ```haskell
+    /// lenOrIndef <- lift decodeListLenOrIndef
+    /// result <- decoder
+    /// case lenOrIndef of
+    ///   Just n -> actOnLength result n          -- matchSize: exact arity
+    ///   Nothing -> lift $ do
+    ///     isBreak <- decodeBreakOr
+    ///     unless isBreak $ cborError $ DecoderErrorCustom name "Excess terms in array"
+    /// ```
+    ///
+    /// `RecD`, `Summands`/`decodeRecordSum` and `CBORGroup` all go through it, so
+    /// every fixed-shape record built from them accepts both array forms. An
+    /// indefinite array with FEWER than `n` elements fails inside the field
+    /// decoders (the break byte is not a valid field); one with MORE fails in
+    /// `close_record`. Records Haskell decodes with an explicit
+    /// `decodeListLenOf`/`enforceSize` (VRF certs, the redeemer map value) are
+    /// definite-only and must NOT use this.
+    pub fn read_record_header(&mut self, name: &str, n: u64) -> Result<bool, SerializationError> {
+        match self.read_array_header()? {
+            Some(len) if len == n => Ok(false),
+            None => Ok(true),
+            Some(len) => Err(SerializationError::CborDecode(format!(
+                "{name}: expected array({n}), got array({len})"
+            ))),
+        }
+    }
+
+    /// Close a record opened with [`read_record_header`](Self::read_record_header):
+    /// a no-op for a definite array, and the mandatory break for an indefinite one.
+    pub fn close_record(&mut self, indefinite: bool) -> Result<(), SerializationError> {
+        if indefinite {
+            self.expect_break()
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Read the `m` of a native script `RequireMOf m [..]`.
+    ///
+    /// Haskell stores it as a signed machine `Int` (`RequireMOf !Int`) and decodes it with
+    /// `decCBOR @Int` (`decodeInt`), so any value in `[-2^63, 2^63 - 1]` is a valid script
+    /// that is part of the chain (a negative `m` is satisfied by every set of signers, an
+    /// `m` above the number of sub-scripts by none). Values outside the `Int` range fail
+    /// the decode, as upstream.
+    ///
+    /// dugite stores the threshold as `u32`. The evaluation rule is `m <= #satisfied`
+    /// with `#satisfied <= #sub-scripts`, so clamping `m` into `[0, u32::MAX]` preserves
+    /// the verdict for every possible signer set. The script HASH never depends on the
+    /// clamped value: it is computed over the original bytes.
+    pub fn read_native_script_threshold(&mut self) -> Result<u32, SerializationError> {
+        let v = self.read_int()?;
+        if v < i128::from(i64::MIN) || v > i128::from(i64::MAX) {
+            return Err(SerializationError::CborDecode(format!(
+                "native_script RequireMOf: {v} does not fit a machine Int"
+            )));
+        }
+        Ok(v.clamp(0, i128::from(u32::MAX)) as u32)
+    }
+
+    /// Close a sum record read with [`read_array_header`](Self::read_array_header)
+    /// and a per-constructor `size` (tag included): the `matchSize` / `decodeBreakOr`
+    /// tail of `decodeRecordSum`. A definite array must have declared exactly `size`
+    /// elements; an indefinite one must be closed by a break.
+    pub fn close_sum_record(
+        &mut self,
+        declared: Option<u64>,
+        size: u64,
+    ) -> Result<(), SerializationError> {
+        match declared {
+            Some(n) if n == size => Ok(()),
+            Some(n) => Err(SerializationError::CborDecode(format!(
+                "sum record: declared array({n}) but the constructor has {size} elements"
+            ))),
+            None => self.expect_break(),
+        }
+    }
+
     /// Skip over exactly one CBOR value at the current position.
     ///
     /// Delegates to `crate::haskell_snapshot::cbor_utils::skip_cbor_value` which has
@@ -241,15 +326,28 @@ impl<'b> Reader<'b> {
     where
         F: FnMut(&mut Reader<'b>) -> Result<T, SerializationError>,
     {
-        // Peek at the next 3 bytes to detect tag 258.
-        let pos = self.inner.position();
-        let remaining = &self.origin[pos..];
-        if remaining.starts_with(&TAG_258_HEADER) {
-            // Consume the tag header (3 bytes).
-            self.inner.set_position(pos + 3);
-        }
+        self.strip_optional_set_tag()?;
         // Now read the array body.
         self.read_array(item)
+    }
+
+    /// Consume an optional set tag in front of a set array.
+    ///
+    /// Haskell's `decodeSetLikeEnforceNoDuplicates` / `decodeSet` peek the token type and,
+    /// for a `TypeTag`, run `decodeSetTag`: `decodeTag` (cborg accepts ANY head width for
+    /// the tag value, e.g. `d9 0102`, `da 00000102`, `db 0000000000000102`) and then
+    /// `when (t /= setTag) $ cborError $ DecoderErrorUnknownTag "Set" t`. So the tag must
+    /// have the VALUE 258 however it is encoded, and any other tag is a decode failure.
+    fn strip_optional_set_tag(&mut self) -> Result<(), SerializationError> {
+        if self.peek_major()? == Type::Tag {
+            let tag = self.read_tag()?;
+            if tag != TAG_SET {
+                return Err(SerializationError::CborDecode(format!(
+                    "set: unknown tag {tag} (expected {TAG_SET})"
+                )));
+            }
+        }
+        Ok(())
     }
 
     /// Read a CBOR set, optionally prefixed with tag 258, **rejecting duplicate
@@ -287,11 +385,7 @@ impl<'b> Reader<'b> {
         F: FnMut(&mut Reader<'b>) -> Result<T, SerializationError>,
     {
         // Strip the optional tag-258 header exactly as `read_set` does.
-        let pos = self.inner.position();
-        let remaining = &self.origin[pos..];
-        if remaining.starts_with(&TAG_258_HEADER) {
-            self.inner.set_position(pos + 3);
-        }
+        self.strip_optional_set_tag()?;
 
         // Decode the array body, counting physical elements and tracking the
         // raw byte span of each so that any duplicate is a hard error.

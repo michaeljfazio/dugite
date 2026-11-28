@@ -565,16 +565,14 @@ fn read_shelley_tx_input(r: &mut Reader<'_>) -> Result<TransactionInput, Seriali
 /// Shelley outputs are 2-element arrays: `[address_bytes, coin_or_value]`.
 /// The value is either a plain uint (ADA only) or `[coin, multiasset_map]` (Mary+).
 fn read_shelley_tx_output(r: &mut Reader<'_>) -> Result<TransactionOutput, SerializationError> {
+    // Haskell `ShelleyTxOut`: `decodeRecordNamed` (definite or indefinite). dugite keeps
+    // accepting the 3-element form here (pre-Alonzo only; unreachable on live chains).
     let arr_len = r.read_array_header()?;
-    match arr_len {
-        Some(2) | Some(3) => {}
-        _ => {
-            return Err(SerializationError::CborDecode(format!(
-                "shelley tx_out: expected array(2) or array(3), got {arr_len:?}"
-            )));
-        }
+    if !matches!(arr_len, Some(2) | Some(3) | None) {
+        return Err(SerializationError::CborDecode(format!(
+            "shelley tx_out: expected array(2) or array(3), got {arr_len:?}"
+        )));
     }
-    let n = arr_len.unwrap();
 
     // Address bytes
     let addr_bytes = r.read_bytes_owned()?;
@@ -585,12 +583,17 @@ fn read_shelley_tx_output(r: &mut Reader<'_>) -> Result<TransactionOutput, Seria
     let value = read_shelley_value(r)?;
 
     // Optional datum hash (pre-Alonzo extension — Shelley CDDL allows it)
-    let datum = if n == 3 {
+    let has_datum_hash = match arr_len {
+        Some(n) => n == 3,
+        None => r.peek_major()? != Type::Break,
+    };
+    let datum = if has_datum_hash {
         let dh = read_hash32(r)?;
         OutputDatum::DatumHash(dh)
     } else {
         OutputDatum::None
     };
+    r.close_record(arr_len.is_none())?;
 
     Ok(TransactionOutput {
         address,
@@ -610,17 +613,13 @@ fn read_shelley_value(r: &mut Reader<'_>) -> Result<Value, SerializationError> {
             let coin = r.read_uint()?;
             Ok(Value::lovelace(coin))
         }
-        Type::Array => {
-            // [coin, multiasset_map]
-            let arr_len = r.read_array_header()?;
-            if !matches!(arr_len, Some(2)) {
-                return Err(SerializationError::CborDecode(format!(
-                    "shelley value array: expected array(2), got {arr_len:?}"
-                )));
-            }
+        Type::Array | Type::ArrayIndef => {
+            // [coin, multiasset_map] — Haskell `decodeMaryValue` accepts both array forms.
+            let indef = r.read_record_header("shelley value array", 2)?;
             let coin = Lovelace(r.read_uint()?);
             // multiasset_map: { policy_id => { asset_name => quantity } }
             let multi_asset = read_multiasset_map_u64(r)?;
+            r.close_record(indef)?;
             if multi_asset.is_empty() {
                 Ok(Value::lovelace(coin.0))
             } else {
@@ -926,6 +925,8 @@ pub(crate) fn read_pool_params_inner(
 ///
 /// Used by both Shelley/Babbage and Conway pool-registration decoders.
 pub(crate) fn read_relay(r: &mut Reader<'_>) -> Result<Relay, SerializationError> {
+    // Haskell `StakePoolRelay` is `decodeRecordSum "Relay"`: a definite array must declare the
+    // constructor's size, an indefinite one must be closed by a break (`close_sum_record`).
     let arr_len = r.read_array_header()?;
     let tag = r.read_uint()?;
     match tag {
@@ -934,35 +935,20 @@ pub(crate) fn read_relay(r: &mut Reader<'_>) -> Result<Relay, SerializationError
             let port = read_opt_port(r)?;
             let ipv4 = read_opt_ipv4(r)?;
             let ipv6 = read_opt_ipv6(r)?;
-            if matches!(arr_len, Some(n) if n != 4) {
-                return Err(SerializationError::CborDecode(format!(
-                    "single_host_addr: expected array(4), got array({:?})",
-                    arr_len
-                )));
-            }
+            r.close_sum_record(arr_len, 4)?;
             Ok(Relay::SingleHostAddr { port, ipv4, ipv6 })
         }
         1 => {
             // single_host_name: [1, port?, dns_name]
             let port = read_opt_port(r)?;
             let dns_name = r.read_str()?.to_string();
-            if matches!(arr_len, Some(n) if n != 3) {
-                return Err(SerializationError::CborDecode(format!(
-                    "single_host_name: expected array(3), got array({:?})",
-                    arr_len
-                )));
-            }
+            r.close_sum_record(arr_len, 3)?;
             Ok(Relay::SingleHostName { port, dns_name })
         }
         2 => {
             // multi_host_name: [2, dns_name]
             let dns_name = r.read_str()?.to_string();
-            if matches!(arr_len, Some(n) if n != 2) {
-                return Err(SerializationError::CborDecode(format!(
-                    "multi_host_name: expected array(2), got array({:?})",
-                    arr_len
-                )));
-            }
+            r.close_sum_record(arr_len, 2)?;
             Ok(Relay::MultiHostName { dns_name })
         }
         other => Err(SerializationError::CborDecode(format!(
@@ -1021,12 +1007,9 @@ fn read_pool_metadata(r: &mut Reader<'_>) -> Result<Option<PoolMetadata>, Serial
         return Ok(None);
     }
     // [url, hash(32)]
-    let arr_len = r.read_array_header()?;
-    if !matches!(arr_len, Some(2)) {
-        return Err(SerializationError::CborDecode(format!(
-            "pool_metadata: expected array(2) or null, got {arr_len:?}"
-        )));
-    }
+    // Haskell `PoolMetadata`: `decodeRecordNamed "PoolMetadata" (const 2)` (definite or
+    // indefinite).
+    let indef = r.read_record_header("pool_metadata", 2)?;
     // pool_metadata_url = text (CDDL). Mainnet uses CBOR major type 3 (text string).
     // Handle both text and bytes for robustness against non-canonical encodings.
     let ty = r.peek_major()?;
@@ -1047,6 +1030,7 @@ fn read_pool_metadata(r: &mut Reader<'_>) -> Result<Option<PoolMetadata>, Serial
         buf[..len].copy_from_slice(&bytes[..len]);
         Hash32::from_bytes(buf)
     };
+    r.close_record(indef)?;
     Ok(Some(PoolMetadata { url, hash }))
 }
 
@@ -1229,7 +1213,7 @@ fn read_native_script(r: &mut Reader<'_>) -> Result<NativeScript, SerializationE
             NativeScript::ScriptAny(scripts)
         }
         3 => {
-            let n = r.read_uint()? as u32;
+            let n = r.read_native_script_threshold()?;
             let scripts = r.read_array(read_native_script)?;
             NativeScript::ScriptNOfK(n, scripts)
         }
