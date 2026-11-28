@@ -375,8 +375,3 @@ or script directly:
 ```bash
 ./testnet/local-devnet/tx-zoo/03-plutus/03a-spend-v1.sh
 ```
-
----
-
-Tracking: see the GitHub issue linked from
-[`docs/superpowers/specs/2026-05-16-local-testnet-design.md`](https://github.com/michaeljfazio/dugite/blob/main/docs/superpowers/specs/2026-05-16-local-testnet-design.md).

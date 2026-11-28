@@ -1,6 +1,16 @@
 #!/usr/bin/env bash
 set -e
 
+# AI agent files are local-only and must never be committed (they were purged
+# from history on 2026-11-28). Mirrors xtask/tests/no_tracked_agent_files.rs.
+agent_paths=$(git diff --cached --name-only --diff-filter=ACMR \
+    | grep -E '^(\.claude/|\.remember/|CLAUDE\.md$|\.mcp\.json$|docs/superpowers/|reports/)' || true)
+if [ -n "$agent_paths" ]; then
+    echo "ERROR: AI agent files are staged; they are local-only:"
+    printf '%s\n' "$agent_paths" | sed 's/^/    /'
+    exit 1
+fi
+
 # Multi-crate tripwire: warn (or fail with DUGITE_PRECOMMIT_STRICT=1) when a
 # single commit's staged paths span more than two distinct workspace crates.
 # Most legitimate commits touch 1-2 crates; co-mingled commits across many

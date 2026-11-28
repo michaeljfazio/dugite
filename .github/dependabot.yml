@@ -11,3 +11,8 @@ updates:
     schedule:
       interval: "weekly"
     open-pull-requests-limit: 5
+    ignore:
+      # The toolchain is pinned in rust-toolchain.toml AND every workflow ref
+      # together (xtask/tests/toolchain_pin_coverage.rs); a one-ref bump
+      # cannot pass that check, so bump it by hand.
+      - dependency-name: "dtolnay/rust-toolchain"
