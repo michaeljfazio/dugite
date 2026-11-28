@@ -490,6 +490,12 @@ ndc-report scenario:
             rc=1
         fi
     done
+    # The README's claim, as a check: every budget equals cardano-node's and Amaru's published budget.
+    if [[ "{{scenario}}" == uplc-turbo && -z "${DUGITE_NDC_TURBO_SAMPLE:-}" ]]; then
+        DUGITE_NDC_REQUIRE=1 cargo nextest run --cargo-profile release -p dugite-conformance \
+            --test ndc_uplc_turbo --run-ignored only --no-tests=fail \
+            || { echo "ndc-report: the uplc-turbo budgets differ from the published reports" >&2; rc=1; }
+    fi
     exit $rc
 
 # A QUICK, NOT PUBLISHABLE uplc-turbo run: every 40th program, written to reports-quick/ so it can

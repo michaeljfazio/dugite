@@ -114,22 +114,32 @@ difference to resolve), `just ndc-selftest`, `just ndc-reports`, and compare `ju
 
 ## The uplc-turbo runner (Phase 2d, #1178)
 
-`tests/conformance/src/node_diversity/uplc_turbo.rs`; `just ndc-report uplc-turbo` (release profile; about
-2.5 minutes for the 3,997 programs on an Apple M2 Max). `just ndc-turbo-quick` runs every 40th program into
-`reports-quick/` and writes a `stub`, so a sample can never be published.
+The runner is `tests/conformance/src/node_diversity/uplc_turbo.rs`.
 
-* **Path.** Each corpus file is the on-chain script (a raw CBOR byte string around flat, not hex text). It goes
-  through `dugite_uplc::eval_redeemer::prepare_script_bytes_gated` once (cost model, language gate, decode,
-  availability, scope check: untimed) and `PreparedScript::run` 50 times (timed). `eval_script_bytes_gated`, which
-  the `uplc-conformance` runner uses, is exactly those two calls.
-* **Measurement.** The fastest 30 of 50 sequential runs; `cpu_us` and `mem_bytes` are means over those same runs.
-  `mem_bytes` is the cumulative bytes the evaluation requested from the allocator on its thread (a counting global
-  allocator installed by the test binary; a reallocation counts as a new allocation of its new size, frees are not
-  subtracted): Go's `TotalAlloc`, as Dingo reports, not a resident peak.
-* **Cost models.** Protocol version 10 and 11 use the `uplc-conformance` corpus' models, version 9 the version 10
-  arrays (same semantics variant), version 8 `uplc-turbo-cost-models-pv8.json` (variant A, from Amaru, with its
-  provenance in the file). Budgets agree with cardano-node's and Amaru's published reports for all 3,997 programs.
-* **A program that does not evaluate** gets `null` budgets and `mem_bytes` and `cpu_us` 0, so it disagrees with the
-  nodes that did evaluate it; a panic or internal error fails the run.
-* **Trend-only.** The schema has no room for it, so the `.status.json` note says whether the run was on the publishing
-  runner (`DUGITE_NDC_PUBLISHING_RUNNER` set) or trend-only, with the machine, rustc, load average and wall time.
+* `just ndc-report uplc-turbo` runs all 3,997 programs in the release profile. It takes about 2.5 minutes on an Apple M2 Max.
+* `just ndc-turbo-quick` runs every 40th program and writes to `reports-quick/`. The result is always a `stub`.
+
+**Path.** Each corpus file is the on-chain script: a raw CBOR byte string around flat. It is not hex text.
+The runner calls `prepare_script_bytes_gated` once. This step is not timed. It does the cost model, the language gate, the decode, the availability rules and the scope check.
+Then it calls `PreparedScript::run` 50 times. This step is timed. `eval_script_bytes_gated` is these two calls, so there is one evaluator.
+
+**Measurement.** The runner keeps the 30 fastest of 50 sequential runs.
+`cpu_us` and `mem_bytes` are means over those same runs.
+`mem_bytes` is the number of bytes the evaluation asked the allocator for, on its own thread. A counting global allocator in the test binary does this.
+A reallocation counts as a new allocation. A free does not subtract. This is the same as Go `TotalAlloc`, which Dingo reports. It is not a peak.
+
+**Cost models.** Protocol versions 10 and 11 use the models of the `uplc-conformance` corpus. Version 9 uses the version 10 arrays. Version 8 uses `uplc-turbo-cost-models-pv8.json`.
+The runner checks the SHA-256 of that file and the length of its two arrays (332).
+The file has no pinned copy to compare with. These checks guard it instead:
+* A test lists budgets from the cardano-node report for programs of each protocol version and language.
+* `every_program_budget_equals_the_published_reports` compares the budget of all 3,997 programs with the cardano-node report and the Amaru report. `just ndc-report uplc-turbo` runs it in release.
+
+**Who may publish.** Only a complete run with `DUGITE_NDC_PUBLISHING_RUNNER` set has status `ok`.
+Every other run has status `stub`. This includes a run on a laptop and a sample.
+A publish step must refuse a `stub`. `just ndc-score` still shows the score of a `stub`.
+The `.status.json` note gives the machine, the rustc version, the load average and the wall time.
+
+**Failures.** A corpus file without a valid outer CBOR wrapper stops the run.
+A program that does not evaluate gets `null` budgets and `null` `mem_bytes`, and `cpu_us` 0.
+On the publishing runner such a program stops the run, because every corpus program ran on mainnet.
+A panic or an internal error always stops the run.

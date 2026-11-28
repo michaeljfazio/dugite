@@ -34,10 +34,12 @@
 //!   did evaluate it and scores as a failure; the schema does not allow a `null` `cpu_us`, so it
 //!   is `0` there.  A panic or an internal error is a dugite defect, not an outcome of the
 //!   program: it fails the run (an error report).
-//! * **Trend only unless produced on the publishing runner.**  The report schema has no room for
-//!   that statement, so it is in the `.status.json` note.  Without
-//!   [`PUBLISHING_RUNNER_ENV`] a run says it is trend-only.  A sampled run
-//!   ([`SAMPLE_ENV`]) is never publishable and is written as a `stub`.
+//! * **Only the publishing runner publishes.**  A run is `ok` only when it is complete and
+//!   [`PUBLISHING_RUNNER_ENV`] is set.  Every other run (this laptop, a sample) is written as a
+//!   `stub`, the status a publish step refuses, and its `.status.json` note says it is
+//!   trend-only.  The score of a stub is still printed.  On the publishing runner a program that
+//!   does not evaluate fails the run, as every corpus program ran on mainnet.  A corpus file whose
+//!   outer CBOR wrapper does not decode always fails the run.
 //!
 //! [`prepare_script_bytes_gated`]: dugite_uplc::eval_redeemer::prepare_script_bytes_gated
 //! [`PreparedScript::run`]: dugite_uplc::eval_redeemer::PreparedScript::run
@@ -70,6 +72,13 @@ pub const KEEP: usize = 30;
 pub const MAX_CPU: i64 = 10_000_000_000;
 pub const MAX_MEM_BEFORE_PV11: i64 = 14_000_000;
 pub const MAX_MEM_FROM_PV11: i64 = 16_500_000;
+
+/// SHA-256 of `node-diversity/uplc-turbo-cost-models-pv8.json`.  The runner refuses any other file,
+/// so a changed number cannot be measured by accident.
+pub const PV8_COST_MODELS_SHA256: &str =
+    "8265cc94be3313026251fef2844b52dfca855d521a439cddf9189bd75f243a5a";
+/// Entries of each protocol version 8 array.
+pub const PV8_ARRAY_LEN: usize = 332;
 
 /// `DUGITE_NDC_TURBO_SAMPLE=N`: run every Nth program only.  The result is a partial report that is
 /// never publishable.
@@ -241,6 +250,16 @@ pub fn turbo_cost_models(corpora: &Path) -> Result<BTreeMap<(u32, String), CostM
     let path = repo_root().join("tests/conformance/node-diversity/uplc-turbo-cost-models-pv8.json");
     let text = std::fs::read_to_string(&path)
         .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+    let actual = {
+        use sha2::{Digest, Sha256};
+        hex::encode(Sha256::digest(text.as_bytes()))
+    };
+    if actual != PV8_COST_MODELS_SHA256 {
+        return Err(format!(
+            "{} has SHA-256 {actual}, the runner pins {PV8_COST_MODELS_SHA256}",
+            path.display()
+        ));
+    }
     let file: Json = serde_json::from_str(&text).map_err(|e| format!("{}: {e}", path.display()))?;
     for (key, version) in [("plutus_v1", "V1"), ("plutus_v2", "V2")] {
         let params: Vec<i64> = serde_json::from_value(
@@ -249,6 +268,13 @@ pub fn turbo_cost_models(corpora: &Path) -> Result<BTreeMap<(u32, String), CostM
                 .ok_or_else(|| format!("{} has no {key}", path.display()))?,
         )
         .map_err(|e| format!("{}: {key}: {e}", path.display()))?;
+        if params.len() != PV8_ARRAY_LEN {
+            return Err(format!(
+                "{}: {key} has {} entries, expected {PV8_ARRAY_LEN}",
+                path.display(),
+                params.len()
+            ));
+        }
         let mut only = CostModels::default();
         if version == "V1" {
             only.plutus_v1 = Some(params);
@@ -306,12 +332,72 @@ fn failure_class(error: &UplcError) -> Option<&'static str> {
     }
 }
 
+/// Whether `bytes` is exactly one definite-length CBOR byte string, the on-chain script form.  A
+/// corpus file that is not one is a broken corpus, never a program that fails to evaluate.
+pub fn check_cbor_wrapper(bytes: &[u8]) -> Result<(), String> {
+    let first = *bytes.first().ok_or("empty file")?;
+    if first >> 5 != 2 {
+        return Err(format!("first byte {first:#04x} is not a byte string"));
+    }
+    let (header, len) = match first & 0x1f {
+        n @ 0..=23 => (1usize, u64::from(n)),
+        24 => (2, u64::from(*bytes.get(1).ok_or("truncated length")?)),
+        25 => (
+            3,
+            u64::from(u16::from_be_bytes(
+                bytes
+                    .get(1..3)
+                    .ok_or("truncated length")?
+                    .try_into()
+                    .unwrap(),
+            )),
+        ),
+        26 => (
+            5,
+            u64::from(u32::from_be_bytes(
+                bytes
+                    .get(1..5)
+                    .ok_or("truncated length")?
+                    .try_into()
+                    .unwrap(),
+            )),
+        ),
+        27 => (
+            9,
+            u64::from_be_bytes(
+                bytes
+                    .get(1..9)
+                    .ok_or("truncated length")?
+                    .try_into()
+                    .unwrap(),
+            ),
+        ),
+        _ => return Err("indefinite or reserved length".into()),
+    };
+    if (bytes.len() - header) as u64 != len {
+        return Err(format!(
+            "the length says {len} bytes, the file has {}",
+            bytes.len().saturating_sub(header)
+        ));
+    }
+    Ok(())
+}
+
 /// Measure one program.  `Err` is a harness failure or a dugite defect (an unreadable file, an
 /// unusable cost model, a panic, an internal error); a program that does not evaluate is an
 /// `Ok(Outcome::Failed)`.
 pub fn measure(
     program: &Program,
     models: &BTreeMap<(u32, String), CostModels>,
+) -> Result<Outcome, String> {
+    measure_with_runs(program, models, RUNS)
+}
+
+/// [`measure`] with another number of runs.  The budget check of every program needs one run.
+pub fn measure_with_runs(
+    program: &Program,
+    models: &BTreeMap<(u32, String), CostModels>,
+    runs: usize,
 ) -> Result<Outcome, String> {
     let model = models
         .get(&(program.major_pv, program.plutus_version.to_string()))
@@ -339,6 +425,13 @@ pub fn measure(
         },
     };
 
+    check_cbor_wrapper(&wrapped).map_err(|e| {
+        format!(
+            "{}: the outer CBOR wrapper does not decode: {e}",
+            program.bench
+        )
+    })?;
+
     // Preparation: untimed, once.
     let prepared = match catch_unwind(AssertUnwindSafe(|| {
         prepare_script_bytes_gated(&wrapped, program.language, program.major_pv, model)
@@ -354,6 +447,14 @@ pub fn measure(
             return Err(format!(
                 "{}: the cost model for PV{} {} could not be applied",
                 program.bench, program.major_pv, program.plutus_version
+            ))
+        }
+        // A mainnet script always has its CBOR wrapper: a file without one is a broken corpus or a
+        // broken decoder, never a result.
+        Ok(Err(ProgramEvalError::Decode(UplcError::CborDecode(e)))) => {
+            return Err(format!(
+                "{}: the outer CBOR wrapper does not decode: {e}",
+                program.bench
             ))
         }
         Ok(Err(ProgramEvalError::Decode(e) | ProgramEvalError::Scope(e))) => {
@@ -376,9 +477,9 @@ pub fn measure(
         }
     };
 
-    let mut samples = Vec::with_capacity(RUNS);
+    let mut samples = Vec::with_capacity(runs);
     let mut consumed = None;
-    for _ in 0..RUNS {
+    for _ in 0..runs {
         // A fresh copy per run, taken outside the timer and the counter: `run` consumes it.
         let fresh = prepared.clone();
         let bytes_before = allocated_bytes();
@@ -550,12 +651,20 @@ pub struct TurboRun {
     pub failures: BTreeMap<&'static str, usize>,
     pub programs_total: usize,
     pub sampled: bool,
+    /// Whether the run was made on the publishing runner ([`PUBLISHING_RUNNER_ENV`] set).
+    pub publishing: bool,
     pub wall: Duration,
     /// Everything a reader of the sidecar needs to interpret the timings.
     pub provenance: String,
 }
 
 impl TurboRun {
+    /// Only a full run on the publishing runner may be published; the shared writer records any
+    /// other run as a `stub`.
+    pub fn publishable(&self) -> bool {
+        self.publishing && !self.sampled
+    }
+
     /// The sidecar note.
     pub fn summary(&self) -> String {
         let failed: usize = self.failures.values().sum();
@@ -652,16 +761,24 @@ pub fn run_all(corpora: &Path) -> Result<TurboRun, String> {
         benchmarks.push(benchmark_entry(program, &outcome));
     }
     let wall = started.elapsed();
-    let load_after = load_average();
-    let rustc = command_output("rustc", &["--version"]).unwrap_or_else(|| "rustc unknown".into());
+    // Every corpus program ran on mainnet.  On the publishing runner a program that does not
+    // evaluate is a dugite defect, so the run fails; elsewhere it is reported and counted.
     let publishing = std::env::var(PUBLISHING_RUNNER_ENV)
         .ok()
         .filter(|v| !v.is_empty());
+    let failed: usize = failures.values().sum();
+    if publishing.is_some() && stride.is_none() && failed > 0 {
+        return Err(format!(
+            "{failed} mainnet programs did not evaluate on the publishing runner: {failures:?}"
+        ));
+    }
+    let load_after = load_average();
+    let rustc = command_output("rustc", &["--version"]).unwrap_or_else(|| "rustc unknown".into());
     let status = match (&publishing, stride) {
         (_, Some(n)) => format!("SAMPLE (every {n}th program), NOT PUBLISHABLE"),
         (Some(runner), None) => format!("publishing runner: {runner}"),
         (None, None) => format!(
-            "TREND-ONLY: not produced on the fixed publishing runner ({PUBLISHING_RUNNER_ENV} unset); \
+            "TREND-ONLY, written as a stub so it cannot be published: not produced on the fixed publishing runner ({PUBLISHING_RUNNER_ENV} unset); \
              timings depend on this machine and its load"
         ),
     };
@@ -686,6 +803,7 @@ pub fn run_all(corpora: &Path) -> Result<TurboRun, String> {
         failures,
         programs_total: all.len(),
         sampled: stride.is_some(),
+        publishing: publishing.is_some(),
         wall,
         provenance,
     })

@@ -62,8 +62,8 @@ fn stub_note(scenario: Scenario) -> &'static str {
     match scenario {
         Scenario::LedgerRules => "ledger-rules runner not implemented yet (#1114 Phase 2b); this report carries no result",
         Scenario::CborDecoding => "cbor-decoding runner not implemented yet (#1114 Phase 2c); this report carries no result",
-        Scenario::UplcConformance => "uplc-conformance runner not implemented yet (#1114 Phase 2a); this report carries no result",
-        Scenario::UplcTurbo => "uplc-turbo runner not implemented yet (#1114 Phase 2d); this report carries no result",
+        // These two have real runners (`generate` never asks for their stub).
+        Scenario::UplcConformance | Scenario::UplcTurbo => unreachable!("{scenario} has a runner"),
     }
 }
 
@@ -106,14 +106,17 @@ fn generate_uplc_conformance(run: &RunInfo) -> Result<(ReportStatus, String, Val
 }
 
 /// `uplc-turbo` (#1114 Phase 2d): the runner is `dugite_conformance::node_diversity::uplc_turbo`.
-/// A sampled run is a partial result, written as a `stub` so a publish step refuses it.
+/// A run that is sampled or not on the publishing runner is written as a `stub`.
 fn generate_uplc_turbo(run: &RunInfo) -> Result<(ReportStatus, String, Value), String> {
     use dugite_conformance::node_diversity::uplc_turbo::run_all;
     let result = run_all(&corpora_dir())?;
-    let status = if result.sampled {
-        ReportStatus::Stub
-    } else {
+    // Only a full run on the publishing runner is `ok`.  Any other run is a `stub`, the status a
+    // publish step already refuses, so a laptop or sampled run cannot be published by mistake.
+    // The score of a stub is still printed by `just ndc-score`.
+    let status = if result.publishable() {
         ReportStatus::Ok
+    } else {
+        ReportStatus::Stub
     };
     Ok((
         status,
