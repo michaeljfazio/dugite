@@ -306,7 +306,7 @@ fn empty_witness_set() -> TransactionWitnessSet {
 // Header decoder (Babbage/Conway Praos style)
 // ============================================================================
 
-fn decode_conway_header_inner(
+pub(crate) fn decode_conway_header_inner(
     r: &mut Reader<'_>,
     era: Era,
 ) -> Result<BlockHeader, SerializationError> {
@@ -446,7 +446,9 @@ fn read_vrf_cert(r: &mut Reader<'_>) -> Result<(Vec<u8>, Vec<u8>), Serialization
     Ok((output, proof))
 }
 
-fn read_operational_cert(r: &mut Reader<'_>) -> Result<OperationalCert, SerializationError> {
+pub(crate) fn read_operational_cert(
+    r: &mut Reader<'_>,
+) -> Result<OperationalCert, SerializationError> {
     // operational_cert = [hot_vkey(32), seq_num, kes_period, sigma(64)]
     let indef = r.read_record_header("operational_cert", 4)?;
     let hot_vkey = r.read_bytes_owned()?;
@@ -462,7 +464,9 @@ fn read_operational_cert(r: &mut Reader<'_>) -> Result<OperationalCert, Serializ
     })
 }
 
-fn read_protocol_version(r: &mut Reader<'_>) -> Result<ProtocolVersion, SerializationError> {
+pub(crate) fn read_protocol_version(
+    r: &mut Reader<'_>,
+) -> Result<ProtocolVersion, SerializationError> {
     let indef = r.read_record_header("protocol_version", 2)?;
     let major = r.read_uint()?;
     let minor = r.read_uint()?;
@@ -1008,7 +1012,7 @@ pub(crate) fn decode_sub_tx_body(
 /// surface the same rejection here.
 ///
 /// See issue #475 Phase 3.3 — UTXO predicate `AccountBalanceOutOfRange`.
-fn decode_account_balance_intervals(
+pub(crate) fn decode_account_balance_intervals(
     r: &mut Reader<'_>,
 ) -> Result<
     Vec<(
@@ -1048,7 +1052,7 @@ fn decode_account_balance_intervals(
 
 /// Decode a single `AccountBalanceInterval` — a 2-element CBOR array
 /// `[lower, upper]` of `coin / null`.
-fn decode_account_balance_interval(
+pub(crate) fn decode_account_balance_interval(
     r: &mut Reader<'_>,
 ) -> Result<dugite_primitives::transaction::AccountBalanceInterval, SerializationError> {
     use dugite_primitives::transaction::AccountBalanceInterval;
@@ -1086,7 +1090,7 @@ fn decode_account_balance_interval(
     Ok(AccountBalanceInterval { lower, upper })
 }
 
-fn read_tx_input(r: &mut Reader<'_>) -> Result<TransactionInput, SerializationError> {
+pub(crate) fn read_tx_input(r: &mut Reader<'_>) -> Result<TransactionInput, SerializationError> {
     let indef = r.read_record_header("tx_input", 2)?;
     let tx_hash = read_hash32(r)?;
     let index = r.read_uint()? as u32;
@@ -1117,7 +1121,9 @@ fn read_babbage_tx_output_with_raw(
 ///
 /// 1. **Legacy array**: `[address, value]` or `[address, value, datum_hash]`
 /// 2. **Post-Alonzo map**: `{ 0: address, 1: value, ? 2: datum_option, ? 3: script_ref }`
-fn read_babbage_tx_output(r: &mut Reader<'_>) -> Result<TransactionOutput, SerializationError> {
+pub(crate) fn read_babbage_tx_output(
+    r: &mut Reader<'_>,
+) -> Result<TransactionOutput, SerializationError> {
     // Haskell `decodeBabbageTxOut` (cardano-ledger `Babbage/TxOut.hs`):
     //
     // ```haskell
@@ -1146,7 +1152,9 @@ fn read_babbage_tx_output(r: &mut Reader<'_>) -> Result<TransactionOutput, Seria
     }
 }
 
-fn read_legacy_tx_output(r: &mut Reader<'_>) -> Result<TransactionOutput, SerializationError> {
+pub(crate) fn read_legacy_tx_output(
+    r: &mut Reader<'_>,
+) -> Result<TransactionOutput, SerializationError> {
     // Haskell `oldTxOut`: `decodeListLenOrIndef`; definite 2 or 3, or an indefinite
     // array of 2 or 3 elements closed by a break ("Excess terms in TxOut" otherwise).
     let arr_len = r.read_array_header()?;
@@ -1186,7 +1194,9 @@ fn read_legacy_tx_output(r: &mut Reader<'_>) -> Result<TransactionOutput, Serial
 /// `BabbageTxOut`'s `DecCBOR` instance verbatim, `SparseKeyed` with
 /// `bodyFields n = invalidField n` for keys outside 0-3, no era gating
 /// needed since the key set is identical across Babbage/Conway/Dijkstra).
-fn read_map_tx_output(r: &mut Reader<'_>) -> Result<TransactionOutput, SerializationError> {
+pub(crate) fn read_map_tx_output(
+    r: &mut Reader<'_>,
+) -> Result<TransactionOutput, SerializationError> {
     let mut address_bytes: Option<Vec<u8>> = None;
     let mut value: Option<Value> = None;
     let mut datum = OutputDatum::None;
@@ -1233,7 +1243,7 @@ fn read_map_tx_output(r: &mut Reader<'_>) -> Result<TransactionOutput, Serializa
 }
 
 /// Read a value: plain uint or `[coin, multiasset_map]`.
-fn read_value(r: &mut Reader<'_>) -> Result<Value, SerializationError> {
+pub(crate) fn read_value(r: &mut Reader<'_>) -> Result<Value, SerializationError> {
     let ty = r.peek_major()?;
     match ty {
         Type::U8 | Type::U16 | Type::U32 | Type::U64 => {
@@ -1261,7 +1271,7 @@ fn read_value(r: &mut Reader<'_>) -> Result<Value, SerializationError> {
     }
 }
 
-fn read_multiasset_map_u64(
+pub(crate) fn read_multiasset_map_u64(
     r: &mut Reader<'_>,
 ) -> Result<BTreeMap<Hash28, BTreeMap<AssetName, u64>>, SerializationError> {
     // Haskell `decodeMultiAsset` (Mary/Value.hs) for decoder version >= 9
@@ -1318,7 +1328,7 @@ fn read_multiasset_map_u64(
     Ok(policy_pairs.into_iter().collect())
 }
 
-fn read_mint_map(
+pub(crate) fn read_mint_map(
     r: &mut Reader<'_>,
 ) -> Result<BTreeMap<Hash28, BTreeMap<AssetName, i64>>, SerializationError> {
     // Use read_map to handle both definite- and indefinite-length outer map.
@@ -1366,14 +1376,16 @@ fn read_mint_map(
     Ok(policy_pairs.into_iter().collect())
 }
 
-fn read_withdrawals(r: &mut Reader<'_>) -> Result<BTreeMap<Vec<u8>, Lovelace>, SerializationError> {
+pub(crate) fn read_withdrawals(
+    r: &mut Reader<'_>,
+) -> Result<BTreeMap<Vec<u8>, Lovelace>, SerializationError> {
     // Use read_map to handle both definite- and indefinite-length maps.
     let pairs = r.read_map(|r| r.read_bytes_owned(), |r| r.read_uint().map(Lovelace))?;
     Ok(pairs.into_iter().collect())
 }
 
 /// Read a datum_option: `[0, datum_hash]` or `[1, tag(24) bytes]`.
-fn read_datum_option(r: &mut Reader<'_>) -> Result<OutputDatum, SerializationError> {
+pub(crate) fn read_datum_option(r: &mut Reader<'_>) -> Result<OutputDatum, SerializationError> {
     // Haskell `Datum` is `Summands "Datum"` (`decodeRecordSum`): definite or indefinite.
     let indef = r.read_record_header("datum_option", 2)?;
     let disc = r.read_uint()?;
@@ -1417,7 +1429,7 @@ fn read_datum_option(r: &mut Reader<'_>) -> Result<OutputDatum, SerializationErr
 ///   containing the serialized Plutus script.
 ///
 /// This mirrors the Babbage `read_script_ref` shape (see `era_babbage.rs`).
-fn read_script_ref(
+pub(crate) fn read_script_ref(
     r: &mut Reader<'_>,
 ) -> Result<dugite_primitives::transaction::ScriptRef, SerializationError> {
     use dugite_primitives::transaction::ScriptRef;
@@ -1631,7 +1643,9 @@ pub(crate) fn read_conway_certificate_for_test(
     read_conway_certificate(r)
 }
 
-fn read_conway_certificate(r: &mut Reader<'_>) -> Result<Certificate, SerializationError> {
+pub(crate) fn read_conway_certificate(
+    r: &mut Reader<'_>,
+) -> Result<Certificate, SerializationError> {
     // Haskell `decodeRecordSum "ConwayTxCert"` (`Conway/TxCert.hs`): `decodeListLenOrIndef`
     // then the per-tag decoder returns `(size, cert)`; a definite array must declare exactly
     // `size`, an indefinite one must be closed by a break right after the fields.
@@ -1815,7 +1829,7 @@ fn read_conway_certificate(r: &mut Reader<'_>) -> Result<Certificate, Serializat
     Ok(cert)
 }
 
-fn read_stake_credential(r: &mut Reader<'_>) -> Result<Credential, SerializationError> {
+pub(crate) fn read_stake_credential(r: &mut Reader<'_>) -> Result<Credential, SerializationError> {
     // Haskell `Credential` is `decodeRecordSum "Credential"`: definite or indefinite.
     let indef = r.read_record_header("stake_credential", 2)?;
     let disc = r.read_uint()?;
@@ -1855,7 +1869,7 @@ pub(crate) fn read_drep_for_test(r: &mut Reader<'_>) -> Result<DRep, Serializati
     read_drep(r)
 }
 
-fn read_drep(r: &mut Reader<'_>) -> Result<DRep, SerializationError> {
+pub(crate) fn read_drep(r: &mut Reader<'_>) -> Result<DRep, SerializationError> {
     // Haskell `DRep` is `decodeRecordSum "DRep"`: `(2, ..)` for key/script hash and `(1, ..)`
     // for the two argument-less constructors; definite or indefinite.
     let declared = r.read_array_header()?;
@@ -1909,7 +1923,7 @@ pub(crate) fn read_anchor(r: &mut Reader<'_>) -> Result<Anchor, SerializationErr
 ///
 /// Delegates to the shared implementation with `strict_owners`, since Conway
 /// PV9+ rejects duplicate set elements.
-fn read_pool_params(r: &mut Reader<'_>) -> Result<PoolParams, SerializationError> {
+pub(crate) fn read_pool_params(r: &mut Reader<'_>) -> Result<PoolParams, SerializationError> {
     super::era_shelley::read_pool_params_inner(r, true)
 }
 
@@ -1918,7 +1932,7 @@ fn read_pool_params(r: &mut Reader<'_>) -> Result<PoolParams, SerializationError
 // ============================================================================
 
 /// Read voting_procedures: `{ voter => { gov_action_id => voting_procedure } }`.
-fn read_voting_procedures(
+pub(crate) fn read_voting_procedures(
     r: &mut Reader<'_>,
 ) -> Result<BTreeMap<Voter, BTreeMap<GovActionId, VotingProcedure>>, SerializationError> {
     // Use read_map to handle both definite- and indefinite-length maps.
@@ -1948,7 +1962,7 @@ pub(crate) fn read_voter_for_test(r: &mut Reader<'_>) -> Result<Voter, Serializa
     read_voter(r)
 }
 
-fn read_voter(r: &mut Reader<'_>) -> Result<Voter, SerializationError> {
+pub(crate) fn read_voter(r: &mut Reader<'_>) -> Result<Voter, SerializationError> {
     // Haskell `Voter` is `decodeRecordSum "Voter"` (definite or indefinite).
     let indef = r.read_record_header("voter", 2)?;
     let disc = r.read_uint()?;
@@ -1989,7 +2003,9 @@ pub(crate) fn read_voting_procedure_for_test(
     read_voting_procedure(r)
 }
 
-fn read_voting_procedure(r: &mut Reader<'_>) -> Result<VotingProcedure, SerializationError> {
+pub(crate) fn read_voting_procedure(
+    r: &mut Reader<'_>,
+) -> Result<VotingProcedure, SerializationError> {
     // voting_procedure = [vote, anchor / null]
     r.read_definite_record_header("voting_procedure", 2)?;
     let vote = read_vote(r)?;
@@ -1997,7 +2013,7 @@ fn read_voting_procedure(r: &mut Reader<'_>) -> Result<VotingProcedure, Serializ
     Ok(VotingProcedure { vote, anchor })
 }
 
-fn read_vote(r: &mut Reader<'_>) -> Result<Vote, SerializationError> {
+pub(crate) fn read_vote(r: &mut Reader<'_>) -> Result<Vote, SerializationError> {
     let v = r.read_uint()?;
     match v {
         0 => Ok(Vote::No),
@@ -2049,7 +2065,10 @@ pub(crate) fn read_gov_action_for_test(
     read_gov_action(r, era)
 }
 
-fn read_gov_action(r: &mut Reader<'_>, era: Era) -> Result<GovAction, SerializationError> {
+pub(crate) fn read_gov_action(
+    r: &mut Reader<'_>,
+    era: Era,
+) -> Result<GovAction, SerializationError> {
     // Haskell `GovAction` is `decodeRecordSum "GovAction"` (definite or indefinite; a definite
     // array must declare exactly the constructor's size, tag included).
     let declared = r.read_array_header()?;
@@ -2162,7 +2181,7 @@ pub(crate) fn read_optional_hash28_gov(
     Ok(Some(read_hash28(r)?))
 }
 
-fn read_constitution(r: &mut Reader<'_>) -> Result<Constitution, SerializationError> {
+pub(crate) fn read_constitution(r: &mut Reader<'_>) -> Result<Constitution, SerializationError> {
     // constitution = [anchor, scripthash / null]
     r.read_definite_record_header("constitution", 2)?;
     let anchor = read_anchor(r)?;
@@ -2244,7 +2263,7 @@ pub(crate) fn read_protocol_param_update_for_test(
 ///   Dijkstra by two keys) — those two are rejected as unknown even under
 ///   `Era::Dijkstra`, a documented fail-closed gap (Dijkstra is unreleased)
 ///   for whoever adds the missing fields, tracked separately from this fix.
-fn read_protocol_param_update(
+pub(crate) fn read_protocol_param_update(
     r: &mut Reader<'_>,
     era: Era,
 ) -> Result<ProtocolParamUpdate, SerializationError> {
@@ -2423,7 +2442,7 @@ pub(crate) fn read_ex_units(r: &mut Reader<'_>) -> Result<ExUnits, Serialization
     Ok(ExUnits { mem, steps })
 }
 
-fn read_pool_voting_thresholds(
+pub(crate) fn read_pool_voting_thresholds(
     r: &mut Reader<'_>,
     ppu: &mut ProtocolParamUpdate,
 ) -> Result<(), SerializationError> {
@@ -2447,7 +2466,7 @@ fn read_pool_voting_thresholds(
     Ok(())
 }
 
-fn read_drep_voting_thresholds(
+pub(crate) fn read_drep_voting_thresholds(
     r: &mut Reader<'_>,
     ppu: &mut ProtocolParamUpdate,
 ) -> Result<(), SerializationError> {
@@ -2624,7 +2643,10 @@ pub(crate) fn decode_conway_witness_set(
 ///
 /// `era` selects the decoder version: from Dijkstra (PV12) on, the legacy
 /// list/array encoding is a hard decode failure (see [`read_redeemers_raw`]).
-fn read_redeemers(r: &mut Reader<'_>, era: Era) -> Result<Vec<Redeemer>, SerializationError> {
+pub(crate) fn read_redeemers(
+    r: &mut Reader<'_>,
+    era: Era,
+) -> Result<Vec<Redeemer>, SerializationError> {
     read_redeemers_raw(r, era).map(crate::decode::helpers::dedup_redeemers_last_wins)
 }
 
@@ -2722,7 +2744,7 @@ fn read_redeemers_raw(r: &mut Reader<'_>, era: Era) -> Result<Vec<Redeemer>, Ser
     }
 }
 
-fn read_redeemer_tag(r: &mut Reader<'_>) -> Result<RedeemerTag, SerializationError> {
+pub(crate) fn read_redeemer_tag(r: &mut Reader<'_>) -> Result<RedeemerTag, SerializationError> {
     let v = r.read_uint()?;
     match v {
         0 => Ok(RedeemerTag::Spend),
@@ -2777,7 +2799,7 @@ pub fn decode_plutus_data_cbor(cbor: &[u8]) -> Result<PlutusData, SerializationE
     read_plutus_data(&mut r)
 }
 
-fn read_native_script(r: &mut Reader<'_>) -> Result<NativeScript, SerializationError> {
+pub(crate) fn read_native_script(r: &mut Reader<'_>) -> Result<NativeScript, SerializationError> {
     // OUTER ARRAY: accept BOTH definite- AND indefinite-length encodings.
     //
     // cardano-ledger's Timelock decoder reads this outer "sum" array via
@@ -2993,7 +3015,7 @@ fn read_plutus_data_depth(
 // Auxiliary data decoder
 // ============================================================================
 
-fn decode_aux_data_map(
+pub(crate) fn decode_aux_data_map(
     r: &mut Reader<'_>,
     era: Era,
 ) -> Result<BTreeMap<u32, AuxiliaryData>, SerializationError> {
@@ -3009,7 +3031,7 @@ fn decode_aux_data_map(
 ///
 /// Delegates to the shared decoder. This copy handled all three shapes but
 /// still skipped the ShelleyMa array's native scripts. Issue #984.
-fn decode_auxiliary_data(
+pub(crate) fn decode_auxiliary_data(
     r: &mut Reader<'_>,
     era: Era,
 ) -> Result<AuxiliaryData, SerializationError> {

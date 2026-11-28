@@ -1628,18 +1628,40 @@ pub(super) fn run_phase1_rules(
     }
 
     // ------------------------------------------------------------------
-    // Rule 7: TTL check
+    // Rule 7: TTL / validity-interval upper bound
     //
-    // Haskell `inInterval` (Cardano.Ledger.Shelley.Rules.Utxo): the tx is
-    // valid only when `slot < invalidHereafter`.  At `slot == invalidHereafter`
-    // the tx is OUT of its validity interval and the predicate fires.  Dugite
-    // previously used strict `>` here, which admitted a tx whose TTL equalled
-    // the current slot — cardano-node then rejected the resulting block with
-    // `OutsideValidityIntervalUTxO (… invalidHereafter = SJust S, current = S)`.
-    // Match Haskell exactly: `>=`.
+    // The bound is NOT the same in every era (IntersectMBO/cardano-ledger @
+    // f649f9751074d2ab3de033fc3912f29c9862c1f5):
+    //
+    // * Shelley (PV 2) — `eras/shelley/impl/src/Cardano/Ledger/Shelley/Rules/Utxo.hs`
+    //   L410-L423:
+    //     validateTimeToLive txb slot = failureUnless (ttl >= slot) $ ExpiredUTxO ..
+    //   i.e. the tx is valid at `slot == ttl` and expired only when `slot > ttl`.
+    //   (The Haddock above it says "open interval ... strictly less"; the code,
+    //   and the spec line `txttl txb >= slot` it cites, are what execute.)
+    //
+    // * Allegra and later (PV >= 3) — `eras/allegra/impl/src/Cardano/Ledger/
+    //   Allegra/Scripts.hs` L502-L509 `inInterval`, called from
+    //   `Allegra/Rules/Utxo.hs` L229-L237 `validateOutsideValidityIntervalUTxO`
+    //   (reused unchanged by Mary, Alonzo L517-519, Babbage L358-359 and Conway
+    //   L235-238): `ValidityInterval` is half open, so `slot < invalidHereafter`
+    //   and the tx is OUT of its interval at `slot == invalidHereafter`.
+    //
+    // A Shelley `ttl` is decoded verbatim into Allegra's `invalidHereafter`
+    // (no +1; `Allegra/TxBody.hs` L199-207 and `Translation.hs` L74-76), so the
+    // same wire value is valid one slot longer under the Shelley rule. Neither
+    // check reads the protocol version; the era is the rule type, and PV 2 is
+    // exactly the Shelley era. Applying the Allegra bound to a Shelley tx
+    // falsely rejects one whose ttl equals the block slot.
     // ------------------------------------------------------------------
     if let Some(ttl) = body.ttl {
-        if current_slot >= ttl.0 {
+        let shelley_era = params.protocol_version_major < 3;
+        let expired = if shelley_era {
+            current_slot > ttl.0
+        } else {
+            current_slot >= ttl.0
+        };
+        if expired {
             errors.push(ValidationError::TtlExpired {
                 current_slot,
                 ttl: ttl.0,
@@ -3813,6 +3835,94 @@ mod tests {
                 .unwrap_or(false),
             "TTL == current_slot must produce TtlExpired (Haskell `slot < invalidHereafter`), got {result:?}"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Rule 7 is era-specific (cardano-ledger f649f975):
+    //   Shelley (PV 2):    Shelley/Rules/Utxo.hs `validateTimeToLive`,
+    //                      `ttl >= slot`  -> valid AT slot == ttl.
+    //   Allegra+ (PV >= 3): Allegra/Scripts.hs `inInterval`,
+    //                      `slot < invalidHereafter` -> invalid AT slot == ttl.
+    // Driven through `validate_transaction_with_context`, the production
+    // entry point shared by block apply, mempool admission and revalidation.
+    // -----------------------------------------------------------------------
+
+    fn ttl_verdict(pv_major: u64, ttl: u64, slot: u64) -> Result<(), Vec<ValidationError>> {
+        let (utxo_set, mut tx, _) = make_valid_tx();
+        tx.body.ttl = Some(SlotNo(ttl));
+        let mut params = ProtocolParameters::mainnet_defaults();
+        params.protocol_version_major = pv_major;
+        // Shelley predates the per-byte min-UTxO rule; keep the output above
+        // the flat minimum and pay a large fee so only Rule 7 is in question.
+        params.min_utxo_value = Lovelace(1_000_000);
+        crate::validation::validate_transaction_with_context(
+            &tx,
+            &utxo_set,
+            &params,
+            slot,
+            300,
+            None,
+            crate::validation::ValidationContext::new(),
+        )
+    }
+
+    fn has_ttl_expired(r: &Result<(), Vec<ValidationError>>) -> bool {
+        r.as_ref().err().is_some_and(|es| {
+            es.iter()
+                .any(|e| matches!(e, ValidationError::TtlExpired { .. }))
+        })
+    }
+
+    #[test]
+    fn test_shelley_pv2_ttl_equal_to_slot_is_valid() {
+        let r = ttl_verdict(2, 100, 100);
+        assert!(
+            !has_ttl_expired(&r),
+            "Shelley validateTimeToLive is `ttl >= slot`: valid at slot == ttl, got {r:?}"
+        );
+        assert!(r.is_ok(), "only Rule 7 differs from a valid tx, got {r:?}");
+    }
+
+    #[test]
+    fn test_shelley_pv2_ttl_one_below_slot_is_expired() {
+        let r = ttl_verdict(2, 99, 100);
+        assert!(has_ttl_expired(&r), "slot > ttl must expire, got {r:?}");
+    }
+
+    #[test]
+    fn test_shelley_pv2_ttl_above_slot_is_valid() {
+        let r = ttl_verdict(2, 101, 100);
+        assert!(!has_ttl_expired(&r), "got {r:?}");
+    }
+
+    #[test]
+    fn test_allegra_pv3_ttl_equal_to_slot_is_expired() {
+        let r = ttl_verdict(3, 100, 100);
+        assert!(
+            has_ttl_expired(&r),
+            "Allegra inInterval is `slot < invalidHereafter`: expired at slot == ttl, got {r:?}"
+        );
+    }
+
+    #[test]
+    fn test_allegra_pv3_ttl_one_above_slot_is_valid() {
+        let r = ttl_verdict(3, 101, 100);
+        assert!(!has_ttl_expired(&r), "got {r:?}");
+    }
+
+    /// Every post-Shelley protocol version keeps the exclusive upper bound.
+    #[test]
+    fn test_post_shelley_pvs_all_exclusive_upper_bound() {
+        for pv in [3u64, 4, 5, 6, 7, 8, 9, 10, 11] {
+            assert!(
+                has_ttl_expired(&ttl_verdict(pv, 100, 100)),
+                "PV{pv}: slot == invalidHereafter must be expired"
+            );
+            assert!(
+                !has_ttl_expired(&ttl_verdict(pv, 101, 100)),
+                "PV{pv}: slot < invalidHereafter must be valid"
+            );
+        }
     }
 
     // -----------------------------------------------------------------------

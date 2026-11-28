@@ -1027,14 +1027,18 @@ impl LedgerState {
         // Activate the phase-2 skip flag only in ValidateAll mode (the only
         // mode that calls `validate_transaction_with_context`). In ApplyOnly
         // mode, the flag would never be read, but we still set it for safety.
-        // The guard holds the previous flag value so we can restore it after
-        // the loop — critical for nested calls (e.g. forging path).
+        // The RAII guard restores the previous flag value on every exit —
+        // including the early `return Err` / `?` exits below and unwinding —
+        // so a failed apply cannot leave Phase-2 suppressed on this thread
+        // (#1193). Outside ValidateAll no guard exists, so an enclosing
+        // guard's value is left untouched (nested calls, e.g. forging path).
         #[cfg(feature = "parallel-verification")]
-        let _phase2_skip_guard: bool = if mode == BlockValidationMode::ValidateAll {
-            crate::validation::suppress_phase2_eval()
-        } else {
-            false
-        };
+        let phase2_skip_guard: Option<crate::validation::Phase2SkipGuard> =
+            if mode == BlockValidationMode::ValidateAll {
+                Some(crate::validation::Phase2SkipGuard::new())
+            } else {
+                None
+            };
 
         // Cache block-level values for RuleContext construction inside the loop.
         // We cannot call self.build_rule_context() inside the loop because it
@@ -2078,7 +2082,7 @@ impl LedgerState {
         // already ran sequentially above.
         #[cfg(feature = "parallel-verification")]
         {
-            crate::validation::restore_phase2_eval(_phase2_skip_guard);
+            drop(phase2_skip_guard);
             // When deferring (bulk-sync pooling), DO NOT drain here — the
             // captured `phase2_work_items` are returned to the caller, which
             // pools them across blocks, evaluates on a rayon pool, and runs
