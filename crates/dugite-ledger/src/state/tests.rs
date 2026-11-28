@@ -18784,11 +18784,9 @@ fn drep_absent_from_the_frozen_registry_is_not_expired() {
 //   Shelley/Rules/Utxo.hs L410-L423   validateTimeToLive: `ttl >= slot`
 //   Allegra/Scripts.hs    L502-L509   inInterval:         `slot < invalidHereafter`
 // `apply_block(ValidateAll)` validates every peer block through
-// `validate_transaction_with_context`. Until Phase-1 failures are block-fatal
-// the verdict only reaches the caller as the "Phase-1 validation divergence"
-// warning, so the test captures that log line: it is the observable output of
-// the production path today, and the assertion keeps its meaning once the
-// failure becomes an `Err`.
+// `validate_transaction_with_context`, and a Phase-1 failure rejects the block
+// with `LedgerError::BlockTxValidationFailed`. The helper accepts the verdict
+// from that `Err` (or from a captured log line).
 
 /// Collects everything the subscriber writes.
 #[derive(Clone, Default)]
@@ -18885,9 +18883,8 @@ fn test_apply_block_allegra_ttl_equal_to_slot_is_expired() {
 // (Core/TxCert.hs L151-154, reached from Shelley/TxCert.hs L596 and
 // Conway/TxCert.hs L795) plus the owners (Shelley/UTxO.hs L237-244).
 // `apply_block(ValidateAll)` validates every peer block through
-// `validate_transaction_with_context`. Phase-1 failures are not yet block-fatal,
-// so the verdict reaches the caller as the "Phase-1 validation divergence"
-// warning; capture it as the observable output of the production path.
+// `validate_transaction_with_context`; a Phase-1 failure rejects the block, so
+// the tests assert on the `Err` it returns.
 
 fn make_pool_params_for_witness_test(operator: Hash28, owner: Hash28) -> PoolParams {
     PoolParams {
