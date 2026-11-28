@@ -451,6 +451,15 @@ ndc-fetch *components:
 ndc-selftest:
     scripts/node-diversity/test-fetch-corpora.sh
 
+# The strict `ledger-rules` gate (#1125): verify the corpus, run the 368 fixtures through dugite's own
+# validation path and compare with the committed expected-results contract, then check that every
+# entry's issue is still open.  `DUGITE_NDC_UPDATE_SNAPSHOT=1 just ndc-gate` rewrites the raised-failure
+# snapshot after a reviewed change.
+ndc-gate:
+    scripts/node-diversity/fetch-corpora.sh ledger-rules
+    DUGITE_NDC_REQUIRE=1 cargo nextest run -p dugite-conformance --test ndc_ledger_rules --no-tests=fail
+    scripts/node-diversity/check-expected-issues.sh
+
 # Write one scenario's schema-validated report (ledger-rules, cbor-decoding, uplc-conformance, uplc-turbo).
 # A generator that fails still leaves an error report (so the scenario can be published), and the recipe FAILS.
 ndc-report scenario:

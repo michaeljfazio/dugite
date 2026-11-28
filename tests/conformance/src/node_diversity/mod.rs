@@ -17,9 +17,11 @@
 //! its schema, an unwritable path), and a generator that crashes writes an error report in its
 //! place so every scenario is still published.
 //!
-//! The runners themselves are Phases 2a-2d of #1114.  Until then each is a stub that writes a
-//! schema-valid report marked [`report::ReportStatus::Stub`]: it carries no result.
+//! The runners themselves are Phases 2a-2d of #1114.  Until a phase lands its runner is a stub
+//! that writes a schema-valid report marked [`report::ReportStatus::Stub`]: it carries no result.
+//! [`ledger_rules`] (Phase 2b, #1125) is the first real one.
 
+pub mod ledger_rules;
 pub mod pins;
 pub mod report;
 pub mod uplc_conformance;

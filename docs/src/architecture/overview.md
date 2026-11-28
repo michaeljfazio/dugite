@@ -18,6 +18,7 @@ crate has a focused responsibility and well-defined dependencies.
 | `dugite-mempool` | Thread-safe transaction mempool with input-conflict checking and TTL sweep (depends on `dugite-ledger` for validation types) |
 | `dugite-storage` | ChainDB (ImmutableDB append-only chunk files + VolatileDB in-memory) |
 | `dugite-node` | Main binary, config, topology, pipelined chain sync loop, Mithril import, block forging |
+| `dugite-tx-admission` | Converts the ledger's `ValidationError`s into the wire-level `TxValidationError` a rejected N2C submission is encoded from; shared by `dugite-node` and the node-diversity conformance harness (depends on `dugite-ledger` and `dugite-network`) |
 | `dugite-rpc` | Native UTxO RPC (gRPC) server exposing chain/mempool data via the `utxorpc` spec |
 | `dugite-cli` | cardano-cli compatible CLI (address, key, transaction, query, stake-address, stake-pool, governance, node, genesis, byron, and text-view command groups) |
 | `dugite-monitor` | Terminal monitoring dashboard (ratatui-based, real-time metrics via Prometheus polling) — standalone binary with no internal crate dependencies |
