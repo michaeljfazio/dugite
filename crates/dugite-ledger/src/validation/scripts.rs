@@ -1399,6 +1399,28 @@ pub(super) fn ex_unit_fee(tx: &Transaction, params: &ProtocolParameters) -> u64 
 /// - `Cardano.Ledger.Alonzo.Tx.toCBORForSizeComputation` (cardano-ledger)
 /// - Conway tiered reference script fee is based on script bytes, not tx size.
 pub(super) fn fee_tx_size(tx: &Transaction, tx_size: u64) -> u64 {
+    // Alonzo+ (`sizeAlonzoTxF`): `encodeListLen 3 <> body <> wits <> aux`, where every
+    // component re-uses its ORIGINAL bytes and the head is the 1-byte definite
+    // `array(3)`; the wire head (definite or indefinite) and the optional `is_valid` flag
+    // do not count. Build the size from the retained component bytes so that an
+    // indefinite-length or 3-element wire transaction is measured exactly as Haskell does.
+    if matches!(
+        tx.era,
+        dugite_primitives::era::Era::Alonzo
+            | dugite_primitives::era::Era::Babbage
+            | dugite_primitives::era::Era::Conway
+            | dugite_primitives::era::Era::Dijkstra
+    ) {
+        if let (Some(body), Some(wits)) = (&tx.raw_body_cbor, &tx.raw_witness_cbor) {
+            let aux = match &tx.auxiliary_data {
+                None => Some(1usize), // CBOR null
+                Some(a) => a.raw_cbor.as_ref().map(Vec::len),
+            };
+            if let Some(aux) = aux {
+                return (1 + body.len() + wits.len() + aux) as u64;
+            }
+        }
+    }
     // The raw CBOR first byte tells us the CBOR major type and additional info.
     // 0x84 = major type 4 (array) with additional info 4 (length = 4 elements).
     // An Alonzo+ transaction is encoded as array(4); pre-Alonzo as array(3) = 0x83.
@@ -1941,6 +1963,43 @@ mod tests {
     // -----------------------------------------------------------------------
     // Min fee computation — 1 test
     // -----------------------------------------------------------------------
+
+    /// `sizeAlonzoTxF` measures `encodeListLen 3 <> body <> wits <> aux` over the ORIGINAL
+    /// component bytes: the wire head (definite or indefinite) and the optional `is_valid`
+    /// flag do not count.
+    #[test]
+    fn fee_size_is_built_from_the_component_bytes() {
+        use dugite_primitives::era::Era;
+        let body = vec![0xa3, 0x00, 0x80, 0x01, 0x80, 0x02, 0x00]; // 7 bytes
+        let wits = vec![0xa0]; // 1 byte
+        let mut tx = Transaction::empty_with_hash(TransactionHash::from_bytes([0x44; 32]));
+        tx.era = Era::Conway;
+        tx.raw_body_cbor = Some(body.clone());
+        tx.raw_witness_cbor = Some(wits.clone());
+        // head (1) + body (7) + wits (1) + null aux (1)
+        let expected = 1 + 7 + 1 + 1;
+        // definite 4-element wire form: 0x84 body wits f5 f6 (11 bytes)
+        let mut definite = vec![0x84];
+        definite.extend(&body);
+        definite.extend(&wits);
+        definite.extend([0xf5, 0xf6]);
+        tx.raw_cbor = Some(definite.clone());
+        assert_eq!(fee_tx_size(&tx, definite.len() as u64), expected);
+        // indefinite wire form: 0x9f ... 0xff counts two bytes more
+        let mut indef = vec![0x9f];
+        indef.extend(&body);
+        indef.extend(&wits);
+        indef.extend([0xf5, 0xf6, 0xff]);
+        tx.raw_cbor = Some(indef.clone());
+        assert_eq!(fee_tx_size(&tx, indef.len() as u64), expected);
+        // 3-element wire form without the flag
+        let mut three = vec![0x83];
+        three.extend(&body);
+        three.extend(&wits);
+        three.push(0xf6);
+        tx.raw_cbor = Some(three.clone());
+        assert_eq!(fee_tx_size(&tx, three.len() as u64), expected);
+    }
 
     /// compute_min_fee with a pre-Alonzo (raw_cbor = None) transaction and no
     /// reference scripts or redeemers.

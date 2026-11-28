@@ -14,6 +14,98 @@
 //! [`crate::haskell_snapshot::cbor_utils::skip_cbor_value`] primitive, which has
 //! been validated against the Haskell cardano-node CBOR encoder.
 
+/// Read one CBOR head at the start of `buf`: `(major type, argument, head length)`.
+///
+/// `argument` is `None` for an indefinite-length head (`info == 31`). Every head width
+/// cborg accepts is handled (`info` 0-23, 24, 25, 26, 27 -> 1, 2, 3, 5, 9 bytes), so a block
+/// whose array or era-tag head is non-minimal (`9b 0000000000000005`) walks like any other.
+fn read_head(buf: &[u8]) -> Option<(u8, Option<u64>, usize)> {
+    let first = *buf.first()?;
+    let major = first >> 5;
+    let info = first & 0x1f;
+    let width = match info {
+        0..=23 => return Some((major, Some(info as u64), 1)),
+        24 => 1usize,
+        25 => 2,
+        26 => 4,
+        27 => 8,
+        31 => return Some((major, None, 1)),
+        _ => return None,
+    };
+    let arg = buf.get(1..1 + width)?;
+    let mut v = 0u64;
+    for b in arg {
+        v = (v << 8) | u64::from(*b);
+    }
+    Some((major, Some(v), 1 + width))
+}
+
+/// The byte layout of a Shelley+ block: `[era_tag, [header, c_0, ..., c_{N-1}]]`.
+///
+/// Returns `(first_component_offset, component_spans)` with each span as `(start, end)`
+/// into `raw_cbor`, or `None` for Byron/EBB blocks and any structure that is not this shape.
+/// The inner array may be definite (any head width) or indefinite: Haskell decodes the block
+/// with `decodeRecordNamed "Block"` (`decodeListLenOrIndef`) and hashes the ORIGINAL bytes of
+/// each segment (`withSlice` / `hashAlonzoSegWits`), so an indefinite block array is hashed
+/// over exactly the same component slices.
+fn locate_block_components(raw_cbor: &[u8]) -> Option<(usize, Vec<(usize, usize)>)> {
+    use crate::haskell_snapshot::cbor_utils::skip_cbor_value;
+
+    // Outer array: [era_tag, inner_block] -- the HFC envelope is a DEFINITE array(2).
+    let (major, len, mut off) = read_head(raw_cbor)?;
+    if major != 4 || len != Some(2) {
+        return None;
+    }
+
+    // Era tag (a uint, any head width): Byron main/EBB (0, 1) have no body hash.
+    let (era_major, era_val, _) = read_head(raw_cbor.get(off..)?)?;
+    if era_major != 0 || era_val? <= 1 {
+        return None;
+    }
+    off += skip_cbor_value(raw_cbor.get(off..)?).ok()?;
+
+    // Inner array: [header, c_0, ..., c_{N-1}]
+    let (inner_major, inner_len, hdr_bytes) = read_head(raw_cbor.get(off..)?)?;
+    if inner_major != 4 {
+        return None;
+    }
+    off += hdr_bytes;
+
+    // Skip the header (index 0)
+    off += skip_cbor_value(raw_cbor.get(off..)?).ok()?;
+
+    let body_start = off;
+    let mut spans = Vec::new();
+    match inner_len {
+        Some(n) => {
+            // Shelley+ blocks have 4 or 5 elements; fewer is not a block.
+            if n < 4 {
+                return None;
+            }
+            for _ in 0..(n - 1) {
+                let size = skip_cbor_value(raw_cbor.get(off..)?).ok()?;
+                spans.push((off, off + size));
+                off += size;
+            }
+        }
+        None => {
+            // Indefinite: components up to the break byte.
+            loop {
+                if *raw_cbor.get(off)? == 0xff {
+                    break;
+                }
+                let size = skip_cbor_value(raw_cbor.get(off..)?).ok()?;
+                spans.push((off, off + size));
+                off += size;
+            }
+            if spans.len() < 3 {
+                return None;
+            }
+        }
+    }
+    Some((body_start, spans))
+}
+
 /// Compute the actual block body size from raw block CBOR bytes.
 ///
 /// Cardano Shelley+ blocks are serialized as `(era_tag, [header, tx_bodies,
@@ -28,84 +120,9 @@
 /// Returns `None` for Byron/EBB blocks (which have no body_size header field)
 /// or if the CBOR structure is unexpected.
 pub fn compute_block_body_size_from_cbor(raw_cbor: &[u8]) -> Option<u64> {
-    use crate::haskell_snapshot::cbor_utils::skip_cbor_value;
-
-    // The wire format is a 2-element CBOR array: [era_tag, inner_block].
-    // Byron blocks use era_tag 0 (EBB) or 1 (main); Shelley+ use 2..8.
-    if raw_cbor.is_empty() {
-        return None;
-    }
-
-    // Parse outer array header (should be a 2-element array: 0x82)
-    let outer_major = raw_cbor[0] >> 5;
-    if outer_major != 4 {
-        return None; // not an array
-    }
-
-    // Skip the array header
-    let info = raw_cbor[0] & 0x1f;
-    let (outer_len, mut off) = match info {
-        0..=23 => (info as u64, 1usize),
-        24 if raw_cbor.len() >= 2 => (raw_cbor[1] as u64, 2),
-        _ => return None,
-    };
-    if outer_len != 2 {
-        return None; // unexpected outer structure
-    }
-
-    // Skip the era tag (first element: a uint)
-    let era_size = skip_cbor_value(&raw_cbor[off..]).ok()?;
-    let era_major = raw_cbor[off] >> 5;
-    if era_major != 0 {
-        return None; // not a uint era tag
-    }
-    // Read era tag value to filter out Byron
-    let era_info = raw_cbor[off] & 0x1f;
-    let era_tag = match era_info {
-        0..=23 => era_info as u64,
-        24 if raw_cbor.len() > off + 1 => raw_cbor[off + 1] as u64,
-        _ => return None,
-    };
-    // Byron main blocks (tag 0) and EBBs (tag 1) don't have body_size
-    if era_tag <= 1 {
-        return None;
-    }
-    off += era_size;
-
-    // Now at the inner block array: [header, tx_bodies, witnesses, aux_data, invalid_txs]
-    // Parse the inner array header
-    if off >= raw_cbor.len() {
-        return None;
-    }
-    let inner_major = raw_cbor[off] >> 5;
-    if inner_major != 4 {
-        return None; // not an array
-    }
-    let inner_info = raw_cbor[off] & 0x1f;
-    let (inner_len, hdr_bytes) = match inner_info {
-        0..=23 => (inner_info as u64, 1usize),
-        24 if raw_cbor.len() > off + 1 => (raw_cbor[off + 1] as u64, 2),
-        _ => return None,
-    };
-    // Shelley+ blocks have 5 elements (some early eras may have 4)
-    if inner_len < 4 {
-        return None;
-    }
-    off += hdr_bytes;
-
-    // Skip the header (index 0)
-    let header_size = skip_cbor_value(&raw_cbor[off..]).ok()?;
-    off += header_size;
-
-    // Measure body components (indices 1..inner_len-1)
-    let body_start = off;
-    let body_components = inner_len - 1; // everything except the header
-    for _ in 0..body_components {
-        let item_size = skip_cbor_value(&raw_cbor[off..]).ok()?;
-        off += item_size;
-    }
-
-    Some((off - body_start) as u64)
+    let (body_start, spans) = locate_block_components(raw_cbor)?;
+    let end = spans.last()?.1;
+    Some((end - body_start) as u64)
 }
 
 /// Extract the raw CBOR bytes of the block body from a full block CBOR buffer.
@@ -124,80 +141,9 @@ pub fn compute_block_body_size_from_cbor(raw_cbor: &[u8]) -> Option<u64> {
 ///
 /// Issue #545 E5: used to wire body-hash verification into `apply_fetched_block`.
 pub fn extract_block_body_cbor(raw_cbor: &[u8]) -> Option<&[u8]> {
-    use crate::haskell_snapshot::cbor_utils::skip_cbor_value;
-
-    if raw_cbor.is_empty() {
-        return None;
-    }
-
-    // Outer array: [era_tag, inner_block]
-    let outer_major = raw_cbor[0] >> 5;
-    if outer_major != 4 {
-        return None;
-    }
-    let info = raw_cbor[0] & 0x1f;
-    let (outer_len, mut off) = match info {
-        0..=23 => (info as u64, 1usize),
-        24 if raw_cbor.len() >= 2 => (raw_cbor[1] as u64, 2),
-        _ => return None,
-    };
-    if outer_len != 2 {
-        return None;
-    }
-
-    // Read and skip era tag
-    if off >= raw_cbor.len() {
-        return None;
-    }
-    let era_major = raw_cbor[off] >> 5;
-    if era_major != 0 {
-        return None;
-    }
-    let era_info = raw_cbor[off] & 0x1f;
-    let era_tag = match era_info {
-        0..=23 => era_info as u64,
-        24 if raw_cbor.len() > off + 1 => raw_cbor[off + 1] as u64,
-        _ => return None,
-    };
-    if era_tag <= 1 {
-        // Byron — no body_hash
-        return None;
-    }
-    let era_size = skip_cbor_value(&raw_cbor[off..]).ok()?;
-    off += era_size;
-
-    // Inner array: [header, tx_bodies, witnesses, aux_data, invalid_txs]
-    if off >= raw_cbor.len() {
-        return None;
-    }
-    let inner_major = raw_cbor[off] >> 5;
-    if inner_major != 4 {
-        return None;
-    }
-    let inner_info = raw_cbor[off] & 0x1f;
-    let (inner_len, hdr_bytes) = match inner_info {
-        0..=23 => (inner_info as u64, 1usize),
-        24 if raw_cbor.len() > off + 1 => (raw_cbor[off + 1] as u64, 2),
-        _ => return None,
-    };
-    if inner_len < 4 {
-        return None;
-    }
-    off += hdr_bytes;
-
-    // Skip the header (index 0)
-    let header_size = skip_cbor_value(&raw_cbor[off..]).ok()?;
-    off += header_size;
-
-    // Body starts here: indices 1..inner_len-1 (tx_bodies, witnesses, aux_data, invalid_txs)
-    let body_start = off;
-    let body_components = inner_len - 1;
-    for _ in 0..body_components {
-        let item_size = skip_cbor_value(&raw_cbor[off..]).ok()?;
-        off += item_size;
-    }
-
-    Some(&raw_cbor[body_start..off])
+    let (body_start, spans) = locate_block_components(raw_cbor)?;
+    let end = spans.last()?.1;
+    Some(&raw_cbor[body_start..end])
 }
 
 /// Extract the raw CBOR bytes of each individual block-body component.
@@ -223,83 +169,8 @@ pub fn extract_block_body_cbor(raw_cbor: &[u8]) -> Option<&[u8]> {
 /// Issue #550 E5: per-component view used by `validate_block_body_hash` to
 /// match the Haskell `bbHash` algorithm exactly.
 pub fn extract_block_body_components(raw_cbor: &[u8]) -> Option<Vec<&[u8]>> {
-    use crate::haskell_snapshot::cbor_utils::skip_cbor_value;
-
-    if raw_cbor.is_empty() {
-        return None;
-    }
-
-    // Outer array: [era_tag, inner_block]
-    let outer_major = raw_cbor[0] >> 5;
-    if outer_major != 4 {
-        return None;
-    }
-    let info = raw_cbor[0] & 0x1f;
-    let (outer_len, mut off) = match info {
-        0..=23 => (info as u64, 1usize),
-        24 if raw_cbor.len() >= 2 => (raw_cbor[1] as u64, 2),
-        _ => return None,
-    };
-    if outer_len != 2 {
-        return None;
-    }
-
-    // Read and skip era tag
-    if off >= raw_cbor.len() {
-        return None;
-    }
-    let era_major = raw_cbor[off] >> 5;
-    if era_major != 0 {
-        return None;
-    }
-    let era_info = raw_cbor[off] & 0x1f;
-    let era_tag = match era_info {
-        0..=23 => era_info as u64,
-        24 if raw_cbor.len() > off + 1 => raw_cbor[off + 1] as u64,
-        _ => return None,
-    };
-    if era_tag <= 1 {
-        // Byron — no body_hash
-        return None;
-    }
-    let era_size = skip_cbor_value(&raw_cbor[off..]).ok()?;
-    off += era_size;
-
-    // Inner array: [header, c_0, c_1, ..., c_{N-1}]
-    if off >= raw_cbor.len() {
-        return None;
-    }
-    let inner_major = raw_cbor[off] >> 5;
-    if inner_major != 4 {
-        return None;
-    }
-    let inner_info = raw_cbor[off] & 0x1f;
-    let (inner_len, hdr_bytes) = match inner_info {
-        0..=23 => (inner_info as u64, 1usize),
-        24 if raw_cbor.len() > off + 1 => (raw_cbor[off + 1] as u64, 2),
-        _ => return None,
-    };
-    // Need at least 4 elements (header + 3 body components for Shelley/Mary)
-    if inner_len < 4 {
-        return None;
-    }
-    off += hdr_bytes;
-
-    // Skip the header (index 0)
-    let header_size = skip_cbor_value(&raw_cbor[off..]).ok()?;
-    off += header_size;
-
-    // Capture each component slice
-    let n_components = (inner_len - 1) as usize;
-    let mut components = Vec::with_capacity(n_components);
-    for _ in 0..n_components {
-        let start = off;
-        let item_size = skip_cbor_value(&raw_cbor[off..]).ok()?;
-        off += item_size;
-        components.push(&raw_cbor[start..off]);
-    }
-
-    Some(components)
+    let (_, spans) = locate_block_components(raw_cbor)?;
+    Some(spans.into_iter().map(|(a, b)| &raw_cbor[a..b]).collect())
 }
 
 #[cfg(test)]

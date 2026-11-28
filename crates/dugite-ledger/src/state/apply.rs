@@ -752,9 +752,12 @@ impl LedgerState {
         // Closes #377.
         if mode == BlockValidationMode::ValidateAll {
             if let Some(ref raw) = block.raw_cbor {
-                if let Some(actual_body_size) =
-                    dugite_serialization::compute_block_body_size_from_cbor(raw)
-                {
+                // Fail closed: a Shelley+ block whose body cannot be measured is not
+                // accepted (Byron has no body size).
+                if block.era != Era::Byron {
+                    let actual_body_size =
+                        dugite_serialization::compute_block_body_size_from_cbor(raw)
+                            .ok_or(LedgerError::BlockBodyUnmeasurable)?;
                     let claimed = block.header.body_size;
                     if actual_body_size != claimed {
                         return Err(LedgerError::WrongBlockBodySize {
@@ -3828,6 +3831,21 @@ mod tests {
         assert!(
             !matches!(result, Err(LedgerError::WrongBlockBodySize { .. })),
             "Bogus body-size approximation must not be present; got: {result:?}"
+        );
+    }
+
+    /// BBODY `WrongBlockBodySizeBBODY` is an equality check, so a Shelley+ block whose raw
+    /// bytes cannot be walked to measure the body must be refused, not waved through.
+    #[test]
+    fn unmeasurable_block_body_fails_closed() {
+        let mut state = LedgerState::new(ProtocolParameters::mainnet_defaults());
+        let mut block = make_test_block(Era::Conway, 1_000, 1, 9, 200, vec![]);
+        // Not `[era, [header, c0, c1, c2, ..]]`: an empty array.
+        block.raw_cbor = Some(vec![0x82, 0x07, 0x80]);
+        let result = state.apply_block(&block, BlockValidationMode::ValidateAll);
+        assert!(
+            matches!(result, Err(LedgerError::BlockBodyUnmeasurable)),
+            "got {result:?}"
         );
     }
 
