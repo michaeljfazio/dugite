@@ -1354,6 +1354,13 @@ impl LedgerState {
             .with_enacted_gov_roots(self.enacted_gov_roots())
             .with_committee_authorized_hot_keys(gov.committee_hot_keys.values().copied().collect())
             .with_committee_authorized_elected_hot_keys(committee_authorized_elected_hot_keys)
+            .with_committee_hot_key_registry(
+                gov.committee_hot_keys
+                    .iter()
+                    .map(|(c, h)| (*c, *h))
+                    .collect(),
+                gov.committee_expiration.keys().copied().collect(),
+            )
             .with_committee_members(gov.committee_auth_eligible_members())
             .with_committee_resigned(gov.committee_resigned.keys().copied().collect())
             .with_vote_delegations(gov.vote_delegations.keys().copied().collect())

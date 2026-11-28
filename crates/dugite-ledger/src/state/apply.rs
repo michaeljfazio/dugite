@@ -1537,6 +1537,23 @@ impl LedgerState {
                         .with_committee_authorized_elected_hot_keys_arc(std::sync::Arc::clone(
                             &block_committee_authorized_elected_hot_keys,
                         ))
+                        // Cold -> hot map and enacted committee, read LIVE (tiny: at
+                        // most a few dozen members) so the GOV predicates can evolve
+                        // the committee state through this tx's own certificates.
+                        .with_committee_hot_key_registry(
+                            self.gov
+                                .governance
+                                .committee_hot_keys
+                                .iter()
+                                .map(|(c, h)| (*c, *h))
+                                .collect(),
+                            self.gov
+                                .governance
+                                .committee_expiration
+                                .keys()
+                                .copied()
+                                .collect(),
+                        )
                         .with_pools_arc(std::sync::Arc::clone(&block_registered_pool_ids))
                         .with_dreps_arc(std::sync::Arc::clone(&block_registered_drep_ids))
                         .with_vrf_key_registry_arc(std::sync::Arc::clone(
