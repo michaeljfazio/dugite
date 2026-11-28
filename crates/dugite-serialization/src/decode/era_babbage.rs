@@ -499,8 +499,8 @@ fn decode_babbage_tx_body(r: &mut Reader<'_>) -> Result<TransactionBody, Seriali
                 })?;
             }
             15 => {
-                let id = r.read_uint()?;
-                network_id = Some(id as u8);
+                // Haskell `Network` DecCBOR: `decodeWord8` + `word8ToNetwork` (0 or 1 only).
+                network_id = Some(crate::decode::helpers::read_network_id(r)?);
             }
             16 => {
                 // collateral_return: a post-Alonzo output (map or legacy array).

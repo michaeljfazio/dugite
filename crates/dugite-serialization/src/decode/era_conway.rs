@@ -631,11 +631,12 @@ pub(crate) fn decode_conway_tx_body(
             }
             15 => {
                 // network_id
-                let raw = r.read_uint()?;
-                network_id = match raw {
-                    0 | 1 => Some(raw as u8),
-                    _ => None,
-                };
+                //
+                // Haskell `Network`'s `DecCBOR` (`BaseTypes.hs`) is `decodeWord8` followed by
+                // `word8ToNetwork`, which fails with "Unknown network id" for anything but
+                // 0 (Testnet) or 1 (Mainnet); a value that decoded to None here would hash
+                // and validate as an absent field.
+                network_id = Some(crate::decode::helpers::read_network_id(r)?);
             }
             16 => {
                 // collateral_return: transaction_output
@@ -937,11 +938,7 @@ pub(crate) fn decode_sub_tx_body(
             }
             15 => {
                 // network_id
-                let raw = r.read_uint()?;
-                sub.network_id = match raw {
-                    0 | 1 => Some(raw as u8),
-                    _ => None,
-                };
+                sub.network_id = Some(crate::decode::helpers::read_network_id(r)?);
             }
             18 => {
                 sub.reference_inputs = r.read_set_strict(read_tx_input)?;
