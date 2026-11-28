@@ -89,16 +89,25 @@ fn mismatches(
 ///
 /// * A sample Haskell ACCEPTS must decode, always: a refusal here is the stall defect (a
 ///   valid on-chain block that no peer can deliver).
-/// * A sample Haskell REJECTS must not decode, except for `known_over_acceptance` samples:
-///   pre-existing over-acceptances that are NOT part of the indefinite-length / embedded-CBOR
-///   / network-id fixes.  In `block` every one of them is a block-segment consistency check
-///   dugite does not make (witness-set count against body count, auxiliary-data key range or
-///   repeat, `invalid_transactions` range / order / repeat); the single `transaction` sample
-///   and the three `babbage_transaction_output` samples are value / required-key strictness.
-///   The figure is a ratchet: the test fails when it is not exact, so fixing one of them
-///   forces the number down and it can never silently grow.
-fn run(rule: &str, known_over_acceptance: usize, decode: &dyn Fn(&[u8]) -> Result<(), String>) {
+/// * A sample Haskell REJECTS must not decode, except for the samples NAMED in
+///   `known_over_acceptance`: pre-existing over-acceptances that are not part of the
+///   indefinite-length / embedded-CBOR / network-id fixes (block-segment consistency that
+///   dugite does not check: witness-set count against body count, auxiliary-data key range or
+///   repeat, `invalid_transactions` range / order / repeat, and a few value / required-key
+///   strictness cases). The list is pinned by NAME, not by count, so a sample can neither
+///   be swapped for another nor silently grow the set: the test fails when the observed set
+///   differs from the list in either direction.
+///
+/// The corpus comes from `just ndc-fetch` (`scripts/node-diversity/fetch-corpora.sh cbor`).
+/// When it is missing the test is skipped, unless `DUGITE_NDC_REQUIRE=1` (set by the CI job
+/// that fetches it, as for the `ndc_reports` tests), where a missing corpus FAILS.
+fn run(rule: &str, known_over_acceptance: &[&str], decode: &dyn Fn(&[u8]) -> Result<(), String>) {
     let Some(root) = dataset_root() else {
+        assert!(
+            std::env::var("DUGITE_NDC_REQUIRE").as_deref() != Ok("1"),
+            "{rule}: DUGITE_NDC_REQUIRE=1 but the cbor-dataset corpus is missing; \
+             run `scripts/node-diversity/fetch-corpora.sh cbor`"
+        );
         eprintln!("SKIP {rule}: cbor-dataset not fetched (run `just ndc-fetch`)");
         return;
     };
@@ -118,18 +127,56 @@ fn run(rule: &str, known_over_acceptance: usize, decode: &dyn Fn(&[u8]) -> Resul
             .collect::<Vec<_>>()
             .join("\n")
     );
+    let mut observed: Vec<String> = over
+        .iter()
+        .map(|l| {
+            l.strip_prefix(&format!("{rule}/"))
+                .unwrap_or(l)
+                .split(": ")
+                .next()
+                .unwrap()
+                .to_string()
+        })
+        .collect();
+    observed.sort();
+    let mut expected: Vec<String> = known_over_acceptance
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    expected.sort();
     assert_eq!(
-        over.len(),
-        known_over_acceptance,
-        "rule `{rule}`: {} samples Haskell rejects still decode, expected exactly \
-         {known_over_acceptance} (lower the figure if you fixed one) (first {show}):\n{}",
-        over.len(),
-        over.iter()
-            .take(show)
-            .cloned()
-            .collect::<Vec<_>>()
-            .join("\n")
+        observed, expected,
+        "rule `{rule}`: the samples Haskell rejects that still decode differ from the pinned list"
     );
+}
+
+/// Block samples Haskell rejects that `decode_block` still accepts (block-segment consistency).
+const BLOCK_OVER_ACCEPTED: &[&str] = &[
+    "invalid-zap-0/00462-d77730577a5b3986.input.cbor",
+    "invalid-zap-0/00547-070cfd6e9914672a.input.cbor",
+    "invalid-zap-1/00061-de40d7fcb83a7099.input.cbor",
+    "invalid-zap-3/00515-7b5fc28dda362af9.input.cbor",
+    "invalid-zap-3/00581-db003ce8b95596e3.input.cbor",
+    "manual-invalid/auxiliary-data-key-past-transaction-index.input.cbor",
+    "manual-invalid/auxiliary-data-key-twice.input.cbor",
+    "manual-invalid/invalid-transactions-repeated.input.cbor",
+    "manual-invalid/invalid-transactions-unsorted.input.cbor",
+];
+
+/// Additional samples only `decode_block_minimal` accepts: it skips the witness sets.
+const BLOCK_MINIMAL_ONLY: &[&str] = &[
+    "invalid-zap-0/00035-80e995ebe3d97a54.input.cbor",
+    "invalid-zap-1/00438-0cff8e86c00c0724.input.cbor",
+    "invalid-zap-1/00479-63e09d3ea2c6f651.input.cbor",
+    "invalid-zap-2/00110-fd03bb2f9d4ea0fe.input.cbor",
+];
+
+fn minimal_over_accepted() -> Vec<&'static str> {
+    BLOCK_OVER_ACCEPTED
+        .iter()
+        .chain(BLOCK_MINIMAL_ONLY)
+        .copied()
+        .collect()
 }
 
 /// The dataset's `block` rule is the bare Conway era block; the node receives it inside the
@@ -142,7 +189,7 @@ fn hfc_wrap_conway(block: &[u8]) -> Vec<u8> {
 
 #[test]
 fn dataset_block_decode_block() {
-    run("block", 31, &|b| {
+    run("block", BLOCK_OVER_ACCEPTED, &|b| {
         decode_block(&hfc_wrap_conway(b))
             .map(|_| ())
             .map_err(|e| e.to_string())
@@ -152,20 +199,67 @@ fn dataset_block_decode_block() {
 /// Minimal mode skips the witness sets, so it cannot see the witness-set-level zaps.
 #[test]
 fn dataset_block_decode_block_minimal() {
-    run("block", 39, &|b| {
+    run("block", &minimal_over_accepted(), &|b| {
         decode_block_minimal(&hfc_wrap_conway(b))
             .map(|_| ())
             .map_err(|e| e.to_string())
     });
 }
 
+/// Every block Haskell accepts must also be measurable and hashable: the sync pipeline
+/// extracts the body segments (`validate_block_body_hash`) and the body size (BBODY) from the
+/// raw bytes after decoding, and refuses a block it cannot walk. Indefinite (`9f`) and wide
+/// (`9b`) block-array heads are in the dataset's `manual-valid` samples.
+#[test]
+fn dataset_valid_blocks_pass_body_extraction() {
+    let Some(root) = dataset_root() else {
+        assert!(
+            std::env::var("DUGITE_NDC_REQUIRE").as_deref() != Ok("1"),
+            "DUGITE_NDC_REQUIRE=1 but the cbor-dataset corpus is missing"
+        );
+        eprintln!("SKIP: cbor-dataset not fetched (run `just ndc-fetch`)");
+        return;
+    };
+    let rule_dir = root.join("block");
+    let mut checked = 0;
+    for class in ACCEPT {
+        for (name, bytes) in samples(&rule_dir, class) {
+            let blk = hfc_wrap_conway(&bytes);
+            let comps = dugite_serialization::extract_block_body_components(&blk)
+                .unwrap_or_else(|| panic!("{class}/{name}: no body components"));
+            assert!(
+                comps.len() >= 3,
+                "{class}/{name}: {} components",
+                comps.len()
+            );
+            assert!(
+                dugite_serialization::compute_block_body_size_from_cbor(&blk).is_some(),
+                "{class}/{name}: body size"
+            );
+            let body = dugite_serialization::extract_block_body_cbor(&blk)
+                .unwrap_or_else(|| panic!("{class}/{name}: no body bytes"));
+            let joined: usize = comps.iter().map(|c| c.len()).sum();
+            assert_eq!(joined, body.len(), "{class}/{name}");
+            checked += 1;
+        }
+    }
+    assert!(
+        checked >= 19,
+        "only {checked} valid block samples were found"
+    );
+}
+
 #[test]
 fn dataset_transaction_decode_transaction() {
-    run("transaction", 1, &|b| {
-        decode_transaction(6, b)
-            .map(|_| ())
-            .map_err(|e| e.to_string())
-    });
+    run(
+        "transaction",
+        &["manual-invalid/auto-array-3-a-value-matching-none-of-60.input.cbor"],
+        &|b| {
+            decode_transaction(6, b)
+                .map(|_| ())
+                .map_err(|e| e.to_string())
+        },
+    );
 }
 
 fn addr_bytes_item() -> Vec<u8> {
@@ -179,7 +273,7 @@ fn addr_bytes_item() -> Vec<u8> {
 #[test]
 fn dataset_data_as_inline_datum() {
     for era in [5u16, 6] {
-        run("data", 0, &|b| {
+        run("data", &[], &|b| {
             let mut out = vec![0xa3, 0x00];
             out.extend(addr_bytes_item());
             out.extend([0x01, 0x00, 0x02, 0x82, 0x01]);
@@ -194,7 +288,7 @@ fn dataset_data_as_inline_datum() {
 /// The `network_id` rule is body key 15: `{0: [], 1: [], 2: 0, 15: <sample>}` inside a tx.
 #[test]
 fn dataset_network_id_in_tx_body() {
-    run("network_id", 0, &|b| {
+    run("network_id", &[], &|b| {
         let mut tx = vec![0x84, 0xa4, 0x00, 0x80, 0x01, 0x80, 0x02, 0x00, 0x0f];
         tx.extend_from_slice(b);
         tx.extend([0xa0, 0xf5, 0xf6]);
@@ -206,9 +300,13 @@ fn dataset_network_id_in_tx_body() {
 
 #[test]
 fn dataset_babbage_transaction_output() {
-    run("babbage_transaction_output", 3, &|b| {
-        decode_transaction_output(6, b)
-            .map(|_| ())
-            .map_err(|e| e.to_string())
-    });
+    run(
+        "babbage_transaction_output",
+        &["manual-invalid/arity-few-1-entries.input.cbor"],
+        &|b| {
+            decode_transaction_output(6, b)
+                .map(|_| ())
+                .map_err(|e| e.to_string())
+        },
+    );
 }
