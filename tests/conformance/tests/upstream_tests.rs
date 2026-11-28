@@ -67,10 +67,13 @@ fn mithril_certificate_checks() {
     mithril::run_all_checks(&dir);
 }
 
-// ── ledger-rules ImpSpec replay (Phase 4) ────────────────────────────────────
+// ── ledger-rules ImpSpec signal decode ───────────────────────────────────────
+//
+// DECODE ONLY: no ledger rule is applied and no state is compared.  See the
+// module doc of `ledger_rules_replay` for exactly what is checked.
 
 #[test]
-fn ledger_rules_imp_spec_replay() {
+fn ledger_rules_signal_decode() {
     let Some(dir) = fixtures::check_area("ledger-rules") else {
         return;
     };

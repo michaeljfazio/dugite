@@ -118,7 +118,9 @@ fn main() {
                 .replace(std::path::MAIN_SEPARATOR, "/");
             let name = unique_name(
                 &mut used_names,
-                &format!("upstream_ledger_rules_{}", sanitise(&rel_str)),
+                // `decode`: the generated test only decodes the vector's
+                // signal; it applies no ledger rule.
+                &format!("upstream_ledger_rules_decode_{}", sanitise(&rel_str)),
             );
             let abs = test_dir.display().to_string();
             out.push_str(&format!(

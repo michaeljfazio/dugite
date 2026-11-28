@@ -1,18 +1,17 @@
-//! # Dugite Formal Ledger Specification Conformance Tests
+//! # Dugite Hand-written Ledger Conformance Vectors
 //!
-//! This crate validates Dugite's ledger implementation against test vectors
-//! derived from the Cardano formal ledger specification (Agda -> Haskell).
+//! This crate runs a set of hand-written JSON test vectors against Dugite's
+//! ledger implementation.
 //!
-//! ## Architecture
+//! ## Provenance
 //!
-//! The formal spec (https://github.com/IntersectMBO/formal-ledger-specifications)
-//! defines STS (state transition system) rules in Agda, which are compiled to
-//! Haskell via MAlonzo. A Haskell test vector generator calls these step functions
-//! and serializes inputs/outputs as JSON test vectors.
+//! The vectors in `vectors/` are NOT generated from the Agda formal ledger
+//! specification: there is no Agda -> Haskell generator in this repository.
+//! They were written by hand, and their expected outputs were edited to follow
+//! code changes, so they are not an independent oracle.
 //!
-//! This crate consumes those test vectors and validates them against Dugite's
-//! Rust implementation. The mapping between Agda abstract types and Dugite's
-//! concrete types is handled by the [`adapters`] module.
+//! The mapping between the spec's abstract types and Dugite's concrete types is
+//! handled by the [`adapters`] module.
 //!
 //! ## Supported Rules
 //!

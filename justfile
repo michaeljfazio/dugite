@@ -405,9 +405,9 @@ test-conformance-cardano-ledger:
 test-conformance-cardano-node:
     DUGITE_REQUIRE_UPSTREAM=1 cargo nextest run -p dugite-conformance --features upstream-conformance --test upstream_tests -E 'test(/^upstream_cardano_node_/) + test(cardano_node_genesis_decodes)'
 
-# ledger-rules: ImpSpec replay across all Conway STS rules (~8,100 vectors).
-test-conformance-ledger-rules:
-    DUGITE_REQUIRE_UPSTREAM=1 cargo nextest run -p dugite-conformance --features upstream-conformance --test upstream_tests -E 'test(/^upstream_ledger_rules_/) + test(ledger_rules_imp_spec_replay)'
+# ledger-rules: ImpSpec signal DECODE across the captured vectors (~8,100). Applies no ledger rule.
+test-conformance-ledger-rules-decode:
+    DUGITE_REQUIRE_UPSTREAM=1 cargo nextest run -p dugite-conformance --features upstream-conformance --test upstream_tests -E 'test(/^upstream_ledger_rules_decode_/) + test(ledger_rules_signal_decode)'
 
 # mithril: certificate fixture verification.
 test-conformance-mithril:

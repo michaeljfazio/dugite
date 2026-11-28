@@ -1,18 +1,15 @@
-//! Phase 4 — Compare: field-by-field state equivalence check.
+//! Compare: byte/shape equivalence helper for two decoded states.
 //!
-//! ## Current state (Phase 4 skeleton)
+//! **Nothing calls `compare_states`.**  The runner never produces a Dugite-side
+//! state, so no test compares Dugite's output against a vector's `st_out`.  The
+//! function is a placeholder for a future ledger check.
 //!
-//! Compares `initial_state` and `final_state` by byte length and CBOR top-level
-//! shape (using `bridge::DecodedState`). This is the minimum meaningful check
-//! that can be made before the full typed bridge is complete.
+//! It compares CBOR byte length and top-level shape (using
+//! `bridge::DecodedState`); when both blobs are byte-identical it reports a
+//! match.
 //!
-//! When initial == final (byte-exact) the comparison is vacuously "same" — the
-//! runner hasn't mutated anything yet. That is expected in skeleton mode.
-//!
-//! ## Phase 4 follow-on
-//!
-//! Once `runner.rs` produces a typed post-event state, replace the byte-length
-//! comparison with field-by-field equivalence:
+//! Once a ledger check produces a typed post-event state, replace the
+//! byte-length comparison with field-by-field equivalence:
 //! - UTxO set contents (input → output pairs)
 //! - Certificate state (delegation, registration)
 //! - Protocol parameters (current, future)
@@ -34,7 +31,7 @@ pub struct CompareResult {
 
 /// Compare `observed` (post-runner state) against `expected` (vector's final_state).
 ///
-/// In Phase 4 skeleton mode: compares CBOR byte length and top-level shape.
+/// Compares CBOR byte length and top-level shape only (no caller yet).
 /// Matches when both are equal; otherwise reports the discrepancy.
 pub fn compare_states(observed: &DecodedState, expected: &DecodedState) -> CompareResult {
     if observed.raw_cbor == expected.raw_cbor {
