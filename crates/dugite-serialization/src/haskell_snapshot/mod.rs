@@ -227,6 +227,20 @@ fn decode_shelley_tip(data: &[u8]) -> Result<(SlotNo, u64, Hash32, usize), Seria
 fn decode_new_epoch_state(
     data: &[u8],
 ) -> Result<(EpochNo, HaskellNewEpochState, usize), SerializationError> {
+    let (epoch, nes, _utxo, n) = decode_new_epoch_state_core(data, false)?;
+    Ok((epoch, nes, n))
+}
+
+/// Shared body of [`decode_new_epoch_state`] and [`decode_bare_new_epoch_state`].
+///
+/// `inline_utxo` selects what happens to `UTxOState[0]`. A node's `state` file
+/// is an `EmptyMK` snapshot whose UTxO lives in the sibling tables file, so
+/// production leaves it skipped (`false`). A bare `NewEpochState` dumped by the
+/// cardano-ledger ImpSpec harness carries the UTxO inline (`true`).
+fn decode_new_epoch_state_core(
+    data: &[u8],
+    inline_utxo: bool,
+) -> Result<(EpochNo, HaskellNewEpochState, Vec<HaskellUtxoEntry>, usize), SerializationError> {
     let mut off = 0;
 
     let (nes_len, n) = decode_array_len(&data[off..])?;
@@ -273,49 +287,17 @@ fn decode_new_epoch_state(
     off += n;
 
     // [3][1] LedgerState = array(2) [CertState, UTxOState]
-    let (ls_len, n) = decode_array_len(&data[off..])?;
+    let (ls, n) = decode_ledger_state_core(&data[off..], inline_utxo)?;
     off += n;
-    if ls_len != 2 {
-        return Err(SerializationError::CborDecode(format!(
-            "LedgerState: expected array(2), got array({ls_len})"
-        )));
-    }
-
-    // CertState
-    let (cert_state, n) = decode_certstate(&data[off..])?;
-    off += n;
-
-    // UTxOState = array(6) [utxo, deposited, fees, GovState, instantStake, donation]
-    let (us_len, n) = decode_array_len(&data[off..])?;
-    off += n;
-    if us_len != 6 {
-        return Err(SerializationError::CborDecode(format!(
-            "UTxOState: expected array(6), got array({us_len})"
-        )));
-    }
-
-    // [0] utxo_map — skip (empty in EmptyMK snapshot)
-    off += skip_cbor_value(&data[off..])?;
-
-    // [1] deposited: uint
-    let (deposited, n) = decode_uint(&data[off..])?;
-    off += n;
-
-    // [2] fees: uint
-    let (fees, n) = decode_uint(&data[off..])?;
-    off += n;
-
-    // [3] GovState (ConwayGovState)
-    let (gov_state, n) = decode_govstate(&data[off..])?;
-    off += n;
-
-    // [4] instantStake: map(credential → coin)
-    let (instant_stake, n) = decode_instant_stake_map(&data[off..])?;
-    off += n;
-
-    // [5] donation: uint
-    let (donation, n) = decode_uint(&data[off..])?;
-    off += n;
+    let HaskellBareLedgerState {
+        cert_state,
+        utxo,
+        deposited,
+        fees,
+        gov_state,
+        instant_stake,
+        donation,
+    } = ls;
 
     // [3][2] SnapShots
     let (snapshots, n) = decode_snapshots(&data[off..])?;
@@ -359,7 +341,150 @@ fn decode_new_epoch_state(
         non_myopic,
     };
 
-    Ok((epoch, new_epoch_state, off))
+    Ok((epoch, new_epoch_state, utxo, off))
+}
+
+/// Decode `LedgerState = array(2) [CertState, UTxOState]`.
+///
+/// `UTxOState = array(6) [utxo, deposited, fees, GovState, instantStake, donation]`.
+/// See [`decode_new_epoch_state_core`] for what `inline_utxo` selects.
+fn decode_ledger_state_core(
+    data: &[u8],
+    inline_utxo: bool,
+) -> Result<(HaskellBareLedgerState, usize), SerializationError> {
+    let mut off = 0;
+
+    let (ls_len, n) = decode_array_len(&data[off..])?;
+    off += n;
+    if ls_len != 2 {
+        return Err(SerializationError::CborDecode(format!(
+            "LedgerState: expected array(2), got array({ls_len})"
+        )));
+    }
+
+    // CertState
+    let (cert_state, n) = decode_certstate(&data[off..])?;
+    off += n;
+
+    // UTxOState = array(6) [utxo, deposited, fees, GovState, instantStake, donation]
+    let (us_len, n) = decode_array_len(&data[off..])?;
+    off += n;
+    if us_len != 6 {
+        return Err(SerializationError::CborDecode(format!(
+            "UTxOState: expected array(6), got array({us_len})"
+        )));
+    }
+
+    // [0] utxo_map — empty in an EmptyMK node snapshot, so production skips it.
+    let utxo = if inline_utxo {
+        let (entries, n) = decode_inline_utxo(&data[off..])?;
+        off += n;
+        entries
+    } else {
+        off += skip_cbor_value(&data[off..])?;
+        Vec::new()
+    };
+
+    // [1] deposited: uint
+    let (deposited, n) = decode_uint(&data[off..])?;
+    off += n;
+
+    // [2] fees: uint
+    let (fees, n) = decode_uint(&data[off..])?;
+    off += n;
+
+    // [3] GovState (ConwayGovState)
+    let (gov_state, n) = decode_govstate(&data[off..])?;
+    off += n;
+
+    // [4] instantStake: map(credential → coin)
+    let (instant_stake, n) = decode_instant_stake_map(&data[off..])?;
+    off += n;
+
+    // [5] donation: uint
+    let (donation, n) = decode_uint(&data[off..])?;
+    off += n;
+
+    Ok((
+        HaskellBareLedgerState {
+            cert_state,
+            utxo,
+            deposited,
+            fees,
+            gov_state,
+            instant_stake,
+            donation,
+        },
+        off,
+    ))
+}
+
+/// Decode an inline `UTxO` map: `map(bytes(34, MemPack TxIn) → bytes(MemPack TxOut))`.
+///
+/// The value is the era's `MemPack` TxOut wrapped as a CBOR byte string (the
+/// `EncCBOR (BabbageTxOut era)` instance is `encodeMemPack`), i.e. the same
+/// payload [`crate::mempack::txout::decode_mempack_txout`] decodes from a node's
+/// tables file.
+fn decode_inline_utxo(data: &[u8]) -> Result<(Vec<HaskellUtxoEntry>, usize), SerializationError> {
+    let mut off = 0;
+    let (mut reader, n) = MapReader::new(&data[off..])?;
+    off += n;
+
+    let mut entries = Vec::with_capacity(reader.size_hint().min(1 << 16));
+    while reader.has_next(&data[off..])? {
+        // Key: `EncCBOR TxIn` is `encodeMemPack`, i.e. a CBOR byte string of
+        // the 34-byte `MemPack TxIn` = `TxId(32) || TxIx(Word16)`. This is the
+        // LEDGER's own instance (host-native Word16, little-endian on the x86-64
+        // hosts the corpus is generated on), not the consensus-layer
+        // `BigEndianTxIn` that a node's tables file uses.
+        let (key, n) = cbor_utils::decode_bytes(&data[off..])?;
+        off += n;
+        let txin =
+            crate::mempack::decode_mempack_txin(key, crate::mempack::TxIxEndianness::Little)?;
+        let (txout, n) = cbor_utils::decode_bytes(&data[off..])?;
+        off += n;
+        entries.push(HaskellUtxoEntry {
+            txid: txin.txid,
+            txix: u64::from(txin.txix),
+            txout_mempack: txout.to_vec(),
+        });
+    }
+    off += reader.finish(&data[off..])?;
+
+    Ok((entries, off))
+}
+
+/// Decode a bare `LedgerState` (no HFC telescope, no `ExtLedgerState` wrapper)
+/// carrying its UTxO inline, as dumped by the cardano-ledger ImpSpec harness for
+/// the LEDGER rule. Requires the input to be consumed exactly.
+pub fn decode_bare_ledger_state(data: &[u8]) -> Result<HaskellBareLedgerState, SerializationError> {
+    let (ls, n) = decode_ledger_state_core(data, true)?;
+    if n != data.len() {
+        return Err(SerializationError::CborDecode(format!(
+            "bare LedgerState: {} trailing byte(s)",
+            data.len() - n
+        )));
+    }
+    Ok(ls)
+}
+
+/// Decode a bare `NewEpochState` (no HFC telescope, no `ExtLedgerState`
+/// wrapper) carrying its UTxO inline, as dumped by the cardano-ledger ImpSpec
+/// harness for the NEWEPOCH rule. Requires the input to be consumed exactly.
+///
+/// This is the same decoder [`decode_state_file`] runs on the telescope's
+/// payload; only the UTxO handling differs (see [`decode_new_epoch_state_core`]).
+pub fn decode_bare_new_epoch_state(
+    data: &[u8],
+) -> Result<(HaskellNewEpochState, Vec<HaskellUtxoEntry>), SerializationError> {
+    let (_epoch, nes, utxo, n) = decode_new_epoch_state_core(data, true)?;
+    if n != data.len() {
+        return Err(SerializationError::CborDecode(format!(
+            "bare NewEpochState: {} trailing byte(s)",
+            data.len() - n
+        )));
+    }
+    Ok((nes, utxo))
 }
 
 /// Decode the HeaderState telescope and extract PraosState.

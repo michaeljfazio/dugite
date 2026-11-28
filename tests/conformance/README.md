@@ -18,9 +18,12 @@ when it was last edited, not that it agrees with the Haskell node or the
 formal spec.
 
 For comparisons against upstream sources see the `upstream/` fixtures and
-`docs/src/reference/conformance.md`. Note that the `ledger-rules` area there
-only decodes its fixtures (`just test-conformance-ledger-rules-decode`); it
-applies no ledger rule.
+`docs/src/reference/conformance.md`. In the `ledger-rules` area, LEDGER and
+NEWEPOCH vectors are applied through dugite's ledger and compared with Haskell's
+`st_out` (`just test-conformance-ledger-rules-apply-compare`; known divergences
+are pinned in `tests/conformance/expected/ledger_rules_replay.tsv`); the other
+rules (POOL, CERT, ...) only decode their fixtures
+(`just test-conformance-ledger-rules-decode`) and apply no ledger rule.
 
 **Validation**: The `dugite-conformance` crate loads the JSON vectors,
 converts them to Dugite types via adapter functions, runs the corresponding
