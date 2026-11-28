@@ -19,7 +19,9 @@ crc32fast = { workspace = true }
 
 [features]
 # Rule-level decode/encode entry points for the node-diversity cbor-decoding conformance harness
-# (`tests/conformance`).  Off by default: nothing in the node uses them.
+# (`tests/conformance`).  Not enabled by this crate or by the node; `tests/conformance` enables it,
+# and it is a default workspace member, so a workspace-wide build turns it on through feature
+# unification.  Nothing in the node calls the entry points.
 conformance-rules = []
 
 [dev-dependencies]

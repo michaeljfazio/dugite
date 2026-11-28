@@ -6,9 +6,11 @@
 //! function is a thin call into the decoder the production paths already use for that item
 //! (the block, transaction and witness decoders call the same `read_*` functions), plus the
 //! "whole input consumed" check that a standalone decode needs and an embedded one gets from the
-//! enclosing structure.  The production decoders are unchanged; the wrappers add the whole-input
-//! check and nothing else, and a rule dugite has no decoder for at that granularity gets no
-//! wrapper (the harness reports it as a failure).
+//! enclosing structure.  The production decoders are unchanged.  Most wrappers add the whole-input
+//! check; `native_script`, `plutus_data`, `block`, `header` and `transaction` call the production
+//! entry point for the item as it is and add nothing, so whatever that entry point does with
+//! trailing bytes is what is measured.  A rule dugite has no decoder for at that granularity gets
+//! no wrapper (the harness reports it as a failure).
 //!
 //! Visibility: the `read_*` functions these call were private to their era module and are now
 //! `pub(crate)`.  This module is the only new public surface, behind the `conformance-rules`
@@ -196,8 +198,8 @@ pub fn script(bytes: &[u8]) -> Res<ScriptRef> {
 /// `address`: a byte string holding the binary address.
 pub fn address(bytes: &[u8]) -> Res<dugite_primitives::address::Address> {
     whole(bytes, |r| {
-        let raw = r.read_bytes()?;
-        dugite_primitives::address::Address::from_bytes(raw)
+        let raw = r.read_bytes_owned()?;
+        dugite_primitives::address::Address::from_bytes(&raw)
             .map_err(|e| SerializationError::CborDecode(format!("address: {e}")))
     })
 }
@@ -289,9 +291,19 @@ pub fn plutus_data(bytes: &[u8]) -> Res<PlutusData> {
     conway::decode_plutus_data_cbor(bytes)
 }
 
-/// One `[tag, index, data, ex_units]` redeemer.
+/// One `[tag, index, data, ex_units]` redeemer, read as the Conway witness set reads it: as the
+/// only element of the array form of `redeemers` (`read_redeemers_raw`, which uses
+/// `read_redeemer_tag`).  The item is wrapped in a one-element array for that reader.
 pub fn redeemer(bytes: &[u8]) -> Res<Redeemer> {
-    whole(bytes, super::era_alonzo::read_redeemer)
+    let mut wrapped = vec![0x81];
+    wrapped.extend_from_slice(bytes);
+    let mut all = whole(&wrapped, |r| conway::read_redeemers(r, Era::Conway))?;
+    match (all.pop(), all.is_empty()) {
+        (Some(one), true) => Ok(one),
+        _ => Err(SerializationError::CborDecode(
+            "redeemer: not exactly one redeemer".into(),
+        )),
+    }
 }
 
 /// The `redeemers` witness term, in either wire form the era accepts.
