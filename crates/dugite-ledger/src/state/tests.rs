@@ -18952,3 +18952,135 @@ fn test_apply_block_allegra_ttl_equal_to_slot_is_expired() {
         "Allegra+ upper bound is exclusive: ttl == slot must expire; got {result:?}"
     );
 }
+
+// ── A pool registration needs the OPERATOR (cold) key witness ───────────────
+//
+// cardano-ledger f649f9751074d2ab3de033fc3912f29c9862c1f5: `poolCertKeyHashWitness`
+// (Core/TxCert.hs L151-154, reached from Shelley/TxCert.hs L596 and
+// Conway/TxCert.hs L795) plus the owners (Shelley/UTxO.hs L237-244).
+// `apply_block(ValidateAll)` validates every peer block through
+// `validate_transaction_with_context`. Phase-1 failures are not yet block-fatal,
+// so the verdict reaches the caller as the "Phase-1 validation divergence"
+// warning; capture it as the observable output of the production path.
+
+fn make_pool_params_for_witness_test(operator: Hash28, owner: Hash28) -> PoolParams {
+    PoolParams {
+        operator,
+        vrf_keyhash: Hash32::from_bytes([0x02; 32]),
+        pledge: Lovelace(100_000_000),
+        cost: Lovelace(340_000_000),
+        margin: Rational {
+            numerator: 1,
+            denominator: 100,
+        },
+        reward_account: {
+            let mut ra = vec![0xE0u8];
+            ra.extend_from_slice(&[0x03; 28]);
+            ra
+        },
+        pool_owners: vec![owner],
+        relays: vec![],
+        pool_metadata: None,
+    }
+}
+
+/// Apply a block carrying one RE-registration of an existing pool, signed by
+/// the seeds in `signers`. Returns the operator key hash and the captured log.
+fn apply_pool_reregistration(
+    operator_seed: u8,
+    owner_seed: u8,
+    signers: &[u8],
+) -> (Hash28, String) {
+    let key = |seed: u8| {
+        let sk = dugite_crypto::keys::PaymentSigningKey::from_bytes(&[seed; 32]).unwrap();
+        let hash = sk.verification_key().hash();
+        (sk, hash)
+    };
+    let (_, operator) = key(operator_seed);
+    let (_, owner) = key(owner_seed);
+
+    let mut state = LedgerState::new(ProtocolParameters::mainnet_defaults());
+    let input = TransactionInput {
+        transaction_id: Hash32::from_bytes([0xF0; 32]),
+        index: 0,
+    };
+    state
+        .utxo
+        .utxo_set
+        .insert(input.clone(), make_lovelace_output(10_000_000));
+    // The pool already exists, so this is a re-registration (no deposit).
+    std::sync::Arc::make_mut(&mut state.certs.pool_params).insert(
+        operator,
+        PoolRegistration {
+            pool_id: operator,
+            vrf_keyhash: Hash32::from_bytes([0x02; 32]),
+            pledge: Lovelace(100_000_000),
+            cost: Lovelace(340_000_000),
+            margin_numerator: 1,
+            margin_denominator: 100,
+            reward_account: {
+                let mut ra = vec![0xE0u8];
+                ra.extend_from_slice(&[0x03; 28]);
+                ra
+            },
+            owners: vec![owner],
+            relays: vec![],
+            metadata_url: None,
+            metadata_hash: None,
+        },
+    );
+
+    let mut tx = make_simple_tx(0xF1, vec![input], vec![make_lovelace_output(9_800_000)]);
+    tx.body.fee = Lovelace(200_000);
+    tx.body.certificates.push(Certificate::PoolRegistration(
+        make_pool_params_for_witness_test(operator, owner),
+    ));
+    tx.witness_set.vkey_witnesses = signers
+        .iter()
+        .map(|seed| {
+            let (sk, _) = key(*seed);
+            VKeyWitness {
+                vkey: sk.verification_key().to_bytes().to_vec(),
+                signature: sk.sign(tx.hash.as_bytes()),
+            }
+        })
+        .collect();
+    let block = make_test_block(1_000, 1, Hash32::ZERO, vec![tx]);
+
+    let capture = LogCapture::default();
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(capture.clone())
+        .with_ansi(false)
+        .with_max_level(tracing::Level::WARN)
+        .finish();
+    let _ = tracing::subscriber::with_default(subscriber, || {
+        state.apply_block(&block, BlockValidationMode::ValidateAll)
+    });
+    let logs = String::from_utf8(capture.0.lock().unwrap().clone()).unwrap();
+    (operator, logs)
+}
+
+#[test]
+fn test_apply_block_pool_reregistration_without_operator_witness_is_reported() {
+    // Owner signs, operator does not.
+    let (operator, logs) = apply_pool_reregistration(0xF2, 0xF3, &[0xF3]);
+    assert!(
+        logs.contains(&format!(
+            "Missing VKey witness for certificate credential: {}",
+            operator.to_hex()
+        )),
+        "a re-registration without the operator witness must be flagged for the \
+         operator key {}; log was:\n{logs}",
+        operator.to_hex()
+    );
+}
+
+#[test]
+fn test_apply_block_pool_reregistration_with_operator_witness_is_not_flagged() {
+    let (_, logs) = apply_pool_reregistration(0xF2, 0xF3, &[0xF2, 0xF3]);
+    assert!(
+        !logs.contains("Missing VKey witness for certificate credential"),
+        "operator + owner both signed; no certificate witness may be reported missing; \
+         log was:\n{logs}"
+    );
+}
