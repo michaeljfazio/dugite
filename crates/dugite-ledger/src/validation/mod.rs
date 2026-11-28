@@ -16,6 +16,7 @@
 mod collateral;
 mod conway;
 mod datum;
+mod input_set;
 pub mod mir;
 mod phase1;
 pub mod ppup;
