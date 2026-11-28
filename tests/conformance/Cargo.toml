@@ -15,6 +15,9 @@ dugite-ledger = { workspace = true }
 dugite-network = { workspace = true }
 dugite-tx-admission = { workspace = true }
 dugite-consensus = { workspace = true }
+# The uplc-conformance runner evaluates through dugite-uplc's production gated path; `parser` is
+# needed for the vectors that exist only as textual UPLC (constants flat cannot carry).
+dugite-uplc = { workspace = true, features = ["parser"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }

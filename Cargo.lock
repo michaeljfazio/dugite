@@ -1532,6 +1532,7 @@ dependencies = [
  "dugite-primitives",
  "dugite-serialization",
  "dugite-tx-admission",
+ "dugite-uplc",
  "hex",
  "jsonschema",
  "minicbor 0.26.5",

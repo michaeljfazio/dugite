@@ -78,11 +78,31 @@ fn generate(
         // Phase 2b (#1125): the real runner.
         return dugite_conformance::node_diversity::ledger_rules::report::generate(pins, run);
     }
+    if scenario == Scenario::UplcConformance {
+        return generate_uplc_conformance(run);
+    }
     let note = stub_note(scenario).to_string();
     Ok((
         ReportStatus::Stub,
         note.clone(),
         empty_report(scenario, era, pins, run, &note),
+    ))
+}
+
+/// `uplc-conformance` (#1114 Phase 2a): every vector through dugite's production gated
+/// evaluation path.  The runner lives in `dugite_conformance::node_diversity::uplc_conformance`.
+fn generate_uplc_conformance(run: &RunInfo) -> Result<(ReportStatus, String, Value), String> {
+    use dugite_conformance::node_diversity::uplc_conformance::run_all;
+    let result = run_all(&corpora_dir())?;
+    // A panic, an internal error or a decoder arm that is not wired is a dugite defect the report
+    // must not carry as a result: it makes the generator fail, so an error report is written.
+    if let Some(fatal) = result.fatal() {
+        return Err(fatal);
+    }
+    Ok((
+        ReportStatus::Ok,
+        result.summary(),
+        uplc_conformance_report(run, &result.cases),
     ))
 }
 

@@ -42,7 +42,7 @@ the reference checker's normalisation (`Amaru validation-rules/.../Run.hs`, `nor
 * the PV<11 mempool-only failure `ConwayMempoolFailure "Unelected committee members are not allowed to cast
   votes: .."` is DROPPED (`Run.hs:387-401`). Fixture 00154 (PV10, vote by an unelected member) therefore
   expects `Pass`; cardano-node's mempool would refuse it (`Conway/Rules/Mempool.hs:122-134`) and dugite has no
-  such check, so dugite agrees with the scenario and differs from the node it models.
+  such check, so dugite agrees with the scenario and differs from the node it models. Tracked as #1179.
 * `ConwayMempoolFailure "All inputs are spent. .."` is mapped to `InputSetEmptyUTxO` (empty input set) or
   `BadInputsUTxO`. A real node sends the mempool text there; dugite sends the typed `BadInputsUTxO`. Fixtures
   00050 and 00074 expect those names and are decided by #1138 today, so the question is open until it is fixed.
@@ -50,6 +50,10 @@ the reference checker's normalisation (`Amaru validation-rules/.../Run.hs`, `nor
   checker reports the expected name alone. Comparison is therefore unordered and payload-free, and so is
   ours: 00290 matches with `[ValueNotConservedUTxO, StakeKeyNotRegisteredDELEG]` raised, where the oracle
   would have reported only the expected name.
+
+Three fixtures match while ALSO emitting the generic fallback, because the expected failure is among the raised
+ones: 00128 (`NetworkMismatch`) and 00329 (`RedeemerIndexOutOfRange`) are tracked as #1180; 00285's fallback is
+`ExUnitsExceeded` (#1143). A match there does not mean the raised set is right: `raised-snapshot.json` records it.
 
 ## The tag table (`tag_table.rs`) and the name table (`ndc_names.rs`)
 
