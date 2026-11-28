@@ -817,10 +817,9 @@ fn bench_immutabledb_slot_range(c: &mut Criterion) {
 // ---------------------------------------------------------------------------
 
 /// Scaling sizes: 10K -> 50K -> 100K. Larger sizes (250K..1M) are O(N)
-/// extrapolations of the same code paths and were the dominant cost in the
-/// nightly bench job (~4h42m of the ~6h runner cap). Run the long sweep
-/// on-demand via `cargo bench` locally when investigating large-dataset
-/// behaviour.
+/// extrapolations of the same code paths and cost hours per run. Run the
+/// long sweep on demand via `cargo bench` locally when investigating
+/// large-dataset behaviour.
 const SCALING_SIZES: &[u64] = &[10_000, 50_000, 100_000];
 
 fn bench_block_index_scaling_insert(c: &mut Criterion) {

@@ -8,12 +8,11 @@ A Cardano node implementation written in Rust, aiming for 100% compatibility wit
 
 Built by [Sandstone Pool](https://www.sandstone.io/)
 
-[Documentation](https://michaeljfazio.github.io/dugite/) | [Benchmarks](https://michaeljfazio.github.io/dugite/reference/benchmarks.html) | [Developer Wiki](https://github.com/michaeljfazio/dugite/wiki) | [Discussions](https://github.com/michaeljfazio/dugite/discussions)
+[Documentation](https://michaeljfazio.github.io/dugite/) | [Developer Wiki](https://github.com/michaeljfazio/dugite/wiki) | [Discussions](https://github.com/michaeljfazio/dugite/discussions)
 
 [![CI](https://github.com/michaeljfazio/dugite/actions/workflows/ci.yml/badge.svg)](https://github.com/michaeljfazio/dugite/actions/workflows/ci.yml)
 [![Code Scanning](https://github.com/michaeljfazio/dugite/actions/workflows/code-scanning.yml/badge.svg)](https://github.com/michaeljfazio/dugite/actions/workflows/code-scanning.yml)
 [![codecov](https://codecov.io/gh/michaeljfazio/dugite/graph/badge.svg)](https://codecov.io/gh/michaeljfazio/dugite)
-[![Nightly Benchmarks](https://github.com/michaeljfazio/dugite/actions/workflows/benchmarks.yml/badge.svg)](https://github.com/michaeljfazio/dugite/actions/workflows/benchmarks.yml)
 [![Docs](https://github.com/michaeljfazio/dugite/actions/workflows/docs.yml/badge.svg)](https://michaeljfazio.github.io/dugite/)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-stable-orange.svg)](https://www.rust-lang.org/)
@@ -153,8 +152,6 @@ evaluation fidelity is checked against a pinned corpus with
 `just download-upstream-fixtures && just test-conformance`.
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for the full workflow, and [Getting Started for Developers](https://github.com/michaeljfazio/dugite/wiki/Getting-Started-for-Developers) on the wiki.
-
-Benchmark instructions and tracked baselines: [Benchmarks](https://michaeljfazio.github.io/dugite/reference/benchmarks.html).
 
 ## Acknowledgments
 

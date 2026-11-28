@@ -18,4 +18,3 @@ ignore:
   - "crates/dugite-node/src/main.rs"
   - "tests/**"
   - "scripts/**"
-  - "benches/**"

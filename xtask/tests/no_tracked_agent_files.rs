@@ -36,7 +36,7 @@ fn forbidden_prefixes_match_what_they_claim() {
     assert!(is_forbidden("CLAUDE.md"));
     assert!(is_forbidden("reports/devnet-validate/v2.8.0.json"));
     assert!(!is_forbidden("crates/dugite-node/CLAUDE.md.rs"));
-    assert!(!is_forbidden("docs/src/reference/benchmarks.md"));
+    assert!(!is_forbidden("docs/src/reference/conformance.md"));
     assert!(!is_forbidden("scripts/reports.sh"));
 }
 

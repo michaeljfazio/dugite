@@ -201,6 +201,5 @@ To iterate on a capture script without publishing a release, `just regenerate-co
 
 ## See also
 
-- [Benchmarks](./benchmarks.md) — performance evidence.
 - Wiki [Protocol Compliance](https://github.com/michaeljfazio/dugite/wiki/Protocol-Compliance) — feature-by-feature compatibility catalogue.
 - Wiki [Known Issues](https://github.com/michaeljfazio/dugite/wiki/Known-Issues) — open gaps and follow-ups.
