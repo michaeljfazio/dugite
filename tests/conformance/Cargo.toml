@@ -10,6 +10,9 @@ dugite-primitives = { workspace = true }
 dugite-crypto = { workspace = true }
 dugite-serialization = { workspace = true, features = ["conformance-rules"] }
 dugite-ledger = { workspace = true }
+# The uplc-conformance runner evaluates through dugite-uplc's production gated path; `parser` is
+# needed for the vectors that exist only as textual UPLC (constants flat cannot carry).
+dugite-uplc = { workspace = true, features = ["parser"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
@@ -36,6 +39,7 @@ upstream-conformance = ["dep:minicbor", "dep:cddl"]
 
 [dev-dependencies]
 tempfile = { workspace = true }
+minicbor = { workspace = true }
 
 [[test]]
 name = "upstream_tests"

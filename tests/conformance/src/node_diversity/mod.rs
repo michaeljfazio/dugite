@@ -23,3 +23,5 @@
 pub mod cbor_decoding;
 pub mod pins;
 pub mod report;
+pub mod uplc_conformance;
+pub mod uplc_print;

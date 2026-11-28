@@ -48,6 +48,14 @@ fn eval_onchain_fixture(name: &str) -> Result<usize, String> {
 }
 
 fn eval_onchain_fixture_expecting(name: &str, expect_valid: bool) -> Result<usize, String> {
+    eval_onchain_fixture_results(name, expect_valid).map(|r| r.len())
+}
+
+/// As [`eval_onchain_fixture_expecting`] but returns every redeemer's result.
+fn eval_onchain_fixture_results(
+    name: &str,
+    expect_valid: bool,
+) -> Result<Vec<dugite_uplc::phase_two::RedeemerResult>, String> {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("tests/fixtures/phase2_onchain")
         .join(name);
@@ -97,8 +105,99 @@ fn eval_onchain_fixture_expecting(name: &str, expect_valid: bool) -> Result<usiz
         false,
         &mut (),
     )
-    .map(|r| r.len())
     .map_err(|e| e.to_string())
+}
+
+/// The ExUnits the transaction itself DECLARES for a redeemer.
+fn declared_ex_units(
+    name: &str,
+    tag: &dugite_primitives::transaction::RedeemerTag,
+    index: u32,
+) -> (i64, i64) {
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/phase2_onchain")
+        .join(name);
+    let doc: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&path).expect("read fixture")).unwrap();
+    let tx_cbor = hexd(doc["tx_cbor"].as_str().unwrap());
+    let tx = [6u16, 5, 4]
+        .iter()
+        .find_map(|e| dugite_serialization::decode_transaction(*e, &tx_cbor).ok())
+        .expect("decode fixture tx");
+    let r = tx
+        .witness_set
+        .redeemers
+        .iter()
+        .find(|r| &r.tag == tag && r.index == index)
+        .expect("redeemer present");
+    (r.ex_units.steps as i64, r.ex_units.mem as i64)
+}
+
+/// The EXACT budget each redeemer of the five Babbage fixtures consumes.
+///
+/// Source of every figure: the ExUnits the transaction itself declares for that
+/// redeemer (read back from the fixture's own CBOR below, and also written out
+/// here so a mistyped constant cannot pass). They are not dugite's output. The
+/// off-chain tooling that built these transactions set each redeemer's units to
+/// the evaluator's exact result, which is why the declared figure equals the
+/// consumed budget for all ten redeemers; a declared figure is only an upper
+/// bound in general, so this is evidence of exactness, not a proof, and it
+/// holds only because dugite lands on the same ten pairs under three different
+/// cost models. `tx_v3_spend_71579b77.json` declares the protocol maximum
+/// (10B / 10M), not its consumption, so no independent exact figure exists for
+/// it and it is not pinned here.
+///
+/// Asserting equality (not "within budget") is what makes this test guard
+/// `eval_redeemer::run_cek` and its callers: a wrong semantics variant, the
+/// reference cost model instead of the on-chain one, or the on-chain model
+/// applied at the wrong protocol version each move at least one pair.
+#[test]
+fn onchain_babbage_scripts_consume_exactly_their_declared_budget() {
+    use dugite_primitives::transaction::RedeemerTag::{Mint, Spend};
+    let expected: [(
+        &str,
+        dugite_primitives::transaction::RedeemerTag,
+        u32,
+        i64,
+        i64,
+    ); 10] = [
+        ("tx0.json", Spend, 0, 512_453_022, 1_734_298),
+        ("tx1.json", Spend, 0, 956_614_224, 3_052_383),
+        ("tx1.json", Spend, 1, 18_201_046, 51_076),
+        ("tx1.json", Mint, 0, 85_517_206, 288_940),
+        ("tx6.json", Spend, 0, 343_264_739, 1_092_646),
+        ("tx6.json", Mint, 0, 409_030_463, 1_364_038),
+        ("zero_asset_tx0.json", Spend, 0, 247_232_964, 579_205),
+        ("zero_asset_tx0.json", Mint, 0, 33_318_665, 87_576),
+        ("zero_asset_tx1.json", Spend, 0, 242_243_762, 567_503),
+        ("zero_asset_tx1.json", Mint, 0, 33_318_665, 87_576),
+    ];
+    let mut by_fixture: std::collections::BTreeMap<&str, usize> = Default::default();
+    for (name, tag, index, cpu, mem) in &expected {
+        assert_eq!(
+            declared_ex_units(name, tag, *index),
+            (*cpu, *mem),
+            "{name} {tag:?}/{index}: table disagrees with the tx's declared ExUnits"
+        );
+        *by_fixture.entry(name).or_default() += 1;
+    }
+    for (name, count) in by_fixture {
+        let results = eval_onchain_fixture_results(name, true).expect("fixture validates");
+        assert_eq!(results.len(), count, "{name}: redeemer count");
+        for r in results {
+            let (_, _, _, cpu, mem) = expected
+                .iter()
+                .find(|(n, t, i, _, _)| *n == name && *t == r.tag && *i == r.index)
+                .expect("redeemer is in the table");
+            assert_eq!(
+                (r.consumed.cpu, r.consumed.mem),
+                (*cpu, *mem),
+                "{name} {:?}/{}: consumed budget",
+                r.tag,
+                r.index
+            );
+        }
+    }
 }
 
 /// Every captured on-chain-valid Babbage tx must validate within its declared
