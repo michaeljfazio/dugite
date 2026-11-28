@@ -361,7 +361,7 @@ impl LedgerState {
         // Every path to `self.era = block.era` (and to `on_era_transition`
         // below) goes through here, in every validation mode. See
         // `check_block_era` for the rule and the Haskell reference.
-        self.check_block_era(block)?;
+        self.check_block_era_for_mode(block, mode)?;
 
         // ── Step 2: HFC era boundary transformation ─────────────────────
         //

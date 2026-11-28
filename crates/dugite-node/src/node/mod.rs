@@ -758,6 +758,13 @@ pub struct Node {
     /// peer that served a provably bad block (the run loop demotes it).
     /// `None` until `run()` creates the channel.
     peer_failure_tx: Option<mpsc::Sender<(SocketAddr, PeerFailureKind)>>,
+    /// Which peer served each block this node stored recently (bounded), so a
+    /// block rejected LATER (fork replay) can still be traced to its server.
+    stored_block_peers: parking_lot::Mutex<HashMap<dugite_primitives::hash::Hash32, SocketAddr>>,
+    /// Test hook: skip the era-tag checks in the node (header and pre-storage)
+    /// so a test can reach the ledger's own check.
+    #[cfg(test)]
+    skip_era_checks_for_test: bool,
     /// Receiver for KeepAlive RTT measurements from connected peers.
     /// The main run loop uses these to update PeerManager EWMA and RTT gauges.
     keepalive_rtt_rx: Option<mpsc::Receiver<(SocketAddr, f64)>>,
@@ -2197,6 +2204,9 @@ impl Node {
         // Extract opcert counters and current era before moving ledger into
         // the lock, so we avoid blocking_read() inside the tokio runtime.
         let snapshot_era = ledger.era;
+        // `TestXHardForkAtEpoch` triggers are config: re-applied on every start,
+        // never part of a snapshot.
+        ledger.set_hard_fork_triggers(args.config.hard_fork_triggers());
         let snapshot_opcert_counters = if ledger.consensus.opcert_counters.is_empty() {
             None
         } else {
@@ -2863,6 +2873,9 @@ impl Node {
             shutdown_rx_for_flush: None,
             peer_failure_rx: None,
             peer_failure_tx: None,
+            stored_block_peers: parking_lot::Mutex::new(HashMap::new()),
+            #[cfg(test)]
+            skip_era_checks_for_test: false,
             keepalive_rtt_rx: None,
             query_handler,
             peer_manager: Arc::new(RwLock::new({
@@ -6563,15 +6576,22 @@ impl Node {
         &self,
         bad_hash: dugite_primitives::hash::Hash32,
         parent: &dugite_primitives::block::Point,
+        peer: Option<SocketAddr>,
     ) {
         {
             let mut db = self.chain_db.write().await;
             if let Err(e) = db.rollback_to_point(parent) {
                 error!(error = %e, "discard_wrong_era_block: volatile rollback to parent failed");
             }
-            db.remove_volatile_block(&bad_hash);
+            // DURABLE removal: the WAL is rewritten, so the re-tagged bytes do
+            // not come back under the honest hash after a restart.
+            db.remove_volatile_blocks_durable(&[bad_hash]);
         }
         let _ = self.handle_ledger_rollback(parent).await;
+        let peer = peer.or_else(|| self.stored_block_peers.lock().remove(&bad_hash));
+        if let Some(peer) = peer {
+            self.report_peer_fault(peer);
+        }
     }
 
     /// Abandon a fork whose replay failed (a body-hash mismatch or a ledger
@@ -6658,10 +6678,16 @@ impl Node {
         // LEDGER (Haskell `HardForkEnvelopeErrWrongEra`). This runs BEFORE the
         // Byron early return: a peer-supplied `[0, ebb]` block on a Conway
         // ledger must not be waved through as "Byron has no header crypto".
+        #[cfg(test)]
+        let skip_era_check = self.skip_era_checks_for_test;
+        #[cfg(not(test))]
+        let skip_era_check = false;
         if let Err(e) = ls.check_block_era(block) {
-            return Err(dugite_consensus::ConsensusError::WrongEra(format!(
-                "era tag check: {e}"
-            )));
+            if !skip_era_check {
+                return Err(dugite_consensus::ConsensusError::WrongEra(format!(
+                    "era tag check: {e}"
+                )));
+            }
         }
 
         // Byron has no Praos header crypto — validated on the ledger path. The
@@ -6675,15 +6701,15 @@ impl Node {
             return Ok(());
         }
 
-        // Diagnostic only (NOT enforced): Haskell's full rule is that the block
-        // era equals the era of the TICKED protocol-version major. For a block
-        // that needs no epoch tick the un-ticked PV is the ticked PV, so count
-        // disagreements; the first-block-of-epoch case is the open follow-up.
+        // Diagnostic: the block era against the era of the protocol version the
+        // block is validated under (the NEXT epoch's for a block that crosses a
+        // boundary). `check_block_era` already enforces the boundary rule; this
+        // counts any residual disagreement (a wrong PV-to-era mapping would show
+        // up here first).
         if ls.tip.point != Point::Origin
-            && ls.epoch_of_slot(block.slot().0) == ls.epoch.0
             && block.era
                 != dugite_primitives::era::Era::from_protocol_major(
-                    ls.epochs.protocol_params.protocol_version_major,
+                    ls.protocol_major_for_slot(block.slot().0),
                 )
         {
             self.metrics
@@ -6693,8 +6719,8 @@ impl Node {
                 slot = block.slot().0,
                 block_era = %block.era,
                 ledger_era = %ls.era,
-                pv_major = ls.epochs.protocol_params.protocol_version_major,
-                "block era tag differs from the era of the ledger protocol version"
+                pv_major = ls.protocol_major_for_slot(block.slot().0),
+                "block era tag differs from the era of the protocol version"
             );
         }
 
@@ -7027,6 +7053,7 @@ impl Node {
                                     self.discard_wrong_era_block(
                                         fork_block.header.header_hash,
                                         &rollback_point,
+                                        None,
                                     )
                                     .await;
                                     break;
@@ -7138,6 +7165,21 @@ impl Node {
                                         // Release the ledger lock before abandon_failed_fork
                                         // (it re-acquires ledger + chain_db).
                                         drop(ls);
+                                        if matches!(
+                                            e,
+                                            dugite_ledger::state::LedgerError::WrongBlockEra { .. }
+                                        ) {
+                                            self.metrics
+                                                .header_validation_failures_total
+                                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                            self.discard_wrong_era_block(
+                                                fork_block.header.header_hash,
+                                                &rollback_point,
+                                                None,
+                                            )
+                                            .await;
+                                            return ForkSwitchOutcome::Aborted;
+                                        }
                                         self.abandon_failed_fork(
                                             fork_block.header.header_hash,
                                             "fork replay: ledger apply failed",
@@ -7384,24 +7426,53 @@ impl Node {
                 Some(tip_hash) => *block.prev_hash() == *tip_hash,
                 None => true,
             };
-            if connects {
-                if let Err(e) = ls.check_block_era(&block) {
-                    drop(ls);
-                    warn!(
-                        peer = %fetched.peer,
-                        slot = block_slot.0,
-                        block = block_number.0,
-                        hash = %block_hash.to_hex(),
-                        hfc_era = %block.era,
-                        "Rejecting peer block before storage: {e}"
-                    );
-                    self.metrics
-                        .header_validation_failures_total
-                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    self.report_peer_fault(fetched.peer);
-                    return;
-                }
+            // A block that does not connect yet cannot be judged against the
+            // next tick, but inside the ledger's CURRENT epoch there is no tick:
+            // its era must be the ledger's. Checking that now narrows the window
+            // in which a re-tagged non-connecting copy is stored and the honest
+            // copy later answered `AlreadyKnown`.
+            let rejection = if connects {
+                ls.check_block_era(&block).err().map(|e| e.to_string())
+            } else if ls.tip.point != Point::Origin
+                && ls.epoch_of_slot(block_slot.0) == ls.epoch.0
+                && block.era != ls.era
+            {
+                Some(format!(
+                    "block era {} in the ledger's current epoch, ledger era {}",
+                    block.era, ls.era
+                ))
+            } else {
+                None
+            };
+            #[cfg(test)]
+            let rejection = if self.skip_era_checks_for_test {
+                None
+            } else {
+                rejection
+            };
+            if let Some(e) = rejection {
+                drop(ls);
+                warn!(
+                    peer = %fetched.peer,
+                    slot = block_slot.0,
+                    block = block_number.0,
+                    hash = %block_hash.to_hex(),
+                    hfc_era = %block.era,
+                    "Rejecting peer block before storage: {e}"
+                );
+                self.metrics
+                    .header_validation_failures_total
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                self.report_peer_fault(fetched.peer);
+                return;
             }
+        }
+        {
+            let mut peers = self.stored_block_peers.lock();
+            if peers.len() >= 8192 {
+                peers.clear();
+            }
+            peers.insert(block_hash, fetched.peer);
         }
 
         // Store in ChainDB via ChainSelQueue.
@@ -7648,9 +7719,8 @@ impl Node {
                     let ls = self.ledger_state.read().await;
                     ls.tip.point.clone()
                 };
-                self.discard_wrong_era_block(block_hash, &parent_point)
+                self.discard_wrong_era_block(block_hash, &parent_point, Some(fetched.peer))
                     .await;
-                self.report_peer_fault(fetched.peer);
                 return;
             }
             if matches!(reason, dugite_consensus::ConsensusError::FutureBlock { .. }) {
@@ -7974,9 +8044,8 @@ impl Node {
                         .header_validation_failures_total
                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     let parent_point = self.ledger_state.read().await.tip.point.clone();
-                    self.discard_wrong_era_block(block_hash, &parent_point)
+                    self.discard_wrong_era_block(block_hash, &parent_point, Some(fetched.peer))
                         .await;
-                    self.report_peer_fault(fetched.peer);
                     return;
                 }
                 Err(e) => {
@@ -10836,6 +10905,7 @@ impl Node {
                                                     self.discard_wrong_era_block(
                                                         fork_block.header.header_hash,
                                                         &rollback_point,
+                                                        None,
                                                     )
                                                     .await;
                                                     replay_failed = true;

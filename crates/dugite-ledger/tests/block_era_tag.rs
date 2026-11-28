@@ -254,3 +254,219 @@ fn the_exemption_ends_after_the_first_block() {
         );
     }
 }
+
+// ── The boundary rule: the era the epoch tick adopts ─────────────────────────
+
+use dugite_ledger::state::FuturePParams;
+use dugite_primitives::time::EpochNo;
+use dugite_primitives::transaction::ProtocolParamUpdate;
+
+/// Schedule protocol version `major` for the next boundary the way the ledger
+/// learns of it: pre-Conway a quorum of genesis delegates voted (PPUP), Conway
+/// onwards the governance `futurePParams`.
+fn schedule_pv(ls: &mut LedgerState, major: u64) {
+    if ls.era >= Era::Conway {
+        let mut pp = ls.epochs.protocol_params.clone();
+        pp.protocol_version_major = major;
+        std::sync::Arc::make_mut(&mut ls.gov.governance).future_pparams =
+            FuturePParams::DefinitePParamsUpdate(Box::new(pp));
+    } else {
+        ls.set_update_quorum(2);
+        let ppu = ProtocolParamUpdate {
+            protocol_version_major: Some(major),
+            protocol_version_minor: Some(0),
+            ..Default::default()
+        };
+        let epoch = ls.epoch;
+        ls.epochs.pending_pp_updates.insert(
+            epoch,
+            vec![
+                (Hash32::from_bytes([1; 32]), ppu.clone()),
+                (Hash32::from_bytes([2; 32]), ppu),
+            ],
+        );
+    }
+}
+
+fn ledger_at(era: Era, pv: u64) -> LedgerState {
+    let mut ls = ledger_in(era);
+    ls.epochs.protocol_params.protocol_version_major = pv;
+    ls
+}
+
+/// Every hard fork mainnet took, from the real protocol-version values: the
+/// ledger in the old era at the old PV, a quorum vote (or, in Conway, the
+/// governance future pparams) for the new PV, and the first block of the next
+/// epoch tagged with the new era must pass the STRICT check; the old tag and
+/// every other tag must not.
+#[test]
+fn every_mainnet_hard_fork_passes_under_the_boundary_rule() {
+    // (old era, old PV, new PV, new era)
+    let forks = [
+        (Era::Shelley, 2, 3, Era::Allegra),
+        (Era::Allegra, 3, 4, Era::Mary),
+        (Era::Mary, 4, 5, Era::Alonzo),
+        (Era::Alonzo, 6, 7, Era::Babbage),
+        (Era::Babbage, 8, 9, Era::Conway),
+        (Era::Conway, 11, 12, Era::Dijkstra),
+    ];
+    for (old, old_pv, new_pv, new) in forks {
+        let mut ls = ledger_at(old, old_pv);
+        schedule_pv(&mut ls, new_pv);
+        assert_eq!(
+            ls.era_due_at_next_boundary(),
+            new,
+            "{old:?} PV{old_pv} -> PV{new_pv}"
+        );
+        let first = block(new, EPOCH + 100, 2, tip_hash(&ls));
+        assert!(ls.check_block_era(&first).is_ok(), "{new:?} must pass");
+        for wrong in [Era::Byron, old, Era::Dijkstra, Era::Shelley] {
+            if wrong == new {
+                continue;
+            }
+            let bad = block(wrong, EPOCH + 100, 2, tip_hash(&ls));
+            assert!(
+                ls.check_block_era(&bad).is_err(),
+                "{wrong:?} on the first block after {old:?}->{new:?} must fail"
+            );
+        }
+    }
+}
+
+/// The intra-era protocol-version bumps mainnet took (no new era) must NOT make
+/// an upgrade due: Alonzo 5->6, Babbage 7->8, Conway 9->10 and 10->11.
+#[test]
+fn intra_era_pv_bumps_do_not_make_an_upgrade_due() {
+    for (era, old_pv, new_pv) in [
+        (Era::Alonzo, 5, 6),
+        (Era::Babbage, 7, 8),
+        (Era::Conway, 9, 10),
+        (Era::Conway, 10, 11),
+    ] {
+        let mut ls = ledger_at(era, old_pv);
+        schedule_pv(&mut ls, new_pv);
+        assert_eq!(
+            ls.era_due_at_next_boundary(),
+            era,
+            "{era:?} PV{old_pv}->{new_pv}"
+        );
+        assert!(ls
+            .check_block_era(&block(era, EPOCH + 100, 2, tip_hash(&ls)))
+            .is_ok());
+        let up = match era {
+            Era::Conway => Era::Dijkstra,
+            Era::Babbage => Era::Conway,
+            _ => Era::Babbage,
+        };
+        assert!(
+            ls.check_block_era(&block(up, EPOCH + 100, 2, tip_hash(&ls)))
+                .is_err(),
+            "{up:?} on the first block of an epoch with no fork due"
+        );
+    }
+}
+
+/// Byron to Shelley is due at the network's `shelley_transition_epoch`
+/// (mainnet 208), not before and not for any other era.
+#[test]
+fn byron_to_shelley_is_due_at_the_transition_epoch() {
+    // A Byron ledger carries the Shelley genesis protocol version (2): the node
+    // applies the Shelley genesis to the parameters at start.
+    let mut ls = ledger_at(Era::Byron, 2);
+    ls.shelley_transition_epoch = 1;
+    let slot = EPOCH + 100;
+    assert_eq!(ls.era_due_at_next_boundary(), Era::Shelley);
+    assert!(ls
+        .check_block_era(&block(Era::Shelley, slot, 2, tip_hash(&ls)))
+        .is_ok());
+    assert!(
+        ls.check_block_era(&block(Era::Byron, slot, 2, tip_hash(&ls)))
+            .is_err(),
+        "a Byron block once Shelley is due"
+    );
+    assert!(
+        ls.check_block_era(&block(Era::Babbage, slot, 2, tip_hash(&ls)))
+            .is_err(),
+        "the fork goes to Shelley, not past it"
+    );
+
+    // Transition epoch 208: the first block of epoch 1 is not a fork.
+    let mut ls = ledger_at(Era::Byron, 2);
+    ls.shelley_transition_epoch = 208;
+    assert_eq!(ls.era_due_at_next_boundary(), Era::Byron);
+    assert!(ls
+        .check_block_era(&block(Era::Shelley, slot, 2, tip_hash(&ls)))
+        .is_err());
+    assert!(ls
+        .check_block_era(&block(Era::Byron, slot, 2, tip_hash(&ls)))
+        .is_ok());
+}
+
+/// `TestXHardForkAtEpoch` (cardano-node `TriggerHardForkAtEpoch`): due at the
+/// configured epoch whatever the protocol version says; several forks at one
+/// boundary resolve to the last.
+#[test]
+fn trigger_hard_forks_are_due_at_their_epoch() {
+    let mut ls = ledger_at(Era::Alonzo, 5);
+    ls.set_hard_fork_triggers([(Era::Babbage, 1), (Era::Conway, 1)].into_iter().collect());
+    assert_eq!(ls.era_due_at_next_boundary(), Era::Conway);
+    assert!(ls
+        .check_block_era(&block(Era::Conway, EPOCH + 100, 2, tip_hash(&ls)))
+        .is_ok());
+
+    let mut ls = ledger_at(Era::Alonzo, 5);
+    ls.set_hard_fork_triggers([(Era::Babbage, 2)].into_iter().collect());
+    assert_eq!(ls.era_due_at_next_boundary(), Era::Alonzo, "epoch 2, not 1");
+}
+
+/// The wedge that motivated the rule: any upgrade on the first block of an
+/// epoch used to pass. With no fork due it must not, and a due fork must be
+/// taken.
+#[test]
+fn an_upgrade_with_no_fork_due_is_rejected_and_a_due_fork_must_be_taken() {
+    let ls = ledger_at(Era::Conway, 10);
+    let retagged = block(Era::Dijkstra, EPOCH + 100, 2, tip_hash(&ls));
+    assert_wrong_era(
+        ls.check_block_era(&retagged),
+        Era::Dijkstra,
+        Era::Conway,
+        "epoch tick adopts",
+    );
+
+    let mut ls = ledger_at(Era::Babbage, 8);
+    schedule_pv(&mut ls, 9);
+    let stale = block(Era::Babbage, EPOCH + 100, 2, tip_hash(&ls));
+    assert_wrong_era(
+        ls.check_block_era(&stale),
+        Era::Babbage,
+        Era::Babbage,
+        "epoch tick adopts",
+    );
+}
+
+/// `ApplyOnly` replays our own validated blocks: a forecast error must never
+/// halt a replay, so it accepts any upgrade on the first block of a new epoch
+/// (downgrades are still rejected).
+#[test]
+fn apply_only_replay_does_not_enforce_the_due_era() {
+    let mut ls = ledger_at(Era::Babbage, 8); // no fork scheduled
+    let fork = block(Era::Conway, EPOCH + 100, 2, tip_hash(&ls));
+    assert!(ls.check_block_era(&fork).is_err());
+    ls.apply_block(&fork, BlockValidationMode::ApplyOnly)
+        .expect("trusted replay accepts the upgrade on an epoch boundary");
+    assert_eq!(ls.era, Era::Conway);
+
+    let mut ls = ledger_at(Era::Conway, 10);
+    let down = block(Era::Babbage, EPOCH + 100, 2, tip_hash(&ls));
+    assert!(ls
+        .apply_block(&down, BlockValidationMode::ApplyOnly)
+        .is_err());
+}
+
+/// Guards the assumption `era_due_at_next_boundary` keys on: the ledger's epoch
+/// is the epoch of its tip block.
+#[test]
+fn the_ledger_epoch_is_the_epoch_of_its_tip() {
+    let ls = ledger_in(Era::Conway);
+    assert_eq!(ls.epoch, EpochNo(0));
+}

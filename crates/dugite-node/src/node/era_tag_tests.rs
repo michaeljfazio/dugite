@@ -195,6 +195,31 @@ impl Harness {
         }
     }
 
+    /// Make the ledger know that protocol version `major` is adopted at the next
+    /// epoch boundary: a quorum of genesis delegates voted for it (pre-Conway
+    /// PPUP, the way every hard fork up to Conway was enacted).
+    async fn schedule_hard_fork(&self, major: u64) {
+        use dugite_primitives::transaction::ProtocolParamUpdate;
+        let mut ls = self.node.ledger_state.write().await;
+        let ppu = ProtocolParamUpdate {
+            protocol_version_major: Some(major),
+            protocol_version_minor: Some(0),
+            ..Default::default()
+        };
+        let epoch = ls.epoch;
+        ls.epochs.pending_pp_updates.insert(
+            epoch,
+            vec![
+                (Hash32::from_bytes([1; 32]), ppu.clone()),
+                (Hash32::from_bytes([2; 32]), ppu),
+            ],
+        );
+        assert_eq!(
+            ls.era_due_at_next_boundary(),
+            Era::from_protocol_major(major)
+        );
+    }
+
     async fn ledger_era(&self) -> Era {
         self.node.ledger_state.read().await.era
     }
@@ -543,13 +568,16 @@ async fn byron_ebb_is_admitted_by_chain_selection_as_the_tip() {
     );
 }
 
-/// A legitimate era boundary must still pass: a Babbage ledger, then the first
-/// block of the next epoch tagged Conway (PV9 header, the +1 the HFC allows).
+/// A legitimate era boundary must still pass: a Babbage ledger that KNOWS a
+/// hard fork to PV9 is due (a quorum of genesis delegates voted for it), then the
+/// first block of the next epoch tagged Conway (PV9 header, the +1 the HFC
+/// allows).
 #[tokio::test(flavor = "multi_thread")]
 async fn legitimate_era_boundary_block_is_accepted() {
     let mut h = Harness::new(8).await;
     let parent = h.bootstrap(Era::Babbage, 8).await;
     assert!(parent.0 < EPOCH_LENGTH, "bootstrap block is in epoch 0");
+    h.schedule_hard_fork(9).await;
 
     // First Conway block of epoch 1.
     let (slot, cbor) = h
@@ -573,6 +601,207 @@ async fn legitimate_era_boundary_block_is_accepted() {
     assert_eq!(h.ledger_era().await, Era::Conway);
     assert_eq!(h.header_failures(), before, "no header failure");
     assert!(!h.is_marked_invalid(block.hash()).await);
+    assert_eq!(
+        h.node
+            .metrics
+            .era_parity_mismatch_total
+            .load(Ordering::Relaxed),
+        0,
+        "the boundary block agrees with the protocol version that was adopted"
+    );
+}
+
+/// The same Babbage ledger with NO hard fork due: a Conway-tagged first block of
+/// the next epoch is not a boundary fork. (The old rule accepted it: any
+/// upgrade on the first block of an epoch.)
+#[tokio::test(flavor = "multi_thread")]
+async fn conway_tag_on_the_first_block_of_an_epoch_with_no_fork_due_is_rejected() {
+    let mut h = Harness::new(8).await;
+    let parent = h.bootstrap(Era::Babbage, 8).await;
+    // Same VRF input as the honest Babbage block at that slot.
+    let (slot, _) = h
+        .honest_leader_block(
+            Era::Babbage,
+            8,
+            EPOCH_LENGTH,
+            EPOCH_LENGTH + 100,
+            2,
+            parent.1,
+        )
+        .await;
+    let cbor = h.forge_at(Era::Conway, 9, slot, 2, parent.1).await;
+    let failures = h.header_failures();
+    let bad = h.deliver(&cbor).await;
+    assert_rejected(&mut h, &bad, Era::Babbage, parent, failures).await;
+    assert_honest_block_applies(&mut h, Era::Babbage, 8, parent, slot).await;
+}
+
+/// THE PROBE. On a PV10 Conway ledger the honest first block of epoch 1 is
+/// re-tagged 7 -> 8 (Dijkstra). No hard fork is due, so it must be rejected; the
+/// honest copy (same hash) must then apply, and so must the next block. (The old
+/// rule accepted it, the ledger became Dijkstra at PV10, and the next honest
+/// block was rejected as an "era downgrade": a stake-free permanent wedge.)
+#[tokio::test(flavor = "multi_thread")]
+async fn retagged_first_block_of_an_epoch_with_no_fork_due_is_rejected_and_the_chain_goes_on() {
+    let mut h = Harness::new(10).await;
+    let parent = h.bootstrap(Era::Conway, 10).await;
+    let (slot, honest_cbor) = h
+        .honest_leader_block(
+            Era::Conway,
+            10,
+            EPOCH_LENGTH,
+            EPOCH_LENGTH + 100,
+            2,
+            parent.1,
+        )
+        .await;
+    let honest_block = h.decode(&honest_cbor).unwrap();
+    assert_eq!(
+        h.node.ledger_state.read().await.era_due_at_next_boundary(),
+        Era::Conway,
+        "no hard fork is due"
+    );
+    let bad_cbor = retag(&honest_cbor, 8);
+    let failures = h.header_failures();
+    let bad = h.deliver(&bad_cbor).await;
+    assert_eq!(bad.era, Era::Dijkstra);
+    assert_rejected(&mut h, &bad, Era::Conway, parent, failures).await;
+
+    let honest = h.deliver(&honest_cbor).await;
+    assert_eq!(honest.hash(), honest_block.hash());
+    assert_eq!(
+        h.ledger_tip_point().await,
+        Point::Specific(SlotNo(slot), *honest.hash()),
+        "the honest first block of the epoch applies"
+    );
+    assert_eq!(h.ledger_era().await, Era::Conway);
+
+    // And the chain keeps going.
+    let (slot3, cbor3) = h
+        .honest_leader_block(Era::Conway, 10, slot + 1, slot + 100, 3, *honest.hash())
+        .await;
+    let next = h.deliver(&cbor3).await;
+    assert_eq!(
+        h.ledger_tip_point().await,
+        Point::Specific(SlotNo(slot3), *next.hash()),
+        "the next honest block applies"
+    );
+    assert_eq!(h.ledger_era().await, Era::Conway);
+}
+
+/// The other half of the same wedge: a hard fork IS due and the first block of
+/// the epoch is tagged with the OLD era. Accepting it would leave the ledger in
+/// the old era under the new protocol version and reject every honest block
+/// after it.
+#[tokio::test(flavor = "multi_thread")]
+async fn old_era_tag_on_the_first_block_after_a_due_fork_is_rejected() {
+    let mut h = Harness::new(8).await;
+    let parent = h.bootstrap(Era::Babbage, 8).await;
+    h.schedule_hard_fork(9).await;
+    // Elected slot, found with the honest Conway block of the due fork.
+    let (slot, _) = h
+        .honest_leader_block(
+            Era::Conway,
+            9,
+            EPOCH_LENGTH,
+            EPOCH_LENGTH + 100,
+            2,
+            parent.1,
+        )
+        .await;
+    let cbor = h.forge_at(Era::Babbage, 8, slot, 2, parent.1).await;
+    let failures = h.header_failures();
+    let bad = h.deliver(&cbor).await;
+    assert_rejected(&mut h, &bad, Era::Babbage, parent, failures).await;
+
+    // The honest Conway block of the due fork then applies.
+    let (cslot, ccbor) = h
+        .honest_leader_block(
+            Era::Conway,
+            9,
+            EPOCH_LENGTH,
+            EPOCH_LENGTH + 100,
+            2,
+            parent.1,
+        )
+        .await;
+    let ok = h.deliver(&ccbor).await;
+    assert_eq!(
+        h.ledger_tip_point().await,
+        Point::Specific(SlotNo(cslot), *ok.hash())
+    );
+    assert_eq!(h.ledger_era().await, Era::Conway);
+}
+
+/// A `TestConwayHardForkAtEpoch` trigger makes the fork due at that epoch with
+/// no protocol-version change (cardano-node `TriggerHardForkAtEpoch`).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_trigger_hard_fork_at_epoch_makes_the_fork_due_without_a_pv_change() {
+    let mut h = Harness::new(8).await;
+    let parent = h.bootstrap(Era::Babbage, 8).await;
+    h.node
+        .ledger_state
+        .write()
+        .await
+        .set_hard_fork_triggers([(Era::Conway, 1)].into_iter().collect());
+    let (slot, cbor) = h
+        .honest_leader_block(
+            Era::Conway,
+            8,
+            EPOCH_LENGTH,
+            EPOCH_LENGTH + 100,
+            2,
+            parent.1,
+        )
+        .await;
+    let block = h.deliver(&cbor).await;
+    assert_eq!(
+        h.ledger_tip_point().await,
+        Point::Specific(SlotNo(slot), *block.hash())
+    );
+    assert_eq!(h.ledger_era().await, Era::Conway);
+}
+
+/// The ledger's own check (`apply_block`) with the node's checks bypassed: the
+/// wrong-era block is stored, fails ledger apply, and is discarded WITHOUT
+/// blacklisting its hash, the peer is reported, and the bytes are gone from the
+/// volatile WAL too: reopening the volatile directory does not bring them back
+/// under the honest hash.
+#[tokio::test(flavor = "multi_thread")]
+async fn ledger_site_rejection_is_discarded_durably_and_not_blacklisted() {
+    let mut h = Harness::new(10).await;
+    let parent = h.bootstrap(Era::Conway, 10).await;
+    let (slot, honest_cbor) = h
+        .honest_leader_block(Era::Conway, 10, parent.0 + 1, parent.0 + 100, 2, parent.1)
+        .await;
+    let bad_cbor = retag(&honest_cbor, 6);
+    h.node.skip_era_checks_for_test = true;
+    let failures = h.header_failures();
+    let bad = h.deliver(&bad_cbor).await;
+    h.node.skip_era_checks_for_test = false;
+
+    // It really went through the store and the ledger (not the node checks).
+    assert_rejected(&mut h, &bad, Era::Conway, parent, failures).await;
+
+    // Durable: a fresh open of the volatile directory (WAL replay) must not
+    // contain the re-tagged bytes.
+    let volatile = h._dir.path().join("db").join("volatile");
+    let reopened = dugite_storage::VolatileDB::open(&volatile).expect("reopen volatile");
+    assert!(
+        !reopened.has_block(bad.hash()),
+        "the re-tagged bytes must not come back from the WAL"
+    );
+    assert!(
+        reopened.has_block(&parent.1),
+        "the control: surviving blocks are still in the WAL"
+    );
+    drop(reopened);
+
+    let honest = h.deliver(&honest_cbor).await;
+    assert_eq!(
+        h.ledger_tip_point().await,
+        Point::Specific(SlotNo(slot), *honest.hash())
+    );
 }
 
 /// The same Conway tag on the SAME ledger but inside epoch 0 is an early

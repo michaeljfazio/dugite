@@ -524,6 +524,34 @@ pub struct NodeConfig {
     #[serde(default)]
     pub experimental_hard_forks_enabled: bool,
 
+    /// cardano-node `TestShelleyHardForkAtEpoch` (`TriggerHardForkAtEpoch`).
+    #[serde(default)]
+    pub test_shelley_hard_fork_at_epoch: Option<u64>,
+
+    /// cardano-node `TestAllegraHardForkAtEpoch` (`TriggerHardForkAtEpoch`).
+    #[serde(default)]
+    pub test_allegra_hard_fork_at_epoch: Option<u64>,
+
+    /// cardano-node `TestMaryHardForkAtEpoch` (`TriggerHardForkAtEpoch`).
+    #[serde(default)]
+    pub test_mary_hard_fork_at_epoch: Option<u64>,
+
+    /// cardano-node `TestAlonzoHardForkAtEpoch` (`TriggerHardForkAtEpoch`).
+    #[serde(default)]
+    pub test_alonzo_hard_fork_at_epoch: Option<u64>,
+
+    /// cardano-node `TestBabbageHardForkAtEpoch` (`TriggerHardForkAtEpoch`).
+    #[serde(default)]
+    pub test_babbage_hard_fork_at_epoch: Option<u64>,
+
+    /// cardano-node `TestConwayHardForkAtEpoch` (`TriggerHardForkAtEpoch`).
+    #[serde(default)]
+    pub test_conway_hard_fork_at_epoch: Option<u64>,
+
+    /// cardano-node `TestDijkstraHardForkAtEpoch` (`TriggerHardForkAtEpoch`).
+    #[serde(default)]
+    pub test_dijkstra_hard_fork_at_epoch: Option<u64>,
+
     /// Consensus protocol mode (`"PraosMode"` or `"GenesisMode"`).
     #[serde(default)]
     pub consensus_mode: ConsensusMode,
@@ -957,6 +985,26 @@ fn sane_peer_selection_targets(
 }
 
 impl NodeConfig {
+    /// The `TestXHardForkAtEpoch` triggers as era -> epoch. An era without an
+    /// entry follows the protocol-version rule (`TriggerHardForkAtVersion`).
+    pub fn hard_fork_triggers(
+        &self,
+    ) -> std::collections::BTreeMap<dugite_primitives::era::Era, u64> {
+        use dugite_primitives::era::Era;
+        [
+            (Era::Shelley, self.test_shelley_hard_fork_at_epoch),
+            (Era::Allegra, self.test_allegra_hard_fork_at_epoch),
+            (Era::Mary, self.test_mary_hard_fork_at_epoch),
+            (Era::Alonzo, self.test_alonzo_hard_fork_at_epoch),
+            (Era::Babbage, self.test_babbage_hard_fork_at_epoch),
+            (Era::Conway, self.test_conway_hard_fork_at_epoch),
+            (Era::Dijkstra, self.test_dijkstra_hard_fork_at_epoch),
+        ]
+        .into_iter()
+        .filter_map(|(era, at)| at.map(|e| (era, e)))
+        .collect()
+    }
+
     /// Returns the protocol version this node should stamp on forged block headers.
     ///
     /// This is a **software capability signal**, not the on-chain protocol version.
@@ -1253,6 +1301,13 @@ impl Default for NodeConfig {
             churn_interval_normal_secs: default_churn_interval_normal_secs(),
             churn_interval_sync_secs: default_churn_interval_sync_secs(),
             experimental_hard_forks_enabled: false,
+            test_shelley_hard_fork_at_epoch: None,
+            test_allegra_hard_fork_at_epoch: None,
+            test_mary_hard_fork_at_epoch: None,
+            test_alonzo_hard_fork_at_epoch: None,
+            test_babbage_hard_fork_at_epoch: None,
+            test_conway_hard_fork_at_epoch: None,
+            test_dijkstra_hard_fork_at_epoch: None,
             consensus_mode: ConsensusMode::default(),
             low_level_genesis_options: None,
             checkpoints_file: None,
