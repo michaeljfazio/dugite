@@ -198,7 +198,10 @@ pub fn registry(era: CborEra) -> BTreeMap<&'static str, Codec> {
 
     // ── blocks, transactions ────────────────────────────────────────────────────────────────
     m.insert("block", scrubbed(move |b| dec::block(b, e), enc::block));
-    m.insert("header", scrubbed(dec::block_header, enc::block_header));
+    m.insert(
+        "header",
+        scrubbed(move |b| dec::block_header(b, e), enc::block_header),
+    );
     m.insert(
         "transaction",
         scrubbed(move |b| dec::transaction(b, e), enc::transaction),
