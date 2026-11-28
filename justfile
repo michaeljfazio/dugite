@@ -405,9 +405,17 @@ test-conformance-cardano-ledger:
 test-conformance-cardano-node:
     DUGITE_REQUIRE_UPSTREAM=1 cargo nextest run -p dugite-conformance --features upstream-conformance --test upstream_tests -E 'test(/^upstream_cardano_node_/) + test(cardano_node_genesis_decodes)'
 
-# ledger-rules: ImpSpec signal DECODE across the captured vectors (~8,100). Applies no ledger rule.
+# ledger-rules: ImpSpec signal DECODE for the ExecSpecRule rules (POOL, CERT, ...). Applies no ledger rule.
 test-conformance-ledger-rules-decode:
     DUGITE_REQUIRE_UPSTREAM=1 cargo nextest run -p dugite-conformance --features upstream-conformance --test upstream_tests -E 'test(/^upstream_ledger_rules_decode_/) + test(ledger_rules_signal_decode)'
+
+# ledger-rules: every LEDGER and NEWEPOCH vector APPLIED through dugite and COMPARED with Haskell's st_out (~8,000), plus the checker's own tests.
+test-conformance-ledger-rules-apply-compare:
+    DUGITE_REQUIRE_UPSTREAM=1 cargo nextest run -p dugite-conformance --features upstream-conformance --test upstream_tests -E 'test(/^upstream_ledger_rules_apply_compare_/) + test(ledger_rules_apply_and_compare) + test(/^ledger_rules_bites::/) + test(/^ledger_rules_contract::/)'
+
+# ledger-rules: the whole LEDGER/NEWEPOCH replay (parallel threads, one fresh thread per vector) with a summary; DUGITE_UPDATE_EXPECTED_RESULTS=1 rewrites the expected-results file (local only; refuses under CI).
+ledger-rules-replay-report:
+    cargo nextest run -p dugite-conformance --features upstream-conformance --test upstream_tests --run-ignored only -E 'test(ledger_rules_replay_report)' --no-capture
 
 # mithril: certificate fixture verification.
 test-conformance-mithril:
@@ -512,10 +520,10 @@ ndc-report scenario:
 ndc-turbo-quick:
     DUGITE_NDC_TURBO_SAMPLE=40 DUGITE_NDC_REPORTS_DIR=target/node-diversity/reports-quick just ndc-report uplc-turbo
 
-# The whole ndc_reports test binary against NDC's real schema.json files, with the corpus REQUIRED
+# The ndc_reports and ndc_cbor_decoding test binaries against NDC's real schema.json files and the cbor dataset, with the corpus REQUIRED
 # (a missing corpus fails instead of skipping): the red-proofs of the schema validation run here.
 ndc-harness-test: ndc-fetch
-    DUGITE_NDC_REQUIRE=1 cargo nextest run -p dugite-conformance --test ndc_reports --no-tests=fail
+    DUGITE_NDC_REQUIRE=1 cargo nextest run -p dugite-conformance --test ndc_reports --test ndc_cbor_decoding --no-tests=fail
 
 # Write all four reports, schema-validated (cbor-decoding once per era), and run the harness tests
 # with the corpus required.  Every step runs; the recipe fails if any step failed.

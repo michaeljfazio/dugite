@@ -74,6 +74,14 @@ fn generate(
     pins: &Pins,
     run: &RunInfo,
 ) -> Result<(ReportStatus, String, Value), String> {
+    if scenario == Scenario::CborDecoding {
+        return dugite_conformance::node_diversity::cbor_decoding::generate_for_runner(
+            &corpora_dir(),
+            era,
+            pins,
+            run,
+        );
+    }
     if scenario == Scenario::LedgerRules {
         // Phase 2b (#1125): the real runner.
         return dugite_conformance::node_diversity::ledger_rules::report::generate(pins, run);

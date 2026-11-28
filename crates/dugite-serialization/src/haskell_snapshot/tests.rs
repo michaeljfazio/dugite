@@ -1299,3 +1299,49 @@ fn decode_float32_is_strict_about_the_major_type() {
     // truncated
     assert!(decode_float32(&[0xfa, 0x00]).is_err());
 }
+
+/// An ImpSpec dump holds the UTxO inline: `map(bytes(34) -> bytes(MemPack TxOut))`,
+/// where the key is the LEDGER's own `MemPack TxIn` (`TxId(32) || TxIx(Word16)`),
+/// whose index is little-endian (not the consensus-layer big-endian layout of a
+/// node's tables file).
+#[test]
+fn decode_inline_utxo_reads_mempack_txin_keys_little_endian() {
+    let mut data = vec![0xa2]; // map(2)
+                               // (txid fill byte, on-the-wire TxIx trailer, MemPack TxOut payload)
+    for (fill, trailer, payload) in [
+        (0x11u8, [0x01u8, 0x00], [0xAAu8, 0xBB]), // LE: index 1
+        (0x22, [0x00, 0x01], [0xCC, 0xDD]),       // LE: index 256
+    ] {
+        data.extend_from_slice(&[0x58, 34]);
+        data.extend_from_slice(&[fill; 32]);
+        data.extend_from_slice(&trailer);
+        data.push(0x42); // bytes(2)
+        data.extend_from_slice(&payload);
+    }
+
+    let (entries, consumed) = super::decode_inline_utxo(&data).unwrap();
+    assert_eq!(consumed, data.len());
+    assert_eq!(entries.len(), 2);
+    assert_eq!(entries[0].txid, Hash32::from_bytes([0x11; 32]));
+    assert_eq!(entries[0].txix, 1);
+    assert_eq!(entries[0].txout_mempack, vec![0xAA, 0xBB]);
+    assert_eq!(entries[1].txid, Hash32::from_bytes([0x22; 32]));
+    assert_eq!(entries[1].txix, 256);
+}
+
+/// A key that is not the 34-byte `MemPack TxIn` is an error, not a skipped entry.
+#[test]
+fn decode_inline_utxo_rejects_a_malformed_key() {
+    let mut data = vec![0xa1, 0x58, 33];
+    data.extend_from_slice(&[0u8; 33]);
+    data.extend_from_slice(&[0x41, 0x00]);
+    assert!(super::decode_inline_utxo(&data).is_err());
+}
+
+/// Production leaves the UTxO of a node `state` file skipped; only the bare
+/// decoders read it inline.
+#[test]
+fn bare_decoders_require_the_input_to_be_consumed_exactly() {
+    assert!(super::decode_bare_ledger_state(&[0x80]).is_err());
+    assert!(super::decode_bare_new_epoch_state(&[0x80]).is_err());
+}

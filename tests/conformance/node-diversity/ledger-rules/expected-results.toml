@@ -788,34 +788,6 @@ class = "serialization: indefinite-length transaction outputs fail to decode, in
 issue = 1138
 
 [[entry]]
-id = "00167"
-expected = "pass"
-observed = "VotersDoNotExist"
-class = "ledger-rules: committee certificate and vote checks do not see earlier certificates of the same transaction"
-issue = 1149
-
-[[entry]]
-id = "00168"
-expected = "pass"
-observed = "VotersDoNotExist"
-class = "ledger-rules: committee certificate and vote checks do not see earlier certificates of the same transaction"
-issue = 1149
-
-[[entry]]
-id = "00169"
-expected = "VotersDoNotExist"
-observed = "pass"
-class = "ledger-rules: committee certificate and vote checks do not see earlier certificates of the same transaction"
-issue = 1149
-
-[[entry]]
-id = "00170"
-expected = "VotersDoNotExist"
-observed = "pass"
-class = "ledger-rules: committee certificate and vote checks do not see earlier certificates of the same transaction"
-issue = 1149
-
-[[entry]]
 id = "00200"
 expected = "ValidationTagMismatch(PassedUnexpectedly)"
 observed = "pass"

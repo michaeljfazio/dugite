@@ -1817,6 +1817,112 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // Program-version gate (`plcVersionsAvailableIn`), both is_valid polarities
+    //
+    // A Plutus V2 always-succeeds validator declaring `(program 1.1.0 ...)` is
+    // well-formed at every PV (phase-1 `validScript` never reads the version)
+    // but may only RUN from PV11 (`vanRossemPV`). At PV10 cardano-node fails it
+    // in `mkTermToEvaluate` — a PHASE-2 failure — so:
+    //   * is_valid = true  → rejected (ValidationTagMismatch FailedUnexpectedly)
+    //   * is_valid = false → valid; collateral collected
+    // `2.0.0` is never available. Driven through the real evaluator
+    // (`evaluate_plutus_scripts`), the real phase-1 well-formedness check and
+    // the real admission decision (`phase2_admission_error`).
+    // -----------------------------------------------------------------------
+    fn v2_always_succeeds_with_version(major: u64, minor: u64, patch: u64) -> Vec<u8> {
+        use dugite_uplc::term::{Constant, Term};
+        use dugite_uplc::Program;
+        use std::rc::Rc;
+        let program = Program {
+            version: dugite_uplc::program::Program::version_triple(major, minor, patch),
+            term: Term::Lam(Rc::new(Term::Lam(Rc::new(Term::Lam(Rc::new(
+                Term::Const(Constant::Unit),
+            )))))),
+        };
+        program.to_cbor().expect("CBOR encode failed")
+    }
+
+    fn eval_v2_script_at(
+        script_cbor: &[u8],
+        tx_input_hash: [u8; 32],
+        pv: u32,
+    ) -> Result<(), PlutusError> {
+        let script_hash = script_hash_v2(script_cbor);
+        let tx_cbor = build_conway_tx_cbor(&tx_input_hash, script_cbor, 14_000_000, 2_000_000);
+        let (utxo_set, input) = build_script_utxo_set(&tx_input_hash, &script_hash);
+        let mut tx = Transaction::empty_with_hash(Hash32::ZERO);
+        tx.raw_cbor = Some(tx_cbor);
+        tx.body.inputs = vec![input];
+        tx.witness_set.plutus_v2_scripts = vec![script_cbor.to_vec()];
+
+        // Phase-1 well-formedness (`MalformedScriptWitnesses`) must NOT fire:
+        // the declared version is not part of `deserialiseScript`.
+        let mut params = dugite_primitives::protocol_params::ProtocolParameters::mainnet_defaults();
+        params.protocol_version_major = pv as u64;
+        let mut phase1 = Vec::new();
+        crate::validation::scripts::check_malformed_script_witnesses(&tx, &params, &mut phase1);
+        assert!(
+            phase1.is_empty(),
+            "version must not be a phase-1 failure at PV{pv}: {phase1:?}"
+        );
+
+        evaluate_plutus_scripts(
+            &tx,
+            &utxo_set,
+            None,
+            (14_000_000, 2_000_000),
+            &SlotConfig::preview(),
+            pv,
+        )
+    }
+
+    #[test]
+    fn plc_version_not_available_is_phase2_failure_both_polarities() {
+        use crate::validation::{phase2_admission_error, ValidationError};
+
+        for (version, pv, input) in [((1, 1, 0), 10, [0x51u8; 32]), ((2, 0, 0), 11, [0x52u8; 32])] {
+            let script = v2_always_succeeds_with_version(version.0, version.1, version.2);
+            let result = eval_v2_script_at(&script, input, pv);
+            assert!(
+                matches!(result, Err(PlutusError::EvalFailed(_))),
+                "{version:?} as PlutusV2 at PV{pv} must be a script failure, got {result:?}"
+            );
+            // is_valid = true → rejected as a script failure.
+            assert!(
+                matches!(
+                    phase2_admission_error(true, &result),
+                    Some(ValidationError::ScriptFailed(_))
+                ),
+                "is_valid=true with {version:?} at PV{pv} must be ScriptFailed"
+            );
+            // is_valid = false → ACCEPTED (the collateral-consuming path).
+            assert!(
+                phase2_admission_error(false, &result).is_none(),
+                "is_valid=false with only a {version:?} script at PV{pv} must be accepted"
+            );
+        }
+
+        // Controls: the same validator where its version IS available runs and
+        // passes, so is_valid=false is the PassedUnexpectedly mismatch.
+        for (version, pv, input) in [((1, 0, 0), 10, [0x53u8; 32]), ((1, 1, 0), 11, [0x54u8; 32])] {
+            let script = v2_always_succeeds_with_version(version.0, version.1, version.2);
+            let result = eval_v2_script_at(&script, input, pv);
+            assert!(
+                result.is_ok(),
+                "{version:?} as PlutusV2 at PV{pv} must pass: {result:?}"
+            );
+            assert!(phase2_admission_error(true, &result).is_none());
+            assert!(matches!(
+                phase2_admission_error(false, &result),
+                Some(ValidationError::IsValidTagMismatch {
+                    declared: false,
+                    evaluated: true
+                })
+            ));
+        }
+    }
+
+    // -----------------------------------------------------------------------
     // Test 2b: CollectError partition (#733/#734)
     //
     // An ALWAYS-SUCCEEDS script whose tx carries a TTL past the safe-zone

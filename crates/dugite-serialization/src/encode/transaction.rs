@@ -62,7 +62,7 @@ where
 /// Used for Conway/Dijkstra `certificates` (key 4) and `proposal_procedures`
 /// (key 20). Pre-Conway certificates are `StrictSeq`, not `OSet` — those take
 /// [`encode_plain_array`].
-fn encode_ordered_set<T, F>(items: &[T], encode_item: F) -> Vec<u8>
+pub(super) fn encode_ordered_set<T, F>(items: &[T], encode_item: F) -> Vec<u8>
 where
     F: Fn(&T) -> Vec<u8>,
 {
@@ -73,6 +73,20 @@ where
         buf.extend(encode_item(item));
     }
     encode_array_close(&mut buf, len);
+    buf
+}
+
+/// Encode a `withdrawals` map: `{ reward_account => coin }`, definite up to 23 entries and
+/// indefinite above (Haskell `encodeMap`, #932).
+pub(super) fn encode_withdrawals(
+    withdrawals: &std::collections::BTreeMap<Vec<u8>, dugite_primitives::value::Lovelace>,
+) -> Vec<u8> {
+    let mut buf = encode_map_open(withdrawals.len());
+    for (addr, amount) in withdrawals {
+        buf.extend(encode_bytes(addr));
+        buf.extend(encode_uint(amount.0));
+    }
+    encode_map_close(&mut buf, withdrawals.len());
     buf
 }
 
@@ -182,15 +196,39 @@ fn encode_post_alonzo_transaction_output(output: &TransactionOutput) -> Vec<u8> 
     // 2: datum_option
     match &output.datum {
         OutputDatum::None => {}
-        OutputDatum::DatumHash(h) => {
+        OutputDatum::DatumHash(_) | OutputDatum::InlineDatum { .. } => {
             buf.extend(encode_uint(2));
+            buf.extend(encode_datum_option(&output.datum));
+        }
+    }
+
+    // 3: script_ref
+    if let Some(script_ref) = &output.script_ref {
+        buf.extend(encode_uint(3));
+        // Tag 24 (CBOR-encoded data item)
+        buf.extend(encode_tag(24));
+        let script_cbor = encode_script_ref(script_ref);
+        buf.extend(encode_bytes(&script_cbor));
+    }
+
+    buf
+}
+
+/// Encode a `datum_option` value: `[0, datum_hash]` or `[1, #6.24(bytes .cbor data)]`.
+///
+/// Callers pass `DatumHash` or `InlineDatum`; `OutputDatum::None` has no encoding and yields an
+/// empty vector (a map output omits key 2 instead).
+pub(super) fn encode_datum_option(datum: &OutputDatum) -> Vec<u8> {
+    let mut buf = Vec::new();
+    match datum {
+        OutputDatum::None => {}
+        OutputDatum::DatumHash(h) => {
             // [0, datum_hash]
             buf.extend(encode_array_header(2));
             buf.extend(encode_uint(0));
             buf.extend(encode_hash32(h));
         }
         OutputDatum::InlineDatum { data, raw_cbor } => {
-            buf.extend(encode_uint(2));
             // [1, #6.24(cbor_encoded_data)]
             buf.extend(encode_array_header(2));
             buf.extend(encode_uint(1));
@@ -208,16 +246,6 @@ fn encode_post_alonzo_transaction_output(output: &TransactionOutput) -> Vec<u8> 
             buf.extend(encode_bytes(&encoded_data));
         }
     }
-
-    // 3: script_ref
-    if let Some(script_ref) = &output.script_ref {
-        buf.extend(encode_uint(3));
-        // Tag 24 (CBOR-encoded data item)
-        buf.extend(encode_tag(24));
-        let script_cbor = encode_script_ref(script_ref);
-        buf.extend(encode_bytes(&script_cbor));
-    }
-
     buf
 }
 
@@ -763,12 +791,7 @@ pub(super) fn encode_transaction_body_for_era(body: &TransactionBody, era: Era) 
     // semantics apply (#932): definite <= 23 entries, indefinite above.
     if !body.withdrawals.is_empty() {
         buf.extend(encode_uint(5));
-        buf.extend(encode_map_open(body.withdrawals.len()));
-        for (addr, amount) in &body.withdrawals {
-            buf.extend(encode_bytes(addr));
-            buf.extend(encode_uint(amount.0));
-        }
-        encode_map_close(&mut buf, body.withdrawals.len());
+        buf.extend(encode_withdrawals(&body.withdrawals));
     }
 
     // 6: update proposal (Shelley..Babbage only).
