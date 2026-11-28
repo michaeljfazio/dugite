@@ -12,6 +12,7 @@ The runners themselves are Phases 2a-2d.
 | Report envelopes, writer, schema validation | `tests/conformance/src/node_diversity/` |
 | Runners and harness tests | `tests/conformance/tests/ndc_reports.rs` |
 | Score with NDC's own builder | `scripts/node-diversity/score-reports.sh` |
+| `ledger-rules` runner and strict gate (#1125) | `ledger-rules/README.md`, `just ndc-gate` |
 | Recipes | `just ndc-fetch`, `ndc-report <scenario>`, `ndc-reports`, `ndc-score`, `ndc-selftest` |
 
 ```sh
