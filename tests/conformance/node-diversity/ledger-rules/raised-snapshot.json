@@ -3,72 +3,46 @@
     "pass"
   ],
   "00002": [
-    "decoding-failure: CBOR decoding error: tx_output: expected array or map, got indefinite map",
-    "shadow (outputs made definite): pass [match]",
-    "  shadow: pass"
+    "pass"
   ],
   "00003": [
-    "decoding-failure: CBOR decoding error: tx_output: expected array or map, got indefinite map",
-    "shadow (outputs made definite): pass [match]",
-    "  shadow: pass"
+    "pass"
   ],
   "00004": [
     "pass"
   ],
   "00005": [
-    "decoding-failure: CBOR decoding error: tx_output: expected array or map, got indefinite map",
-    "shadow (outputs made definite): pass [match]",
-    "  shadow: pass"
+    "pass"
   ],
   "00006": [
-    "decoding-failure: CBOR decoding error: tx_output: expected array or map, got indefinite map",
-    "shadow (outputs made definite): pass [match]",
-    "  shadow: pass"
+    "pass"
   ],
   "00007": [
-    "decoding-failure: CBOR decoding error: tx_output: expected array or map, got indefinite map",
-    "shadow (outputs made definite): pass [match]",
-    "  shadow: pass"
+    "pass"
   ],
   "00008": [
-    "decoding-failure: CBOR decoding error: tx_output: expected array or map, got indefinite map",
-    "shadow (outputs made definite): pass [match]",
-    "  shadow: pass"
+    "pass"
   ],
   "00009": [
-    "decoding-failure: CBOR decoding error: tx_output: expected array or map, got indefinite map",
-    "shadow (outputs made definite): pass [match]",
-    "  shadow: pass"
+    "pass"
   ],
   "00010": [
-    "decoding-failure: CBOR decoding error: tx_output: expected array or map, got indefinite map",
-    "shadow (outputs made definite): pass [match]",
-    "  shadow: pass"
+    "pass"
   ],
   "00011": [
-    "decoding-failure: CBOR decoding error: tx_output: expected array or map, got indefinite map",
-    "shadow (outputs made definite): pass [match]",
-    "  shadow: pass"
+    "pass"
   ],
   "00012": [
-    "decoding-failure: CBOR decoding error: tx_output: expected array or map, got indefinite map",
-    "shadow (outputs made definite): pass [match]",
-    "  shadow: pass"
+    "pass"
   ],
   "00013": [
-    "decoding-failure: CBOR decoding error: tx_output: expected array or map, got indefinite map",
-    "shadow (outputs made definite): pass [match]",
-    "  shadow: pass"
+    "pass"
   ],
   "00014": [
-    "decoding-failure: CBOR decoding error: tx_output: expected array or map, got indefinite map",
-    "shadow (outputs made definite): pass [match]",
-    "  shadow: pass"
+    "pass"
   ],
   "00015": [
-    "decoding-failure: CBOR decoding error: tx_output: expected array or map, got indefinite map",
-    "shadow (outputs made definite): pass [match]",
-    "  shadow: pass"
+    "pass"
   ],
   "00016": [
     "pass"
@@ -77,33 +51,22 @@
     "pass"
   ],
   "00018": [
-    "decoding-failure: CBOR decoding error: tx_output: expected array or map, got indefinite map",
-    "shadow (outputs made definite): pass [match]",
-    "  shadow: pass"
+    "pass"
   ],
   "00019": [
-    "decoding-failure: CBOR decoding error: tx_output: expected array or map, got indefinite map",
-    "shadow (outputs made definite): unmapped:ConwayMempoolFailure (generic fallback, text: \"transaction validation failed\"; ledger: Phase2CollectError) [MISMATCH]",
-    "  shadow: ConwayMempoolFailure [7] -> GENERIC-FALLBACK (text: \"transaction validation failed\")",
-    "  shadow: ledger failures: Phase2CollectError"
+    "pass"
   ],
   "00020": [
-    "decoding-failure: CBOR decoding error: tx_output: expected array or map, got indefinite map",
-    "shadow (outputs made definite): pass [match]",
-    "  shadow: pass"
+    "pass"
   ],
   "00021": [
     "pass"
   ],
   "00022": [
-    "decoding-failure: CBOR decoding error: tx_output: expected array or map, got indefinite map",
-    "shadow (outputs made definite): pass [match]",
-    "  shadow: pass"
+    "pass"
   ],
   "00023": [
-    "decoding-failure: CBOR decoding error: tx_output: expected array or map, got indefinite map",
-    "shadow (outputs made definite): pass [match]",
-    "  shadow: pass"
+    "pass"
   ],
   "00024": [
     "pass"
@@ -130,19 +93,13 @@
     "pass"
   ],
   "00032": [
-    "decoding-failure: CBOR decoding error: tx_output: expected array or map, got indefinite map",
-    "shadow (outputs made definite): pass [match]",
-    "  shadow: pass"
+    "pass"
   ],
   "00033": [
-    "decoding-failure: CBOR decoding error: tx_output: expected array or map, got indefinite map",
-    "shadow (outputs made definite): pass [match]",
-    "  shadow: pass"
+    "pass"
   ],
   "00034": [
-    "decoding-failure: CBOR decoding error: tx_output: expected array or map, got indefinite map",
-    "shadow (outputs made definite): pass [match]",
-    "  shadow: pass"
+    "pass"
   ],
   "00035": [
     "pass"
@@ -151,9 +108,7 @@
     "pass"
   ],
   "00037": [
-    "decoding-failure: CBOR decoding error: tx_output: expected array or map, got indefinite map",
-    "shadow (outputs made definite): pass [match]",
-    "  shadow: pass"
+    "pass"
   ],
   "00038": [
     "pass"
@@ -165,171 +120,111 @@
     "pass"
   ],
   "00041": [
-    "decoding-failure: CBOR decoding error: tx_output: expected array or map, got indefinite map",
-    "shadow (outputs made definite): pass [match]",
-    "  shadow: pass"
+    "pass"
   ],
   "00042": [
-    "decoding-failure: CBOR decoding error: tx_output: expected array or map, got indefinite map",
-    "shadow (outputs made definite): pass [match]",
-    "  shadow: pass"
+    "pass"
   ],
   "00043": [
-    "decoding-failure: CBOR decoding error: tx_output: expected array or map, got indefinite map",
-    "shadow (outputs made definite): pass [match]",
-    "  shadow: pass"
+    "pass"
   ],
   "00044": [
     "pass"
   ],
   "00045": [
-    "decoding-failure: CBOR decoding error: tx_output: expected array or map, got indefinite map",
-    "shadow (outputs made definite): pass [match]",
-    "  shadow: pass"
+    "pass"
   ],
   "00046": [
-    "decoding-failure: CBOR decoding error: tx_output: expected array or map, got indefinite map",
-    "shadow (outputs made definite): pass [match]",
-    "  shadow: pass"
+    "pass"
   ],
   "00047": [
-    "decoding-failure: CBOR decoding error: tx_output: expected array or map, got indefinite map",
-    "shadow (outputs made definite): pass [match]",
-    "  shadow: pass"
+    "pass"
   ],
   "00048": [
-    "decoding-failure: CBOR decoding error: tx_output: expected array or map, got indefinite map",
-    "shadow (outputs made definite): BabbageNonDisjointRefInputs [match]",
-    "  shadow: ConwayUtxowFailure/UtxoFailure/BabbageNonDisjointRefInputs [1, 0, 22] -> BabbageNonDisjointRefInputs"
+    "ConwayUtxowFailure/UtxoFailure/BabbageNonDisjointRefInputs [1, 0, 22] -> BabbageNonDisjointRefInputs"
   ],
   "00049": [
     "ConwayUtxowFailure/UtxoFailure/BabbageOutputTooSmallUTxO [1, 0, 21] -> BabbageOutputTooSmallUTxO"
   ],
   "00050": [
-    "decoding-failure: CBOR decoding error: tx_output: expected array or map, got indefinite map",
-    "shadow (outputs made definite): BadInputsUTxO [match]",
-    "  shadow: ConwayUtxowFailure/UtxoFailure/BadInputsUTxO [1, 0, 1] -> BadInputsUTxO"
+    "ConwayUtxowFailure/UtxoFailure/BadInputsUTxO [1, 0, 1] -> BadInputsUTxO"
   ],
   "00051": [
-    "decoding-failure: CBOR decoding error: tx_output: expected array or map, got indefinite map",
-    "shadow (outputs made definite): unmapped:ConwayMempoolFailure (generic fallback, text: \"transaction validation failed\"; ledger: ReferenceInputNotFound) [MISMATCH]",
-    "  shadow: ConwayMempoolFailure [7] -> GENERIC-FALLBACK (text: \"transaction validation failed\")",
-    "  shadow: ledger failures: ReferenceInputNotFound"
+    "ConwayMempoolFailure [7] -> GENERIC-FALLBACK (text: \"transaction validation failed\")",
+    "ledger failures: ReferenceInputNotFound"
   ],
   "00052": [
-    "decoding-failure: CBOR decoding error: tx_output: expected array or map, got indefinite map",
-    "shadow (outputs made definite): pass [MISMATCH]",
-    "  shadow: pass"
+    "pass"
   ],
   "00053": [
-    "decoding-failure: CBOR decoding error: tx_output: expected array or map, got indefinite map",
-    "shadow (outputs made definite): ConflictingMetadataHash [match]",
-    "  shadow: ConwayUtxowFailure/ConflictingMetadataHash [1, 7] -> ConflictingMetadataHash"
+    "ConwayUtxowFailure/ConflictingMetadataHash [1, 7] -> ConflictingMetadataHash"
   ],
   "00054": [
     "ConwayTreasuryValueMismatch [5] -> ConwayTreasuryValueMismatch"
   ],
   "00055": [
-    "decoding-failure: CBOR decoding error: tx_output: expected array or map, got indefinite map",
-    "shadow (outputs made definite): unmapped:ConwayMempoolFailure (generic fallback, text: \"transaction validation failed\"; ledger: RefScriptsSizeTooBig) [MISMATCH]",
-    "  shadow: ConwayMempoolFailure [7] -> GENERIC-FALLBACK (text: \"transaction validation failed\")",
-    "  shadow: ledger failures: RefScriptsSizeTooBig"
+    "ConwayMempoolFailure [7] -> GENERIC-FALLBACK (text: \"transaction validation failed\")",
+    "ledger failures: RefScriptsSizeTooBig"
   ],
   "00056": [
-    "decoding-failure: CBOR decoding error: tx_output: expected array or map, got indefinite map",
-    "shadow (outputs made definite): unmapped:ConwayMempoolFailure (generic fallback, text: \"transaction validation failed\"; ledger: RefScriptsSizeTooBig) [MISMATCH]",
-    "  shadow: ConwayMempoolFailure [7] -> GENERIC-FALLBACK (text: \"transaction validation failed\")",
-    "  shadow: ledger failures: RefScriptsSizeTooBig"
+    "ConwayMempoolFailure [7] -> GENERIC-FALLBACK (text: \"transaction validation failed\")",
+    "ledger failures: RefScriptsSizeTooBig"
   ],
   "00057": [
-    "decoding-failure: CBOR decoding error: tx_output: expected array or map, got indefinite map",
-    "shadow (outputs made definite): unmapped:ConwayMempoolFailure (generic fallback, text: \"transaction validation failed\"; ledger: RefScriptsSizeTooBig) [MISMATCH]",
-    "  shadow: ConwayMempoolFailure [7] -> GENERIC-FALLBACK (text: \"transaction validation failed\")",
-    "  shadow: ledger failures: RefScriptsSizeTooBig"
+    "ConwayMempoolFailure [7] -> GENERIC-FALLBACK (text: \"transaction validation failed\")",
+    "ledger failures: RefScriptsSizeTooBig"
   ],
   "00058": [
-    "decoding-failure: CBOR decoding error: tx_output: expected array or map, got indefinite map",
-    "shadow (outputs made definite): unmapped:ConwayMempoolFailure (generic fallback, text: \"transaction validation failed\"; ledger: WdrlNotDelegatedToDRep) [MISMATCH]",
-    "  shadow: ConwayMempoolFailure [7] -> GENERIC-FALLBACK (text: \"transaction validation failed\")",
-    "  shadow: ledger failures: WdrlNotDelegatedToDRep"
+    "ConwayMempoolFailure [7] -> GENERIC-FALLBACK (text: \"transaction validation failed\")",
+    "ledger failures: WdrlNotDelegatedToDRep"
   ],
   "00059": [
-    "decoding-failure: CBOR decoding error: tx_output: expected array or map, got indefinite map",
-    "shadow (outputs made definite): DRepAlreadyRegistered [match]",
-    "  shadow: ConwayCertsFailure/CertFailure/GovCertFailure/ConwayDRepAlreadyRegistered [2, 1, 3, 0] -> DRepAlreadyRegistered"
+    "ConwayCertsFailure/CertFailure/GovCertFailure/ConwayDRepAlreadyRegistered [2, 1, 3, 0] -> DRepAlreadyRegistered"
   ],
   "00060": [
-    "decoding-failure: CBOR decoding error: tx_output: expected array or map, got indefinite map",
-    "shadow (outputs made definite): DRepAlreadyRegistered [match]",
-    "  shadow: ConwayCertsFailure/CertFailure/GovCertFailure/ConwayDRepAlreadyRegistered [2, 1, 3, 0] -> DRepAlreadyRegistered"
+    "ConwayCertsFailure/CertFailure/GovCertFailure/ConwayDRepAlreadyRegistered [2, 1, 3, 0] -> DRepAlreadyRegistered"
   ],
   "00061": [
-    "decoding-failure: CBOR decoding error: tx_output: expected array or map, got indefinite map",
-    "shadow (outputs made definite): DelegateeDRepNotRegistered [match]",
-    "  shadow: ConwayCertsFailure/CertFailure/DelegFailure/DelegateeDRepNotRegisteredDELEG [2, 1, 1, 5] -> DelegateeDRepNotRegistered"
+    "ConwayCertsFailure/CertFailure/DelegFailure/DelegateeDRepNotRegisteredDELEG [2, 1, 1, 5] -> DelegateeDRepNotRegistered"
   ],
   "00062": [
-    "decoding-failure: CBOR decoding error: tx_output: expected array or map, got indefinite map",
-    "shadow (outputs made definite): DelegateeDRepNotRegistered [match]",
-    "  shadow: ConwayCertsFailure/CertFailure/DelegFailure/DelegateeDRepNotRegisteredDELEG [2, 1, 1, 5] -> DelegateeDRepNotRegistered"
+    "ConwayCertsFailure/CertFailure/DelegFailure/DelegateeDRepNotRegisteredDELEG [2, 1, 1, 5] -> DelegateeDRepNotRegistered"
   ],
   "00063": [
-    "decoding-failure: CBOR decoding error: tx_output: expected array or map, got indefinite map",
-    "shadow (outputs made definite): DelegateeDRepNotRegistered [match]",
-    "  shadow: ConwayCertsFailure/CertFailure/DelegFailure/DelegateeDRepNotRegisteredDELEG [2, 1, 1, 5] -> DelegateeDRepNotRegistered"
+    "ConwayCertsFailure/CertFailure/DelegFailure/DelegateeDRepNotRegisteredDELEG [2, 1, 1, 5] -> DelegateeDRepNotRegistered"
   ],
   "00064": [
-    "decoding-failure: CBOR decoding error: tx_output: expected array or map, got indefinite map",
-    "shadow (outputs made definite): DelegateeDRepNotRegistered [match]",
-    "  shadow: ConwayCertsFailure/CertFailure/DelegFailure/DelegateeDRepNotRegisteredDELEG [2, 1, 1, 5] -> DelegateeDRepNotRegistered"
+    "ConwayCertsFailure/CertFailure/DelegFailure/DelegateeDRepNotRegisteredDELEG [2, 1, 1, 5] -> DelegateeDRepNotRegistered"
   ],
   "00065": [
-    "decoding-failure: CBOR decoding error: tx_output: expected array or map, got indefinite map",
-    "shadow (outputs made definite): DelegateeStakePoolNotRegistered [match]",
-    "  shadow: ConwayCertsFailure/CertFailure/DelegFailure/DelegateeStakePoolNotRegisteredDELEG [2, 1, 1, 6] -> DelegateeStakePoolNotRegistered"
+    "ConwayCertsFailure/CertFailure/DelegFailure/DelegateeStakePoolNotRegisteredDELEG [2, 1, 1, 6] -> DelegateeStakePoolNotRegistered"
   ],
   "00066": [
-    "decoding-failure: CBOR decoding error: tx_output: expected array or map, got indefinite map",
-    "shadow (outputs made definite): DelegateeStakePoolNotRegistered [match]",
-    "  shadow: ConwayCertsFailure/CertFailure/DelegFailure/DelegateeStakePoolNotRegisteredDELEG [2, 1, 1, 6] -> DelegateeStakePoolNotRegistered"
+    "ConwayCertsFailure/CertFailure/DelegFailure/DelegateeStakePoolNotRegisteredDELEG [2, 1, 1, 6] -> DelegateeStakePoolNotRegistered"
   ],
   "00067": [
-    "decoding-failure: CBOR decoding error: tx_output: expected array or map, got indefinite map",
-    "shadow (outputs made definite): DelegateeStakePoolNotRegistered [match]",
-    "  shadow: ConwayCertsFailure/CertFailure/DelegFailure/DelegateeStakePoolNotRegisteredDELEG [2, 1, 1, 6] -> DelegateeStakePoolNotRegistered"
+    "ConwayCertsFailure/CertFailure/DelegFailure/DelegateeStakePoolNotRegisteredDELEG [2, 1, 1, 6] -> DelegateeStakePoolNotRegistered"
   ],
   "00068": [
-    "decoding-failure: CBOR decoding error: tx_output: expected array or map, got indefinite map",
-    "shadow (outputs made definite): DelegateeStakePoolNotRegistered [match]",
-    "  shadow: ConwayCertsFailure/CertFailure/DelegFailure/DelegateeStakePoolNotRegisteredDELEG [2, 1, 1, 6] -> DelegateeStakePoolNotRegistered"
+    "ConwayCertsFailure/CertFailure/DelegFailure/DelegateeStakePoolNotRegisteredDELEG [2, 1, 1, 6] -> DelegateeStakePoolNotRegistered"
   ],
   "00069": [
-    "decoding-failure: CBOR decoding error: tx_output: expected array or map, got indefinite map",
-    "shadow (outputs made definite): FeeTooSmallUTxO [match]",
-    "  shadow: ConwayUtxowFailure/UtxoFailure/FeeTooSmallUTxO [1, 0, 5] -> FeeTooSmallUTxO"
+    "ConwayUtxowFailure/UtxoFailure/FeeTooSmallUTxO [1, 0, 5] -> FeeTooSmallUTxO"
   ],
   "00070": [
-    "decoding-failure: CBOR decoding error: tx_output: expected array or map, got indefinite map",
-    "shadow (outputs made definite): FeeTooSmallUTxO [match]",
-    "  shadow: ConwayUtxowFailure/UtxoFailure/FeeTooSmallUTxO [1, 0, 5] -> FeeTooSmallUTxO"
+    "ConwayUtxowFailure/UtxoFailure/FeeTooSmallUTxO [1, 0, 5] -> FeeTooSmallUTxO"
   ],
   "00071": [
-    "decoding-failure: CBOR decoding error: tx_output: expected array or map, got indefinite map",
-    "shadow (outputs made definite): FeeTooSmallUTxO [match]",
-    "  shadow: ConwayUtxowFailure/UtxoFailure/FeeTooSmallUTxO [1, 0, 5] -> FeeTooSmallUTxO"
+    "ConwayUtxowFailure/UtxoFailure/FeeTooSmallUTxO [1, 0, 5] -> FeeTooSmallUTxO"
   ],
   "00072": [
-    "decoding-failure: CBOR decoding error: tx_output: expected array or map, got indefinite map",
-    "shadow (outputs made definite): IncorrectDepositDELEG [match]",
-    "  shadow: ConwayCertsFailure/CertFailure/DelegFailure/IncorrectDepositDELEG [2, 1, 1, 1] -> IncorrectDepositDELEG"
+    "ConwayCertsFailure/CertFailure/DelegFailure/IncorrectDepositDELEG [2, 1, 1, 1] -> IncorrectDepositDELEG"
   ],
   "00073": [
     "ConwayUtxowFailure/UtxoFailure/IncorrectTotalCollateralField [1, 0, 20] -> IncorrectTotalCollateralField"
   ],
   "00074": [
-    "decoding-failure: CBOR decoding error: tx_output: expected array or map, got indefinite map",
-    "shadow (outputs made definite): InputSetEmptyUTxO [match]",
-    "  shadow: ConwayUtxowFailure/UtxoFailure/InputSetEmptyUTxO [1, 0, 4] -> InputSetEmptyUTxO"
+    "ConwayUtxowFailure/UtxoFailure/InputSetEmptyUTxO [1, 0, 4] -> InputSetEmptyUTxO"
   ],
   "00075": [
     "ConwayUtxowFailure/UtxoFailure/InsufficientCollateral [1, 0, 12] -> InsufficientCollateral"
@@ -356,26 +251,18 @@
     "ledger failures: InvalidWitnessSignature, MissingInputWitness"
   ],
   "00081": [
-    "decoding-failure: CBOR decoding error: tx_output: expected array or map, got indefinite map",
-    "shadow (outputs made definite): MaxTxSizeUTxO [match]",
-    "  shadow: ConwayUtxowFailure/UtxoFailure/MaxTxSizeUTxO [1, 0, 3] -> MaxTxSizeUTxO"
+    "ConwayUtxowFailure/UtxoFailure/MaxTxSizeUTxO [1, 0, 3] -> MaxTxSizeUTxO"
   ],
   "00082": [
-    "decoding-failure: CBOR decoding error: tx_output: expected array or map, got indefinite map",
-    "shadow (outputs made definite): unmapped:ConwayMempoolFailure (generic fallback, text: \"AuxiliaryDataWithoutHash: auxiliary data present but no hash in tx body\"; ledger: AuxiliaryDataWithoutHash) [MISMATCH]",
-    "  shadow: ConwayMempoolFailure [7] -> GENERIC-FALLBACK (text: \"AuxiliaryDataWithoutHash: auxiliary data present but no hash in tx body\")",
-    "  shadow: ledger failures: AuxiliaryDataWithoutHash"
+    "ConwayMempoolFailure [7] -> GENERIC-FALLBACK (text: \"AuxiliaryDataWithoutHash: auxiliary data present but no hash in tx body\")",
+    "ledger failures: AuxiliaryDataWithoutHash"
   ],
   "00083": [
-    "decoding-failure: CBOR decoding error: tx_output: expected array or map, got indefinite map",
-    "shadow (outputs made definite): unmapped:ConwayMempoolFailure (generic fallback, text: \"AuxiliaryDataHashWithoutData: metadata hash declared but no auxiliary data\"; ledger: AuxiliaryDataHashWithoutData) [MISMATCH]",
-    "  shadow: ConwayMempoolFailure [7] -> GENERIC-FALLBACK (text: \"AuxiliaryDataHashWithoutData: metadata hash declared but no auxiliary data\")",
-    "  shadow: ledger failures: AuxiliaryDataHashWithoutData"
+    "ConwayMempoolFailure [7] -> GENERIC-FALLBACK (text: \"AuxiliaryDataHashWithoutData: metadata hash declared but no auxiliary data\")",
+    "ledger failures: AuxiliaryDataHashWithoutData"
   ],
   "00084": [
-    "decoding-failure: CBOR decoding error: tx_output: expected array or map, got indefinite map",
-    "shadow (outputs made definite): MissingVerificationKeyWitnessesUTXOW [match]",
-    "  shadow: ConwayUtxowFailure/MissingVKeyWitnessesUTXOW [1, 2] -> MissingVerificationKeyWitnessesUTXOW"
+    "ConwayUtxowFailure/MissingVKeyWitnessesUTXOW [1, 2] -> MissingVerificationKeyWitnessesUTXOW"
   ],
   "00085": [
     "ConwayMempoolFailure [7] -> GENERIC-FALLBACK (text: \"transaction validation failed\")",
@@ -388,25 +275,17 @@
     "pass"
   ],
   "00088": [
-    "decoding-failure: CBOR decoding error: tx_output: expected array or map, got indefinite map",
-    "shadow (outputs made definite): unmapped:ConwayMempoolFailure (generic fallback, text: \"transaction validation failed\"; ledger: Phase2CollectError) [MISMATCH]",
-    "  shadow: ConwayMempoolFailure [7] -> GENERIC-FALLBACK (text: \"transaction validation failed\")",
-    "  shadow: ledger failures: Phase2CollectError"
+    "ConwayMempoolFailure [7] -> GENERIC-FALLBACK (text: \"transaction validation failed\")",
+    "ledger failures: Phase2CollectError"
   ],
   "00089": [
-    "decoding-failure: CBOR decoding error: tx_output: expected array or map, got indefinite map",
-    "shadow (outputs made definite): OutsideValidityIntervalUTxO [match]",
-    "  shadow: ConwayUtxowFailure/UtxoFailure/OutsideValidityIntervalUTxO [1, 0, 2] -> OutsideValidityIntervalUTxO"
+    "ConwayUtxowFailure/UtxoFailure/OutsideValidityIntervalUTxO [1, 0, 2] -> OutsideValidityIntervalUTxO"
   ],
   "00090": [
-    "decoding-failure: CBOR decoding error: tx_output: expected array or map, got indefinite map",
-    "shadow (outputs made definite): OutsideValidityIntervalUTxO [match]",
-    "  shadow: ConwayUtxowFailure/UtxoFailure/OutsideValidityIntervalUTxO [1, 0, 2] -> OutsideValidityIntervalUTxO"
+    "ConwayUtxowFailure/UtxoFailure/OutsideValidityIntervalUTxO [1, 0, 2] -> OutsideValidityIntervalUTxO"
   ],
   "00091": [
-    "decoding-failure: CBOR decoding error: tx_output: expected array or map, got indefinite map",
-    "shadow (outputs made definite): OutsideValidityIntervalUTxO [match]",
-    "  shadow: ConwayUtxowFailure/UtxoFailure/OutsideValidityIntervalUTxO [1, 0, 2] -> OutsideValidityIntervalUTxO"
+    "ConwayUtxowFailure/UtxoFailure/OutsideValidityIntervalUTxO [1, 0, 2] -> OutsideValidityIntervalUTxO"
   ],
   "00092": [
     "ConwayGovFailure/ProposalReturnAccountDoesNotExist [3, 16] -> ProposalReturnAccountDoesNotExist"
@@ -433,70 +312,46 @@
     "ConwayUtxowFailure/UtxoFailure/ScriptsNotPaidUTxO [1, 0, 13] -> ScriptsNotPaidUTxO"
   ],
   "00100": [
-    "decoding-failure: CBOR decoding error: tx_output: expected array or map, got indefinite map",
-    "shadow (outputs made definite): StakeCredentialInvalidPoolDelegation [match]",
-    "  shadow: ConwayCertsFailure/CertFailure/DelegFailure/StakeKeyNotRegisteredDELEG [2, 1, 1, 3] -> StakeKeyNotRegistered|StakeCredentialInvalidPoolDelegation"
+    "ConwayCertsFailure/CertFailure/DelegFailure/StakeKeyNotRegisteredDELEG [2, 1, 1, 3] -> StakeKeyNotRegistered|StakeCredentialInvalidPoolDelegation"
   ],
   "00101": [
-    "decoding-failure: CBOR decoding error: tx_output: expected array or map, got indefinite map",
-    "shadow (outputs made definite): StakeCredentialInvalidPoolDelegation [match]",
-    "  shadow: ConwayCertsFailure/CertFailure/DelegFailure/StakeKeyNotRegisteredDELEG [2, 1, 1, 3] -> StakeKeyNotRegistered|StakeCredentialInvalidPoolDelegation"
+    "ConwayCertsFailure/CertFailure/DelegFailure/StakeKeyNotRegisteredDELEG [2, 1, 1, 3] -> StakeKeyNotRegistered|StakeCredentialInvalidPoolDelegation"
   ],
   "00102": [
-    "decoding-failure: CBOR decoding error: tx_output: expected array or map, got indefinite map",
-    "shadow (outputs made definite): StakeCredentialInvalidPoolDelegation [match]",
-    "  shadow: ConwayUtxowFailure/MissingScriptWitnessesUTXOW [1, 3] -> MissingScriptWitnessesUTXOW",
-    "  shadow: ConwayUtxowFailure/MissingScriptWitnessesUTXOW [1, 3] -> MissingScriptWitnessesUTXOW",
-    "  shadow: ConwayCertsFailure/CertFailure/DelegFailure/StakeKeyNotRegisteredDELEG [2, 1, 1, 3] -> StakeKeyNotRegistered|StakeCredentialInvalidPoolDelegation"
+    "ConwayUtxowFailure/MissingScriptWitnessesUTXOW [1, 3] -> MissingScriptWitnessesUTXOW",
+    "ConwayUtxowFailure/MissingScriptWitnessesUTXOW [1, 3] -> MissingScriptWitnessesUTXOW",
+    "ConwayCertsFailure/CertFailure/DelegFailure/StakeKeyNotRegisteredDELEG [2, 1, 1, 3] -> StakeKeyNotRegistered|StakeCredentialInvalidPoolDelegation"
   ],
   "00103": [
-    "decoding-failure: CBOR decoding error: tx_output: expected array or map, got indefinite map",
-    "shadow (outputs made definite): StakeCredentialInvalidPoolDelegation [match]",
-    "  shadow: ConwayUtxowFailure/MissingScriptWitnessesUTXOW [1, 3] -> MissingScriptWitnessesUTXOW",
-    "  shadow: ConwayUtxowFailure/MissingScriptWitnessesUTXOW [1, 3] -> MissingScriptWitnessesUTXOW",
-    "  shadow: ConwayCertsFailure/CertFailure/DelegFailure/StakeKeyNotRegisteredDELEG [2, 1, 1, 3] -> StakeKeyNotRegistered|StakeCredentialInvalidPoolDelegation"
+    "ConwayUtxowFailure/MissingScriptWitnessesUTXOW [1, 3] -> MissingScriptWitnessesUTXOW",
+    "ConwayUtxowFailure/MissingScriptWitnessesUTXOW [1, 3] -> MissingScriptWitnessesUTXOW",
+    "ConwayCertsFailure/CertFailure/DelegFailure/StakeKeyNotRegisteredDELEG [2, 1, 1, 3] -> StakeKeyNotRegistered|StakeCredentialInvalidPoolDelegation"
   ],
   "00104": [
-    "decoding-failure: CBOR decoding error: tx_output: expected array or map, got indefinite map",
-    "shadow (outputs made definite): StakeKeyHasNonZeroAccountBalance [match]",
-    "  shadow: ConwayCertsFailure/CertFailure/DelegFailure/StakeKeyHasNonZeroAccountBalanceDELEG [2, 1, 1, 4] -> StakeKeyHasNonZeroAccountBalance"
+    "ConwayCertsFailure/CertFailure/DelegFailure/StakeKeyHasNonZeroAccountBalanceDELEG [2, 1, 1, 4] -> StakeKeyHasNonZeroAccountBalance"
   ],
   "00105": [
-    "decoding-failure: CBOR decoding error: tx_output: expected array or map, got indefinite map",
-    "shadow (outputs made definite): StakeKeyHasNonZeroAccountBalance [match]",
-    "  shadow: ConwayCertsFailure/CertFailure/DelegFailure/StakeKeyHasNonZeroAccountBalanceDELEG [2, 1, 1, 4] -> StakeKeyHasNonZeroAccountBalance"
+    "ConwayCertsFailure/CertFailure/DelegFailure/StakeKeyHasNonZeroAccountBalanceDELEG [2, 1, 1, 4] -> StakeKeyHasNonZeroAccountBalance"
   ],
   "00106": [
-    "decoding-failure: CBOR decoding error: tx_output: expected array or map, got indefinite map",
-    "shadow (outputs made definite): StakeKeyRegistered [match]",
-    "  shadow: ConwayCertsFailure/CertFailure/DelegFailure/StakeKeyRegisteredDELEG [2, 1, 1, 2] -> StakeKeyRegistered"
+    "ConwayCertsFailure/CertFailure/DelegFailure/StakeKeyRegisteredDELEG [2, 1, 1, 2] -> StakeKeyRegistered"
   ],
   "00107": [
-    "decoding-failure: CBOR decoding error: tx_output: expected array or map, got indefinite map",
-    "shadow (outputs made definite): StakeKeyRegistered [match]",
-    "  shadow: ConwayCertsFailure/CertFailure/DelegFailure/StakeKeyRegisteredDELEG [2, 1, 1, 2] -> StakeKeyRegistered",
-    "  shadow: ConwayCertsFailure/CertFailure/DelegFailure/DelegateeStakePoolNotRegisteredDELEG [2, 1, 1, 6] -> DelegateeStakePoolNotRegistered"
+    "ConwayCertsFailure/CertFailure/DelegFailure/StakeKeyRegisteredDELEG [2, 1, 1, 2] -> StakeKeyRegistered",
+    "ConwayCertsFailure/CertFailure/DelegFailure/DelegateeStakePoolNotRegisteredDELEG [2, 1, 1, 6] -> DelegateeStakePoolNotRegistered"
   ],
   "00108": [
-    "decoding-failure: CBOR decoding error: tx_output: expected array or map, got indefinite map",
-    "shadow (outputs made definite): StakeKeyRegistered [match]",
-    "  shadow: ConwayCertsFailure/CertFailure/DelegFailure/StakeKeyRegisteredDELEG [2, 1, 1, 2] -> StakeKeyRegistered"
+    "ConwayCertsFailure/CertFailure/DelegFailure/StakeKeyRegisteredDELEG [2, 1, 1, 2] -> StakeKeyRegistered"
   ],
   "00109": [
-    "decoding-failure: CBOR decoding error: tx_output: expected array or map, got indefinite map",
-    "shadow (outputs made definite): StakeKeyRegistered [match]",
-    "  shadow: ConwayCertsFailure/CertFailure/DelegFailure/StakeKeyRegisteredDELEG [2, 1, 1, 2] -> StakeKeyRegistered",
-    "  shadow: ConwayCertsFailure/CertFailure/DelegFailure/DelegateeStakePoolNotRegisteredDELEG [2, 1, 1, 6] -> DelegateeStakePoolNotRegistered"
+    "ConwayCertsFailure/CertFailure/DelegFailure/StakeKeyRegisteredDELEG [2, 1, 1, 2] -> StakeKeyRegistered",
+    "ConwayCertsFailure/CertFailure/DelegFailure/DelegateeStakePoolNotRegisteredDELEG [2, 1, 1, 6] -> DelegateeStakePoolNotRegistered"
   ],
   "00110": [
-    "decoding-failure: CBOR decoding error: tx_output: expected array or map, got indefinite map",
-    "shadow (outputs made definite): StakePoolCostTooLowPOOL [match]",
-    "  shadow: ConwayCertsFailure/CertFailure/PoolFailure/StakePoolCostTooLowPOOL [2, 1, 2, 3] -> StakePoolCostTooLowPOOL"
+    "ConwayCertsFailure/CertFailure/PoolFailure/StakePoolCostTooLowPOOL [2, 1, 2, 3] -> StakePoolCostTooLowPOOL"
   ],
   "00111": [
-    "decoding-failure: CBOR decoding error: tx_output: expected array or map, got indefinite map",
-    "shadow (outputs made definite): StakePoolCostTooLowPOOL [match]",
-    "  shadow: ConwayCertsFailure/CertFailure/PoolFailure/StakePoolCostTooLowPOOL [2, 1, 2, 3] -> StakePoolCostTooLowPOOL"
+    "ConwayCertsFailure/CertFailure/PoolFailure/StakePoolCostTooLowPOOL [2, 1, 2, 3] -> StakePoolCostTooLowPOOL"
   ],
   "00112": [
     "ConwayCertsFailure/CertFailure/PoolFailure/StakePoolNotRegisteredOnKeyPOOL [2, 1, 2, 0] -> StakePoolNotRegisteredOnKeyPOOL"
@@ -505,32 +360,22 @@
     "ConwayCertsFailure/CertFailure/PoolFailure/StakePoolNotRegisteredOnKeyPOOL [2, 1, 2, 0] -> StakePoolNotRegisteredOnKeyPOOL"
   ],
   "00114": [
-    "decoding-failure: CBOR decoding error: tx_output: expected array or map, got indefinite map",
-    "shadow (outputs made definite): StakePoolRetirementWrongEpochPOOL [match]",
-    "  shadow: ConwayCertsFailure/CertFailure/PoolFailure/StakePoolRetirementWrongEpochPOOL [2, 1, 2, 1] -> StakePoolRetirementWrongEpochPOOL"
+    "ConwayCertsFailure/CertFailure/PoolFailure/StakePoolRetirementWrongEpochPOOL [2, 1, 2, 1] -> StakePoolRetirementWrongEpochPOOL"
   ],
   "00115": [
-    "decoding-failure: CBOR decoding error: tx_output: expected array or map, got indefinite map",
-    "shadow (outputs made definite): StakePoolRetirementWrongEpochPOOL [match]",
-    "  shadow: ConwayCertsFailure/CertFailure/PoolFailure/StakePoolRetirementWrongEpochPOOL [2, 1, 2, 1] -> StakePoolRetirementWrongEpochPOOL"
+    "ConwayCertsFailure/CertFailure/PoolFailure/StakePoolRetirementWrongEpochPOOL [2, 1, 2, 1] -> StakePoolRetirementWrongEpochPOOL"
   ],
   "00116": [
     "ConwayUtxowFailure/UtxoFailure/TooManyCollateralInputs [1, 0, 18] -> TooManyCollateralInputs"
   ],
   "00117": [
-    "decoding-failure: CBOR decoding error: tx_output: expected array or map, got indefinite map",
-    "shadow (outputs made definite): TreasuryWithdrawalReturnAccountsDoNotExist [match]",
-    "  shadow: ConwayGovFailure/TreasuryWithdrawalReturnAccountsDoNotExist [3, 17] -> TreasuryWithdrawalReturnAccountsDoNotExist"
+    "ConwayGovFailure/TreasuryWithdrawalReturnAccountsDoNotExist [3, 17] -> TreasuryWithdrawalReturnAccountsDoNotExist"
   ],
   "00118": [
-    "decoding-failure: CBOR decoding error: tx_output: expected array or map, got indefinite map",
-    "shadow (outputs made definite): TreasuryWithdrawalReturnAccountsDoNotExist [match]",
-    "  shadow: ConwayGovFailure/TreasuryWithdrawalReturnAccountsDoNotExist [3, 17] -> TreasuryWithdrawalReturnAccountsDoNotExist"
+    "ConwayGovFailure/TreasuryWithdrawalReturnAccountsDoNotExist [3, 17] -> TreasuryWithdrawalReturnAccountsDoNotExist"
   ],
   "00119": [
-    "decoding-failure: CBOR decoding error: tx_output: expected array or map, got indefinite map",
-    "shadow (outputs made definite): TreasuryWithdrawalReturnAccountsDoNotExist [match]",
-    "  shadow: ConwayGovFailure/TreasuryWithdrawalReturnAccountsDoNotExist [3, 17] -> TreasuryWithdrawalReturnAccountsDoNotExist"
+    "ConwayGovFailure/TreasuryWithdrawalReturnAccountsDoNotExist [3, 17] -> TreasuryWithdrawalReturnAccountsDoNotExist"
   ],
   "00120": [
     "ConwayUtxowFailure/UtxoFailure/ValueNotConservedUTxO [1, 0, 6] -> ValueNotConservedUTxO"
@@ -546,28 +391,20 @@
     "ConwayUtxowFailure/UtxoFailure/ValueNotConservedUTxO [1, 0, 6] -> ValueNotConservedUTxO"
   ],
   "00124": [
-    "decoding-failure: CBOR decoding error: tx_output: expected array or map, got indefinite map",
-    "shadow (outputs made definite): ValueNotConservedUTxO [match]",
-    "  shadow: ConwayUtxowFailure/UtxoFailure/ValueNotConservedUTxO [1, 0, 6] -> ValueNotConservedUTxO",
-    "  shadow: ConwayUtxowFailure/UtxoFailure/InsufficientCollateral [1, 0, 12] -> InsufficientCollateral"
+    "ConwayUtxowFailure/UtxoFailure/ValueNotConservedUTxO [1, 0, 6] -> ValueNotConservedUTxO",
+    "ConwayUtxowFailure/UtxoFailure/InsufficientCollateral [1, 0, 12] -> InsufficientCollateral"
   ],
   "00125": [
-    "decoding-failure: CBOR decoding error: tx_output: expected array or map, got indefinite map",
-    "shadow (outputs made definite): WithdrawalsNotInRewardsCERTS [match]",
-    "  shadow: ConwayCertsFailure/WithdrawalsNotInRewardsCERTS [2, 0] -> WithdrawalsNotInRewardsCERTS",
-    "  shadow: ConwayMempoolFailure [7] -> GENERIC-FALLBACK (text: \"transaction validation failed\")",
-    "  shadow: ledger failures: WithdrawalsNotInRewardsCERTS, WdrlNotDelegatedToDRep"
+    "ConwayCertsFailure/WithdrawalsNotInRewardsCERTS [2, 0] -> WithdrawalsNotInRewardsCERTS",
+    "ConwayMempoolFailure [7] -> GENERIC-FALLBACK (text: \"transaction validation failed\")",
+    "ledger failures: WithdrawalsNotInRewardsCERTS, WdrlNotDelegatedToDRep"
   ],
   "00126": [
-    "decoding-failure: CBOR decoding error: tx_output: expected array or map, got indefinite map",
-    "shadow (outputs made definite): WithdrawalsNotInRewardsCERTS [match]",
-    "  shadow: ConwayCertsFailure/WithdrawalsNotInRewardsCERTS [2, 0] -> WithdrawalsNotInRewardsCERTS"
+    "ConwayCertsFailure/WithdrawalsNotInRewardsCERTS [2, 0] -> WithdrawalsNotInRewardsCERTS"
   ],
   "00127": [
-    "decoding-failure: CBOR decoding error: tx_output: expected array or map, got indefinite map",
-    "shadow (outputs made definite): unmapped:ConwayMempoolFailure (generic fallback, text: \"transaction validation failed\"; ledger: NetworkMismatch) [MISMATCH]",
-    "  shadow: ConwayMempoolFailure [7] -> GENERIC-FALLBACK (text: \"transaction validation failed\")",
-    "  shadow: ledger failures: NetworkMismatch"
+    "ConwayMempoolFailure [7] -> GENERIC-FALLBACK (text: \"transaction validation failed\")",
+    "ledger failures: NetworkMismatch"
   ],
   "00128": [
     "ConwayMempoolFailure [7] -> GENERIC-FALLBACK (text: \"transaction validation failed\")",
@@ -575,10 +412,8 @@
     "ledger failures: NetworkMismatch, WrongNetworkInOutput"
   ],
   "00129": [
-    "decoding-failure: CBOR decoding error: tx_output: expected array or map, got indefinite map",
-    "shadow (outputs made definite): WrongNetworkWithdrawal [match]",
-    "  shadow: ConwayUtxowFailure/UtxoFailure/WrongNetworkWithdrawal [1, 0, 8] -> WrongNetworkWithdrawal",
-    "  shadow: ConwayCertsFailure/WithdrawalsNotInRewardsCERTS [2, 0] -> WithdrawalsNotInRewardsCERTS"
+    "ConwayUtxowFailure/UtxoFailure/WrongNetworkWithdrawal [1, 0, 8] -> WrongNetworkWithdrawal",
+    "ConwayCertsFailure/WithdrawalsNotInRewardsCERTS [2, 0] -> WithdrawalsNotInRewardsCERTS"
   ],
   "00130": [
     "ConwayGovFailure/ZeroTreasuryWithdrawals [3, 15] -> TreasuryWithdrawalsAllZeros"
@@ -587,106 +422,66 @@
     "ConwayUtxowFailure/UtxoFailure/MaxTxSizeUTxO [1, 0, 3] -> MaxTxSizeUTxO"
   ],
   "00132": [
-    "decoding-failure: CBOR decoding error: tx_output: expected array or map, got indefinite map",
-    "shadow (outputs made definite): pass [match]",
-    "  shadow: pass"
+    "pass"
   ],
   "00133": [
-    "decoding-failure: CBOR decoding error: tx_output: expected array or map, got indefinite map",
-    "shadow (outputs made definite): pass [match]",
-    "  shadow: pass"
+    "pass"
   ],
   "00134": [
-    "decoding-failure: CBOR decoding error: tx_output: expected array or map, got indefinite map",
-    "shadow (outputs made definite): pass [match]",
-    "  shadow: pass"
+    "pass"
   ],
   "00135": [
-    "decoding-failure: CBOR decoding error: tx_output: expected array or map, got indefinite map",
-    "shadow (outputs made definite): pass [match]",
-    "  shadow: pass"
+    "pass"
   ],
   "00136": [
-    "decoding-failure: CBOR decoding error: tx_output: expected array or map, got indefinite map",
-    "shadow (outputs made definite): pass [match]",
-    "  shadow: pass"
+    "pass"
   ],
   "00137": [
-    "decoding-failure: CBOR decoding error: tx_output: expected array or map, got indefinite map",
-    "shadow (outputs made definite): pass [match]",
-    "  shadow: pass"
+    "pass"
   ],
   "00138": [
-    "decoding-failure: CBOR decoding error: tx_output: expected array or map, got indefinite map",
-    "shadow (outputs made definite): pass [match]",
-    "  shadow: pass"
+    "pass"
   ],
   "00139": [
-    "decoding-failure: CBOR decoding error: tx_output: expected array or map, got indefinite map",
-    "shadow (outputs made definite): pass [match]",
-    "  shadow: pass"
+    "pass"
   ],
   "00140": [
-    "decoding-failure: CBOR decoding error: tx_output: expected array or map, got indefinite map",
-    "shadow (outputs made definite): pass [match]",
-    "  shadow: pass"
+    "pass"
   ],
   "00141": [
-    "decoding-failure: CBOR decoding error: tx_output: expected array or map, got indefinite map",
-    "shadow (outputs made definite): pass [match]",
-    "  shadow: pass"
+    "pass"
   ],
   "00142": [
-    "decoding-failure: CBOR decoding error: tx_output: expected array or map, got indefinite map",
-    "shadow (outputs made definite): pass [match]",
-    "  shadow: pass"
+    "pass"
   ],
   "00143": [
-    "decoding-failure: CBOR decoding error: tx_output: expected array or map, got indefinite map",
-    "shadow (outputs made definite): pass [match]",
-    "  shadow: pass"
+    "pass"
   ],
   "00144": [
-    "decoding-failure: CBOR decoding error: tx_output: expected array or map, got indefinite map",
-    "shadow (outputs made definite): pass [match]",
-    "  shadow: pass"
+    "pass"
   ],
   "00145": [
-    "decoding-failure: CBOR decoding error: tx_output: expected array or map, got indefinite map",
-    "shadow (outputs made definite): pass [match]",
-    "  shadow: pass"
+    "pass"
   ],
   "00146": [
-    "decoding-failure: CBOR decoding error: tx_output: expected array or map, got indefinite map",
-    "shadow (outputs made definite): pass [match]",
-    "  shadow: pass"
+    "pass"
   ],
   "00147": [
-    "decoding-failure: CBOR decoding error: tx_output: expected array or map, got indefinite map",
-    "shadow (outputs made definite): pass [match]",
-    "  shadow: pass"
+    "pass"
   ],
   "00148": [
-    "decoding-failure: CBOR decoding error: tx_output: expected array or map, got indefinite map",
-    "shadow (outputs made definite): InvalidPrevGovActionId [match]",
-    "  shadow: ConwayGovFailure/InvalidPrevGovActionId [3, 8] -> InvalidPrevGovActionId",
-    "  shadow: ConwayGovFailure/ProposalReturnAccountDoesNotExist [3, 16] -> ProposalReturnAccountDoesNotExist"
+    "ConwayGovFailure/InvalidPrevGovActionId [3, 8] -> InvalidPrevGovActionId",
+    "ConwayGovFailure/ProposalReturnAccountDoesNotExist [3, 16] -> ProposalReturnAccountDoesNotExist"
   ],
   "00149": [
-    "decoding-failure: CBOR decoding error: tx_output: expected array or map, got indefinite map",
-    "shadow (outputs made definite): pass [MISMATCH]",
-    "  shadow: pass"
+    "pass"
   ],
   "00150": [
-    "decoding-failure: CBOR decoding error: tx_output: expected array or map, got indefinite map",
-    "shadow (outputs made definite): InvalidPrevGovActionId [match]",
-    "  shadow: ConwayGovFailure/InvalidPrevGovActionId [3, 8] -> InvalidPrevGovActionId",
-    "  shadow: ConwayGovFailure/ProposalReturnAccountDoesNotExist [3, 16] -> ProposalReturnAccountDoesNotExist"
+    "ConwayGovFailure/InvalidPrevGovActionId [3, 8] -> InvalidPrevGovActionId",
+    "ConwayGovFailure/ProposalReturnAccountDoesNotExist [3, 16] -> ProposalReturnAccountDoesNotExist"
   ],
   "00151": [
-    "decoding-failure: CBOR decoding error: tx_output: expected array or map, got indefinite map",
-    "shadow (outputs made definite): MalformedReferenceScripts [match]",
-    "  shadow: ConwayUtxowFailure/MalformedReferenceScripts [1, 17] -> MalformedReferenceScripts"
+    "ConwayUtxowFailure/MalformedReferenceScripts [1, 17] -> MalformedReferenceScripts"
   ],
   "00152": [
     "pass"
@@ -839,16 +634,12 @@
     "ConwayCertsFailure/CertFailure/GovCertFailure/ConwayCommitteeIsUnknown [2, 1, 3, 5] -> CommitteeIsUnknown"
   ],
   "00202": [
-    "decoding-failure: CBOR decoding error: tx_output: expected array or map, got indefinite map",
-    "shadow (outputs made definite): unmapped:ConwayMempoolFailure (generic fallback, text: \"transaction validation failed\"; ledger: ProposalCantFollow) [MISMATCH]",
-    "  shadow: ConwayMempoolFailure [7] -> GENERIC-FALLBACK (text: \"transaction validation failed\")",
-    "  shadow: ledger failures: ProposalCantFollow"
+    "ConwayMempoolFailure [7] -> GENERIC-FALLBACK (text: \"transaction validation failed\")",
+    "ledger failures: ProposalCantFollow"
   ],
   "00203": [
-    "decoding-failure: CBOR decoding error: tx_output: expected array or map, got indefinite map",
-    "shadow (outputs made definite): unmapped:ConwayMempoolFailure (generic fallback, text: \"transaction validation failed\"; ledger: ProposalCantFollow) [MISMATCH]",
-    "  shadow: ConwayMempoolFailure [7] -> GENERIC-FALLBACK (text: \"transaction validation failed\")",
-    "  shadow: ledger failures: ProposalCantFollow"
+    "ConwayMempoolFailure [7] -> GENERIC-FALLBACK (text: \"transaction validation failed\")",
+    "ledger failures: ProposalCantFollow"
   ],
   "00204": [
     "ConwayCertsFailure/CertFailure/GovCertFailure/ConwayCommitteeIsUnknown [2, 1, 3, 5] -> CommitteeIsUnknown"
@@ -980,9 +771,7 @@
     "pass"
   ],
   "00247": [
-    "decoding-failure: CBOR decoding error: tx_output: expected array or map, got indefinite map",
-    "shadow (outputs made definite): pass [match]",
-    "  shadow: pass"
+    "pass"
   ],
   "00254": [
     "ConwayUtxowFailure/UtxoFailure/BabbageOutputTooSmallUTxO [1, 0, 21] -> BabbageOutputTooSmallUTxO"
@@ -1072,9 +861,7 @@
     "ConwayGovFailure/ProposalProcedureNetworkIdMismatch [3, 2] -> ProposalProcedureNetworkIdMismatch"
   ],
   "00283": [
-    "decoding-failure: CBOR decoding error: tx_output: expected array or map, got indefinite map",
-    "shadow (outputs made definite): MalformedReferenceScripts [match]",
-    "  shadow: ConwayUtxowFailure/MalformedReferenceScripts [1, 17] -> MalformedReferenceScripts"
+    "ConwayUtxowFailure/MalformedReferenceScripts [1, 17] -> MalformedReferenceScripts"
   ],
   "00284": [
     "ConwayMempoolFailure [7] -> GENERIC-FALLBACK (text: \"transaction validation failed\")",
@@ -1095,7 +882,7 @@
     "ConwayCertsFailure/CertFailure/DelegFailure/StakeKeyNotRegisteredDELEG [2, 1, 1, 3] -> StakeCredentialInvalidVoteDelegation"
   ],
   "00289": [
-    "pass"
+    "ConwayCertsFailure/CertFailure/GovCertFailure/ConwayDRepNotRegistered [2, 1, 3, 1] -> DRepNotRegistered"
   ],
   "00290": [
     "ConwayUtxowFailure/UtxoFailure/ValueNotConservedUTxO [1, 0, 6] -> ValueNotConservedUTxO",
@@ -1107,8 +894,7 @@
   ],
   "00292": [
     "ConwayUtxowFailure/UtxoFailure/ValueNotConservedUTxO [1, 0, 6] -> ValueNotConservedUTxO",
-    "ConwayMempoolFailure [7] -> GENERIC-FALLBACK (text: \"transaction validation failed\")",
-    "ledger failures: ValueNotConserved, DRepNotRegistered"
+    "ConwayCertsFailure/CertFailure/GovCertFailure/ConwayDRepNotRegistered [2, 1, 3, 1] -> DRepNotRegistered"
   ],
   "00293": [
     "ConwayUtxowFailure/MissingVKeyWitnessesUTXOW [1, 2] -> MissingVerificationKeyWitnessesUTXOW"
@@ -1280,10 +1066,8 @@
     "ConwayUtxowFailure/MalformedReferenceScripts [1, 17] -> MalformedReferenceScripts"
   ],
   "00350": [
-    "decoding-failure: CBOR decoding error: tx_output: expected array or map, got indefinite map",
-    "shadow (outputs made definite): unmapped:ConwayMempoolFailure (generic fallback, text: \"transaction validation failed\"; ledger: ExUnitsExceeded) [MISMATCH]",
-    "  shadow: ConwayMempoolFailure [7] -> GENERIC-FALLBACK (text: \"transaction validation failed\")",
-    "  shadow: ledger failures: ExUnitsExceeded"
+    "ConwayMempoolFailure [7] -> GENERIC-FALLBACK (text: \"transaction validation failed\")",
+    "ledger failures: ExUnitsExceeded"
   ],
   "00351": [
     "ConwayGovFailure/ConflictingCommitteeUpdate [3, 6] -> ConflictingCommitteeUpdate"
@@ -1324,15 +1108,13 @@
     "pass"
   ],
   "00362": [
-    "decoding-failure: CBOR decoding error: tx_output: expected array or map, got indefinite map"
+    "decoding-failure: CBOR decoding error: script_ref: unknown script type 99"
   ],
   "00363": [
-    "decoding-failure: CBOR decoding error: tx_output: expected array or map, got indefinite map"
+    "decoding-failure: CBOR decoding error: script_ref: expected array(2), got array(3)"
   ],
   "00364": [
-    "decoding-failure: CBOR decoding error: tx_output: expected array or map, got indefinite map",
-    "shadow (outputs made definite): pass [match]",
-    "  shadow: pass"
+    "pass"
   ],
   "00365": [
     "pass"

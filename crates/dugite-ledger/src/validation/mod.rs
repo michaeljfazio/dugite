@@ -16,6 +16,7 @@
 mod collateral;
 mod conway;
 mod datum;
+mod input_set;
 pub mod mir;
 mod phase1;
 pub mod ppup;
@@ -3399,8 +3400,23 @@ pub fn validate_transaction_with_context(
         // `ValidationContext::reward_accounts` (Haskell `accountsL` —
         // staking credential → account info). When `reward_accounts` is
         // `None`, the predicate is silently skipped (lenient default).
+        //
+        // Bootstrap gate: the whole account block of `processProposal`,
+        // this check included, sits under
+        // `unless (hardforkConwayBootstrapPhase $ pp ^. ppProtocolVersionL)`
+        // (cardano-ledger f649f9751074d2ab3de033fc3912f29c9862c1f5,
+        // Conway/Rules/Gov.hs L504), and
+        // `hardforkConwayBootstrapPhase pv = pvMajor pv == natVersion @9`
+        // (Conway/Era.hs L256-258). So at PV9 this predicate must not appear
+        // in the failure list. (A TreasuryWithdrawals proposal is still
+        // rejected at PV9 by `DisallowedProposalDuringBootstrap`, Gov.hs
+        // L440-442, which dugite raises above.)
         // -------------------------------------------------------------------
-        if let Some(reward_accounts) = gov_ctx.reward_accounts.as_ref() {
+        if let Some(reward_accounts) = gov_ctx
+            .reward_accounts
+            .as_ref()
+            .filter(|_| params.protocol_version_major != 9)
+        {
             let mut bad_withdrawal_addrs: Vec<String> = Vec::new();
             for proposal in &tx.body.proposal_procedures {
                 if let GovAction::TreasuryWithdrawals { withdrawals, .. } = &proposal.gov_action {
@@ -4309,6 +4325,25 @@ pub fn validate_transaction_with_pools(
                             });
                         }
                         overlay.unregister(key);
+                    }
+                    // `UpdateDRep` needs the DRep to be registered at THIS point
+                    // of the walk and does not change membership:
+                    //
+                    //   ConwayUpdateDRep cred mAnchor -> do
+                    //     Map.member cred (certState ^. certVStateL . vsDRepsL)
+                    //       ?! (injectFailure . ConwayDRepNotRegistered) cred
+                    //
+                    // (cardano-ledger f649f9751074d2ab3de033fc3912f29c9862c1f5,
+                    // Conway/Rules/GovCert.hs L256-258; no protocol-version gate.)
+                    dugite_primitives::transaction::Certificate::UpdateDRep {
+                        credential, ..
+                    } => {
+                        let key = credential.to_typed_hash32();
+                        if !overlay.contains(&key) {
+                            errors.push(ValidationError::DRepNotRegistered {
+                                credential_hash: key.to_hex(),
+                            });
+                        }
                     }
                     _ => {}
                 }

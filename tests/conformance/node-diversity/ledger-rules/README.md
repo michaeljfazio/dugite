@@ -45,7 +45,8 @@ the reference checker's normalisation (`Amaru validation-rules/.../Run.hs`, `nor
   such check, so dugite agrees with the scenario and differs from the node it models. Tracked as #1179.
 * `ConwayMempoolFailure "All inputs are spent. .."` is mapped to `InputSetEmptyUTxO` (empty input set) or
   `BadInputsUTxO`. A real node sends the mempool text there; dugite sends the typed `BadInputsUTxO`. Fixtures
-  00050 and 00074 expect those names and are decided by #1138 today, so the question is open until it is fixed.
+  00050 and 00074 expect those names and match by name since #1138 was fixed (they were refused at decode before),
+  so the question of the mempool text stays open.
 * when the fixture names an expected predicate and ANY raised failure renders to a string containing it, the
   checker reports the expected name alone. Comparison is therefore unordered and payload-free, and so is
   ours: 00290 matches with `[ValueNotConservedUTxO, StakeKeyNotRegisteredDELEG]` raised, where the oracle
@@ -105,9 +106,9 @@ Both tests below count SCORED results only (a fixture refused at decode has none
 `context_none_set_is_the_documented_one` (exactly the documented context fields are `None`:
 the Shelley-Babbage MIR fields, and `drep_deposits`, which the node's own context builder leaves unset, see
 the `drep-incorrect-refund` class) and `dropping_each_initial_state_section_is_observable` (the negative
-control: dropping a section turns a scored fixture red; `proposals_roots` is unobservable on scored results because
-every fixture that carries it is behind #1138, and `governance_activity` is read by no admission-path rule; both
-are listed and asserted, so `proposals_roots` flips when #1138 is fixed).
+control: dropping a section turns a scored fixture red; `governance_activity` is read by no admission-path rule, so it
+is the one listed and asserted section; `proposals_roots` left the list when #1138 was fixed, because the five fixtures
+that carry it now reach a rule).
 
 ## The contract
 
@@ -121,10 +122,12 @@ Never edit an entry to make a number match. Fix the ledger and delete the entry.
 
 ## The shadow run
 
-108 fixtures are refused at decode because dugite does not accept an indefinite-length output map (#1138), so
-no rule runs on them. For those, the runner re-runs the rules on the transaction with only the outer map
-header of each output made definite, keeping the original body bytes, hash and size. It is a diagnostic: it
-appears in the snapshot and in #1160, never in the contract.
+Before #1138 was fixed, 108 fixtures were refused at decode because dugite did not accept an indefinite-length
+output map, so no rule ran on them. For a fixture still refused at decode the runner re-runs the rules on the
+transaction with only the outer map header of each output made definite, keeping the original body bytes, hash
+and size. It is a diagnostic: it appears in the snapshot, never in the contract. Since the fix only the two
+fixtures that expect a decoding failure (00362, 00363) are in that situation; the rules that the decode refusal
+had been hiding are now ordinary entries (#1160).
 
 ## What this does not prove
 
@@ -137,5 +140,5 @@ appears in the snapshot and in #1160, never in the contract.
 `DecodingFailure` is the one scenario name not read from bytes: an undecodable transaction has no `ApplyTxErr`.
 Haskell fails it at the codec layer (a `DeserialiseFailure`, connection dropped); dugite answers a
 `ConwayMempoolFailure` with the text "transaction decode failed: ..." (`encode.rs`). The two fixtures that
-expect it and match (00362, 00363) are pinned to fail for their own reason, not for #1138
+expect it and match (00362, 00363) are pinned to fail for their own reason (the reference-script shape)
 (`decoding_failure_fixtures_fail_for_their_own_reason`).

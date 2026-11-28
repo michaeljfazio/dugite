@@ -28,6 +28,7 @@ use dugite_primitives::value::AssetName;
 
 use crate::utxo::UtxoLookup;
 
+use super::input_set::tx_in_set;
 use super::scripts::compute_script_ref_hash;
 use super::ValidationError;
 
@@ -81,7 +82,9 @@ pub(crate) fn check_collateral(
     let mut collateral_multi_asset: BTreeMap<PolicyId, BTreeMap<AssetName, i128>> = BTreeMap::new();
     let mut script_locked_inputs: Vec<String> = Vec::new();
 
-    for col_input in &body.collateral {
+    // `collateral_inputs` is a `Set TxIn` too (same `decodeSet`): a pre-PV9
+    // duplicate is one collateral input, counted once.
+    for col_input in tx_in_set(&body.collateral) {
         match utxo_set.lookup(col_input) {
             Some(output) => {
                 // ScriptsNotPaidUTxO: collateral inputs must be at VKey (non-script) addresses.
@@ -293,7 +296,8 @@ pub(crate) fn check_max_collateral_inputs(
     params: &ProtocolParameters,
     errors: &mut Vec<ValidationError>,
 ) {
-    let actual = tx.body.collateral.len() as u64;
+    // `Set.size` of the collateral set, not the wire array length.
+    let actual = tx_in_set(&tx.body.collateral).len() as u64;
     if actual > params.max_collateral_inputs {
         errors.push(ValidationError::TooManyCollateralInputs {
             max: params.max_collateral_inputs,
@@ -339,7 +343,9 @@ fn check_ex_units(
 /// non-None `policy_hash`).
 fn check_redeemer_indices(tx: &Transaction, errors: &mut Vec<ValidationError>) {
     let body = &tx.body;
-    let input_count = body.inputs.len();
+    // Size of the `Set TxIn`, not of the wire array: a pre-PV9 duplicate TxIn
+    // collapses (see `input_set`).
+    let input_count = tx_in_set(&body.inputs).len();
     let mint_count = body.mint.len();
     let cert_count = body.certificates.len();
     let withdrawal_count = body.withdrawals.len();
@@ -419,12 +425,7 @@ pub(crate) fn check_script_redeemers(
 
     // Cardano sorts inputs by (tx_id, index) for deterministic redeemer index
     // assignment.
-    let mut sorted_inputs: Vec<_> = body.inputs.iter().collect();
-    sorted_inputs.sort_by(|a, b| {
-        a.transaction_id
-            .cmp(&b.transaction_id)
-            .then(a.index.cmp(&b.index))
-    });
+    let sorted_inputs = tx_in_set(&body.inputs);
 
     for (idx, input) in sorted_inputs.iter().enumerate() {
         if let Some(utxo) = utxo_set.lookup(input) {
@@ -793,12 +794,7 @@ pub(crate) fn check_extra_redeemers(
     // Spend: PLUTUS-script-locked inputs only (sorted by TxIn).
     // A redeemer for a native-script-locked input is extra (not in
     // `redeemersNeeded`), matching Haskell's `hasExactSetOfRedeemers`.
-    let mut sorted_inputs: Vec<_> = body.inputs.iter().collect();
-    sorted_inputs.sort_by(|a, b| {
-        a.transaction_id
-            .cmp(&b.transaction_id)
-            .then(a.index.cmp(&b.index))
-    });
+    let sorted_inputs = tx_in_set(&body.inputs);
     for (idx, input) in sorted_inputs.iter().enumerate() {
         if let Some(utxo) = utxo_set.lookup(input) {
             let script_hash: Option<&Hash28> = match &utxo.address {
@@ -1141,12 +1137,7 @@ pub(crate) fn redeemer_script_version_map(
     // ------------------------------------------------------------------ Spend
     // Inputs are sorted by (tx_hash, output_index) to determine the redeemer
     // index, matching Haskell's `toSortedList (txins txb)`.
-    let mut sorted_inputs: Vec<_> = body.inputs.iter().collect();
-    sorted_inputs.sort_by(|a, b| {
-        a.transaction_id
-            .cmp(&b.transaction_id)
-            .then(a.index.cmp(&b.index))
-    });
+    let sorted_inputs = tx_in_set(&body.inputs);
     for (idx, input) in sorted_inputs.iter().enumerate() {
         if let Some(utxo) = utxo_set.lookup(input) {
             let script_hash = match &utxo.address {
@@ -2842,5 +2833,117 @@ mod tests {
             )),
             "Spend redeemer for native-script-locked input must be ExtraRedeemer; got: {errors:?}"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Pre-PV9 duplicate wire inputs: each index-addressed consumer must see the
+    // sorted, deduplicated `Set TxIn` (cardano-ledger f649f975 `decodeSet`,
+    // `Set.fromList` below PV9). `[S,S]` alone cannot pin a site that skips the
+    // dedup but still lines up, so the cases below also place a key-locked input
+    // BEFORE the script input.
+    // -----------------------------------------------------------------------
+
+    fn dup_script_hash() -> Hash28 {
+        Hash28::from_bytes([0x5C; 28])
+    }
+
+    fn dup_script_output() -> TransactionOutput {
+        TransactionOutput {
+            address: Address::Enterprise(dugite_primitives::address::EnterpriseAddress {
+                network: dugite_primitives::network::NetworkId::Mainnet,
+                payment: Credential::Script(dup_script_hash()),
+            }),
+            value: Value::lovelace(5_000_000),
+            datum: OutputDatum::None,
+            script_ref: None,
+            is_legacy: false,
+            raw_cbor: None,
+        }
+    }
+
+    fn spend_redeemer(index: u32) -> Redeemer {
+        Redeemer {
+            tag: RedeemerTag::Spend,
+            index,
+            data: PlutusData::Integer(0.into()),
+            ex_units: ExUnits { mem: 1, steps: 1 },
+        }
+    }
+
+    /// `K` (0x10, key/Byron-locked) sorts before `S` (0x38, script-locked).
+    fn dup_fixture(
+        wire: Vec<TransactionInput>,
+        redeemers: Vec<Redeemer>,
+    ) -> (Transaction, UtxoSet) {
+        let mut utxo = UtxoSet::new();
+        utxo.insert(input(0x10), ada_output(2_000_000));
+        utxo.insert(input(0x38), dup_script_output());
+        let mut tx = make_plutus_tx(300_000, vec![]);
+        tx.body.inputs = wire;
+        tx.witness_set.redeemers = redeemers;
+        (tx, utxo)
+    }
+
+    fn plutus_versions() -> std::collections::HashMap<Hash28, u8> {
+        std::collections::HashMap::from([(dup_script_hash(), 2u8)])
+    }
+
+    /// Wire `[K,K,S]`, Spend redeemer at index 1 = the script input's position
+    /// in the SET `[K,S]`. Without the dedup `S` would sit at index 2.
+    #[test]
+    fn pre_pv9_duplicate_key_input_does_not_shift_the_spend_redeemer_index() {
+        let (tx, utxo) = dup_fixture(
+            vec![input(0x10), input(0x10), input(0x38)],
+            vec![spend_redeemer(1)],
+        );
+        let mut errors = Vec::new();
+        super::check_extra_redeemers(&tx, &utxo, &plutus_versions(), &mut errors);
+        super::check_script_redeemers(&tx, &utxo, &plutus_versions(), &mut errors);
+        assert!(errors.is_empty(), "got {errors:?}");
+    }
+
+    /// Wire `[S,S]` with redeemers at 0 AND 1: the set has one input, so the
+    /// index-1 redeemer is extra (Haskell `ExtraRedeemers`).
+    #[test]
+    fn pre_pv9_duplicate_script_input_makes_the_second_spend_redeemer_extra() {
+        let (tx, utxo) = dup_fixture(
+            vec![input(0x38), input(0x38)],
+            vec![spend_redeemer(0), spend_redeemer(1)],
+        );
+        let mut errors = Vec::new();
+        super::check_extra_redeemers(&tx, &utxo, &plutus_versions(), &mut errors);
+        assert!(
+            errors.iter().any(|e| matches!(
+                e,
+                ValidationError::ExtraRedeemer { tag, index: 1 } if tag == "Spend"
+            )),
+            "got {errors:?}"
+        );
+        assert!(
+            !errors
+                .iter()
+                .any(|e| matches!(e, ValidationError::ExtraRedeemer { index: 0, .. })),
+            "the index-0 redeemer is the real one; got {errors:?}"
+        );
+    }
+
+    /// `redeemer_script_version_map` is keyed by (tag, index) over the SET: wire
+    /// `[S,S]` yields exactly `{(Spend,0)}`. Its production callers read only
+    /// `.values()`, so only the keys can pin the dedup.
+    #[test]
+    fn pre_pv9_redeemer_script_version_map_is_keyed_over_the_input_set() {
+        let (tx, utxo) = dup_fixture(vec![input(0x38), input(0x38)], vec![spend_redeemer(0)]);
+        let map = super::redeemer_script_version_map(&tx, &utxo, &plutus_versions());
+        let keys: std::collections::BTreeSet<(u8, u32)> = map.keys().copied().collect();
+        assert_eq!(keys, std::collections::BTreeSet::from([(0u8, 0u32)]));
+
+        // And with a key input ahead of it: `[K,K,S]` puts S at set index 1.
+        let (tx, utxo) = dup_fixture(
+            vec![input(0x10), input(0x10), input(0x38)],
+            vec![spend_redeemer(1)],
+        );
+        let map = super::redeemer_script_version_map(&tx, &utxo, &plutus_versions());
+        let keys: std::collections::BTreeSet<(u8, u32)> = map.keys().copied().collect();
+        assert_eq!(keys, std::collections::BTreeSet::from([(0u8, 1u32)]));
     }
 }
