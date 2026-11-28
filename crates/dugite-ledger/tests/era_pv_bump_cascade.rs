@@ -197,14 +197,20 @@ fn era_boundary_pv_cascade_not_mutated_by_on_era_transition() {
 
     // (era, slot, block_no, header_pv_major)
     // expected_pv is always 2 — on_era_transition is a no-op for PV in all eras.
+    //
+    // Each era change lands on the FIRST block of a new epoch (one default
+    // Byron epoch, 21_600 slots, apart): hard forks are enacted by the
+    // epoch-boundary tick, and `apply_block` rejects an era change anywhere
+    // else (`LedgerState::check_block_era`, #1233).
+    const EPOCH: u64 = 21_600;
     let steps = [
         (Era::Byron, 100, 1, 2),
-        (Era::Shelley, 200, 2, 2),
-        (Era::Allegra, 300, 3, 2),
-        (Era::Mary, 400, 4, 2),
-        (Era::Alonzo, 500, 5, 2),
-        (Era::Babbage, 600, 6, 2),
-        (Era::Conway, 700, 7, 2),
+        (Era::Shelley, EPOCH + 100, 2, 2),
+        (Era::Allegra, 2 * EPOCH + 100, 3, 2),
+        (Era::Mary, 3 * EPOCH + 100, 4, 2),
+        (Era::Alonzo, 4 * EPOCH + 100, 5, 2),
+        (Era::Babbage, 5 * EPOCH + 100, 6, 2),
+        (Era::Conway, 6 * EPOCH + 100, 7, 2),
     ];
 
     for (era, slot, block_no, header_pv) in steps {

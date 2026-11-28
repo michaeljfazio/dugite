@@ -519,6 +519,12 @@ pub struct NodeMetrics {
     /// Non-zero during honest sync indicates either an adversarial peer or a
     /// dugite crypto-validation bug — investigate immediately.
     pub header_validation_failures_total: AtomicU64,
+    /// Peer blocks that passed the era-tag check but whose era differs from the era of
+    /// the ledger's protocol-version major, on a block that needs no epoch tick (so the
+    /// un-ticked PV is the right one). Diagnostic only: Haskell's full rule (block era ==
+    /// era of the ticked PV major) is NOT enforced yet. Non-zero means either the
+    /// residual first-block-of-epoch gap is being probed or the PV-to-era mapping is wrong.
+    pub era_parity_mismatch_total: AtomicU64,
     // Block production metrics
     pub leader_checks_total: AtomicU64,
     pub leader_checks_not_elected: AtomicU64,
@@ -883,6 +889,7 @@ impl NodeMetrics {
             disk_available_bytes: AtomicU64::new(0),
             header_full_validations_total: AtomicU64::new(0),
             header_validation_failures_total: AtomicU64::new(0),
+            era_parity_mismatch_total: AtomicU64::new(0),
             leader_checks_total: AtomicU64::new(0),
             leader_checks_not_elected: AtomicU64::new(0),
             forge_failures: AtomicU64::new(0),
@@ -1721,6 +1728,11 @@ impl NodeMetrics {
                 "dugite_header_validation_failures_total",
                 "Shelley+ peer blocks rejected because full header validation failed",
                 &self.header_validation_failures_total,
+            ),
+            (
+                "dugite_era_parity_mismatch_total",
+                "Peer blocks whose era tag differs from the era of the ledger protocol-version major (diagnostic, not enforced)",
+                &self.era_parity_mismatch_total,
             ),
             (
                 "dugite_leader_checks_total",

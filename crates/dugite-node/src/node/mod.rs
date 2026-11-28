@@ -661,6 +661,112 @@ pub struct NodeArgs {
 
 // ─── Node struct ─────────────────────────────────────────────────────────────
 
+/// Who to blame for a wrong-era block being discarded.
+pub(crate) enum WrongEraCulprit<'a> {
+    /// The peer that just delivered it.
+    Peer(SocketAddr),
+    /// It was stored earlier: look the server of these exact bytes up.
+    StoredBytes(&'a [u8]),
+}
+
+/// Which peer served the exact bytes stored under a block hash, so a block that
+/// is rejected LATER (fork replay) can still be traced to its server.
+///
+/// Keyed on `(header hash, blake2b-256 of the stored bytes)`: a re-tagged copy
+/// and the honest copy share the hash but not the bytes, so the peer that
+/// served the rejected bytes is the one blamed. An existing entry is never
+/// overwritten (the first server of those exact bytes is the one that put them
+/// in the ChainDB), and eviction is least-recently-used, never a wholesale
+/// clear an attacker could trigger.
+pub(crate) struct StoredBlockPeers {
+    map: HashMap<
+        (
+            dugite_primitives::hash::Hash32,
+            dugite_primitives::hash::Hash32,
+        ),
+        SocketAddr,
+    >,
+    /// Least recently used first.
+    order: std::collections::VecDeque<(
+        dugite_primitives::hash::Hash32,
+        dugite_primitives::hash::Hash32,
+    )>,
+    cap: usize,
+}
+
+impl StoredBlockPeers {
+    pub(crate) fn new(cap: usize) -> Self {
+        Self {
+            map: HashMap::new(),
+            order: std::collections::VecDeque::new(),
+            cap: cap.max(1),
+        }
+    }
+
+    fn key(
+        hash: &dugite_primitives::hash::Hash32,
+        bytes: &[u8],
+    ) -> (
+        dugite_primitives::hash::Hash32,
+        dugite_primitives::hash::Hash32,
+    ) {
+        (*hash, dugite_primitives::hash::blake2b_256(bytes))
+    }
+
+    /// Record `peer` as the server of `bytes` under `hash`, unless an entry for
+    /// exactly these bytes exists (then it is only marked recently used).
+    pub(crate) fn record(
+        &mut self,
+        hash: &dugite_primitives::hash::Hash32,
+        bytes: &[u8],
+        peer: SocketAddr,
+    ) {
+        let key = Self::key(hash, bytes);
+        if self.map.contains_key(&key) {
+            self.touch(&key);
+            return;
+        }
+        while self.map.len() >= self.cap {
+            match self.order.pop_front() {
+                Some(oldest) => {
+                    self.map.remove(&oldest);
+                }
+                None => break,
+            }
+        }
+        self.map.insert(key, peer);
+        self.order.push_back(key);
+    }
+
+    /// Take (and forget) the server of exactly these bytes.
+    pub(crate) fn take(
+        &mut self,
+        hash: &dugite_primitives::hash::Hash32,
+        bytes: &[u8],
+    ) -> Option<SocketAddr> {
+        let key = Self::key(hash, bytes);
+        let peer = self.map.remove(&key)?;
+        self.order.retain(|k| *k != key);
+        Some(peer)
+    }
+
+    fn touch(
+        &mut self,
+        key: &(
+            dugite_primitives::hash::Hash32,
+            dugite_primitives::hash::Hash32,
+        ),
+    ) {
+        self.order.retain(|k| k != key);
+        self.order.push_back(*key);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn len(&self) -> usize {
+        self.map.len()
+    }
+}
+
 pub struct Node {
     pub(crate) config: NodeConfig,
     pub(crate) topology: Topology,
@@ -754,6 +860,17 @@ pub struct Node {
     /// Receiver for peer failure reports from protocol tasks (e.g. fetch timeout).
     /// The main run loop drains this to call `peer_failed()` for reputation scoring.
     peer_failure_rx: Option<mpsc::Receiver<(SocketAddr, PeerFailureKind)>>,
+    /// Sending half of the peer-failure channel, so the apply path can report a
+    /// peer that served a provably bad block (the run loop demotes it).
+    /// `None` until `run()` creates the channel.
+    peer_failure_tx: Option<mpsc::Sender<(SocketAddr, PeerFailureKind)>>,
+    /// Which peer served each block this node stored recently (bounded), so a
+    /// block rejected LATER (fork replay) can still be traced to its server.
+    stored_block_peers: parking_lot::Mutex<StoredBlockPeers>,
+    /// Test hook: skip the era-tag checks in the node (header and pre-storage)
+    /// so a test can reach the ledger's own check.
+    #[cfg(test)]
+    skip_era_checks_for_test: bool,
     /// Receiver for KeepAlive RTT measurements from connected peers.
     /// The main run loop uses these to update PeerManager EWMA and RTT gauges.
     keepalive_rtt_rx: Option<mpsc::Receiver<(SocketAddr, f64)>>,
@@ -2193,6 +2310,9 @@ impl Node {
         // Extract opcert counters and current era before moving ledger into
         // the lock, so we avoid blocking_read() inside the tokio runtime.
         let snapshot_era = ledger.era;
+        // `TestXHardForkAtEpoch` triggers are config: re-applied on every start,
+        // never part of a snapshot.
+        ledger.set_hard_fork_triggers(args.config.hard_fork_triggers());
         let snapshot_opcert_counters = if ledger.consensus.opcert_counters.is_empty() {
             None
         } else {
@@ -2858,6 +2978,10 @@ impl Node {
                 .unwrap_or(256),
             shutdown_rx_for_flush: None,
             peer_failure_rx: None,
+            peer_failure_tx: None,
+            stored_block_peers: parking_lot::Mutex::new(StoredBlockPeers::new(8192)),
+            #[cfg(test)]
+            skip_era_checks_for_test: false,
             keepalive_rtt_rx: None,
             query_handler,
             peer_manager: Arc::new(RwLock::new({
@@ -5178,7 +5302,7 @@ impl Node {
             active_slots_coeff,
             self.metrics.clone(),
             self.mempool.clone(),
-            peer_failure_tx,
+            peer_failure_tx.clone(),
             keepalive_rtt_tx,
             self.gsm_event_tx.clone(),
             self.peer_registry.clone(),
@@ -5242,6 +5366,7 @@ impl Node {
         }
         self.connection_lifecycle = Some(lifecycle);
         self.fetched_blocks_rx = Some(fetched_blocks_rx);
+        self.peer_failure_tx = Some(peer_failure_tx);
         self.peer_failure_rx = Some(peer_failure_rx);
         self.keepalive_rtt_rx = Some(keepalive_rtt_rx);
 
@@ -6533,6 +6658,55 @@ impl Node {
 
     // ─── apply_fetched_block() ──────────────────────────────────────────────
 
+    /// Report a peer that served a provably bad block (the run loop demotes it
+    /// with reputation + teardown, as for any `ProtocolFault`). A no-op until
+    /// `run()` has created the channel.
+    fn report_peer_fault(&self, peer: SocketAddr) {
+        if let Some(ref tx) = self.peer_failure_tx {
+            let _ = tx.try_send((peer, PeerFailureKind::ProtocolFault));
+        }
+    }
+
+    /// Reject a block whose era tag the ledger cannot explain, WITHOUT
+    /// blacklisting its hash.
+    ///
+    /// The era tag is not part of the header hash, so a re-tagged copy of an
+    /// honest block has the honest block's hash. Marking that hash invalid, or
+    /// leaving the re-tagged bytes in the ChainDB under it, would make the node
+    /// refuse the honest block (and every chain through it) on the word of a
+    /// peer that needs no stake. So: roll the selected chain and ledger back to
+    /// `parent`, drop whatever bytes are stored under `bad_hash`, and never
+    /// touch the invalid cache. Haskell rejects the same case at the header
+    /// (`HardForkEnvelopeErrWrongEra`) and never stores the copy.
+    async fn discard_wrong_era_block(
+        &self,
+        bad_hash: dugite_primitives::hash::Hash32,
+        parent: &dugite_primitives::block::Point,
+        culprit: WrongEraCulprit<'_>,
+    ) {
+        {
+            let mut db = self.chain_db.write().await;
+            if let Err(e) = db.rollback_to_point(parent) {
+                error!(error = %e, "discard_wrong_era_block: volatile rollback to parent failed");
+            }
+            // DURABLE removal: the WAL is rewritten, so the re-tagged bytes do
+            // not come back under the honest hash after a restart.
+            db.remove_volatile_blocks_durable(&[bad_hash]);
+        }
+        let _ = self.handle_ledger_rollback(parent).await;
+        let peer = match culprit {
+            WrongEraCulprit::Peer(peer) => Some(peer),
+            // Blame the peer that served THESE bytes, not whoever served the
+            // honest copy of the same hash.
+            WrongEraCulprit::StoredBytes(bytes) => {
+                self.stored_block_peers.lock().take(&bad_hash, bytes)
+            }
+        };
+        if let Some(peer) = peer {
+            self.report_peer_fault(peer);
+        }
+    }
+
     /// Abandon a fork whose replay failed (a body-hash mismatch or a ledger
     /// apply error on a fork-replayed block).
     ///
@@ -6609,14 +6783,59 @@ impl Node {
         &mut self,
         block: &dugite_primitives::block::Block,
     ) -> Result<(), dugite_consensus::ConsensusError> {
-        // Byron has no Praos header crypto — validated on the ledger path.
-        if !block.era.is_shelley_based() {
-            return Ok(());
-        }
-
         // Haskell `getCurrentSlot` (wall clock) for the future-block guard.
         let wall_clock_slot = self.current_wall_clock_slot().await;
         let ls = self.ledger_state.read().await;
+
+        // The block's era tag is attacker-controlled; the era comes from the
+        // LEDGER (Haskell `HardForkEnvelopeErrWrongEra`). This runs BEFORE the
+        // Byron early return: a peer-supplied `[0, ebb]` block on a Conway
+        // ledger must not be waved through as "Byron has no header crypto".
+        #[cfg(test)]
+        let skip_era_check = self.skip_era_checks_for_test;
+        #[cfg(not(test))]
+        let skip_era_check = false;
+        if let Err(e) = ls.check_block_era(block) {
+            if !skip_era_check {
+                return Err(dugite_consensus::ConsensusError::WrongEra(format!(
+                    "era tag check: {e}"
+                )));
+            }
+        }
+
+        // Byron has no Praos header crypto — validated on the ledger path. The
+        // decision rests on the LEDGER era (a genesis ledger, tip at Origin,
+        // carries only a placeholder era and takes its first block's tag).
+        // `check_block_era` has already refused a Byron tag on a post-Byron
+        // ledger, so this can only be a Byron block on a Byron ledger.
+        if !block.era.is_shelley_based()
+            && (ls.tip.point == Point::Origin || !ls.era.is_shelley_based())
+        {
+            return Ok(());
+        }
+
+        // Diagnostic: the block era against the era of the protocol version the
+        // block is validated under (the NEXT epoch's for a block that crosses a
+        // boundary). `check_block_era` already enforces the boundary rule; this
+        // counts any residual disagreement (a wrong PV-to-era mapping would show
+        // up here first).
+        if ls.tip.point != Point::Origin
+            && block.era
+                != dugite_primitives::era::Era::from_protocol_major(
+                    ls.protocol_major_for_slot(block.slot().0),
+                )
+        {
+            self.metrics
+                .era_parity_mismatch_total
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            debug!(
+                slot = block.slot().0,
+                block_era = %block.era,
+                ledger_era = %ls.era,
+                pv_major = ls.protocol_major_for_slot(block.slot().0),
+                "block era tag differs from the era of the protocol version"
+            );
+        }
 
         // Leader eligibility uses the "set" snapshot (previous-epoch stake).
         let set_snapshot = ls.epochs.snapshots.set.as_ref();
@@ -6932,6 +7151,26 @@ impl Node {
                             // is in range. No `ls` lock is held here, so the read-lock
                             // acquired by `validate_peer_header_full` is safe.
                             if let Err(reason) = self.validate_peer_header_full(&fork_block).await {
+                                // Wrong era tag: the stored copy shares its hash with the
+                                // honest block, so drop it and do NOT blacklist the hash.
+                                if matches!(reason, dugite_consensus::ConsensusError::WrongEra(_)) {
+                                    warn!(
+                                        slot = fork_slot.0,
+                                        block = fork_block_no.0,
+                                        "Fork replay: {reason} — abandoning fork, discarding the \
+                                         stored copy (hash NOT blacklisted)"
+                                    );
+                                    self.metrics
+                                        .header_validation_failures_total
+                                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                    self.discard_wrong_era_block(
+                                        fork_block.header.header_hash,
+                                        &rollback_point,
+                                        WrongEraCulprit::StoredBytes(&cbor),
+                                    )
+                                    .await;
+                                    break;
+                                }
                                 // FutureBlock during fork replay: transient — do NOT
                                 // blacklist.  The fork is simply abandoned for now; the
                                 // peer may reconnect and re-offer the fork once the slot
@@ -7039,6 +7278,21 @@ impl Node {
                                         // Release the ledger lock before abandon_failed_fork
                                         // (it re-acquires ledger + chain_db).
                                         drop(ls);
+                                        if matches!(
+                                            e,
+                                            dugite_ledger::state::LedgerError::WrongBlockEra { .. }
+                                        ) {
+                                            self.metrics
+                                                .header_validation_failures_total
+                                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                            self.discard_wrong_era_block(
+                                                fork_block.header.header_hash,
+                                                &rollback_point,
+                                                WrongEraCulprit::StoredBytes(&cbor),
+                                            )
+                                            .await;
+                                            return ForkSwitchOutcome::Aborted;
+                                        }
                                         self.abandon_failed_fork(
                                             fork_block.header.header_hash,
                                             "fork replay: ledger apply failed",
@@ -7273,6 +7527,59 @@ impl Node {
             self.last_volatile_wal_sync = std::time::Instant::now();
         }
 
+        // Era-tag check BEFORE storage, for a block that extends the ledger tip
+        // (the live case). The tag is not part of the header hash, so a
+        // re-tagged copy of an honest block shares its hash: it must be neither
+        // stored nor blacklisted, or the honest copy is refused afterwards. A
+        // block that does not connect yet is checked when it is applied
+        // (`validate_peer_header_full`), where the stored copy is removed.
+        {
+            let ls = self.ledger_state.read().await;
+            let connects = match ls.tip.point.hash() {
+                Some(tip_hash) => *block.prev_hash() == *tip_hash,
+                None => true,
+            };
+            // A block that does not connect yet cannot be judged against the
+            // next tick, but inside the ledger's CURRENT epoch there is no tick:
+            // its era must be the ledger's. Checking that now narrows the window
+            // in which a re-tagged non-connecting copy is stored and the honest
+            // copy later answered `AlreadyKnown`.
+            let rejection = if connects {
+                ls.check_block_era(&block).err().map(|e| e.to_string())
+            } else if ls.tip.point != Point::Origin
+                && ls.epoch_of_slot(block_slot.0) == ls.epoch.0
+                && block.era != ls.era
+            {
+                Some(format!(
+                    "block era {} in the ledger's current epoch, ledger era {}",
+                    block.era, ls.era
+                ))
+            } else {
+                None
+            };
+            #[cfg(test)]
+            let rejection = if self.skip_era_checks_for_test {
+                None
+            } else {
+                rejection
+            };
+            if let Some(e) = rejection {
+                drop(ls);
+                warn!(
+                    peer = %fetched.peer,
+                    slot = block_slot.0,
+                    block = block_number.0,
+                    hash = %block_hash.to_hex(),
+                    hfc_era = %block.era,
+                    "Rejecting peer block before storage: {e}"
+                );
+                self.metrics
+                    .header_validation_failures_total
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                self.report_peer_fault(fetched.peer);
+                return;
+            }
+        }
         // Store in ChainDB via ChainSelQueue.
         // `fork_replayed` is set to true when the TriggeredFork path has already
         // applied all fork blocks to the ledger; in that case the single-block
@@ -7290,6 +7597,20 @@ impl Node {
                     block.header.clone(),
                 )
                 .await;
+            // Record the server only when THESE bytes were actually stored
+            // (never for `AlreadyKnown` / `Invalid`).
+            if matches!(
+                result,
+                Some(dugite_storage::AddBlockResult::AddedAsTip { .. })
+                    | Some(dugite_storage::AddBlockResult::StoredAsFork)
+                    | Some(dugite_storage::AddBlockResult::TriggeredFork { .. })
+            ) {
+                self.stored_block_peers.lock().record(
+                    &block_hash,
+                    block.raw_cbor.as_deref().unwrap_or(&[]),
+                    fetched.peer,
+                );
+            }
             match result {
                 Some(dugite_storage::AddBlockResult::AddedAsTip { .. }) => true,
                 Some(dugite_storage::AddBlockResult::StoredAsFork) => {
@@ -7500,6 +7821,31 @@ impl Node {
             // parent (so we are not stuck with an unapplied tip) but do NOT
             // insert into invalid_cache.  The peer will reconnect and re-offer
             // once the slot has passed.
+            if matches!(reason, dugite_consensus::ConsensusError::WrongEra(_)) {
+                warn!(
+                    peer = %fetched.peer,
+                    slot = block_slot.0,
+                    block = block_number.0,
+                    hash = %block_hash.to_hex(),
+                    hfc_era = %block.era,
+                    "Peer block rejected: {reason} — rolling back, discarding the stored \
+                     copy, NOT blacklisting its hash (the era tag is not part of the hash)"
+                );
+                self.metrics
+                    .header_validation_failures_total
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let parent_point = {
+                    let ls = self.ledger_state.read().await;
+                    ls.tip.point.clone()
+                };
+                self.discard_wrong_era_block(
+                    block_hash,
+                    &parent_point,
+                    WrongEraCulprit::Peer(fetched.peer),
+                )
+                .await;
+                return;
+            }
             if matches!(reason, dugite_consensus::ConsensusError::FutureBlock { .. }) {
                 warn!(
                     peer = %fetched.peer,
@@ -7812,6 +8158,22 @@ impl Node {
                         }
                     }
                     (delta, items)
+                }
+                Err(dugite_ledger::state::LedgerError::WrongBlockEra { .. }) => {
+                    // Defence in depth: header validation rejects this first.
+                    // Same handling: discard the copy, keep its hash usable.
+                    drop(ls);
+                    self.metrics
+                        .header_validation_failures_total
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    let parent_point = self.ledger_state.read().await.tip.point.clone();
+                    self.discard_wrong_era_block(
+                        block_hash,
+                        &parent_point,
+                        WrongEraCulprit::Peer(fetched.peer),
+                    )
+                    .await;
+                    return;
                 }
                 Err(e) => {
                     // Issue #669 — surface this as a hard operator-actionable
@@ -10658,9 +11020,24 @@ impl Node {
                                                 slot = fork_slot.0,
                                                 block = fork_block_no.0,
                                                 "Forge fork replay: ledger apply failed: {e} — \
-                                                 abandoning fork (block marked invalid)"
+                                                 abandoning fork"
                                             );
                                                 drop(ls);
+                                                if matches!(
+                                                    e,
+                                                    dugite_ledger::state::LedgerError::WrongBlockEra { .. }
+                                                ) {
+                                                    // The stored copy shares its hash with the
+                                                    // honest block: discard it, do not blacklist.
+                                                    self.discard_wrong_era_block(
+                                                        fork_block.header.header_hash,
+                                                        &rollback_point,
+                                                        WrongEraCulprit::StoredBytes(&cbor),
+                                                    )
+                                                    .await;
+                                                    replay_failed = true;
+                                                    break;
+                                                }
                                                 self.abandon_failed_fork(
                                                     fork_block.header.header_hash,
                                                     "forge fork replay: ledger apply failed",
@@ -10939,6 +11316,9 @@ impl Node {
 }
 
 // ─── Tests ───────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod era_tag_tests;
 
 #[cfg(test)]
 mod tests {

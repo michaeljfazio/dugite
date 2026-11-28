@@ -591,6 +591,8 @@ impl From<LedgerStateSnapshot> for super::LedgerState {
             future_gen_delegs: s.future_gen_delegs.into_iter().collect(),
             byron: s.byron,
             update_quorum: s.update_quorum,
+            // Config, not chain state: re-applied from the node config on load.
+            hard_fork_triggers: Default::default(),
             node_network: s.node_network,
             // #1092: NOT part of `LedgerStateSnapshot` — same treatment as
             // `security_param` below. Every load-snapshot call site already

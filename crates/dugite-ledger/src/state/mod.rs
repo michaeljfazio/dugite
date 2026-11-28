@@ -219,6 +219,11 @@ pub struct LedgerState {
     pub byron: crate::eras::byron::ByronSubState,
     /// Quorum for pre-Conway protocol parameter updates (from Shelley genesis)
     pub update_quorum: u64,
+    /// `TestXHardForkAtEpoch` triggers (cardano-node `TriggerHardForkAtEpoch`):
+    /// era -> the epoch it starts in. An era with no entry follows the
+    /// protocol-version rule. Config, not chain state: never persisted, and
+    /// re-applied from the node config on every start.
+    pub hard_fork_triggers: std::collections::BTreeMap<Era, u64>,
     /// The network this node is running on (mainnet, testnet, etc.).
     ///
     /// Used for unconditional output/withdrawal address network checks during
@@ -1476,6 +1481,7 @@ impl LedgerState {
             future_gen_delegs: HashMap::new(),
             byron: crate::eras::byron::ByronSubState::default(),
             update_quorum: default_update_quorum(),
+            hard_fork_triggers: Default::default(),
             node_network: None,
             network_magic: dugite_primitives::network::NetworkId::Mainnet.magic(), // mainnet default
             randomness_stabilisation_window: 172800, // 4k/f on mainnet: ceil(4*2160/0.05)
@@ -2086,6 +2092,7 @@ impl LedgerState {
             // never read (design doc §3.3).
             byron: crate::eras::byron::ByronSubState::default(),
             update_quorum: 5,
+            hard_fork_triggers: Default::default(),
             node_network: None, // Will be set by caller
             network_magic: dugite_primitives::network::NetworkId::Mainnet.magic(), // Will be set by caller
             // Will be recalculated by set_epoch_length()
@@ -2139,6 +2146,7 @@ impl LedgerState {
             future_gen_delegs: self.future_gen_delegs.clone(),
             byron: self.byron.clone(),
             update_quorum: self.update_quorum,
+            hard_fork_triggers: self.hard_fork_triggers.clone(),
             node_network: self.node_network,
             network_magic: self.network_magic,
             randomness_stabilisation_window: self.randomness_stabilisation_window,
@@ -2263,6 +2271,244 @@ impl LedgerState {
             self.shelley_transition_epoch
                 .saturating_add(shelley_slots / self.epoch_length)
         }
+    }
+
+    /// Replace this ledger with a state loaded from a snapshot (rollback via
+    /// snapshot, fork-rollback replay, recovery), keeping the CONFIG that is not
+    /// part of a snapshot: the `TestXHardForkAtEpoch` triggers. Every runtime
+    /// `*ls = snapshot_state` goes through here, or a legitimate trigger fork
+    /// would be rejected after the reload.
+    pub fn adopt_snapshot_state(&mut self, mut snapshot_state: LedgerState) {
+        snapshot_state.hard_fork_triggers = std::mem::take(&mut self.hard_fork_triggers);
+        *self = snapshot_state;
+    }
+
+    /// Install the `TestXHardForkAtEpoch` triggers from the node config.
+    pub fn set_hard_fork_triggers(&mut self, triggers: std::collections::BTreeMap<Era, u64>) {
+        self.hard_fork_triggers = triggers;
+    }
+
+    /// The protocol-version major the NEXT epoch tick adopts, read from the
+    /// ledger's own state (never from a block).
+    ///
+    /// * Conway and later: Haskell `nextEpochPParams` of the governance state
+    ///   (`futurePParams`), the term the ledger-view forecast reads.
+    /// * Earlier eras: the pre-Conway PPUP proposals that reach quorum at the
+    ///   next boundary (the same fold `forecast_d_for_epoch` uses).
+    pub fn next_epoch_protocol_major(&self) -> u64 {
+        let current = &self.epochs.protocol_params;
+        if self.era >= Era::Conway {
+            return self
+                .gov
+                .governance
+                .future_pparams
+                .next_epoch_pparams(current)
+                .protocol_version_major;
+        }
+        let Some(proposals) = self.epochs.pending_pp_updates.get(&self.epoch) else {
+            return current.protocol_version_major;
+        };
+        let proposal_map = crate::validation::ppup::fold_pp_proposals(proposals);
+        crate::validation::ppup::voted_future_pparams(&proposal_map, self.update_quorum, current)
+            .and_then(|w| w.protocol_version_major)
+            .unwrap_or(current.protocol_version_major)
+    }
+
+    /// The era the ledger will be in after the NEXT epoch tick: the current era
+    /// unless a hard fork is due at that boundary.
+    ///
+    /// An era `k` is due when its `TestXHardForkAtEpoch` trigger is at or
+    /// before the next epoch; with no trigger, Byron to Shelley is due at
+    /// `shelley_transition_epoch` (the per-network constant, as the Byron
+    /// update state is not consulted), and every later era is due when the
+    /// protocol-version major the tick adopts has reached the era's first major
+    /// (Haskell `TriggerHardForkAtVersion`, `shelleyTransition`). Eras are
+    /// stepped one at a time, so a chain of forks at one boundary resolves to
+    /// the last of them.
+    ///
+    /// Haskell additionally requires `shelleyAfterVoting >= k` (blocks since
+    /// the voting deadline) before the transition is announced. dugite does not
+    /// track that counter; the difference is only observable when a fork is
+    /// guaranteed to be adopted yet fewer than `k` blocks followed the voting
+    /// deadline, which no honest producer can create.
+    pub fn era_due_at_next_boundary(&self) -> Era {
+        self.era_due_at_epoch(self.epoch.0.saturating_add(1))
+    }
+
+    /// The era the ledger is in at the start of `target_epoch`, at or after the
+    /// next boundary.
+    ///
+    /// Several boundaries can lie between the ledger tip and a block (an empty
+    /// epoch after a stall on a low-density devnet). The tick is deterministic
+    /// from ledger state: the protocol version adopted at the FIRST boundary is
+    /// the one every later boundary carries, because no block between them can
+    /// add a proposal or a vote; only the epoch-keyed rules (`TestX` triggers,
+    /// the Shelley transition epoch) can add a fork at a later boundary.
+    pub fn era_due_at_epoch(&self, target_epoch: u64) -> Era {
+        const ERAS: [Era; 8] = [
+            Era::Byron,
+            Era::Shelley,
+            Era::Allegra,
+            Era::Mary,
+            Era::Alonzo,
+            Era::Babbage,
+            Era::Conway,
+            Era::Dijkstra,
+        ];
+        let next_epoch = target_epoch;
+        let next_pv = self.next_epoch_protocol_major();
+        let mut era = self.era;
+        while let Some(&candidate) = ERAS.iter().find(|e| **e > era) {
+            let due = match self.hard_fork_triggers.get(&candidate) {
+                Some(&at) => at <= next_epoch,
+                None if candidate == Era::Shelley => self.shelley_transition_epoch <= next_epoch,
+                None => {
+                    // First major of `candidate`: smallest major mapping to it.
+                    let first_major = (0..=64u64)
+                        .find(|m| Era::from_protocol_major(*m) == candidate)
+                        .unwrap_or(u64::MAX);
+                    next_pv >= first_major
+                }
+            };
+            if !due {
+                break;
+            }
+            era = candidate;
+        }
+        era
+    }
+
+    /// The protocol-version major in force when a block at `slot` is validated:
+    /// the next-epoch major for a block that crosses an epoch boundary, else
+    /// the current one. Diagnostics only.
+    pub fn protocol_major_for_slot(&self, slot: u64) -> u64 {
+        // Any block past the next boundary is judged against the FIRST
+        // boundary's forecast (the only one ledger state can give).
+        if self.epoch_of_slot(slot) > self.epoch.0 {
+            self.next_epoch_protocol_major()
+        } else {
+            self.epochs.protocol_params.protocol_version_major
+        }
+    }
+
+    /// Reject a block whose era tag the ledger's state cannot explain.
+    ///
+    /// Haskell never trusts a block's own era tag: the hard-fork combinator
+    /// derives the era from the LEDGER state (`extendToSlot`), and a block that
+    /// disagrees fails `HardForkEnvelopeErrWrongEra` at header validation and
+    /// `HardForkLedgerErrorWrongEra` at ledger validation. dugite decoded by
+    /// tag and followed it: a Babbage-tagged block in Conway moved the ledger
+    /// back to Babbage, and a Byron `[0, ebb]` tag skipped every Praos header
+    /// check.
+    ///
+    /// * A ledger whose tip is `Origin` is exempt: a genesis ledger has no era
+    ///   of its own (`LedgerState::new` stamps `Conway` as a placeholder) and
+    ///   its first block fixes it.
+    /// * `block.era < self.era` is always an error.
+    /// * Inside the ledger's current epoch the block must carry the ledger's
+    ///   era: hard forks are enacted by the epoch TICK.
+    /// * On the first block of the next epoch the block must carry exactly the
+    ///   era the tick adopts, [`Self::era_due_at_next_boundary`]. This is what
+    ///   rejects a re-tagged first block (7 -> 8 with no fork due) AND a
+    ///   re-tagged first block at a real fork (old era when the new one is
+    ///   due); either would otherwise leave the ledger in an era its protocol
+    ///   version does not match and reject every honest block after it.
+    /// * More than one epoch ahead (an empty epoch, e.g. a stalled low-density
+    ///   devnet) only the first tick can be forecast, so the rule is monotonic:
+    ///   no downgrade and at most one era per skipped boundary. Never a free
+    ///   pass, never an exact match against an incomplete forecast.
+    ///
+    /// `strict = false` is for replaying our OWN already-validated blocks
+    /// (`ApplyOnly`: ImmutableDB, Mithril): the due-era equality is skipped and
+    /// an upgrade is accepted on any first block of a new epoch, so a forecast
+    /// error can never halt a replay. Downgrades are rejected in both.
+    ///
+    /// Called from `apply_block_impl` (every mode, every path) and from the
+    /// node's header validation and pre-storage check (always strict).
+    pub fn check_block_era(
+        &self,
+        block: &dugite_primitives::block::Block,
+    ) -> Result<(), LedgerError> {
+        self.check_block_era_inner(block, true)
+    }
+
+    /// [`Self::check_block_era`] with the strictness chosen by the validation
+    /// mode: `ValidateAll` is strict, `ApplyOnly` (trusted replay) is not.
+    pub fn check_block_era_for_mode(
+        &self,
+        block: &dugite_primitives::block::Block,
+        mode: BlockValidationMode,
+    ) -> Result<(), LedgerError> {
+        self.check_block_era_inner(block, matches!(mode, BlockValidationMode::ValidateAll))
+    }
+
+    fn check_block_era_inner(
+        &self,
+        block: &dugite_primitives::block::Block,
+        strict: bool,
+    ) -> Result<(), LedgerError> {
+        let wrong = |reason: &'static str| LedgerError::WrongBlockEra {
+            block_era: block.era,
+            ledger_era: self.era,
+            reason,
+        };
+        if self.tip.point == Point::Origin {
+            return Ok(());
+        }
+        if block.era < self.era {
+            return Err(wrong("era downgrade"));
+        }
+        let block_epoch = self.epoch_of_slot(block.slot().0);
+        if block_epoch <= self.epoch.0 {
+            // Inside the ledger's epoch (or behind it): no tick, no new era.
+            if block.era > self.era {
+                return Err(wrong("era upgrade outside the first block of a new epoch"));
+            }
+            return Ok(());
+        }
+        if !strict {
+            return Ok(());
+        }
+        let boundaries = block_epoch - self.epoch.0; // >= 1 here
+        if boundaries == 1 {
+            // Exactly one tick: the first-boundary forecast is complete.
+            if block.era != self.era_due_at_next_boundary() {
+                return Err(wrong(
+                    "era is not the era the epoch tick adopts (no hard fork due, or a due one was not taken)",
+                ));
+            }
+            return Ok(());
+        }
+        // Two or more skipped boundaries. Only the FIRST tick can be forecast
+        // from ledger state: a hard fork ratified by the pulser, or a PPUP vote
+        // that only becomes final later, can enact at a LATER boundary inside
+        // the gap, and an exact match here could reject an honest chain, which
+        // is worse than the bug. So accept exactly the monotonic set: never a
+        // downgrade (rejected above), and at most one era per skipped boundary.
+        // The node counts a disagreement with the first-boundary forecast in
+        // `dugite_era_parity_mismatch_total`.
+        //
+        // A gap of two or more epochs is a devnet-only situation. A mainnet or
+        // preprod epoch is 432000 slots and a preview epoch 86400, all at
+        // f = 0.05, so an epoch with no block at all has probability
+        // (0.95)^432000 (about 10^-9600) resp. (0.95)^86400 (about 10^-1900).
+        // A devnet (epochLength 400, f = 0.5) or a node idle for a long time
+        // can plausibly skip one.
+        //
+        // Residual risk, accepted on purpose: across an N-epoch gap a block may
+        // be up to N eras above the ledger even when no fork is pending. The
+        // alternative (cap at the target of a pending HardForkInitiation, an
+        // in-flight pulser ratification, a PPUP vote that could still become
+        // final, or an epoch-keyed trigger) needs those mechanisms read exactly
+        // right at every later boundary; a mistake there halts an honest chain,
+        // which is worse than this residual. It needs an empty epoch to exist at
+        // all (devnet-only) and is visible: the parity counter fires whenever
+        // the block's era differs from the first-boundary forecast.
+        let allowed_up = u32::try_from(boundaries).unwrap_or(u32::MAX);
+        if block.era.to_era_index() > self.era.to_era_index().saturating_add(allowed_up) {
+            return Err(wrong("more eras than skipped epoch boundaries"));
+        }
+        Ok(())
     }
 
     /// Compute the first slot of the epoch that contains the given slot.
@@ -3286,6 +3532,22 @@ fn stake_credential_hash(address: &dugite_primitives::address::Address) -> Optio
 pub enum LedgerError {
     #[error("Block does not connect to tip: expected {expected}, got {got}")]
     BlockDoesNotConnect { expected: String, got: String },
+    /// The block's era tag disagrees with the era the ledger is in.
+    ///
+    /// Haskell fixes a block's era from the ledger state (`extendToSlot`),
+    /// never from a tag the block carries, and rejects a disagreeing block
+    /// with `HardForkEnvelopeErrWrongEra` (header) /
+    /// `HardForkLedgerErrorWrongEra` (ledger). See
+    /// [`LedgerState::check_block_era`].
+    #[error(
+        "Block era {block_era} is not valid on a ledger in era {ledger_era}: {reason} \
+         (HardForkLedgerErrorWrongEra)"
+    )]
+    WrongBlockEra {
+        block_era: Era,
+        ledger_era: Era,
+        reason: &'static str,
+    },
     #[error("UTxO error: {0}")]
     UtxoError(String),
     #[error("Invalid transaction: {0}")]

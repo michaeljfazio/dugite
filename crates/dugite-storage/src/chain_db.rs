@@ -1204,6 +1204,13 @@ impl ChainDB {
         self.volatile.remove_block(hash);
     }
 
+    /// Remove blocks from the VolatileDB DURABLY: the WAL is rewritten, so a
+    /// reopen does not bring them back. [`Self::remove_volatile_block`] is
+    /// memory-only (it suits GC of blocks the WAL will drop on its own).
+    pub fn remove_volatile_blocks_durable(&mut self, hashes: &[Hash32]) {
+        self.volatile.remove_blocks_by_hashes(hashes);
+    }
+
     /// Flush finalized blocks from VolatileDB to ImmutableDB.
     ///
     /// Blocks with block_no <= (tip_block_no - k) are considered finalized.

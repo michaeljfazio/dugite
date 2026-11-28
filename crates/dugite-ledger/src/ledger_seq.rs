@@ -1860,6 +1860,8 @@ fn _assert_ledger_state_fields_audited(state: LedgerState) {
         // above.
         byron: _,
         update_quorum: _,
+        // Config re-applied from the node config on every start, never in a delta.
+        hard_fork_triggers: _,
         node_network: _,
         // #1092: config-only, set once at startup, never mutated during
         // block apply — same treatment as `node_network`/`security_param`

@@ -33,6 +33,13 @@ pub const CLOCK_SKEW_SLOTS: u64 = 2;
 pub enum ConsensusError {
     #[error("Invalid block: {0}")]
     InvalidBlock(String),
+    /// The block's era tag disagrees with the ledger's era
+    /// (`HardForkEnvelopeErrWrongEra`). Distinct from `InvalidBlock` because the
+    /// era tag is NOT part of the header hash: a re-tagged copy of an honest
+    /// block carries the honest block's hash, so a rejection must never
+    /// blacklist or keep that hash.
+    #[error("Wrong era: {0}")]
+    WrongEra(String),
     #[error("Block from future slot: current={current}, block={block}")]
     FutureBlock { current: u64, block: u64 },
     #[error("Not a slot leader")]
