@@ -113,6 +113,34 @@ impl<'b> Reader<'b> {
         &self.origin[start..self.inner.position()]
     }
 
+    /// Require that the whole input has been consumed.
+    ///
+    /// This is `cardano-ledger-binary`'s `decodeFullDecoder` check
+    /// (`Cardano.Ledger.Binary.Decoding.Decoding`):
+    ///
+    /// ```haskell
+    /// Right (x, leftover) ->
+    ///   if BS.null leftover then pure x
+    ///   else Left $ DecoderErrorLeftover lbl leftover
+    /// ```
+    ///
+    /// Haskell applies it to every CBOR-in-CBOR (`#6.24(bytes)`) payload that the ledger
+    /// decodes: `decodeBinaryData` (inline datums) and `decodeCIC` -> `decodeFullAnnotator`
+    /// (script references). A trailing byte, a stray break or a second value after the
+    /// embedded item fails the whole decode.
+    pub fn expect_end(&self, what: &str) -> Result<(), SerializationError> {
+        let pos = self.inner.position();
+        if pos == self.origin.len() {
+            Ok(())
+        } else {
+            Err(SerializationError::CborDecode(format!(
+                "{what}: {} trailing byte(s) after the embedded CBOR item \
+                 (decodeFullDecoder: DecoderErrorLeftover)",
+                self.origin.len() - pos
+            )))
+        }
+    }
+
     /// Peek at the CBOR major type at the current position without advancing.
     ///
     /// Returns an error if the buffer is exhausted.

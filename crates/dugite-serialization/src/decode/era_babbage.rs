@@ -819,6 +819,8 @@ fn read_datum_option(r: &mut Reader<'_>) -> Result<OutputDatum, SerializationErr
             // Parse the PlutusData from the inner bytes
             let mut inner_r = Reader::new(&inner_bytes);
             let data = read_plutus_data(&mut inner_r)?;
+            // Haskell `decodeBinaryData` -> `decodeFull'`: exactly one PlutusData value.
+            inner_r.expect_end("inline datum")?;
             OutputDatum::InlineDatum {
                 data,
                 raw_cbor: Some(inner_bytes),
@@ -864,6 +866,8 @@ fn read_script_ref(r: &mut Reader<'_>) -> Result<ScriptRef, SerializationError> 
         }
     };
     inner_r.close_record(indef)?;
+    // Haskell `decodeCIC` -> `decodeFullAnnotator`: no bytes may follow the script.
+    inner_r.expect_end("script_ref")?;
     Ok(out)
 }
 
