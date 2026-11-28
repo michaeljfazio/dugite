@@ -1,0 +1,91 @@
+# Pins for the node-diversity conformance harness (#1114, Phase 1: #1116).
+#
+# Every corpus the four shared scenarios read is pinned HERE and nowhere else, by git commit
+# or by SHA-256.  Two readers consume this file and must agree on it:
+#
+#   scripts/node-diversity/fetch-corpora.sh   fetches and verifies every pin, fails on any mismatch
+#   tests/conformance/src/node_diversity/     the report writer names these commits in each report
+#
+# Changing a pin is a deliberate corpus upgrade: re-run `just ndc-reports`, compare the scores,
+# and re-check `known_divergences` below.  The four scenarios and their report formats are
+# defined by https://github.com/pragma-org/node-diversity-conformance (NDC).
+
+# ── NDC: ledger-rules fixtures, every scenario's schema.json, and the site builder ──────────
+[ndc]
+repository = "https://github.com/pragma-org/node-diversity-conformance.git"
+# main as of 2026-11-20.
+commit = "628006278309c02a1c3e49dce00e43595d925c2e"
+
+# ── Amaru: the source of the ledger-rules fixtures ───────────────────────────────────────────
+[amaru]
+repository = "https://github.com/pragma-org/amaru.git"
+# The Amaru commit that LAST CHANGED `scenarios_dir` before NDC copied the fixtures (NDC last
+# changed its fixtures in commit 8a28f252d4, 2026-11-07).  The ledger-rules report must name it as `dataset_commit`; the site
+# compares that value with the latest Amaru commit that changed the directory.  Amaru main has
+# moved on since (53467f0504, 2026-11-24), so until NDC re-syncs, the site may flag every
+# ledger-rules report "Outdated" -- that is the site's freshness check, not a harness defect.
+dataset_commit = "40ba995081b2b066cab497eade9abfbc0e350970"
+scenarios_dir = "crates/amaru-ledger/tests/data/transaction/scenarios"
+common_dir = "crates/amaru-ledger/tests/data/transaction/common"
+
+# ── ledger-rules: NDC vs Amaru ───────────────────────────────────────────────────────────────
+[ledger_rules]
+# Workaround for an NDC defect: 32 fixtures (1 + 14 + 17, counted by fetch-corpora.sh) reference
+# these three protocol-parameter files, but NDC does not ship them.  They are fetched from Amaru
+# at amaru.dataset_commit (the `common_dir` of the Amaru checkout) and checked by SHA-256.  fetch-corpora.sh FAILS once NDC ships any of
+# them, so that this list gets deleted.
+[[ledger_rules.missing_protocol_parameters]]
+file = "preprod-conway-v9-zero-cost-models.json"
+sha256 = "c90a092471d571dfa3f1b5688b100aafe7616f296b841c9a3c8df14c8b75ec1f"
+fixtures = 17
+
+[[ledger_rules.missing_protocol_parameters]]
+file = "preprod-conway-v10-zero-cost-models.json"
+sha256 = "b7939a6ed1681c77ae11bb3e1451bea8699145c0074f89d9ce86ae912a83dc81"
+fixtures = 14
+
+[[ledger_rules.missing_protocol_parameters]]
+file = "preprod-conway-v10-no-v3-cost-models.json"
+sha256 = "1bd993bac8ac2c9163bebccffd4343b372d2800fdf1986fa0654ce7e4cdcd59c"
+fixtures = 1
+
+# NDC's fixtures are Amaru's at `amaru.dataset_commit` plus NDC's own edits.  fetch-corpora.sh
+# compares every fixture after normalising what NDC is known to rewrite mechanically (`category`
+# added; JSON nulls and default-empty `initial_state` sections dropped).  Whatever still differs
+# must be listed here, id -> the top-level fixture keys that differ.  The check fails on a
+# difference that is not listed, and on a listed entry that no longer differs (remove it).
+#
+# Two kinds of edit:
+#   * title / description wording only (00016, 00039, 00054, 00112, 00113, 00130);
+#   * 00034, 00055, 00056, 00057: NDC replaced Amaru's `max_reference_scripts_size = 50`
+#     override and its 50-byte scripts with the real Conway 204,800-byte limit and
+#     ~200 KiB scripts, so the fixtures need no parameter override.  These four differ in
+#     transaction, initial_state and protocol_parameters: NDC's bytes are what we score against.
+[ledger_rules.known_divergences]
+"00016" = ["description"]
+"00034" = ["description", "initial_state", "protocol_parameters", "transaction"]
+"00039" = ["title"]
+"00054" = ["description"]
+"00055" = ["description", "initial_state", "protocol_parameters", "transaction"]
+"00056" = ["description", "initial_state", "protocol_parameters", "transaction"]
+"00057" = ["description", "initial_state", "protocol_parameters", "transaction"]
+"00112" = ["title"]
+"00113" = ["title"]
+"00130" = ["title"]
+
+# ── cbor-decoding ────────────────────────────────────────────────────────────────────────────
+[cbor_dataset]
+repository = "https://github.com/r2rationality/cardano-cbor-dataset.git"
+# main as of 2026-11-09.  Names itself as `dataset_commit` in the cbor-decoding reports.
+commit = "ed6c49a4e273bb540a26c46d61c011974d0192f6"
+
+# ── uplc-conformance and uplc-turbo ──────────────────────────────────────────────────────────
+# The two tarballs the NDC scenario READMEs link to.  The URLs are mutable object-store keys,
+# so the SHA-256 is the pin.
+[uplc_conformance]
+url = "https://pub-2239d82d9a074482b2eb2c886191cb4e.r2.dev/uplc-conformance.tar.zst"
+sha256 = "8bd4ad4f9f4c8c6b8ffa1f06ed1db0b43043afbba77ef6a14bcfb5a52345ed3f"
+
+[uplc_turbo]
+url = "https://pub-2239d82d9a074482b2eb2c886191cb4e.r2.dev/turbo.tar.zst"
+sha256 = "821af55e3323c826b5598c964d634b46dd468014834d0e97ebdc5edb0a158576"
