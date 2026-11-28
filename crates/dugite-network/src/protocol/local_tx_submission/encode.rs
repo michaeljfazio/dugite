@@ -890,6 +890,19 @@ fn encode_conway_ledger_pred_failure(enc: &mut Encoder<&mut Vec<u8>>, err: &TxVa
                 None => partial_fallback(enc, err),
             }
         }
+        // `ConwayDRepNotRegistered cred -> Sum ConwayDRepNotRegistered 1 !> To cred`
+        // (cardano-ledger f649f9751074d2ab3de033fc3912f29c9862c1f5,
+        // Conway/Rules/GovCert.hs L132). Raised for `UnRegDRep` and `UpdateDRep`
+        // of a DRep that is not registered. The payload is the typed credential,
+        // as for tag 0.
+        TxValidationError::DRepNotRegistered { credential_hash } => {
+            match parse_typed_credential(credential_hash) {
+                Some((disc, h)) => {
+                    encode_govcert_failure(enc, 1, |e| encode_credential(e, disc, &h))
+                }
+                None => partial_fallback(enc, err),
+            }
+        }
         // `ToGroup mm` — the Mismatch is FLATTENED into the constructor's own
         // fields. Contrast DELEG 7/8 above, which nest the same type.
         TxValidationError::ConwayDRepIncorrectDeposit { supplied, expected } => {
@@ -2234,6 +2247,21 @@ mod tests {
             },
             &want,
             "ConwayDRepAlreadyRegistered",
+        );
+    }
+
+    /// `ConwayDRepNotRegistered` is GOVCERT tag 1 (GovCert.hs L132).
+    #[test]
+    fn golden_conway_drep_not_registered_is_govcert_tag_1() {
+        let mut want = govcert_prefix();
+        want.extend_from_slice(&[0x82, 0x01, 0x82, 0x00, 0x58, 0x1c]);
+        want.extend_from_slice(&[0xEE; 28]);
+        assert_ledger_bytes(
+            &TxValidationError::DRepNotRegistered {
+                credential_hash: typed_cred(0xEE, false),
+            },
+            &want,
+            "ConwayDRepNotRegistered",
         );
     }
 

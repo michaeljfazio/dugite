@@ -4310,6 +4310,25 @@ pub fn validate_transaction_with_pools(
                         }
                         overlay.unregister(key);
                     }
+                    // `UpdateDRep` needs the DRep to be registered at THIS point
+                    // of the walk and does not change membership:
+                    //
+                    //   ConwayUpdateDRep cred mAnchor -> do
+                    //     Map.member cred (certState ^. certVStateL . vsDRepsL)
+                    //       ?! (injectFailure . ConwayDRepNotRegistered) cred
+                    //
+                    // (cardano-ledger f649f9751074d2ab3de033fc3912f29c9862c1f5,
+                    // Conway/Rules/GovCert.hs L256-258; no protocol-version gate.)
+                    dugite_primitives::transaction::Certificate::UpdateDRep {
+                        credential, ..
+                    } => {
+                        let key = credential.to_typed_hash32();
+                        if !overlay.contains(&key) {
+                            errors.push(ValidationError::DRepNotRegistered {
+                                credential_hash: key.to_hex(),
+                            });
+                        }
+                    }
                     _ => {}
                 }
             }
