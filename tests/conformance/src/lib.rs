@@ -21,6 +21,7 @@
 //! - **EPOCH**: Epoch boundary transitions
 
 pub mod adapters;
+pub mod node_diversity;
 pub mod runner;
 pub mod schema;
 
