@@ -68,6 +68,32 @@ numbers next to the report as `<report>.guards.json` (and in the status sidecar'
   scrubbed nor audited as harmless, and every decoded type a codec does not scrub must be declared
   `NoPreservedBytes`. `reuse_of_preserved_bytes_would_make_a_wrong_encoding_look_right` shows the
   encoder echoing an input from preserved bytes and the harness path not doing so.
+* **Byte-carrying fields are audited in both serialization crates.** The scan covers
+  `dugite-primitives` and `dugite-serialization` and every field whose type carries bytes
+  (`Vec<u8>`, `Bytes`, `Arc<[u8]>`, `Box<[u8]>`, `KeepRaw<..>`, also inside `Option`), whatever its
+  name. Each is either scrubbed or exempted by owner type AND field with a reason. After a scrub the
+  value is also formatted with `Debug` and checked for a populated byte `Option` or a
+  `raw_*`/`original_*` field, independently of the scrub's own list, so a traversal gap is caught.
+  Not covered by this: `TransactionOutput.is_legacy`, a decoded form hint (array or map output) the
+  encoder honours; it is not input bytes, but it is input information that survives the re-encoding.
+  A Byron address keeps its payload as opaque input and writes it back, so an echo and a rebuild are
+  the same thing for it: those samples are still scored, but are left out of the discriminating
+  counts and published as `samples_with_opaque_reemitted_input`.
+* **Entries use the reader production uses for the field, or the rule is unregistered.** Keys and
+  signatures (`vkey`, `vrf_vkey`, `kes_vkey`, `signature`) are read with `read_bytes_owned`, which
+  checks no length; `big_int`, `bounded_bytes` and `%constr<plutus_data>` have no decoder at that
+  granularity and fail as "no decoder registered"; `data` and `network_id` read exactly what the
+  inline-datum arm and the transaction body read. Those readers accept some samples the dataset says
+  must be refused (an inline datum followed by a trailing byte: #1181; a `network_id` other than 0
+  or 1 decoded as `None`: #1182); they show up in the invalid-samples-accepted counts, not as
+  harness exceptions.
+* **"Refused" is any `Err`.** The reason of every refusal is written to `<report>.refusals.json`,
+  summarised in `refusal_reasons`, and the `manual-invalid` refusals whose reason does not mention a
+  defect their name states (`indefinite`, `trailing`, `duplicate`) are counted.
+* **The rule-level entry points** (`dugite_serialization::decode::rules` / `encode::rules`) are
+  behind the `conformance-rules` feature and hidden from the docs. They are not all production
+  encoders: `vote`, `ex_units`, `ex_unit_prices`, `constitution`, `account_balance_interval(s)`,
+  `data`, `bytes` and `network_id` are written from CBOR primitives.
 * **Discriminating samples.** `discriminating_valid_samples` counts valid samples whose input
   differs from `.expected.cbor` (and how many pass). Because the comparison normalises first, a
   stricter count is published too, `echo_proof_valid_samples`: the samples that echoing the input
