@@ -928,20 +928,6 @@ class = "ledger-rules: ExUnitsExceeded degrades to the generic ConwayMempoolFail
 issue = 1143
 
 [[entry]]
-id = "00289"
-expected = "DRepNotRegistered"
-observed = "pass"
-class = "ledger-rules: UpdateDRep of an unregistered DRep is accepted"
-issue = 1154
-
-[[entry]]
-id = "00292"
-expected = "DRepNotRegistered"
-observed = "ValueNotConservedUTxO"
-class = "ledger-rules: UnregDRep of an unregistered DRep counts the certificate refund in the value balance"
-issue = 1155
-
-[[entry]]
 id = "00295"
 expected = "MissingVerificationKeyWitnessesUTXOW"
 observed = "pass"

@@ -1095,7 +1095,7 @@
     "ConwayCertsFailure/CertFailure/DelegFailure/StakeKeyNotRegisteredDELEG [2, 1, 1, 3] -> StakeCredentialInvalidVoteDelegation"
   ],
   "00289": [
-    "pass"
+    "ConwayCertsFailure/CertFailure/GovCertFailure/ConwayDRepNotRegistered [2, 1, 3, 1] -> DRepNotRegistered"
   ],
   "00290": [
     "ConwayUtxowFailure/UtxoFailure/ValueNotConservedUTxO [1, 0, 6] -> ValueNotConservedUTxO",
@@ -1107,8 +1107,7 @@
   ],
   "00292": [
     "ConwayUtxowFailure/UtxoFailure/ValueNotConservedUTxO [1, 0, 6] -> ValueNotConservedUTxO",
-    "ConwayMempoolFailure [7] -> GENERIC-FALLBACK (text: \"transaction validation failed\")",
-    "ledger failures: ValueNotConserved, DRepNotRegistered"
+    "ConwayCertsFailure/CertFailure/GovCertFailure/ConwayDRepNotRegistered [2, 1, 3, 1] -> DRepNotRegistered"
   ],
   "00293": [
     "ConwayUtxowFailure/MissingVKeyWitnessesUTXOW [1, 2] -> MissingVerificationKeyWitnessesUTXOW"
