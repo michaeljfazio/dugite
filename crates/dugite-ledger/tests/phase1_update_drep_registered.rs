@@ -430,9 +430,12 @@ fn update_before_unregistration_is_accepted() {
 /// `[UpdateDRep X]` with X never registered.
 #[test]
 fn update_of_a_drep_that_was_never_registered_is_rejected() {
-    for pv in [9, 10, 11] {
+    // One tx tag (so one tx hash) per protocol version: the WARN buffer is
+    // process-global and filtered by tx hash, so a shared tag would let the
+    // PV9 log line satisfy the PV10 and PV11 block-path assertions.
+    for (pv, tag) in [(9, 0x3A), (10, 0x3B), (11, 0x3C)] {
         let x = Signer::new(0xA5);
-        assert_not_registered(fresh(pv), 0x35, vec![update(&x)], 0, &x);
+        assert_not_registered(fresh(pv), tag, vec![update(&x)], 0, &x);
     }
 }
 
