@@ -13675,93 +13675,27 @@ mod tests {
 
     #[test]
     fn test_cert_witness_pool_registration_with_matching_operator_and_owner_witnesses() {
-        let pool_deposit = ProtocolParameters::mainnet_defaults().pool_deposit.0;
-        let (utxo_set, _input, mut tx, params) = make_cert_test_tx(pool_deposit, 0);
-
         // The operator (cold) key must sign as well as every owner
         // (`poolCertKeyHashWitness` + `owners`, cardano-ledger f649f975).
-        let (w_op, operator) = make_cert_vkey_witness([0xA0; 32]);
-        let (w1, owner1) = make_cert_vkey_witness([0xA1; 32]);
-        let (w2, owner2) = make_cert_vkey_witness([0xA2; 32]);
-
-        tx.body
-            .certificates
-            .push(Certificate::PoolRegistration(PoolParams {
-                operator,
-                vrf_keyhash: Hash32::from_bytes([0x02; 32]),
-                pledge: Lovelace(100_000_000),
-                cost: Lovelace(340_000_000),
-                margin: Rational {
-                    numerator: 1,
-                    denominator: 100,
-                },
-                reward_account: {
-                    let mut ra = vec![0xE0u8];
-                    ra.extend_from_slice(&[0x03; 28]);
-                    ra
-                },
-                pool_owners: vec![owner1, owner2],
-                relays: vec![],
-                pool_metadata: None,
-            }));
-        tx.witness_set.vkey_witnesses.push(w_op);
-        tx.witness_set.vkey_witnesses.push(w1);
-        tx.witness_set.vkey_witnesses.push(w2);
-
-        let result = validate_transaction(&tx, &utxo_set, &params, 100, 300, None);
-        match result {
-            Ok(()) => {}
-            Err(errors) => {
-                assert!(
-                    !errors
-                        .iter()
-                        .any(|e| matches!(e, ValidationError::MissingCertificateWitness(_))),
-                    "Should not have MissingCertificateWitness, got: {errors:?}"
-                );
-            }
-        }
+        let (_, result) = validate_pool_reg(9, false, 0xA0, &[0xA1, 0xA2], &[0xA0, 0xA1, 0xA2]);
+        assert!(
+            result.is_ok(),
+            "operator + every owner witnessed must be accepted, got: {result:?}"
+        );
     }
 
     #[test]
     fn test_cert_witness_pool_registration_missing_owner_witness() {
-        let pool_deposit = ProtocolParameters::mainnet_defaults().pool_deposit.0;
-        let (utxo_set, _input, mut tx, params) = make_cert_test_tx(pool_deposit, 0);
-
-        let (w1, owner1) = make_cert_vkey_witness([0xB1; 32]);
-        let (w2, owner2) = make_cert_vkey_witness([0xB2; 32]);
-        let owner3 = Hash28::from_bytes([0xB3; 28]); // No witness for this one
-
-        tx.body
-            .certificates
-            .push(Certificate::PoolRegistration(PoolParams {
-                operator: Hash28::from_bytes([0x01; 28]),
-                vrf_keyhash: Hash32::from_bytes([0x02; 32]),
-                pledge: Lovelace(100_000_000),
-                cost: Lovelace(340_000_000),
-                margin: Rational {
-                    numerator: 1,
-                    denominator: 100,
-                },
-                reward_account: {
-                    let mut ra = vec![0xE0u8];
-                    ra.extend_from_slice(&[0x03; 28]);
-                    ra
-                },
-                pool_owners: vec![owner1, owner2, owner3],
-                relays: vec![],
-                pool_metadata: None,
-            }));
-        tx.witness_set.vkey_witnesses.push(w1);
-        tx.witness_set.vkey_witnesses.push(w2);
-
-        let result = validate_transaction(&tx, &utxo_set, &params, 100, 300, None);
-        assert!(result.is_err());
-        let errors = result.unwrap_err();
-        assert!(
-            errors
-                .iter()
-                .any(|e| matches!(e, ValidationError::MissingCertificateWitness(_))),
-            "Expected MissingCertificateWitness for missing pool owner, got: {errors:?}"
+        // Operator and owners 1 and 2 sign; owner 3 does not. The error must
+        // name exactly owner 3, so this test fails if the owner requirement
+        // is dropped (the operator alone is satisfied).
+        let (_, owner3) = pool_test_key(0xB3);
+        let (_, result) =
+            validate_pool_reg(9, false, 0xB0, &[0xB1, 0xB2, 0xB3], &[0xB0, 0xB1, 0xB2]);
+        assert_eq!(
+            missing_cert_witnesses(&result),
+            vec![owner3.to_hex()],
+            "Expected MissingCertificateWitness for exactly the unsigned owner, got: {result:?}"
         );
     }
 
@@ -18829,5 +18763,207 @@ mod tests {
             !proposal_cant_follow_fires(vec![pc_proposal(None)], Some(EnactedGovRoots::default())),
             "a ParameterChange proposal must never trip ProposalCantFollow"
         );
+    }
+
+    // ---------------------------------------------------------------------------
+    // #1193: the phase-2 skip flag must not outlive `apply_block`
+    // ---------------------------------------------------------------------------
+    //
+    // `apply_block` suppresses sequential phase-2 evaluation on its thread for
+    // the duration of the tx loop (deferred-parallel strategy). It used to
+    // restore the flag by hand at the very end, so every early `return Err` /
+    // `?` in between left it set: after a block was rejected, any later
+    // `validate_transaction_with_context` on that thread skipped Phase-2 and
+    // admitted a tx the Haskell ledger rejects (UTXOS `CollectErrors` /
+    // `ValidationTagMismatch`). The verdict then depended on what the thread had
+    // done before, so two nodes could disagree on one block.
+
+    /// Minimal Conway block for `apply_block`, carrying `txs`.
+    fn block_with_txs(txs: Vec<Transaction>) -> dugite_primitives::block::Block {
+        use dugite_primitives::block::{
+            Block, BlockHeader, OperationalCert, ProtocolVersion, VrfOutput,
+        };
+        use dugite_primitives::time::BlockNo;
+        Block {
+            header: BlockHeader {
+                header_hash: Hash32::from_bytes([0x11; 32]),
+                prev_hash: Hash32::ZERO,
+                issuer_vkey: vec![],
+                vrf_vkey: vec![],
+                vrf_result: VrfOutput {
+                    output: vec![],
+                    proof: vec![],
+                },
+                nonce_vrf_output: vec![],
+                nonce_vrf_proof: vec![],
+                prev_nonce: None,
+                raw_header_body: None,
+                block_number: BlockNo(1),
+                slot: SlotNo(1_000),
+                epoch_nonce: Hash32::ZERO,
+                body_size: 0,
+                body_hash: Hash32::ZERO,
+                operational_cert: OperationalCert {
+                    hot_vkey: vec![],
+                    sequence_number: 0,
+                    kes_period: 0,
+                    sigma: vec![],
+                },
+                protocol_version: ProtocolVersion { major: 9, minor: 0 },
+                kes_signature: vec![],
+            },
+            transactions: txs,
+            era: dugite_primitives::era::Era::Conway,
+            raw_cbor: None,
+            byron: None,
+        }
+    }
+
+    /// The verdict for the Plutus tx must be identical before and after a
+    /// rejected `apply_block` on the same thread. The tx has no slot
+    /// configuration, which is a Phase-2 precondition (`MissingSlotConfig`)
+    /// raised only when Phase-2 runs.
+    #[test]
+    fn test_failed_apply_block_does_not_leak_phase2_skip_into_validation() {
+        use crate::state::{BlockValidationMode, LedgerError, LedgerState};
+        use dugite_primitives::transaction::TransactionInput;
+
+        let verdict = || {
+            let (utxo_set, mut tx) = make_plutus_utxo_and_tx(Some(vec![0x84, 0x00]));
+            // Give the tx a full evaluation context so that the ONLY thing
+            // that can reject it is Phase-2 itself: a cost model for the
+            // executed language, the matching script-integrity hash, and a
+            // slot configuration. The tx's CBOR does not decode as a
+            // transaction, so Phase-2 collection fails (`Phase2CollectError`,
+            // the class the leak flipped to "ok").
+            let mut params = ProtocolParameters::mainnet_defaults();
+            params.cost_models.plutus_v1 = Some(vec![100; 166]);
+            tx.body.script_data_hash = Some(dugite_serialization::compute_script_data_hash(
+                &tx.witness_set.redeemers,
+                &[],
+                &params.cost_models,
+                true,
+                false,
+                false,
+                None,
+                None,
+                params.protocol_version_major >= 9,
+            ));
+            let slot_config = crate::plutus::SlotConfig::default();
+            validate_transaction_with_context(
+                &tx,
+                &utxo_set,
+                &params,
+                100,
+                300,
+                Some(&slot_config),
+                ValidationContext::new(),
+            )
+        };
+
+        let before = verdict().expect_err("a tx whose Phase-2 collection fails must be rejected");
+        assert!(
+            before
+                .iter()
+                .any(|e| matches!(e, ValidationError::Phase2CollectError(_))),
+            "baseline must be rejected by Phase-2 evaluation, got: {before:?}"
+        );
+
+        // A block that `apply_block(ValidateAll)` rejects AFTER it has set the
+        // skip flag: the second copy of a tx re-spends consumed inputs.
+        let mut state = LedgerState::new(ProtocolParameters::mainnet_defaults());
+        let input = TransactionInput {
+            transaction_id: Hash32::from_bytes([0xD0; 32]),
+            index: 0,
+        };
+        state.utxo.utxo_set.insert(
+            input.clone(),
+            TransactionOutput {
+                address: Address::Byron(ByronAddress {
+                    payload: vec![0u8; 32],
+                }),
+                value: Value::lovelace(5_000_000),
+                datum: OutputDatum::None,
+                script_ref: None,
+                is_legacy: false,
+                raw_cbor: None,
+            },
+        );
+        let mut tx = Transaction::empty_with_hash(Hash32::from_bytes([0xD1; 32]));
+        tx.body.inputs = vec![input];
+        tx.body.outputs = vec![TransactionOutput {
+            address: Address::Byron(ByronAddress {
+                payload: vec![1u8; 32],
+            }),
+            value: Value::lovelace(4_500_000),
+            datum: OutputDatum::None,
+            script_ref: None,
+            is_legacy: false,
+            raw_cbor: None,
+        }];
+        tx.body.fee = Lovelace(500_000);
+        let block = block_with_txs(vec![tx.clone(), tx]);
+        let applied = state.apply_block(&block, BlockValidationMode::ValidateAll);
+        assert!(
+            matches!(applied, Err(LedgerError::BlockTxValidationFailed { .. })),
+            "the duplicate-tx block must be rejected, got: {applied:?}"
+        );
+
+        let after = verdict().expect_err(
+            "a rejected apply_block must not make this thread skip Phase-2 for later validation",
+        );
+        assert!(
+            after
+                .iter()
+                .any(|e| matches!(e, ValidationError::Phase2CollectError(_))),
+            "verdict changed after a failed apply_block: before={before:?} after={after:?}"
+        );
+    }
+
+    /// The guard restores the previous value even when its holder unwinds, and
+    /// nested guards restore what each found (not unconditionally `false`).
+    #[test]
+    fn test_phase2_skip_guard_restores_on_unwind_and_nests() {
+        use super::super::Phase2SkipGuard;
+
+        let (utxo_set, tx) = make_plutus_utxo_and_tx(Some(vec![0x84, 0x00]));
+        let params = ProtocolParameters::mainnet_defaults();
+        let rejected_by_phase2 = || {
+            validate_transaction_with_context(
+                &tx,
+                &utxo_set,
+                &params,
+                100,
+                300,
+                None,
+                ValidationContext::new(),
+            )
+            .err()
+            .is_some_and(|es| {
+                es.iter()
+                    .any(|e| matches!(e, ValidationError::MissingSlotConfig))
+            })
+        };
+
+        assert!(rejected_by_phase2());
+        let unwound = std::panic::catch_unwind(|| {
+            let _g = Phase2SkipGuard::new();
+            panic!("unwind with the guard held");
+        });
+        assert!(unwound.is_err());
+        assert!(
+            rejected_by_phase2(),
+            "guard must restore the flag on panic unwinding"
+        );
+
+        let outer = Phase2SkipGuard::new();
+        assert!(!rejected_by_phase2(), "outer guard suppresses Phase-2");
+        drop(Phase2SkipGuard::new());
+        assert!(
+            !rejected_by_phase2(),
+            "an inner guard must restore the OUTER guard's value, not false"
+        );
+        drop(outer);
+        assert!(rejected_by_phase2());
     }
 }

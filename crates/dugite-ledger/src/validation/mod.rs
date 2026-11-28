@@ -19,7 +19,7 @@ mod datum;
 pub mod mir;
 mod phase1;
 pub mod ppup;
-mod scripts;
+pub(crate) mod scripts;
 pub(crate) mod size_check;
 pub mod withdrawals;
 
@@ -84,22 +84,37 @@ thread_local! {
     static SKIP_PHASE2_EVAL: Cell<bool> = const { Cell::new(false) };
 }
 
-/// Set the thread-local phase-2 skip flag and return the previous value.
+/// RAII guard for the thread-local phase-2 skip flag.
 ///
-/// Used by the block-apply parallel-phase-2 path. Always restore the returned
-/// value with [`restore_phase2_eval`] (even on error) to avoid leaking the
-/// skip state across invocations.
-pub(crate) fn suppress_phase2_eval() -> bool {
-    SKIP_PHASE2_EVAL.with(|c| {
-        let prev = c.get();
-        c.set(true);
-        prev
-    })
+/// Constructing the guard sets the flag to `true` and remembers the previous
+/// value; dropping it restores that value. Because restoration happens in
+/// `Drop`, it runs on every exit path of the holder: normal return, early
+/// `return Err(..)`, `?`, and panic unwinding. Nested guards compose, since
+/// each restores exactly what it found.
+///
+/// This replaces a manual set/restore pair whose restore was skipped by the
+/// early exits of `apply_block`, which left the flag set on the thread and made
+/// every later `validate_transaction_with_context` on it skip Phase-2. A tx
+/// that the Haskell ledger rejects was then accepted, so the verdict depended
+/// on what the thread had done before (#1193).
+#[must_use = "the phase-2 skip flag is restored when the guard is dropped"]
+pub(crate) struct Phase2SkipGuard {
+    prev: bool,
 }
 
-/// Restore the thread-local phase-2 skip flag to a previously-saved value.
-pub(crate) fn restore_phase2_eval(prev: bool) {
-    SKIP_PHASE2_EVAL.with(|c| c.set(prev));
+impl Phase2SkipGuard {
+    /// Suppress sequential phase-2 evaluation on this thread until the guard
+    /// is dropped.
+    pub(crate) fn new() -> Self {
+        let prev = SKIP_PHASE2_EVAL.with(|c| c.replace(true));
+        Self { prev }
+    }
+}
+
+impl Drop for Phase2SkipGuard {
+    fn drop(&mut self) {
+        SKIP_PHASE2_EVAL.with(|c| c.set(self.prev));
+    }
 }
 
 /// Re-validate an already-admitted mempool transaction against the current
@@ -151,8 +166,8 @@ pub fn reapply_tx_for_mempool(
     slot_config: Option<&SlotConfig>,
     context: ValidationContext,
 ) -> Result<(), Vec<ValidationError>> {
-    let prev = suppress_phase2_eval();
-    let result = validate_transaction_with_context(
+    let _skip_phase2 = Phase2SkipGuard::new();
+    validate_transaction_with_context(
         tx,
         utxo_set,
         params,
@@ -160,9 +175,7 @@ pub fn reapply_tx_for_mempool(
         tx_size,
         slot_config,
         context,
-    );
-    restore_phase2_eval(prev);
-    result
+    )
 }
 
 /// On-chain governance proposal record used by validation rules that need
