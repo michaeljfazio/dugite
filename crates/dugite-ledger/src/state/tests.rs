@@ -14212,7 +14212,7 @@ fn test_treasury_mismatch_does_not_abort_apply_block() {
     let result = state.apply_block(&block, BlockValidationMode::ValidateAll);
     assert!(
         matches!(result, Err(LedgerError::BlockTxValidationFailed { ref errors, .. })
-            if errors.contains("MismatchedTreasuryValue")),
+            if errors.contains("Treasury value mismatch")),
         "ValidateAll must reject treasury mismatch (no silent correction) per #678; \
          got: {result:?}"
     );
@@ -14264,7 +14264,7 @@ fn test_treasury_mismatch_no_cascade_in_downstream_block() {
     let result_a = state.apply_block(&block_a, BlockValidationMode::ValidateAll);
     assert!(
         matches!(result_a, Err(LedgerError::BlockTxValidationFailed { ref errors, .. })
-            if errors.contains("MismatchedTreasuryValue")),
+            if errors.contains("Treasury value mismatch")),
         "Block A must be rejected on treasury mismatch (no silent correction); \
          got: {result_a:?}"
     );
@@ -14282,26 +14282,28 @@ fn test_treasury_mismatch_no_cascade_in_downstream_block() {
     // reference rejected outputs would correctly fail Phase-1 InputNotFound.
 }
 
-/// Regression: UnelectedCommitteeMember must NOT abort apply_block for
-/// confirmed on-chain blocks.
+/// A CommitteeHotAuth for a cold credential that is neither a current nor a
+/// potential future committee member rejects the block in `ValidateAll`.
 ///
-/// Scenario: a Conway block contains a CommitteeHotAuth cert for a cold
-/// credential that is NOT in our committee_expiration map (i.e. our committee
-/// state is stale).  Prior to the fix, apply_block returned
-/// `Err(UnelectedCommitteeMember)` and the block's outputs were never inserted.
-/// After the fix, the block applies successfully and outputs are in the UTxO set.
+/// Haskell GOVCERT (`Cardano.Ledger.Conway.Rules.GovCert`,
+/// `checkAndOverwriteCommitteeMemberState`):
+/// `isCurrentMember || isPotentialFutureMember ?! (injectFailure .
+/// ConwayCommitteeIsUnknown) coldCred`, and a LEDGER predicate failure makes
+/// the whole block invalid (`applyBlockEither`). This used to be logged and
+/// the tx applied ("committee state may be stale; trusting on-chain
+/// consensus"), which let a block producer put an unknown-member hot-key
+/// authorisation into dugite's ledger that every Haskell node refuses.
 #[test]
-fn test_unelected_committee_member_does_not_abort_apply_block() {
+fn test_unelected_committee_member_rejects_block_in_validate_all() {
     let mut params = ProtocolParameters::mainnet_defaults();
     params.protocol_version_major = 9;
     let mut state = LedgerState::new(params);
 
-    // Ensure the cold credential is NOT in committee_expiration (stale state).
+    // governance has no committee and no UpdateCommittee proposal, so the
+    // cold credential is neither a current nor a potential future member.
     let cold_cred = Credential::VerificationKey(Hash28::from_bytes([0xD0u8; 28]));
     let hot_cred = Credential::VerificationKey(Hash28::from_bytes([0xD1u8; 28]));
-    // governance.committee_expiration is empty by default for a new LedgerState.
 
-    // Seed input UTxO.
     let seed_input = TransactionInput {
         transaction_id: Hash32::from_bytes([0xD2u8; 32]),
         index: 0,
@@ -14313,97 +14315,31 @@ fn test_unelected_committee_member_does_not_abort_apply_block() {
 
     let tx = make_tx_with_committee_hot_auth(
         0xD3,
-        vec![seed_input],
+        vec![seed_input.clone()],
         vec![make_lovelace_output(9_800_000)],
         cold_cred,
         hot_cred,
     );
-
     let block = make_test_block(2000, 200, Hash32::ZERO, vec![tx]);
 
-    // Use ValidateAll — this is the mode that triggers the committee check
-    // and was the exact code path that caused the cascade failure.
-    state
-        .apply_block(&block, BlockValidationMode::ValidateAll)
-        .expect("UnelectedCommitteeMember must not abort apply_block for confirmed blocks");
-
-    // Block output MUST be in UTxO set.
+    let result = state.apply_block(&block, BlockValidationMode::ValidateAll);
+    assert!(
+        matches!(result, Err(LedgerError::BlockTxValidationFailed { ref errors, .. })
+            if errors.contains("not a current CC member")),
+        "ValidateAll must reject a CommitteeHotAuth for an unknown cold credential; \
+         got: {result:?}"
+    );
     let produced = TransactionInput {
         transaction_id: Hash32::from_bytes([0xD3u8; 32]),
         index: 0,
     };
     assert!(
-        state.utxo.utxo_set.contains(&produced),
-        "Block output must be inserted despite unelected committee member cert"
+        !state.utxo.utxo_set.contains(&produced),
+        "a rejected block's outputs must not be inserted"
     );
-}
-
-/// Regression: cascading InputNotFound after UnelectedCommitteeMember.
-///
-/// Block A: tx_a has an UnelectedCommitteeMember cert → pre-fix: abort, outputs
-///   never inserted.
-/// Block B (next): tx_b spends tx_a's output → pre-fix: InputNotFound.
-///
-/// After the fix: tx_a's output is inserted normally, tx_b succeeds.
-#[test]
-fn test_unelected_committee_member_no_cascade_in_downstream_block() {
-    let mut params = ProtocolParameters::mainnet_defaults();
-    params.protocol_version_major = 9;
-    let mut state = LedgerState::new(params);
-
-    let cold_cred = Credential::VerificationKey(Hash28::from_bytes([0xE0u8; 28]));
-    let hot_cred = Credential::VerificationKey(Hash28::from_bytes([0xE1u8; 28]));
-
-    // Seed input for Block A.
-    let seed_input = TransactionInput {
-        transaction_id: Hash32::from_bytes([0xE2u8; 32]),
-        index: 0,
-    };
-    state
-        .utxo
-        .utxo_set
-        .insert(seed_input.clone(), make_lovelace_output(10_000_000));
-
-    // Block A: CommitteeHotAuth for un-elected cold credential.
-    // Use ValidateAll to trigger the committee check (ApplyOnly skips it).
-    let tx_a = make_tx_with_committee_hot_auth(
-        0xE3,
-        vec![seed_input],
-        vec![make_lovelace_output(9_800_000)],
-        cold_cred,
-        hot_cred,
-    );
-    let block_a = make_test_block(2000, 200, Hash32::ZERO, vec![tx_a]);
-    state
-        .apply_block(&block_a, BlockValidationMode::ValidateAll)
-        .expect("Block A must apply despite unelected committee member cert");
-
-    let output_a = TransactionInput {
-        transaction_id: Hash32::from_bytes([0xE3u8; 32]),
-        index: 0,
-    };
     assert!(
-        state.utxo.utxo_set.contains(&output_a),
-        "output_a must be in UTxO set after Block A"
-    );
-
-    // Block B: spend output_a.
-    let block_a_hash = Hash32::from_bytes([200u8; 32]);
-    let tx_b = make_simple_tx(
-        0xE4,
-        vec![output_a.clone()],
-        vec![make_lovelace_output(9_600_000)],
-    );
-    let block_b = make_test_block(2001, 201, block_a_hash, vec![tx_b]);
-    state
-        .apply_block(&block_b, BlockValidationMode::ApplyOnly)
-        .expect(
-        "Block B must apply — output_a must be visible (no cascade from unelected committee cert)",
-    );
-
-    assert!(
-        !state.utxo.utxo_set.contains(&output_a),
-        "output_a must be consumed by Block B"
+        state.utxo.utxo_set.contains(&seed_input),
+        "a rejected block must not spend its inputs"
     );
 }
 
