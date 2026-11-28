@@ -199,7 +199,7 @@ To iterate on a capture script without publishing a release, `just regenerate-co
 
 ### Currently pinned
 
-`[release].tag = "conformance-corpus-v20260725-154355"`, built from:
+`[release].tag = "conformance-corpus-v20261128-084556"`, built from:
 
 | Area | Pin |
 |---|---|
